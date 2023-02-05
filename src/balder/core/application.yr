@@ -14,6 +14,8 @@ import balder::core::window;
 import balder::core::input;
 import balder::core::activity;
 
+import balder::core::vulkan::_;
+
 /**
  * Main part of a Balder application
  * @example:
@@ -31,29 +33,31 @@ pub class Application {
     // The window rendering the application 
     let dmut _window = Window::new ();
 
-    // The timer to cap the frame rendering
-    let dmut _frameTimer = Timer::new ();
+    // The timer to cap the activity update frequency
+    let dmut _timer = Timer::new ();
 
-    // The cumulated time 
-    let dmut _secondTimer = Timer::new ();
-
+    // The duration of a step of the application (one update of the activity)
+    let mut _stepDuration = dur::millis (16u64) + dur::micros (666u64);
+    
     // While _isRunning is true the app is running
     let mut _isRunning : bool = true;
-
-    // The duration of a frame in ms, by default 60 frame per seconds
-    let mut _frameDuration : Duration = dur::millis (16u64) + dur::micros (666u64);
-
-    /// The number of frame in the current second
-    let mut _nbFrame : u32 = 0u32;
-    
-    /// The number of frame rendered during the last second
-    let mut _lastNbFrame : u32 = 0u32;
     
     // The list of input manager for each activities
     let dmut _inputs : [&InputManager] = [];
 
     // The list of activities that controlling the application
     let dmut _activities : [&Activity] = [];
+
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =======================================   CTOR AND CONFIGURE  ========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+    
+    prot self empty () {}
     
     /**
      * Create a new application from a file configuration
@@ -66,207 +70,253 @@ pub class Application {
         let conf = self.readTomConfig (path);
 
         self:.configure (conf);
+    }    
+
+    prv {
+        
+        /**
+         * Configure the application with a given configuration
+         * @params: 
+         *    - conf: the configuration of the window
+         */
+        def configure (mut self, conf : &Config)
+            throws &BalderError
+        {
+            self:.configureWindow (conf);
+
+            let step = (to!i32 (conf["timer"]["ips"])?).getOr (60);
+            self._stepDuration = dur::seconds (1) / step;            
+        }
+
+        /**
+         * Configure the window of the application using the configuration `conf["window"]`
+         * @params: 
+         *    - conf: the configuration of the application
+         */
+        def configureWindow (mut self, conf : &Config)
+            throws &BalderError
+        {
+            let winConfO = conf["window"]?;
+            let fps = cast!u32 ((to!i32 (conf["timer"]["fps"])?).getOr (60));
+            match winConfO {
+                Ok (winConf : _) => {
+                    self._window:.setDimension ((to!u32 (winConf["width"])?).getOr (1024u32),
+                                                (to!u32 (winConf["height"])?).getOr (768u32));
+                    
+                    self._window:.setName ((config::conv::to![c8] (winConf["name"])?).getOr ("Balder"s8));
+                    self._window:.configureVulkan (winConf, fps, resizable-> (config::conv::to!bool (winConf["resizable"])?).getOr (false));
+                }
+                Err () => {
+                    self._window:.setDimension (1024u32, 768u32);
+                    self._window:.setName ("Balder"s8);
+                    self._window:.configureVulkan (Dict::new (), fps, resizable-> false);
+                }
+            }
+        }
+
+        /**
+         * Parse the content of the configuration file and return the configuration
+         * @params: 
+         *    - path: the path of the configuration file (relative to `${pwd}/res`)
+         * @throws:
+         *   - &BalderError: 
+         *      + the parsing failed 
+         *      + the file does not exist
+         */
+        def readTomConfig (self, path : &Path)-> &Config
+            throws &BalderError
+        {
+            import std::syntax::_; // SyntaxError
+            import std::env; // currentDir
+            
+            let completePath = env::currentDir ().push ("res"s8).push (path);
+            let content = with dmut f = File::open (completePath) {
+                toml::parse (f:.readAll ())
+            } catch {
+                _ : &FsError => {
+                    throw BalderError::new ("File not found : "s8 ~ completePath.toStr ());
+                }
+                s : &SyntaxError => {
+                    import std::conv;
+                    throw BalderError::new ("Configuration format : "s8 ~ s.msg.(std::conv::to)![c8]() ~ ":("s8 ~ s.line.(std::conv::to)![c8] () ~ ","s8 ~ s.col.(std::conv::to)![c8] () ~ ")"s8);
+                }
+            }
+
+            content
+        } 
+
+    }
+
+    
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * ================================================   USAGE    ==========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    pub {
+        
+        /**
+         * Start the application 
+         */
+        def run (mut self) {
+            self._window:.show ();
+            self._window:.startRendering ();
+            
+            while self._isRunning {
+                self:.waitClock ();
+                self._inputs [$ - 1us]:.pollEvents ();
+
+                self:.callActivity ();
+            }
+
+            self._window:.stopRendering ();
+        }
+
+
+        /**
+         * Close the application
+         */
+        def quit (mut self) {
+            self._isRunning = false;
+        }
+        
+    }
+
+    
+    /**
+     * Wait until the next update of the activity should be called.
+     * @info: update the clock count.
+     */
+    prv def waitClock (mut self) {        
+        let tick = self._timer.timeSinceStart ();
+        let x = instant::now ();
+        let r = self._stepDuration - tick - dur::micros (1u64);
+        sleep (r);
+        self._timer:.reset ((instant::now () - x) - r);
     }
 
     /**
-     * Start the application 
+     * ======================================================================================================
+     * ======================================================================================================
+     * ================================================   ACTIVITY    =======================================
+     * ======================================================================================================
+     * ======================================================================================================
      */
-    pub def run (mut self) {
-        self._window:.show ();
-        while self._isRunning {
-            self:.waitFrame ();
-            self._inputs [$ - 1us]:.pollEvents ();
+    
 
-            self._window:.startPass ();
-            self:.callActivity ();
-            
-            self._window:.submitPass ();
-            self._window:.presentPass ();
+    pub {
+
+        /**
+         * Open an activity in the application and start it.
+         * @info: put the current activity in Pause mode.
+         */
+        def openActivity {T over &Activity} (mut self) {
+            if self._activities.len != 0us
+                self._activities [$ - 1us]:.onPause ()?;
+
+            self._inputs = alias (self._inputs ~ [InputManager::new ()]);
+
+            let dmut act : &Activity = T::new (alias self);
+            self._activities = alias (self._activities ~ [alias act]);
         }
-    }
 
+        /**
+         * Open an activity in the application and start it.
+         * @info: put the current activity in Pause mode.
+         */
+        def openActivity {T over &Activity, P...} (mut self, p : P) {
+            if self._activities.len != 0us
+                self._activities [$ - 1us]:.onPause ()?;
+
+            self._inputs = alias (self._inputs ~ [InputManager::new ()]);
+            self._activities = alias (self._activities ~ [alias cast!{&Activity} (T::new (alias self, expand p))]);
+        }
+
+        /**
+         * Close the current activity
+         * @info: resume the previous activity if there was one
+         */
+        def closeActivity (mut self) {
+            {
+                if self._activities.len != 0us {
+                    self._activities [$ - 1us]:.dispose ();
+                    self._activities = self._activities [0us .. $ - 1us];
+                    self._inputs = self._inputs [0us .. $ - 1us];
+                }
+            }
+
+            {
+                if self._activities.len == 0us {
+                    self._isRunning = false;
+                    self._inputs = alias (self._inputs ~ [InputManager::new ()]);
+                    self._activities = alias (self._activities ~ [alias cast!{&Activity} (EmptyActivity::new (alias self))]);
+                } else {
+                    self._activities [$ - 1us]:.onResume ();
+                }
+            } 
+        }
+        
+    }   
+    
     /**
      * Call the activity update and draw routine.
      */
     prv def callActivity (mut self) {
         self._activities[$ - 1us]:.onUpdate ();
-        self._activities[$ - 1us]:.on3dDraw ();
     }
 
     /**
-     * Wait until the next frame should be drawn.
-     * @info: update the frame count.
+     * ======================================================================================================
+     * ======================================================================================================
+     * ================================================   GETTERS    ========================================
+     * ======================================================================================================
+     * ======================================================================================================
      */
-    prv def waitFrame (mut self) {
-        self._nbFrame += 1u32;
-
-        if (self._secondTimer.timeSinceStart () >= dur::seconds (1u64)) {
-            self._secondTimer:.reset ();
-            self._lastNbFrame = self._nbFrame;
-            self._nbFrame = 0u32;
-        }
-
-        let tick = self._frameTimer.timeSinceStart ();
-        let x = instant::now ();
-        let r = self._frameDuration - tick - dur::micros (1u64);
-        sleep (r);
-        self._frameTimer:.reset ((instant::now () - x) - r);
-    }
-
-    /**
-     * Open an activity in the application and start it.
-     * @info: put the current activity in Pause mode.
-     */
-    pub def openActivity {T over &Activity} (mut self) {
-        if self._activities.len != 0us
-            self._activities [$ - 1us]:.onPause ()?;
-
-        self._inputs = alias (self._inputs ~ [InputManager::new ()]);
-
-        let dmut act : &Activity = T::new (alias self);
-        self._activities = alias (self._activities ~ [alias act]);
-    }
-
-    /**
-     * Open an activity in the application and start it.
-     * @info: put the current activity in Pause mode.
-     */
-    pub def openActivity {T over &Activity, P...} (mut self, p : P) {
-        if self._activities.len != 0us
-            self._activities [$ - 1us]:.onPause ()?;
-
-        self._inputs = alias (self._inputs ~ [InputManager::new ()]);
-        self._activities = alias (self._activities ~ [alias cast!{&Activity} (T::new (alias self, expand p))]);
-    }
-
-    /**
-     * @returns: the input manager of the current activity
-     */
-    pub def getInputManager (mut self) -> dmut &InputManager
-    {
-        alias self._inputs [$ - 1us]
-    }
-
-    /**
-     * @returns: the input manager of the current activity
-     */
-    pub def getInputManager (self) -> &InputManager
-    {
-        self._inputs [$ - 1us]
-    }
     
-    /**
-     * @returns: the window of the application
-     */
-    pub def getWindow (mut self)-> dmut &Window {
-        alias self._window
-    }
-
-    /**
-     * @returns: the window of the application
-     */
-    pub def getWindow (self)-> &Window {
-        self._window
-    }
-    
-    /**
-     * Close the current activity
-     * @info: resume the previous activity if there was one
-     */
-    pub def closeActivity (mut self) {
-        {
-            if self._activities.len != 0us {
-                self._activities [$ - 1us]:.dispose ();
-                self._activities = self._activities [0us .. $ - 1us];
-                self._inputs = self._inputs [0us .. $ - 1us];
-            }
-        }
-
-        {
-            if self._activities.len == 0us {
-                self._isRunning = false;
-                self._inputs = alias (self._inputs ~ [InputManager::new ()]);
-                self._activities = alias (self._activities ~ [alias cast!{&Activity} (EmptyActivity::new (alias self))]);
-            } else {
-                self._activities [$ - 1us]:.onResume ();
-            }
-        } 
-    }
-
-    /**
-     * Close the application
-     */
-    pub def quit (mut self) {
-        self._isRunning = false;
-    }
-    
-    /**
-     * Configure the application with a given configuration
-     * @params: 
-     *    - conf: the configuration of the window
-     */
-    prv def configure (mut self, conf : &Config)
-        throws &BalderError
-    {
-        self:.configureWindow (conf);
-    }
-
-    /**
-     * Configure the window of the application using the configuration `conf["window"]`
-     * @params: 
-     *    - conf: the configuration of the application
-     */
-    prv def configureWindow (mut self, conf : &Config)
-        throws &BalderError
-    {
-        let winConfO = conf["window"]?;
-        match winConfO {
-            Ok (winConf : _) => {
-                self._window:.setDimension ((to!u32 (winConf["width"])?).getOr (1024u32),
-                                            (to!u32 (winConf["height"])?).getOr (768u32));
-                
-                self._window:.setName ((config::conv::to![c8] (winConf["name"])?).getOr ("Balder"s8));
-                self._window:.configureVulkan (winConf, resizable-> (config::conv::to!bool (winConf["resizable"])?).getOr (false));
-            }
-            Err () => {
-                self._window:.setDimension (1024u32, 768u32);
-                self._window:.setName ("Balder"s8);
-                self._window:.configureVulkan (Dict::new (), resizable-> false);
-            }
-        }
-    }
-
-    /**
-     * Parse the content of the configuration file and return the configuration
-     * @params: 
-     *    - path: the path of the configuration file (relative to `${pwd}/res`)
-     * @throws:
-     *   - &BalderError: 
-     *      + the parsing failed 
-     *      + the file does not exist
-     */
-    prv def readTomConfig (self, path : &Path)-> &Config
-        throws &BalderError
-    {
-        import std::syntax::_; // SyntaxError
-        import std::env; // currentDir
+    pub {
         
-        let completePath = env::currentDir ().push ("res"s8).push (path);
-        let content = with dmut f = File::open (completePath) {
-            toml::parse (f:.readAll ())
-        } catch {
-            _ : &FsError => {
-                throw BalderError::new ("File not found : "s8 ~ completePath.toStr ());
-            }
-            s : &SyntaxError => {
-                import std::conv;
-                throw BalderError::new ("Configuration format : "s8 ~ s.msg.(std::conv::to)![c8]() ~ ":("s8 ~ s.line.(std::conv::to)![c8] () ~ ","s8 ~ s.col.(std::conv::to)![c8] () ~ ")"s8);
-            }
+        /**
+         * @returns: the input manager of the current activity
+         */
+        def getInputManager (mut self) -> dmut &InputManager
+        {
+            alias self._inputs [$ - 1us]
         }
 
-        content
-    } 
+        /**
+         * @returns: the input manager of the current activity
+         */
+        def getInputManager (self) -> &InputManager
+        {
+            self._inputs [$ - 1us]
+        }
+        
+        /**
+         * @returns: the window of the application
+         */
+        def getWindow (mut self)-> dmut &Window {
+            alias self._window
+        }
 
+        /**
+         * @returns: the window of the application
+         */
+        def getWindow (self)-> &Window {
+            self._window
+        }
+
+    }
+       
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =============================================   DISPOSING    =========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
     
     impl Disposable {
         pub over dispose (mut self) {
@@ -282,3 +332,4 @@ pub class Application {
     }
     
 }
+

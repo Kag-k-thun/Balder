@@ -1,0 +1,327 @@
+mod balder::core::vulkan::shader;
+
+import balder::core::vulkan::device;
+import balder::core::vulkan::layout;
+import balder::core::error;
+import balder::math::vector;
+
+import vulkan::_;
+import std::fs::_;
+import std::conv;
+
+/**
+ * Ancestor of all kind of shaders
+ */
+pub class @abstract Shader {
+
+    // The layout of the shader
+    let dmut _pipelineLayout : &PipelineLayout;
+    
+    // The vulkan device holding the shader
+    let dmut _device : &VulkanDevice;
+    
+    // The vulkan handle
+    let mut _program : VkPipeline = null;
+    
+    prot self (dmut device : &VulkanDevice, dmut pipelineLayout : &PipelineLayout)
+        with _device = alias device, _pipelineLayout = alias pipelineLayout
+    {}
+
+    impl Disposable {
+        pub over dispose (mut self) {}
+    }
+    
+}
+
+/**
+ * A shader
+ * @template: 
+ *    - IN: the input type of the shader 
+ *    - UN: the uniform type of the shader
+ */
+pub class Shader {struct IN, struct UN} over Shader {
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =======================================   CTOR AND CONFIGURE  ========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+    
+    /**
+     * @params: 
+     *    - device: the device used to allocate the shader
+     *    - pipelineLayout: the layout describing the shader uniform content
+     *    - vertSrc: the path of the vertex shader
+     *    - fragSrc: the path of the fragment shader
+     */
+    pub self simplePass (dmut device : &VulkanDevice, vertSrc : &Path, fragSrc : &Path)
+        with super (alias device, PipelineLayout!{UN}::new (alias device))
+        throws &BalderError
+    {
+        let vertContent = self.readFile (vertSrc);
+        let fragContent = self.readFile (fragSrc);
+
+        let vertShader = self:.createShaderModule (vertContent);
+        let fragShader = self:.createShaderModule (fragContent);
+
+        let vertShaderStageInfo = VkPipelineShaderStageCreateInfo (
+            sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage-> VkShaderStageFlagBits::VK_SHADER_STAGE_VERTEX_BIT,
+            module-> vertShader,
+            pName-> toStringZ ("main"s8)
+        );
+
+        let fragShaderStageInfo = VkPipelineShaderStageCreateInfo (
+            sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage-> VkShaderStageFlagBits::VK_SHADER_STAGE_FRAGMENT_BIT,
+            module-> fragShader,
+            pName-> toStringZ ("main"s8)
+            );
+
+        let dmut shaderStages = [VkPipelineShaderStageCreateInfo () ; 2];
+        shaderStages[0] = vertShaderStageInfo;
+        shaderStages[1] = fragShaderStageInfo;
+
+        self._program = self:.createPipeline (shaderStages);
+        
+        vkDestroyShaderModule (self._device:.getDeviceHandle (), vertShader, null);
+        vkDestroyShaderModule (self._device:.getDeviceHandle (), fragShader, null);                
+    }
+    
+    prv {
+
+        /**
+         * @returns: the content of a shader file
+         */
+        def readFile (self, src : &Path)-> [u8]
+            throws &BalderError
+        {
+            with dmut f = File::open (src) {
+                f:.readBytesAll ()
+            } catch {
+                _ => throw BalderError::new ("Shader file not found : "s8 ~ src.toStr ());
+            }
+        }
+
+        /**
+         * Create a shader module from bytecode of the shader
+         * @returns: the shader module
+         */
+        def createShaderModule (mut self, bytecode : [u8])-> VkShaderModule
+            throws &BalderError
+        {
+            let createInfo = VkShaderModuleCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                codeSize-> bytecode.len,
+                pCode-> cast!{&u32} (cast!{&void} (bytecode.ptr))
+                );
+
+            let dmut module : VkShaderModule = null;
+            if (vkCreateShaderModule (self._device:.getDeviceHandle (), &createInfo, null, alias &module) != VkResult::VK_SUCCESS) {
+                throw BalderError::new ("Failed to create shader module"s8);
+            }
+
+            module
+        }
+
+        /**
+         * Create the pipeline of the shader
+         */
+        def createPipeline (mut self, stages : [VkPipelineShaderStageCreateInfo])-> dmut VkPipeline
+            throws &BalderError
+        {
+            let (attrDescr, bindDescr) = self.createAttributeDescription ();
+
+            let vertexInputInfo = VkPipelineVertexInputStateCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+                vertexBindingDescriptionCount-> 1u32,
+                pVertexBindingDescriptions-> &bindDescr,
+                vertexAttributeDescriptionCount-> cast!u32 (attrDescr.len),
+                pVertexAttributeDescriptions-> attrDescr.ptr
+                );
+
+
+            let inputAssembly = VkPipelineInputAssemblyStateCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                topology-> VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                primitiveRestartEnable-> VK_FALSE
+                );
+
+            let viewport = VkViewport (
+                x-> 0.0f,
+                y-> 0.0f,
+                width-> to!f32 (self._device.getSwapchainExtent ().width),
+                height-> to!f32 (self._device.getSwapchainExtent ().height),
+                minDepth-> 0.0f,
+                maxDepth-> 1.0f
+                );
+
+            let scissors = VkRect2D (
+                extent-> self._device.getSwapchainExtent ()
+                );
+
+            let dynStateList = [VkDynamicState::VK_DYNAMIC_STATE_VIEWPORT,
+                             VkDynamicState::VK_DYNAMIC_STATE_SCISSOR];
+
+            let dynState = VkPipelineDynamicStateCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                dynamicStateCount-> cast!u32 (dynStateList.len),
+                pDynamicStates-> dynStateList.ptr
+                );
+
+            let viewportState = VkPipelineViewportStateCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                viewportCount-> 1u32,
+                pViewports-> &viewport,
+                scissorCount-> 1u32,
+                pScissors-> &scissors
+                );
+
+            let rasterizer = VkPipelineRasterizationStateCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                depthClampEnable-> VK_FALSE,
+                rasterizerDiscardEnable-> VK_FALSE,
+                polygonMode-> VkPolygonMode::VK_POLYGON_MODE_FILL,
+                cullMode-> cast!u32 (VkCullModeFlagBits::VK_CULL_MODE_BACK_BIT),
+                frontFace-> VkFrontFace::VK_FRONT_FACE_CLOCKWISE,
+                depthBiasEnable-> VK_FALSE,
+                lineWidth-> 1.0f
+                );
+
+            let multisampling = VkPipelineMultisampleStateCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                sampleShadingEnable-> VK_FALSE,
+                rasterizationSamples-> VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+                minSampleShading-> 1.0f,
+                alphaToCoverageEnable-> VK_FALSE,
+                alphaToOneEnable-> VK_FALSE
+                );
+
+            let colorBlendAttachement = VkPipelineColorBlendAttachmentState (
+                colorWriteMask-> cast!u32 (VkColorComponentFlagBits::VK_COLOR_COMPONENT_R_BIT |
+                                           VkColorComponentFlagBits::VK_COLOR_COMPONENT_G_BIT |
+                                           VkColorComponentFlagBits::VK_COLOR_COMPONENT_B_BIT |
+                                           VkColorComponentFlagBits::VK_COLOR_COMPONENT_A_BIT),
+                blendEnable-> VK_TRUE,
+                srcColorBlendFactor-> VkBlendFactor::VK_BLEND_FACTOR_SRC_ALPHA,
+                dstColorBlendFactor-> VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
+                colorBlendOp-> VkBlendOp::VK_BLEND_OP_ADD,
+                srcAlphaBlendFactor-> VkBlendFactor::VK_BLEND_FACTOR_ONE,
+                dstAlphaBlendFactor-> VkBlendFactor::VK_BLEND_FACTOR_ZERO,
+                alphaBlendOp-> VkBlendOp::VK_BLEND_OP_ADD
+                );
+            
+            let colorBlending = VkPipelineColorBlendStateCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                logicOpEnable-> VK_FALSE,
+                logicOp-> VkLogicOp::VK_LOGIC_OP_COPY,
+                attachmentCount-> 1u32,
+                pAttachments-> &colorBlendAttachement
+                );
+
+            let renderPass = self._device:.getRenderPass ();
+            let pipelineInfo = VkGraphicsPipelineCreateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                stageCount-> cast!u32 (stages.len),
+                pStages-> stages.ptr,
+                pVertexInputState-> &vertexInputInfo,
+                pInputAssemblyState-> &inputAssembly,
+                pViewportState-> &viewportState,
+                pRasterizationState-> &rasterizer,
+                pMultisampleState-> &multisampling,
+                pDepthStencilState-> null,
+                pColorBlendState-> &colorBlending,
+                pDynamicState-> &dynState,
+                renderPass-> renderPass,
+                layout-> self._pipelineLayout:.getVulkanHandle (),
+                subpass-> 0u32,
+                basePipelineHandle-> null,
+                basePipelineIndex-> -1
+                );
+
+
+            let dmut pipeline : VkPipeline = null;
+            if (vkCreateGraphicsPipelines (self._device:.getDeviceHandle (), null, 1u32, &pipelineInfo, null, alias &pipeline) != VkResult::VK_SUCCESS) {
+                throw BalderError::new ("Failed to create graphic pipeline"s8);
+            }
+            
+            alias pipeline
+        }
+
+
+        /**
+         * Create the vertex description of the input vertex type of the shader
+         */
+        def createAttributeDescription (self)-> ([VkVertexInputAttributeDescription], VkVertexInputBindingDescription) {
+            let dmut res = [VkVertexInputAttributeDescription () ; new (__pragma!field_offsets (IN)).len];
+            
+            cte for i in 0us .. (__pragma!field_offsets (IN)).len {
+                let offset = (__pragma!field_offsets (IN))[i];
+
+                res[i] = VkVertexInputAttributeDescription (
+                    binding-> 0u32,
+                    location-> cast!u32 (i),
+                    format-> getFormat!{IN, (__pragma!field_type (IN, (__pragma!field_names (IN))[i]))} (),
+                    offset-> cast!u32 (offset)
+                    );                
+            }
+
+            let bind = VkVertexInputBindingDescription (
+                binding-> 0u32,
+                stride-> cast!u32 (sizeof (IN)),
+                inputRate-> VkVertexInputRate::VK_VERTEX_INPUT_RATE_VERTEX
+                );
+            
+            (res, bind)
+        }
+        
+    }
+
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            self._pipelineLayout:.dispose ();
+            
+            if (self._program !is null) {
+                vkDestroyPipeline (self._device:.getDeviceHandle (), self._program, null);
+                self._program = null;
+            }
+            
+        }
+    }
+
+    __dtor (mut self) {
+        self:.dispose ();
+    }
+    
+}
+
+
+/**
+ * @returns: the format that can be used for the type V
+ * @static_assert: if type V is not supported
+ */
+def getFormat {T, struct V} ()-> VkFormat {
+    cte if (is!{V}{U of vec4}) {
+        VkFormat::VK_FORMAT_R32G32B32A32_SFLOAT
+    } else cte if (is!{V}{U of vec3}) {
+        VkFormat::VK_FORMAT_R32G32B32_SFLOAT
+    } else cte if (is!{V}{U of vec2}) {
+        VkFormat::VK_FORMAT_R32G32_SFLOAT
+    } else cte if (is!{V}{U of f32}) {
+        VkFormat::VK_FORMAT_R32_SFLOAT
+    } else cte if (is!{V}{U of ivec4}) {
+        VkFormat::VK_FORMAT_R32G32B32A32_SINT
+    } else cte if (is!{V}{U of ivec3}) {
+        VkFormat::VK_FORMAT_R32G32B32_SINT
+    } else cte if (is!{V}{U of ivec2}) {
+        VkFormat::VK_FORMAT_R32G32_SINT
+    } else cte if (is!{V}{U of i32}) {
+        VkFormat::VK_FORMAT_R32_SINT
+    } else {
+        cte assert (false, "Field of type : " ~ (V)::typeid ~ " in type " ~ T::typeid ~ " is unsable as a shader input");
+    }
+}
+
