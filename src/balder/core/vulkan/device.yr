@@ -87,7 +87,7 @@ pub class VulkanDevice {
         let dmut _renderPass : VkRenderPass = null;
 
         // The color used when clearing an image of the swap chain;
-        let dmut _clearColor : VkClearValue = VkClearValue (color-> VkClearColorValue (int32-> [0 ; 4]));
+        let dmut _clearColor : [VkClearValue] = [];
 
         // The begin info used when begining the render pass
         let dmut _renderPassBeginInfo : VkRenderPassBeginInfo = VkRenderPassBeginInfo ();
@@ -102,9 +102,9 @@ pub class VulkanDevice {
         // The command buffer for recording (one per frame in flight)
         let dmut _commandBuffers : [VkCommandBuffer] = [];
 
-        // The maximum number of drawing frame before one is displayed
-        let dmut _maxFrameInFlight = 0u32;
-
+        // The number of image in the swapchain
+        let mut _imageCount = 0u32;
+        
         // The fences to synchronize inflight frames
         let dmut _inFlightFences : [VkFence] = [];
 
@@ -115,7 +115,7 @@ pub class VulkanDevice {
         let dmut _renderFinishedSem : [VkSemaphore] = [];
         
         // The memory allocator
-        let dmut _vmaAllocator : VmaAllocator = null;
+        let dmut _allocator : (&MemoryAllocator)? = (dmut (&MemoryAllocator)?)::__err__;
 
         // The index of the frame being drawn
         let mut _currentFrame = 0u32;
@@ -157,9 +157,7 @@ pub class VulkanDevice {
         self._win = alias &win;        
         self._instance = alias win:.getVulkanInstance ();
         
-        self._config = config;
-        self._maxFrameInFlight = (self._config["max-frame-in-flight"].to!{u32} ()?).getOr (2u32);
-        
+        self._config = config;        
         self._requiredExtensions:.insert (VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         
         self:.selectPhysicalDevice (alias win);
@@ -171,7 +169,7 @@ pub class VulkanDevice {
         self:.createCommandPool (alias win);
         self:.createCommandBuffers (alias win);
         self:.createSyncObjects ();
-        self:.createVmaAllocator (alias win);
+        self:.createMemoryAllocator (alias win);        
     }
 
     /**
@@ -225,6 +223,13 @@ pub class VulkanDevice {
         def getCommandBuffer (mut self)-> dmut VkCommandBuffer {
             alias self._commandBuffers [self._currentFrame]
         }
+        
+        /**
+         * @returns: the number of frames in the swap chain
+         */
+        def getSwapchainNbFrames (self)-> u32 {
+            cast!u32 (self._swapChainFramebuffers.len)
+        }
 
         /**
          * @returns: the command pool used to create command buffers
@@ -243,17 +248,14 @@ pub class VulkanDevice {
         /**
          * @returns: the vma allocator of the device
          */
-        def getVmaAllocator (mut self)-> dmut VmaAllocator {
-            alias self._vmaAllocator
-        }
+        def getMemoryAllocator (mut self)-> dmut &MemoryAllocator {
+            match ref self._allocator {
+                Ok (dmut a : _) => return alias a;
+            }
 
-        /**
-         * @returns: the maximum number of frame that can be drawn at the same time
-         */
-        def getMaxFrameInflight (self)-> u32 {
-            self._maxFrameInFlight
+            __pragma!panic ();
         }
-                
+        
         /**
          * @returns: the index of the frame being drawn (on which command are sent)
          */
@@ -262,10 +264,36 @@ pub class VulkanDevice {
         }
 
         /**
+         * Change the current frame index
+         * @assume: i < self.getSwapchainNbFrames ()
+         */
+        def setCurrentFrameIndex (mut self, i : u32) {
+            self._currentFrame = i;
+        }
+
+        /**
+         * Reset the command buffers
+         */
+        def clearCommandBuffers (mut self) {
+            for i in 0us .. self._commandBuffers.len {
+                vkResetCommandBuffer (self._commandBuffers [i], 0u32);
+            }
+        }
+
+        /**
          * @returns: the indices of the queue family used by the physical device (basically graphics and present)
          */
         def getPhysicalDeviceFamilyIndices (self)-> [u32] {
             self._physicalDeviceFamilyIndices
+        }
+
+        /**
+         * @returns: the number of uniq family indices
+         */
+        def getPhysicalDeviceFamilyIndiceCounts (self)-> u32 {
+            if (self._physicalDeviceFamilyIndices[0] == self._physicalDeviceFamilyIndices[1]) {
+                1u32
+            } else 2u32
         }
         
     }    
@@ -284,7 +312,7 @@ pub class VulkanDevice {
          * Wait for the previous frame to be finished rendering
          */
         def waitPreviousFrame (mut self) {            
-            vkWaitForFences (self._device, 1u32, &self._inFlightFences[self._currentFrame], VK_TRUE, u64::max);
+            vkWaitForFences (self._device, 1u32, &self._inFlightFences [self._currentFrame], VK_TRUE, u64::max);
         }
 
         /**
@@ -307,7 +335,6 @@ pub class VulkanDevice {
         def acquireNextImage (mut self)-> i32 {        
             let mut imageIndex = 0u32;
             let result = vkAcquireNextImageKHR (self._device, self._swapChain, u64::max, self._imageAvailableSem[self._currentFrame], null, alias &imageIndex);
-
             if (result == VkResult::VK_ERROR_OUT_OF_DATE_KHR) {
                 self:.recreateSwapchain ()?;
                 return -1;
@@ -316,10 +343,8 @@ pub class VulkanDevice {
                 return -1;
             }
 
-            vkResetFences (self._device, 1u32, alias &self._inFlightFences[self._currentFrame]);
-            vkResetCommandBuffer (self._commandBuffers [self._currentFrame], 0u32);
-
-            return cast!i32 (imageIndex);
+            vkResetFences (self._device, 1u32, alias &self._inFlightFences [self._currentFrame]);            
+            return cast!i32 (imageIndex);            
         }
         
         /**
@@ -380,7 +405,7 @@ pub class VulkanDevice {
             
             let r = vkQueueSubmit (self._graphicsQueue, 1u32, &submitInfo, self._inFlightFences [self._currentFrame]);
             if (r != VkResult::VK_SUCCESS) return r;
-
+            
             let presentInfo = VkPresentInfoKHR (
                 sType-> VkStructureType::VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                 waitSemaphoreCount-> 1u32,
@@ -388,21 +413,67 @@ pub class VulkanDevice {
                 swapchainCount-> 1u32,
                 pSwapchains-> &self._swapChain,
                 pImageIndices-> &image);
-
+            
             let r2 = vkQueuePresentKHR (self._presentQueue, &presentInfo);
             if (r2 == VkResult::VK_ERROR_OUT_OF_DATE_KHR || r2 == VkResult::VK_SUBOPTIMAL_KHR || self._resizingWindow) {
                 self._resizingWindow = false;
                 {
                     self:.recreateSwapchain ();
-                } catch {
+                } catch {                    
                     _ => return VkResult::VK_ERROR_UNKNOWN;
                 }
                 
-            } else if (r2 != VkResult::VK_SUCCESS) return r2;
-
-            self._currentFrame = (self._currentFrame + 1u32) % self._maxFrameInFlight;
-
+            } else if (r2 != VkResult::VK_SUCCESS) {
+                return r2;
+            }
+            
+            self._currentFrame = (self._currentFrame + 1u32) % self._imageCount;
+            
             return VkResult::VK_SUCCESS;
+        }
+
+        /**
+         * Create a command buffer for a single time command
+         */
+        def beginSingleTimeCommand (mut self)-> dmut VkCommandBuffer {
+            let allocInfo = VkCommandBufferAllocateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                level-> VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                commandPool-> self._commandPool,
+                commandBufferCount-> 1u32
+                );
+
+            let dmut cmd : VkCommandBuffer = null;
+            vkAllocateCommandBuffers (self._device, &allocInfo, alias &cmd);
+
+            let beginInfo = VkCommandBufferBeginInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                flags-> cast!u32 (VkCommandBufferUsageFlagBits::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+                );
+
+            vkBeginCommandBuffer (cmd, &beginInfo);
+
+            return alias cmd;
+        }
+
+        /**
+         * End a command that was created by 'self:.beginSingleTimeCommand ()'
+         * @params: 
+         *     - cmd: the command to end
+         * @warning: the command buffer is unusable afterwards
+         */
+        def endSingleTimeCommand (mut self, dmut cmd : VkCommandBuffer) {
+            vkEndCommandBuffer (cmd);
+            let submitInfo = VkSubmitInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                commandBufferCount-> 1u32,
+                pCommandBuffers-> &cmd
+                );
+
+            vkQueueSubmit (self._graphicsQueue, 1u32, &submitInfo, null);
+            vkQueueWaitIdle (self._graphicsQueue);
+
+            vkFreeCommandBuffers (self._device, self._commandPool, 1u32, &cmd);
         }
         
     }
@@ -410,26 +481,17 @@ pub class VulkanDevice {
     /**
      * ======================================================================================================
      * ======================================================================================================
-     * ============================================   VMA ALLOCATOR  ========================================
+     * ============================================   MEM ALLOCATOR  ========================================
      * ======================================================================================================
      * ======================================================================================================
      */
 
     prv {
 
-        def createVmaAllocator (mut self, dmut _ : &Window)
-            throws &BalderError
+        def createMemoryAllocator (mut self, dmut _ : &Window)
+            // throws &BalderError
         {
-            let createInfo = VmaAllocatorCreateInfo (
-                vulkanApiVersion-> cast!u32 (VK_API_VERSION_1_0),
-                physicalDevice-> self._physicalDevice,
-                device-> self._device,
-                instance-> self._instance:.getHandle ()
-                );
-
-            if (vmaCreateAllocator (&createInfo, alias &self._vmaAllocator) != VkResult::VK_SUCCESS) {
-                throw BalderError::new ("Failed to create vma allocator"s8);
-            }            
+            self._allocator = (MemoryAllocator::new (alias self))?;
         }               
 
     }    
@@ -468,7 +530,7 @@ pub class VulkanDevice {
         def createCommandBuffers (mut self, dmut _ : &Window)
             throws &BalderError
         {
-            self._commandBuffers = [null ; new self._maxFrameInFlight];
+            self._commandBuffers = [null ; new self._imageCount];
             let allocInfo = VkCommandBufferAllocateInfo (
                 sType-> VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                 commandPool-> self._commandPool,
@@ -489,9 +551,9 @@ pub class VulkanDevice {
         def createSyncObjects (mut self)
             throws &BalderError
         {
-            self._inFlightFences = [null ; new self._maxFrameInFlight];
-            self._imageAvailableSem = [null ; new self._maxFrameInFlight];
-            self._renderFinishedSem = [null ; new self._maxFrameInFlight];
+            self._inFlightFences = [null ; new self._imageCount];
+            self._imageAvailableSem = [null ; new self._imageCount];
+            self._renderFinishedSem = [null ; new self._imageCount];
 
             let semInfo = VkSemaphoreCreateInfo (
                 sType-> VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
@@ -502,7 +564,7 @@ pub class VulkanDevice {
                 flags-> cast!u32 (VkFenceCreateFlagBits::VK_FENCE_CREATE_SIGNALED_BIT)
                 );
 
-            for i in 0u32 .. self._maxFrameInFlight {
+            for i in 0u32 .. self._imageCount {
                 let r1 = vkCreateSemaphore (self._device, &semInfo, null, alias &self._imageAvailableSem[i]);
                 let r2 = vkCreateSemaphore (self._device, &semInfo, null, alias &self._renderFinishedSem[i]);
                 let r3 = vkCreateFence (self._device, &fenceInfo, null, alias &self._inFlightFences[i]);
@@ -568,17 +630,18 @@ pub class VulkanDevice {
             }
 
 
-            let dmut colors = [0 ; 4];
-            colors [3] = 1;
+            let dmut colors = [0.0f ; 4];
+            colors [3] = 1.0f;
 
-            self._clearColor = VkClearValue (color-> VkClearColorValue (int32-> colors));
+            self._clearColor = [ VkClearValue (color-> VkClearColorValue (float32-> colors)),
+                                 VkClearValue (depthStencil-> VkClearDepthStencilValue (depth-> 1.0f)) ];
             
             self._renderPassBeginInfo = VkRenderPassBeginInfo (
                 sType-> VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                 renderPass-> self._renderPass,
                 renderArea-> VkRect2D (extent-> self._swapChainExtent),
-                clearValueCount-> 1u32,
-                pClearValues-> &self._clearColor
+                clearValueCount-> 2u32,
+                pClearValues-> self._clearColor.ptr
                 );            
         }
         
@@ -696,7 +759,7 @@ pub class VulkanDevice {
                 self._physicalDeviceSwapChainDetail.capabilities.maxImageCount
             } else {
                 self._physicalDeviceSwapChainDetail.capabilities.minImageCount + 1u32
-            };
+            };            
 
             self._swapChainFormat = surfaceFormat.format;
             self._swapChainExtent = self.chooseSwapChainExtent (win.getDimension (), self._physicalDeviceSwapChainDetail.capabilities);
@@ -735,9 +798,11 @@ pub class VulkanDevice {
             }
 
             let mut imageCreated = 0u32;
-            vkGetSwapchainImagesKHR (self._device, self._swapChain, alias &imageCreated, null);            
+            vkGetSwapchainImagesKHR (self._device, self._swapChain, alias &imageCreated, null);
             self._swapChainImages = [null ; new imageCreated];
-            vkGetSwapchainImagesKHR (self._device, self._swapChain, alias &imageCreated, alias self._swapChainImages.ptr);                        
+            vkGetSwapchainImagesKHR (self._device, self._swapChain, alias &imageCreated, alias self._swapChainImages.ptr);
+            
+            self._imageCount = imageCreated;
         }
 
         /**
@@ -822,8 +887,8 @@ pub class VulkanDevice {
                 sType-> VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                 renderPass-> self._renderPass,
                 renderArea-> VkRect2D (extent-> self._swapChainExtent),
-                clearValueCount-> 1u32,
-                pClearValues-> &self._clearColor
+                clearValueCount-> 2u32,
+                pClearValues-> self._clearColor.ptr
                 );            
         }        
     }    
@@ -1113,10 +1178,10 @@ pub class VulkanDevice {
 
             self:.disposeSwapchain ();
 
-            if (self._vmaAllocator !is null) {
-                vmaDestroyAllocator (alias self._vmaAllocator);
-                self._vmaAllocator = null;
+            match ref self._allocator {
+                Ok (dmut a : _) => a:.dispose ();
             }
+            self._allocator = (dmut (&MemoryAllocator)?)::__err__;
             
             if (self._imageAvailableSem.len != 0us) {
                 // We dispose the three elements at the same time, they are always constructed and used together
@@ -1143,7 +1208,7 @@ pub class VulkanDevice {
             if (self._renderPass !is null) {
                 vkDestroyRenderPass (self._device, self._renderPass, null);
                 self._renderPass = null;
-                self._clearColor = VkClearValue (color-> VkClearColorValue (int32-> [0 ; 4]));
+                self._clearColor = [];
                 self._renderPassBeginInfo = VkRenderPassBeginInfo ();
             }
             

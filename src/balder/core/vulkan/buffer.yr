@@ -1,32 +1,40 @@
 mod balder::core::vulkan::buffer;
 
 import balder::core::vulkan::device;
+import balder::core::vulkan::mem_alloc;
 import balder::core::error;
 import vulkan::_;
 
+extern (C) def memcpy (src : &void, dst : &void, size : usize);
 
 pub class Buffer {
 
     // The device on which the buffer is allocated
     let dmut _device : &VulkanDevice;
+
+    // The allocator used to allocate the buffer memory
+    let dmut _allocator : &MemoryAllocator;
     
     // The buffer handle
     let dmut _buffer : VkBuffer = null;
-
-    // The allocation of the buffer from VMA
-    let dmut _alloc : VmaAllocation = null;
-
+    
     // The size of the allocation
     let dmut _size : VkDeviceSize = 0u64;
 
-    // The memory associated to the buffer
-    let dmut _memory : VkDeviceMemory = null;
+    // The memory allocation of the buffer (description used by MemoryAllocator)
+    let dmut _memAlloc : MemoryAllocation;
+    
+    // The descriptor of the buffer
+    let dmut _descriptor : VkDescriptorBufferInfo = VkDescriptorBufferInfo ();
 
     // True iif the buffer is mapped to a CPU pointer
     let mut _mapped : bool = false;
 
     // If self._mapped, this pointer can be used to get or modified the content of the buffer
-    let dmut _mappedData : &u8 = null;
+    let dmut _mappedData : &void = null;
+
+    // True if the buffer is local to host 
+    let _isLocal : bool;
 
     /**
      * ======================================================================================================
@@ -42,48 +50,19 @@ pub class Buffer {
      *    - device: the device used for the allocation
      *    - size: the size of the allocation
      *    - usage: the usage of the memory that will be allocated
-     *    - flags: the flags to pass to VMA during allocation
      */
-    pub self (dmut device : &VulkanDevice, size : VkDeviceSize, bufferUsage : VkBufferUsageFlags, memoryUsage : VmaMemoryUsage, flags : VmaAllocationCreateFlags)        
-        with _device = alias device, _size = size
-        throws &BalderError
-    {
-        let useFlags = flags & cast!u32 (~VmaAllocationCreateFlagBits::VMA_ALLOCATION_CREATE_MAPPED_BIT);
-
-
-
-        let fam = device.getPhysicalDeviceFamilyIndices ();
-        let bufferInfo = if (fam.len >= 2us) {
-            VkBufferCreateInfo (
-                sType-> VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                usage-> bufferUsage,
-                size-> size,
-                sharingMode-> VkSharingMode::VK_SHARING_MODE_CONCURRENT,
-                queueFamilyIndexCount-> cast!u32 (fam.len),
-                pQueueFamilyIndices-> fam.ptr
-            )
-        } else {
-            VkBufferCreateInfo (
-                sType-> VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                usage-> bufferUsage,
-                size-> size
-            )
-        };
-
-        let memInfo = VmaAllocationCreateInfo (
-            flags-> useFlags,
-            usage-> memoryUsage
-            );
-
-        let mut allocInfo = VmaAllocationInfo ();
-        
-        if (vmaCreateBuffer (self._device:.getVmaAllocator (), &bufferInfo, &memInfo, alias &self._buffer, alias &self._alloc, alias &allocInfo) != VkResult::VK_SUCCESS) {
-            throw BalderError::new ("Failed to allocate buffer"s8);
-        }
-        
-        self._memory = alias allocInfo.deviceMemory;
-    }
-
+    pub self (dmut alloc : &MemoryAllocator, memAlloc : MemoryAllocation, dmut buffer : VkBuffer, isLocal : bool)        
+        with  _allocator = alias alloc, _device = alloc:.getDevice (),
+    _size = memAlloc.size,
+    _buffer = alias buffer,
+    _memAlloc = memAlloc,
+    _descriptor = VkDescriptorBufferInfo (
+        buffer-> buffer,
+        offset-> 0u64,
+        range-> memAlloc.size
+        ),
+    _isLocal = isLocal
+    {}
 
     /**
      * ======================================================================================================
@@ -96,24 +75,10 @@ pub class Buffer {
     pub {
 
         /**
-         * @returns: the handle on the vma allocation
-         */
-        def getVmaAllocation (mut self)-> dmut VmaAllocation {
-            alias self._alloc
-        }
-
-        /**
          * @returns: the handle on the vulkan buffer
          */
         def getVulkanBuffer (mut self)-> dmut VkBuffer {
             alias self._buffer
-        }
-
-        /**
-         * @returns: the handle of the memory segment allocated for the buffer
-         */
-        def getVulkanMemory (mut self)-> VkDeviceMemory {
-            alias self._memory
         }
         
         /**
@@ -133,7 +98,7 @@ pub class Buffer {
         /**
          * @returns: the pointer to the mapped addr, null if the buffer is not mapped
          */
-        def getMapAddress (mut self)-> dmut &u8 {
+        def getMapAddress (mut self)-> dmut &void {
             alias self._mappedData
         }
 
@@ -143,6 +108,13 @@ pub class Buffer {
         def isMapped (self)-> bool {
             self._mappedData !is null
         }
+
+        /**
+         * @returns: the address of the descriptor buffer info
+         */
+        def getDescriptorInfo (mut self)-> dmut &VkDescriptorBufferInfo {
+            alias &self._descriptor
+        }        
         
     }
     
@@ -157,27 +129,20 @@ pub class Buffer {
     pub {
 
         /**
-         * Flush the buffer allocation, to syncronize it with the GPU buffer
-         * @assume: the buffer was not disposed
-         */
-        def flush (mut self) {
-            vmaFlushAllocation (self._device:.getVmaAllocator (), alias self._alloc, 0u64, self._size);
-        }
-
-        /**
          * Map the buffer onto CPU memory , so it can be updated
          * @assume: the buffer was not disposed
          */
         def map (mut self)-> VkResult {
             if (self._mappedData is null) {
-                let dmut m : &void = null;
-                let r = vmaMapMemory (self._device:.getVmaAllocator (), alias self._alloc, alias &m);
-                if (r == VkResult::VK_SUCCESS) {
-                    self._mappedData = alias (cast!{&u8} (m));
-                }
-                
-                r
-            } else VkResult::VK_SUCCESS
+                vkMapMemory (self._device:.getDeviceHandle (),
+                             self._memAlloc.mem,
+                             self._memAlloc.offset,
+                             self._memAlloc.size,
+                             0u32,
+                             alias &(self._mappedData))
+            } else {
+                VkResult::VK_SUCCESS
+            }
         }
 
         /**
@@ -185,11 +150,65 @@ pub class Buffer {
          */
         def unmap (mut self) {
             if (self._mappedData !is null) {
-                vmaUnmapMemory (self._device:.getVmaAllocator (), alias self._alloc);
+                vkUnmapMemory (self._device:.getDeviceHandle (), self._memAlloc.mem);
                 self._mappedData = null;
             }
         }
 
+        /**
+         * Update the buffer from CPU datas
+         */
+        def update {T of [U], U} (mut self, datas : T)
+            throws &BalderError
+        {
+            if (self._isLocal) {
+                self:.map  ();
+                memcpy (self._mappedData, cast!{&void} (datas.ptr), datas.len * sizeof (U));
+                self:.unmap ();
+            } else {
+                let dmut stagingBuf = self._device:.getMemoryAllocator ():.allocBuffer (
+                    self._size,
+                    cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+                    cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                              VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
+
+                stagingBuf:.update (datas);
+                self:.copyFrom (alias stagingBuf);
+                stagingBuf:.dispose ();
+            }
+        }
+
+        /**
+         * Update the buffer from CPU datas
+         */
+        def update {T} (mut self, datas : T)
+            throws &BalderError
+        {
+            let d = [datas ; 1u32];
+            self:.update (d[]);            
+        }
+        
+    }
+    
+    prv {
+        
+        /**
+         * Copy the buffer 'src' into the self buffer
+         * @params:
+         *    - src: the buffer to copy from
+         */
+        def copyFrom (mut self, dmut src : &Buffer) {
+            let dmut cmd = self._device:.beginSingleTimeCommand ();
+            let copyRegion = VkBufferCopy (
+                srcOffset-> 0u64,
+                dstOffset-> 0u64,
+                size-> self._size                
+                );
+
+            vkCmdCopyBuffer (cmd, src._buffer, self._buffer, 1u32, &copyRegion);            
+            self._device:.endSingleTimeCommand (alias cmd);
+        }
+        
     }
         
 
@@ -206,13 +225,11 @@ pub class Buffer {
     impl Disposable {
 
         pub over dispose (mut self) {
-            if (self._alloc !is null) {
+            if (self._buffer !is null) {
                 self:.unmap ();
-
-                vmaDestroyBuffer (self._device:.getVmaAllocator (), alias self._buffer, alias self._alloc);
-                self._alloc = null;
+                self._allocator:.free (alias self._buffer, self._memAlloc);
+                
                 self._buffer = null;
-                self._memory = null;
                 self._size = 0u64;
             }
         }

@@ -1,0 +1,424 @@
+mod balder::core::vulkan::mem_alloc;
+
+import vulkan::_;
+import balder::core::vulkan::_;
+import balder::core::error;
+
+import std::collection::map;
+import std::collection::vec;
+import std::algorithm::comparison;
+
+pub struct
+| type : u32 = 0u32
+| index : usize = 0us
+| offset : u64 = 0u64
+| size : u64 = 0u64
+| mem : VkDeviceMemory = null
+ -> MemoryAllocation;
+
+struct
+| dmut buffer : VkBuffer
+| alloc : MemoryAllocation
+ -> BufferDescription;
+
+
+class @final MemoryDescription {
+
+    // The allocated memory segment
+    let dmut _mem : VkDeviceMemory;
+
+    // The type of memory
+    let _type : u32;
+
+    // The size of the memory segment
+    let _size = 0u64;    
+    
+    // The memory segments
+    let mut _segments : [mut (u64, u64)] = [];
+    
+    /**
+     * @params:
+     *   - type: the type of memory
+     *   - mem: the allocated memory
+     *   - size: the size of the allocated memory
+     */
+    pub self (type : u32, dmut mem : VkDeviceMemory, size : u64)
+        with _mem = alias mem, _type = type, _segments = [(0u64, size)], _size = size
+    {}
+
+    /**
+     * Find a free location in the memory segment
+     * @params:
+     *    - size: the size of the allocation to find
+     *    - align: the alignement of the allocation
+     * @returns:
+     *    - .0: true iif found
+     *    - .1: the index of the offset
+     */
+    pub def findFreeSegment (mut self, size : u64, align : u64)-> (bool, u64) {
+        for i in 0us .. self._segments.len {
+            let current = self._segments [i].0 + if (self._segments [i].0 % align != 0u64) { (align - (self._segments [i].0 % align)) } else { 0u64 };
+            if (current + size <= self._segments [i].1) {
+                return (true, current);
+            }
+        }
+
+        (false, 0u64)
+    }
+
+    /**
+     * @returns: the vulkan handle of the memory
+     */
+    pub def getMemory (mut self)-> dmut VkDeviceMemory {
+        alias self._mem
+    }
+
+    /**
+     * @returns: true if the segment is completely free 
+     */
+    pub def isEmpty (self)-> bool {
+        (self._segments.len == 1us && self._segments[0us].0 == 0u64 && self._segments [0].1 == self._size)
+    }
+    
+    /**    
+     * Reserve a segment of the memory
+     * @params:
+     *    - offset: the offset of the reservation
+     *    - size: the size of the reservation   
+     * @assume: the segment is free
+     */
+    pub def reserve (mut self, offset : u64, size : u64) {        
+        for i in 0us .. self._segments.len {
+            if (self._segments[i].0 <= offset && self._segments[i].1 >= (offset + size)) {
+                let mut left  : [mut (u64, u64)] = if (self._segments[i].0 != offset) { [(self._segments[i].0, offset)] } else { [] };
+                let mut right : [mut (u64, u64)] = if (self._segments[i].1 != (offset + size)) { [(offset + size, self._segments[i].1)] } else { [] };
+                
+                self._segments = alias (self._segments [0us .. i] ~ left ~ right ~ self._segments[i + 1us .. $]);
+            }
+        }
+    }
+
+    
+    /**
+     * Free a segment
+     * @params:
+     *    - offset: the start of the segment
+     *    - size: the size of the segment to reserve
+     * @assume the segment was reserved
+     */
+    pub def free (mut self, offset : u64, size : u64) {
+        if (self._segments.len == 0us) {
+            self._segments = [(offset, size)];
+        } else {
+            let mut where = 0us;
+            for i in 0us .. self._segments.len {
+                if (offset + size <= self._segments [i].0) {
+                    break {}
+                }
+                where += 1us;
+            }
+
+            if (where == 0us) {                
+                if (self._segments [0].0 == offset + size) {
+                    self._segments [0] = (offset, self._segments [0].1);
+                } else {
+                    self._segments = alias ([(offset, offset + size)] ~ self._segments);
+                }
+            } else if (where == self._segments.len) {
+                if (self._segments [$ - 1us].1 == offset) {
+                    self._segments [$ - 1us] = (self._segments [$ - 1us].0, offset + size);
+                } else {
+                    self._segments = alias (self._segments ~ [(offset, offset + size)]);
+                }
+            } else {
+                if (self._segments [where - 1us].1 == offset && self._segments [where].0 == offset + size) {
+                    self._segments = alias (self._segments [0us .. where - 1us] ~ [(self._segments[where - 1us].0, self._segments[where].1)] ~ self._segments [where + 1us .. $]);
+                } else if (self._segments [where - 1us].1 == offset) {
+                    self._segments [where - 1us] = (self._segments [where - 1us].0, offset + size);
+                } else if (self._segments [where].0 == offset + size) {
+                    self._segments [where] = (offset, self._segments [where].1);
+                } else {
+                    self._segments = alias (self._segments [0us .. where - 1us] ~ [(offset, offset + size)] ~ self._segments [where .. $]);
+                }
+            }
+        }
+        
+    }
+    
+}
+
+
+/**
+ * Memory allocator used to manage the memory of a vulkan device
+ */
+pub class MemoryAllocator {
+
+    // The device used by the allocator
+    let dmut _device : &VulkanDevice;
+
+    // The allocated memory segments
+    let dmut _memDescs = HashMap!{u32, dmut &Vec!{dmut &MemoryDescription}}::new ();
+
+    // The size of a memory segment
+    let mut _memorySegmentSize : u64 = 0u64;
+    
+    /**
+     * @params:
+     *   - device: the device used to allocate memory
+     */
+    pub self (dmut device : &VulkanDevice)
+        with _device = alias device
+    {
+        let dmut properties = VkPhysicalDeviceProperties ();
+        let mut memProperties = VkPhysicalDeviceMemoryProperties ();
+        vkGetPhysicalDeviceProperties (self._device:.getPhysicalDeviceHandle (), alias &properties);
+        vkGetPhysicalDeviceMemoryProperties (self._device:.getPhysicalDeviceHandle (), alias &memProperties);
+        
+        self._memorySegmentSize = memProperties.memoryHeaps[0us].size / min (4096u32, properties.limits.maxMemoryAllocationCount);
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =============================================   GETTERS   ============================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    pub {
+
+        /**
+         * @returns: the device used by the allocator
+         */
+        def getDevice (mut self)-> dmut &VulkanDevice {
+            alias self._device
+        }        
+        
+    }
+    
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =============================================   ALLOCATION   =========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    pub {
+
+        /**
+         * Allocate a buffer
+         * @params:
+         *    - size: the size of the buffer to allocate
+         *    - bufferUsage: the type of buffer to allocate
+         */
+        def allocBuffer (mut self, size : u64, bufferUsage : u32, memoryFlags : u32)-> dmut &Buffer
+            throws &BalderError
+        {
+            let fam = self._device:.getPhysicalDeviceFamilyIndiceCounts ();
+            let bufferInfo = if (fam >= 2u32) {
+                VkBufferCreateInfo (
+                    sType-> VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    size-> size,
+                    usage-> bufferUsage,
+                    sharingMode-> VkSharingMode::VK_SHARING_MODE_CONCURRENT,
+                    queueFamilyIndexCount-> fam,
+                    pQueueFamilyIndices-> self._device:.getPhysicalDeviceFamilyIndices ().ptr
+                )
+            } else {
+                VkBufferCreateInfo (
+                    sType-> VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    size-> size,
+                    usage-> bufferUsage,
+                    sharingMode-> VkSharingMode::VK_SHARING_MODE_EXCLUSIVE
+                )
+            };
+
+            let dmut buf : VkBuffer = null;
+            if (vkCreateBuffer (self._device:.getDeviceHandle (), &bufferInfo, null, alias &buf) != VkResult::VK_SUCCESS) {
+                throw BalderError::new ("Failed to create buffer."s8);
+            }
+
+            let memAlloc = self:.findSuitableMemory (buf, bufferInfo, memoryFlags);            
+            return Buffer::new (alias self, memAlloc, alias buf,
+                                isLocal -> (memoryFlags & cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0u32) || (memoryFlags & cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0u32));
+        }
+        
+    }
+
+    prv {
+
+        /**
+         * Find a suitable free memory segment to bind to the buffer
+         * @params:
+         *    - buf: the buffer to bind
+         *    - 
+         */
+        def findSuitableMemory (mut self, buf : VkBuffer, bufferInfo : VkBufferCreateInfo, memoryFlags : u32)-> MemoryAllocation
+            throws &BalderError
+        {
+            let dmut memReq = VkMemoryRequirements ();
+            vkGetBufferMemoryRequirements (self._device:.getDeviceHandle (), buf, alias &memReq);
+
+            let type = self:.findMemoryType (memReq.memoryTypeBits, memoryFlags);
+            let dmut v = self._memDescs:.find (type);
+            match ref v {
+                Ok (dmut vector : _) => {
+                    let dmut vec = (alias vector)[];
+                    for i in 0us .. vec.len {                        
+                        let (succ, off) = (vec [i]):.findFreeSegment (bufferInfo.size, memReq.alignment);
+                        if (succ) {
+                            (vec [i]):.reserve (off, bufferInfo.size);
+                            let res = MemoryAllocation (
+                                type-> type,
+                                index-> i,
+                                offset-> off,
+                                size-> bufferInfo.size,
+                                mem-> vec [i]:.getMemory ()
+                                );
+                            
+                            vkBindBufferMemory (self._device:.getDeviceHandle (), buf, (vec [i]):.getMemory (), off);                            
+                            return res;
+                        }
+                    }
+                }
+            }
+
+            let mut index = 0us;
+            let allocSize = max (self._memorySegmentSize, bufferInfo.size);
+            let dmut mem = self:.allocateNewMemorySegment (type, allocSize, ref index);
+            mem:.reserve (0u64, bufferInfo.size);
+            
+            vkBindBufferMemory (self._device:.getDeviceHandle (), buf, mem:.getMemory (), 0u64);
+
+            return MemoryAllocation (
+                type-> type,
+                index-> index,
+                offset-> 0u64,
+                size-> bufferInfo.size,
+                mem-> mem:.getMemory ()
+                );          
+        }
+
+        /**
+         * Allocate a new memory segment 
+         * @params:
+         *    - type: the type of memory to allocate
+         *    - size: the size of the memory to allocate
+         * @returns:
+         *    - the allocated memory
+         *    - index: the index where the memory was inserted in the memDesc map
+         */
+        def allocateNewMemorySegment (mut self, type : u32, size : u64, ref mut index : usize)-> dmut &MemoryDescription
+            throws &BalderError
+        {
+            let memInfo = VkMemoryAllocateInfo (
+                sType-> VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                allocationSize-> size,
+                memoryTypeIndex-> type
+                );
+        
+            let dmut mem : VkDeviceMemory = null;
+            if (vkAllocateMemory (self._device:.getDeviceHandle (), &memInfo, null, alias &mem) != VkResult::VK_SUCCESS) {
+                throw BalderError::new ("Failed to allocate buffer memory."s8);
+            }
+            
+            let dmut memDesc = MemoryDescription::new (type, alias mem, size);            
+            let dmut v = self._memDescs:.find (type);
+            index = match ref v {
+                Ok (dmut vec : &Vec!{dmut &MemoryDescription})=> {
+                    vec:.push (alias memDesc);
+                    vec.len () - 1us
+                }
+                _ => {
+                    let dmut vec = Vec!{dmut &MemoryDescription}::new ();
+                    vec:.push (alias memDesc);
+                    self._memDescs:.insert (type, alias vec);
+
+                    0us
+                }
+            };            
+        
+            return alias memDesc;
+        }
+        
+        /**
+         * Find a memory type that can be bound to the buffer
+         */
+        def findMemoryType (mut self, typeFilter : u32, properties : VkMemoryPropertyFlags)-> u32
+            throws &BalderError
+        {
+            let dmut memProperties = VkPhysicalDeviceMemoryProperties ();
+            vkGetPhysicalDeviceMemoryProperties (self._device:.getPhysicalDeviceHandle (), alias &memProperties);
+
+            for i in 0u32 .. memProperties.memoryTypeCount {
+                if ((typeFilter & (1u32 << i)) != 0u32 && ((memProperties.memoryTypes [i].propertyFlags & properties) != 0u32)) {
+                    return i;
+                }
+            }
+
+            throw BalderError::new ("Failed to find suitable memory type."s8);
+        }
+        
+    }
+    
+    
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =============================================   CLEANING   ===========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+    
+    pub {
+        
+        /**
+         * Remove an allocation
+         */
+        def free (mut self, dmut buf : VkBuffer, memAlloc : MemoryAllocation) {
+            vkDestroyBuffer (self._device:.getDeviceHandle (), buf, null);
+            let dmut v = self._memDescs:.find (memAlloc.type);
+
+            match ref v {
+                Ok (dmut vector : _) => {
+                    let dmut vec = (alias vector)[];
+                    vec [memAlloc.index]:.free (memAlloc.offset, memAlloc.size);
+                    if (vec [memAlloc.index].isEmpty ()) {
+                        vkFreeMemory (self._device:.getDeviceHandle (), vec [memAlloc.index]:.getMemory (), null);
+                        vector:.remove (cast!u64 (memAlloc.index));
+                        if (vector.len () == 0us) {
+                            self._memDescs:.remove (memAlloc.type);
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    
+    impl Disposable {
+        pub over dispose (mut self) {
+            for k, _ in self._memDescs {
+                let dmut v = self._memDescs:.find (k);
+                match ref v {
+                    Ok (dmut vector : _) => {
+                        let dmut vec = (alias vector) [];
+                        for i in 0us .. vec.len {
+                            vkFreeMemory (self._device:.getDeviceHandle (), vec[i]:.getMemory (), null);
+                        }
+                    }
+                }
+            } 
+            
+            self._memDescs:.clear ();
+        }
+    }
+
+    __dtor (mut self) {
+        self:.dispose ();
+    }
+    
+}

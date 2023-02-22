@@ -63,6 +63,9 @@ pub class Window {
         // The thread running the rendering loop        
         let dmut _renderingTh : Thread = Thread (0us, ThreadPipe::new (create-> false));
 
+        // The command allocator used to allocate the indirect command buffer, and draw with it
+        let dmut _cmdAlloc : (&IndirectCommandAllocator)? = (dmut (&IndirectCommandAllocator)?)::__err__;
+        
         // True if the window is rendering
         let mut _isRunning : bool = false;
 
@@ -147,6 +150,11 @@ pub class Window {
         SDL_HideWindow (alias self._sdlWindow);
 
         self._frameDuration = dur::seconds (1) / fps;
+
+        self._cmdAlloc = alias (IndirectCommandAllocator::new (alias self._vkDevice))?;
+
+        // Draw empty screen, to configure default command buffers 
+        self:.resetDrawing ();
     }
 
     
@@ -298,9 +306,87 @@ pub class Window {
             
             self:.waitIdle ();
         }
+
+        /**
+         * Clear all screen drawings
+         */
+        def resetDrawing (mut self)
+            throws &BalderError
+        {
+            self:.updateDrawing (
+                &self.emptyLoad,
+                &self.emptyDraw
+            );
+        }
+        
+        /**
+         * Update the elements that are drawn to the window screen
+         * @params:
+         *     - loadPhase: a callback closure for the loading phase 
+         *     - drawPhase: a callback closure for the drawing phase 
+         * @info: the command allocator is correctly set for both phases. This function can be called before the window start its rendering threads, and is thread safe.
+         * @warning: 
+         * 1. This function interrupts the screen drawing for the duration of the redrawing
+         *     The loading phase should be used to inform the command allocator of the meshes that are already loaded to buffers, but not for the real loading of the scene
+         * 2. loading and drawing should be made in the same order (load mesh 1 then 2, draw mesh 1 then 2, but not load mesh 1 and 2, draw mesh 2 and 1)
+         */
+        def updateDrawing (mut self, loadPhase : dg (dmut &IndirectCommandAllocator)-> void, drawPhase : dg (dmut &IndirectCommandAllocator)-> void)
+            throws &BalderError
+        {            
+            let wasDrawing = self._isRunning;
+            self:.stopRendering ();
+            
+            atomic self {
+                match ref self._cmdAlloc {
+                    Ok (dmut alloc : _) => {                   
+                        // Clearing the current scene
+                        alloc:.dispose ();                        
+                        loadPhase (alias alloc);
+
+                        alloc:.finalizeLoading ();
+
+                        self._vkDevice:.clearCommandBuffers ();
+                        for i in 0u32 .. self._vkDevice:.getSwapchainNbFrames () {
+                            alloc:.startRecording ();
+                            self._vkDevice:.setCurrentFrameIndex (i);
+                            self._vkDevice:.startRecording ();
+                            self._vkDevice:.startRenderPass (i);
+                            
+                            drawPhase (alias alloc);
+
+                            self._vkDevice:.stopRenderPass ();
+                            self._vkDevice:.stopRecording ();
+                        }
+                        
+                        self._vkDevice:.setCurrentFrameIndex (0u32);
+                    }
+                    Err () => {
+                        eprintln ("Window has no indirect command allocator, Panic !");
+                        __pragma!panic ();
+                    }
+                }
+            }
+            if (wasDrawing) {
+                self:.startRendering ();
+            }
+        }
         
     }
 
+
+    prv {
+
+        /**
+         * Empty indirect command buffer loading
+         */
+        def emptyLoad (self, dmut _ : &IndirectCommandAllocator) {}
+        
+        /**
+         * Empty indirect command buffer drawing
+         */
+        def emptyDraw (self, dmut _ : &IndirectCommandAllocator) {}
+        
+    }
 
     /**
      * ======================================================================================================
@@ -318,10 +404,12 @@ pub class Window {
          */
         def renderingThread (mut self, _ : Thread) {
             while self._isRunning {
+                atomic self {
+                    self:.presentPass (self:.startPass ());
+                }
+                
                 self:.waitFrame ();
-
-                self:.presentPass (self:.startPass ());            
-            }       
+            }
         }
     
         /**
@@ -354,12 +442,8 @@ pub class Window {
          */
         def startPass (mut self)-> i32 {
             self._vkDevice:.waitPreviousFrame ();
-            let image = self._vkDevice:.acquireNextImage ();
-
+            let image = self._vkDevice:.acquireNextImage ();            
             if (image < 0) return image;
-
-            self._vkDevice:.startRecording ();
-            self._vkDevice:.startRenderPass (cast!u32 (image));
 
             image
         }
@@ -368,11 +452,7 @@ pub class Window {
          * Present the pass that was rendered on the GPU
          */
         def presentPass (mut self, image : i32) {
-            if (image >= 0) {
-                self._vkDevice:.stopRenderPass ();
-                self._vkDevice:.stopRecording ();
-                self._vkDevice:.presentScreen (cast!u32 (image));
-            }
+            self._vkDevice:.presentScreen (cast!u32 (image));        
         }
 
         /**
@@ -397,6 +477,11 @@ pub class Window {
     impl Disposable {
         pub over dispose (mut self) {
             self:.stopRendering ();
+            self:.waitIdle ();
+
+            match ref self._cmdAlloc {
+                Ok (dmut cmd : _) => cmd:.dispose ();
+            }
             
             self._vkDevice:.disposeSwapchain ();
             
