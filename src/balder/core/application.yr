@@ -1,20 +1,12 @@
 /**
  * @authors: Emile Cadorel
  */
-mod balder::core::application;
+in application;
 
-import std::fs::_; // File, FsError
-import std::config::_; // Config, toml
-import std::io;
-import std::time::_;
+use std::{config::_, fs::_, io, time::_, syntax::_};
 
-import balder::concurrency::timer;
-import balder::core::error;
-import balder::core::window;
-import balder::core::input;
-import balder::core::activity;
-
-import balder::core::vulkan::_;
+use balder::core::_;
+use balder::core::driver::_;
 
 /**
  * Main part of a Balder application
@@ -22,23 +14,27 @@ import balder::core::vulkan::_;
  * ===
  * // Create an application from toml configuration file
  * // Config path is relative to `${pwd}/res/`
- * with dmut app = Application::new (Path::new ("path/to/config.toml"s8)) {
- *     app:.run (); // start the application with the default activity
- * } // Application is disposable
+ * let dmut app = copy Application (Path ("path/to/config.toml"));
+ * app:.run (); // start the application with the fnault activity
+ * app:.dispose (); // Application is disposable
  * ===
  * @info: application can handle only one window
  */
+@final
 pub class Application {
 
     // The window rendering the application 
-    let dmut _window = Window::new ();
+    let dmut _window = copy Window ();
 
     // The timer to cap the activity update frequency
-    let dmut _timer = Timer::new ();
+    let mut _timer = Timer ();
+
+    // The timer between two onUpdate Calls
+    let mut _stepTimer = Timer ();
 
     // The duration of a step of the application (one update of the activity)
     let mut _stepDuration = dur::millis (16u64) + dur::micros (666u64);
-    
+
     // While _isRunning is true the app is running
     let mut _isRunning : bool = true;
     
@@ -64,89 +60,81 @@ pub class Application {
      * @params:
      *    - path: the path of the configuration file
      */
-    pub self (path : &Path)
-        throws &BalderError
+    pub self (path : Path)
+        throws BalderError
     {
-        let conf = self.readTomConfig (path);
+        let conf = self.readTomlConfig (path);
 
         self:.configure (conf);
     }    
 
-    prv {
-        
-        /**
-         * Configure the application with a given configuration
-         * @params: 
-         *    - conf: the configuration of the window
-         */
-        def configure (mut self, conf : &Config)
-            throws &BalderError
-        {
-            self:.configureWindow (conf);
+    /**
+     * Configure the application with a given configuration
+     * @params:
+     *    - conf: the configuration of the window
+     */
+    prv fn configure (mut self, conf : &Config)
+        throws BalderError
+    {
+        self:.configureWindow (conf);
+        let step = if let Ok (Int (value-> f)) =  conf["timer"]["ips"]? { cast!u64 (f) } else { 60 };
 
-            let step = (to!i32 (conf["timer"]["ips"])?).getOr (60);
-            self._stepDuration = dur::seconds (1) / step;            
-        }
-
-        /**
-         * Configure the window of the application using the configuration `conf["window"]`
-         * @params: 
-         *    - conf: the configuration of the application
-         */
-        def configureWindow (mut self, conf : &Config)
-            throws &BalderError
-        {
-            let winConfO = conf["window"]?;
-            let fps = cast!u32 ((to!i32 (conf["timer"]["fps"])?).getOr (60));
-            match winConfO {
-                Ok (winConf : _) => {
-                    self._window:.setDimension ((to!u32 (winConf["width"])?).getOr (1024u32),
-                                                (to!u32 (winConf["height"])?).getOr (768u32));
-                    
-                    self._window:.setName ((config::conv::to![c8] (winConf["name"])?).getOr ("Balder"s8));
-                    self._window:.configureVulkan (winConf, fps, resizable-> (config::conv::to!bool (winConf["resizable"])?).getOr (false));
-                }
-                Err () => {
-                    self._window:.setDimension (1024u32, 768u32);
-                    self._window:.setName ("Balder"s8);
-                    self._window:.configureVulkan (Dict::new (), fps, resizable-> false);
-                }
-            }
-        }
-
-        /**
-         * Parse the content of the configuration file and return the configuration
-         * @params: 
-         *    - path: the path of the configuration file (relative to `${pwd}/res`)
-         * @throws:
-         *   - &BalderError: 
-         *      + the parsing failed 
-         *      + the file does not exist
-         */
-        def readTomConfig (self, path : &Path)-> &Config
-            throws &BalderError
-        {
-            import std::syntax::_; // SyntaxError
-            import std::env; // currentDir
-            
-            let completePath = env::currentDir ().push ("res"s8).push (path);
-            let content = with dmut f = File::open (completePath) {
-                toml::parse (f:.readAll ())
-            } catch {
-                _ : &FsError => {
-                    throw BalderError::new ("File not found : "s8 ~ completePath.toStr ());
-                }
-                s : &SyntaxError => {
-                    import std::conv;
-                    throw BalderError::new ("Configuration format : "s8 ~ s.msg.(std::conv::to)![c8]() ~ ":("s8 ~ s.line.(std::conv::to)![c8] () ~ ","s8 ~ s.col.(std::conv::to)![c8] () ~ ")"s8);
-                }
-            }
-
-            content
-        } 
-
+        self._stepDuration = dur::seconds (1) / step;
     }
 
+    /**
+     * Configure the window of the application using the configuration `conf["window"]`
+     * @params:
+     *    - conf: the configuration of the application
+     */
+    prv fn configureWindow (mut self, conf : &Config)
+        throws BalderError
+    {
+        let fps = if let Ok (Int (value-> f)) = conf ["timer"]["fps"]? { cast!u32 (f) } else { 60 };
+
+        if let Ok (winConf) = conf ["window"]? {
+            let w = if let Ok (Int (value-> f)) = winConf ["width"]? { cast!u32 (f) } else { 1024 };
+            let h = if let Ok (Int (value-> f)) = winConf ["height"]? { cast!u32 (f) } else { 768 };
+            let name = if let Ok (Str (value-> s)) = winConf ["name"]? { s } else { "Balder" };
+            let resizable = if let Ok (Bool (value-> b)) = winConf ["resizable"]? { b } else { false };
+
+            self._window:.setDimension (w, h);
+            self._window:.setName (name);
+            self._window:.configureVulkan (winConf, fps, resizable-> resizable);
+        } else {
+            self._window:.setDimension (1024u32, 768u32);
+            self._window:.setName ("Balder");
+            self._window:.configureVulkan (copy Dict (), fps, resizable-> false);
+        }
+    }
+
+    /**
+     * Parse the content of the configuration file and return the configuration
+     * @params:
+     *    - path: the path of the configuration file (relative to `${pwd}/res`)
+     * @throws:
+     *   - &BalderError:
+     *      + the parsing failed
+     *      + the file does not exist
+     */
+    prv fn readTomlConfig (self, path : Path)-> &Config
+        throws BalderError
+    {
+        let completePath = env::currentDir ().push ("res").push (path);
+        let content = {
+            let dmut f = File::open (completePath);
+            toml::parse (f:.readAll ())
+        } catch {
+            _ : &FsError => {
+                throw copy BalderError ("File not found : " ~ completePath.toStr ());
+            }
+            s : &SyntaxError => {
+                throw copy BalderError ("Configuration format : " ~ s.msg ~ ":(" ~ std::conv::to!{[c8]} (s.line) ~ "," ~ std::conv::to!{[c8]} (s.col) ~ ")");
+            }
+        }
+
+        content
+    }
     
     /**
      * ======================================================================================================
@@ -155,47 +143,47 @@ pub class Application {
      * ======================================================================================================
      * ======================================================================================================
      */
+    /**
+     * Start the application
+     */
+    pub fn run (mut self) {
+        self._window:.show ();
+        self._window:.startRendering ();
 
-    pub {
-        
-        /**
-         * Start the application 
-         */
-        def run (mut self) {
-            self._window:.show ();
-            self._window:.startRendering ();
-            
-            while self._isRunning {
-                self:.waitClock ();
-                self._inputs [$ - 1us]:.pollEvents ();
-                
-                self:.callActivity ();
-            }
-
-            self._window:.stopRendering ();
+        self._timer:.reset ();
+        self._stepTimer:.reset ();
+        while self._isRunning {
+            self:.callActivity ();
+            self._inputs [$ - 1us]:.pollEvents ();
+            self:.waitClock ();
         }
 
-
-        /**
-         * Close the application
-         */
-        def quit (mut self) {
-            self._isRunning = false;
-        }
-        
+        self._window:.stopRendering ();
     }
 
+    /**
+     * Close the application
+     */
+    pub fn quit (mut self) {
+        self._isRunning = false;
+    }
     
     /**
      * Wait until the next update of the activity should be called.
      * @info: update the clock count.
      */
-    prv def waitClock (mut self) {        
+    prv fn waitClock (mut self) {
         let tick = self._timer.timeSinceStart ();
-        let x = instant::now ();
-        let r = self._stepDuration - tick - dur::micros (1u64);
-        sleep (r);
-        self._timer:.reset ((instant::now () - x) - r);
+        if (self._stepDuration > tick - dur::micros (10)) {
+            let x = Instant::now ();
+            let r = self._stepDuration - tick - dur::micros (10);
+            sleep (r);
+            let z = (Instant::now () - x) - r;
+            self._timer:.reset (z);
+        } else {
+            let z = tick - self._stepDuration;
+            self._timer:.reset (z);
+        }
     }
 
     /**
@@ -207,66 +195,63 @@ pub class Application {
      */
     
 
-    pub {
+    /**
+     * Open an activity in the application and start it.
+     * @info: put the current activity in Pause mode.
+     */
+    pub fn openActivity {T over &Activity} (mut self) {
+        if self._activities.len != 0us
+            self._activities [$ - 1us]:.onPause ()?;
 
-        /**
-         * Open an activity in the application and start it.
-         * @info: put the current activity in Pause mode.
-         */
-        def openActivity {T over &Activity} (mut self) {
-            if self._activities.len != 0us
-                self._activities [$ - 1us]:.onPause ()?;
+        self._inputs = alias (self._inputs ~ [copy InputManager ()]);
 
-            self._inputs = alias (self._inputs ~ [InputManager::new ()]);
+        let dmut act : &Activity = copy T (alias self);
+        self._activities = alias (self._activities ~ [alias act]);
+    }
 
-            let dmut act : &Activity = T::new (alias self);
-            self._activities = alias (self._activities ~ [alias act]);
-        }
+    /**
+     * Open an activity in the application and start it.
+     * @info: put the current activity in Pause mode.
+     */
+    pub fn openActivity {T over &Activity, P...} (mut self, p : P) {
+        if self._activities.len != 0us
+            self._activities [$ - 1us]:.onPause ()?;
 
-        /**
-         * Open an activity in the application and start it.
-         * @info: put the current activity in Pause mode.
-         */
-        def openActivity {T over &Activity, P...} (mut self, p : P) {
-            if self._activities.len != 0us
-                self._activities [$ - 1us]:.onPause ()?;
+        self._inputs = alias (self._inputs ~ [copy InputManager ()]);
+        self._activities = alias (self._activities ~ [alias cast!{&Activity} (copy T (alias self, expand p))]);
+    }
 
-            self._inputs = alias (self._inputs ~ [InputManager::new ()]);
-            self._activities = alias (self._activities ~ [alias cast!{&Activity} (T::new (alias self, expand p))]);
-        }
-
-        /**
-         * Close the current activity
-         * @info: resume the previous activity if there was one
-         */
-        def closeActivity (mut self) {
-            {
-                if self._activities.len != 0us {
-                    self._window:.resetDrawing ()?;
-                    self._activities [$ - 1us]:.dispose ();
-                    self._activities = self._activities [0us .. $ - 1us];
-                    self._inputs = self._inputs [0us .. $ - 1us];
-                }
+    /**
+     * Close the current activity
+     * @info: resume the previous activity if there was one
+     */
+    pub fn closeActivity (mut self) {
+        {
+            if self._activities.len != 0us {
+                self._window:.resetDrawing ()?;
+                self._activities [$ - 1us]:.dispose ();
+                self._activities = alias self._activities [0us .. $ - 1us];
+                self._inputs = alias self._inputs [0us .. $ - 1us];
             }
-
-            {
-                if self._activities.len == 0us {
-                    self._isRunning = false;
-                    self._inputs = alias (self._inputs ~ [InputManager::new ()]);
-                    self._activities = alias (self._activities ~ [alias cast!{&Activity} (EmptyActivity::new (alias self))]);
-                } else {
-                    self._activities [$ - 1us]:.onResume ();
-                }
-            } 
         }
-        
-    }   
-    
+
+        {
+            if self._activities.len == 0us {
+                self._isRunning = false;
+                self._inputs = alias (self._inputs ~ [copy InputManager ()]);
+                self._activities = alias (self._activities ~ [copy EmptyActivity (alias self)]);
+            } else {
+                self._activities [$ - 1us]:.onResume ();
+            }
+        }
+    }
+
     /**
      * Call the activity update and draw routine.
      */
-    prv def callActivity (mut self) {
-        self._activities[$ - 1us]:.onUpdate ();
+    prv fn callActivity (mut self) {
+        self._activities[$ - 1us]:.onUpdate (self._stepTimer.timeSinceStart ());
+        self._stepTimer:.reset ();
     }
 
     /**
@@ -276,41 +261,36 @@ pub class Application {
      * ======================================================================================================
      * ======================================================================================================
      */
-    
-    pub {
-        
-        /**
-         * @returns: the input manager of the current activity
-         */
-        def getInputManager (mut self) -> dmut &InputManager
-        {
-            alias self._inputs [$ - 1us]
-        }
 
-        /**
-         * @returns: the input manager of the current activity
-         */
-        def getInputManager (self) -> &InputManager
-        {
-            self._inputs [$ - 1us]
-        }
-        
-        /**
-         * @returns: the window of the application
-         */
-        def getWindow (mut self)-> dmut &Window {
-            alias self._window
-        }
 
-        /**
-         * @returns: the window of the application
-         */
-        def getWindow (self)-> &Window {
-            self._window
-        }
-
+    /**
+     * @returns: the input manager of the current activity
+     */
+    pub fn getInputManager (mut self) -> dmut &InputManager {
+        alias self._inputs [$ - 1us]
     }
-       
+
+    /**
+     * @returns: the input manager of the current activity
+     */
+    pub fn getInputManager (self) -> &InputManager {
+        self._inputs [$ - 1us]
+    }
+
+    /**
+     * @returns: the window of the application
+     */
+    pub fn getWindow (mut self)-> dmut &Window {
+        alias self._window
+    }
+
+    /**
+     * @returns: the window of the application
+     */
+    pub fn getWindow (self)-> &Window {
+        self._window
+    }
+
     /**
      * ======================================================================================================
      * ======================================================================================================
