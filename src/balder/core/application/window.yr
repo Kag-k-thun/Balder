@@ -3,11 +3,27 @@
  */
 in window;
 
-use balder::core::{_, driver::_};
+use balder::core::{_, driver::_, application::_};
+use balder::utils::log;
+
 use vulkan::_;
 use std::{io, time::_, config::_};
 
+use ::core::concurrency::sync::semaphore;
+
 use sdl2::_;
+
+
+/**
+ * Empty indirect command buffer loading
+ */
+prv fn emptyLoad (dmut _ : &IndirectCommandAllocator) {}
+
+/**
+ * Empty indirect command buffer drawing
+     */
+prv fn emptyDraw (dmut _ : &IndirectCommandAllocator) {}
+
 
 /**
  * Class managing a window and vulkan devices to enable 3D rendering
@@ -48,11 +64,36 @@ pub class Window {
     // The device used for rendering
     prot let dmut _vkDevice : &VulkanDevice = copy VulkanDevice ();
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DRAWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     // The thread running the rendering loop
     prot let dmut _renderingTh : (future-> void)? = none;
 
     // The command allocator used to allocate the indirect command buffer, and draw with it
     prot let dmut _cmdAlloc : (&IndirectCommandAllocator)? = none;
+
+    // Set to 0 when the frames have to be redrawn
+    prot let mut _redrawing = 0u32;
+
+    // The delegate used to upload the buffers
+    prot let mut _loadPhase : dg (dmut &IndirectCommandAllocator)-> void = &emptyLoad;
+
+    // The delegate used to list the draw command to store
+    prot let mut _drawPhase : dg (dmut &IndirectCommandAllocator)-> void = &emptyDraw;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          THREAD          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     // True if the window is rendering
     prot let mut _isRunning : bool = false;
@@ -136,8 +177,9 @@ pub class Window {
 
         self._cmdAlloc = alias (copy IndirectCommandAllocator (alias self._vkDevice))?;
 
-        // Draw empty screen, to configure fnault command buffers
+        // Draw empty screen, to configure default command buffers
         self:.resetDrawing ();
+        self._redrawing = 0;
     }
 
     /**
@@ -252,6 +294,14 @@ pub class Window {
         }
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===========================          START/STOP DRAWING THREAD          ============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     /**
      * Launch the thread that draws on the window at a given framerate
      */
@@ -263,27 +313,24 @@ pub class Window {
     }
 
     /**
-     * Stop the thread that draws on the window
-     */
-    pub fn stopRendering (mut self) {
+     * Kill the rendering thread
+     * */
+    pub fn killRendering (mut self) {
         self._isRunning = false;
         if let Ok (th) = self._renderingTh {
-            th.value;
+            th.value; // join thread
             self._renderingTh = none;
         }
-
-        self:.waitIdle ();
+        log::debug ("Thread killed");
     }
 
     /**
      * Clear all screen drawings
      */
-    pub fn resetDrawing (mut self)
-        throws BalderError
-    {
+    pub fn resetDrawing (mut self) {
         self:.updateDrawing (
-            &self.emptyLoad,
-            &self.emptyDraw);
+            &emptyLoad,
+            &emptyDraw);
     }
 
     /**
@@ -297,55 +344,11 @@ pub class Window {
      *     The loading phase should be used to inform the command allocator of the meshes that are already loaded to buffers, but not for the real loading of the scene
      * 2. loading and drawing should be made in the same order (load mesh 1 then 2, draw mesh 1 then 2, but not load mesh 1 and 2, draw mesh 2 and 1)
      */
-    pub fn updateDrawing (mut self, loadPhase : dg (dmut &IndirectCommandAllocator)-> void, drawPhase : dg (dmut &IndirectCommandAllocator)-> void)
-        throws BalderError
-    {
-        let wasDrawing = self._isRunning;
-        self:.stopRendering ();
-
-        atomic self {
-            if let Ok (dmut alloc) = alias self._cmdAlloc {
-                // Clearing the current scene
-                alloc:.dispose ();
-                loadPhase (alias alloc);
-
-                alloc:.finalizeLoading ();
-
-                self._vkDevice:.clearCommandBuffers ();
-                for i in 0u32 .. self._vkDevice.getSwapchainNbFrames () {
-                    alloc:.startRecording ();
-                    self._vkDevice:.setCurrentFrameIndex (i);
-                    self._vkDevice:.startRecording ();
-                    self._vkDevice:.startRenderPass (i);
-
-                    drawPhase (alias alloc);
-
-                    self._vkDevice:.stopRenderPass ();
-                    self._vkDevice:.stopRecording ();
-                }
-
-                self._vkDevice:.setCurrentFrameIndex (0u32);
-            }
-            else {
-                eprintln ("Window has no indirect command allocator, Panic !");
-                panic;
-            }
-        }
-
-        if (wasDrawing) {
-            self:.startRendering ();
-        }
+    pub fn updateDrawing (mut self, loadPhase : dg (dmut &IndirectCommandAllocator)-> void, drawPhase : dg (dmut &IndirectCommandAllocator)-> void) {
+        self._redrawing = 0u32;
+        self._loadPhase = loadPhase;
+        self._drawPhase = drawPhase;
     }
-
-    /**
-     * Empty indirect command buffer loading
-     */
-    prv fn emptyLoad (self, dmut _ : &IndirectCommandAllocator) {}
-
-    /**
-     * Empty indirect command buffer drawing
-     */
-    pub fn emptyDraw (self, dmut _ : &IndirectCommandAllocator) {}
 
     /**
      * ======================================================================================================
@@ -359,15 +362,67 @@ pub class Window {
      * Content of the rendering thread, updating the window at a given framerate
      */
     fn renderingThread (mut self) {
+        self._secondTimer:.reset ();
+        self._frameTimer:.reset ();
+
         while self._isRunning {
-            atomic self {
-                self:.presentPass (self:.startPass ());
+            if self._redrawing == 0 {
+                self:.redraw ();
+            }
+
+            else {
+                let image = self:.startPass ();
+                self:.presentPass (image);
+
+                self:.waitFrame ();
+            }
+        }
+
+        log::debug ("Quit thread loop");
+    }
+
+    /**
+     * Redraw the frames
+     * */
+    fn redraw (mut self) {
+        if let Ok (dmut all) = alias self._cmdAlloc {
+            all:.dispose ();
+        }
+
+        let dmut newAlloc = copy IndirectCommandAllocator (alias self._vkDevice);
+        self._loadPhase (alias newAlloc);
+        {
+            newAlloc:.finalizeLoading ();
+        } catch {
+            _ => {
+                log::error ("Failed to reload");
+                return;
+            }
+        }
+
+        while self._redrawing < self._vkDevice.getSwapchainNbFrames () && self._isRunning {
+            self._vkDevice:.clearCommandBuffer ();
+            newAlloc:.startRecording ();
+            let image = self:.startPass ();
+            if (image >= 0) {
+                self._vkDevice:.startRecording ();
+                self._vkDevice:.startRenderPass (cast!u32 (image));
+
+                self._drawPhase (alias newAlloc);
+
+                self._vkDevice:.stopRenderPass ();
+                self._vkDevice:.stopRecording ();
+
+                self:.presentPass (image);
+                self._redrawing += 1;
             }
 
             self:.waitFrame ();
         }
+
+        self._cmdAlloc = (alias newAlloc)?;
     }
-    
+
     /**
      * Wait until the next frame should be drawn.
      * @info: update the frame count.
@@ -388,7 +443,7 @@ pub class Window {
         let tick = self._frameTimer.timeSinceStart ();
         if (self._frameDuration > tick) {
             let x = Instant::now ();
-            let r = self._frameDuration - tick; // - dur::micros (1u64);
+            let r = self._frameDuration - tick - dur::micros (1u64);
             sleep (r);
 
             let z = (Instant::now () - x) - r;
@@ -434,8 +489,7 @@ pub class Window {
     
     impl Disposable {
         pub over dispose (mut self) {
-            self:.stopRendering ();
-            self:.waitIdle ();
+            self:.killRendering ();
 
             if let Ok (dmut cmd) = alias self._cmdAlloc {
                 cmd:.dispose ();
@@ -443,7 +497,6 @@ pub class Window {
             }
             
             self._vkDevice:.disposeSwapchain ();
-            
             self:.disposeSurface ();            
             
             self._vkDevice:.dispose ();

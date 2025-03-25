@@ -1,6 +1,6 @@
 in desc_set;
 
-use balder::core::driver::_;
+use balder::core::{memory::_, driver::_};
 use balder::core::error;
 
 use vulkan::_;
@@ -9,43 +9,65 @@ use std::io;
 /**
  * Ancestor of all descriptor sets
  */
-@abstract
+@final
 pub class DescriptorSet {
 
     // The allocator that allocated the descriptor set    
     let dmut _allocator : &DescriptorAllocator;
 
     // The allocated descriptor sets (one by in flight frame)
-    let dmut _set : VkDescriptorSet;
+    let dmut _set : [VkDescriptorSet];
 
     // The buffer and image binding 
     let dmut _writes : [VkWriteDescriptorSet] = [];
-    
+
+    // The size of the buffers bound to the desc set
+    let _size : usize;
+
     /**
      * @params:
      *    - allocator: the allocator used to allocate the descriptor set
      *    - sets: the descriptor set (assumed to have one by frame in flight of the drawing device)
+     *    - uniformSize: the size of the uniform content
      */
-    prot self (dmut allocator : &DescriptorAllocator, dmut set : VkDescriptorSet)
-        with _allocator = alias allocator, _set = alias set
+    pub self (dmut allocator : &DescriptorAllocator, dmut set : [VkDescriptorSet], uniformSize : usize)
+        with _allocator = alias allocator
+        , _set = alias set
+        , _size = uniformSize
     {}
 
     /**
      * Bind a buffer to a uniform value in the descriptor description
-     * @params: 
-     *    - name: the name of the uniform value to bind
-     *    - buf: the buffer to bind to the uniform value
+     * @params:
+     *    - buffers: the list of buffers (assumed one per image in flight)
      */
-    pub fn bind (mut self, name : [c8], dmut buf : &Buffer)-> dmut &DescriptorSet
-        throws BalderError
-        ;
+    pub fn bind (mut self, dmut buffers : [&Buffer]) {
+        let dmut device = self._allocator:.getDevice ();
+        __version DEBUG {
+            if (buffers.len < device.getSwapchainNbFrames ()) {
+                balder::utils::log::error ("malformed descriptor set");
+                panic;
+            }
+        }
 
-    /**
-     * Finalize the binding of the descriptor set
-     * @assume: all uniform values are bound to a buffer
-     */
-    pub fn finalize (mut self) {
-        vkUpdateDescriptorSets (self._allocator:.getDevice ():.getDeviceHandle (), cast!u32 (self._writes.len), self._writes.ptr, 0u32, null);        
+
+        for i in 0 .. buffers.len {
+            let mut bufferInfo = VkDescriptorBufferInfo ();
+            bufferInfo.buffer = buffers [i]:.getVulkanBuffer ();
+            bufferInfo.offset = 0;
+            bufferInfo.range = cast!u64 (self._size);
+
+            let mut descWrite = VkWriteDescriptorSet ();
+            descWrite.sType = VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descWrite.dstSet = self._set [i];
+            descWrite.dstBinding = 0;
+            descWrite.dstArrayElement = 0;
+            descWrite.descriptorType = VkDescriptorType::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descWrite.descriptorCount = 1;
+            descWrite.pBufferInfo = &bufferInfo;
+
+            vkUpdateDescriptorSets (device:.getDeviceHandle (), 1, &descWrite, 0, null);
+        }
     }
 
     /**
@@ -54,69 +76,16 @@ pub class DescriptorSet {
     pub fn select (mut self) {
         let dmut device = self._allocator:.getDevice ();
         let dmut pipeline = self._allocator:.getPipelineLayout ();
+        let current = self._set [device.getCurrentFrameIndex ()];
+
         vkCmdBindDescriptorSets (device:.getCommandBuffer (),
                                  VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS,
                                  pipeline:.getVulkanHandle (),
                                  0u32,
                                  1u32,
-                                 &self._set,
+                                 &current,
                                  0u32,
                                  null);
     }
-    
-}
 
-/**
- * @template: 
- *    - T: the struct fnining the content of the descriptor set
- */
-pub class DescriptorSet {record T} over DescriptorSet {
-
-    /**
-     * @params:
-     *    - allocator: the allocator used to allocate the descriptor set
-     *    - sets: the descriptor set (assumed to have one by frame in flight of the drawing device)
-     */
-    pub self (dmut allocator : &DescriptorAllocator, dmut set : VkDescriptorSet)
-        with super (alias allocator, alias set)
-    {
-        self._writes = copy [VkWriteDescriptorSet () ; (__pragma!field_infos (T)).len];
-    }     
-
-    /**
-     * Bind a buffer to a uniform value in the descriptor description
-     * @params: 
-     *    - name: the name of the uniform value to bind
-     *    - buf: the buffer to bind to the uniform value
-
-     */
-    pub over bind (mut self, name : [c8], dmut buf : &Buffer)-> dmut &DescriptorSet
-        throws BalderError
-    {
-        let infos = __pragma!field_infos (T);
-        cte for i in 0us .. infos.len {
-            if (infos [i].name == name) {
-                let mut f = false;
-                if (getDescriptorType!{__pragma!field_type (T, infos [i].name)} () != VkDescriptorType::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || f) {
-                    throw copy BalderError ("cannot bind a buffer to a texture");
-                }
-
-                let mut write = VkWriteDescriptorSet ();
-                write.sType           = VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                write.dstSet          = self._set;
-                write.dstBinding      = cast!u32 (i);
-                write.dstArrayElement = 0u32;
-                write.descriptorType  = VkDescriptorType::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-                write.descriptorCount = 1u32;
-                write.pBufferInfo     = buf:.getDescriptorInfo ();
-
-                self._writes [i] = write;
-                return alias self;
-            }
-        }
-
-        throw copy BalderError ("descriptor set has no field named '" ~ name ~ "'");
-    }
-
-    
 }

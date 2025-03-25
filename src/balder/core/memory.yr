@@ -1,0 +1,252 @@
+in memory;
+
+pub mod ::free_list;
+pub mod ::segment;
+pub mod ::buffer;
+
+use balder::core::{_, driver::_, memory::_};
+use balder::utils::log;
+use vulkan::_;
+
+use std::algorithm::comparison;
+use std::io;
+
+/**
+ * Memory allocator used to manage the memory of a vulkan device
+ */
+@final
+pub class MemoryAllocator {
+
+    // The device used by the allocator
+    let dmut _device : &VulkanDevice;
+
+    // The last uniq id given to a free list
+    let mut _lastId = 0us;
+
+    // The allocated memory segments
+    let dmut _allocations : [usize => &FreeList] = copy [];
+
+    // The size of a memory segment
+    let mut _memorySegmentSize : u64 = 0u64;
+
+    /**
+     * @params:
+     *   - device: the device used to allocate memory
+     */
+    pub self (dmut device : &VulkanDevice)
+        with _device = alias device
+    {
+        let dmut properties = VkPhysicalDeviceProperties ();
+        let mut memProperties = VkPhysicalDeviceMemoryProperties ();
+        vkGetPhysicalDeviceProperties (self._device:.getPhysicalDeviceHandle (), alias &properties);
+        vkGetPhysicalDeviceMemoryProperties (self._device:.getPhysicalDeviceHandle (), alias &memProperties);
+
+        let nbAllocations = cast!u64 (min (4096u32, properties.limits.maxMemoryAllocationCount));
+        self._memorySegmentSize = memProperties.memoryHeaps [0us].size / nbAllocations;
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =============================================   GETTERS   ============================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * @returns: the device used by the allocator
+     */
+    pub fn getDevice (mut self)-> dmut &VulkanDevice {
+        alias self._device
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =============================================   ALLOCATION   =========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * Allocate a buffer
+     * @params:
+     *    - size: the size of the buffer to allocate
+     *    - bufferUsage: the type of buffer to allocate
+     */
+    pub fn allocBuffer (mut self, size : u64, bufferUsage : u32, memoryFlags : u32)-> dmut &Buffer
+        throws BalderError
+    {
+        let mut isLocal = (memoryFlags & cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 1u32);
+        isLocal = isLocal || (memoryFlags & cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 1u32);
+
+        let mut bufferInfo = VkBufferCreateInfo ();
+        bufferInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = size;
+        bufferInfo.usage = bufferUsage;
+        bufferInfo.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
+
+        let dmut buf : VkBuffer = null;
+        if (vkCreateBuffer (self._device:.getDeviceHandle (), &bufferInfo, null, alias &buf) != VkResult::VK_SUCCESS) {
+            throw copy BalderError ("Failed to create buffer.");
+        }
+
+        let memAlloc = self:.findSuitableMemory (buf, bufferInfo, memoryFlags);
+        return copy Buffer (alias self, memAlloc, alias buf, isLocal-> isLocal);
+    }
+
+
+    /**
+     * Find a suitable free memory segment to bind to the buffer
+     * @params:
+     *    - buf: the buffer to bind
+     *    -
+     */
+    fn findSuitableMemory (mut self, buf : VkBuffer, bufferInfo : VkBufferCreateInfo, memoryFlags : u32)-> MemoryAllocation
+        throws BalderError
+    {
+        let dmut memReq = VkMemoryRequirements ();
+        vkGetBufferMemoryRequirements (self._device:.getDeviceHandle (), buf, alias &memReq);
+
+        let type = self:.findMemoryType (memReq.memoryTypeBits, memoryFlags);
+        for _, dmut list in alias self._allocations {
+            if let Ok (res) = self:.allocateInList (alias list, type, buf, bufferInfo, memReq) {
+                return res;
+            }
+        }
+
+        let allocSize = max (self._memorySegmentSize, bufferInfo.size);
+        let dmut mem = self:.allocateNewMemorySegment (type, allocSize);
+        if let Ok (res) = self:.allocateInList (alias mem, type, buf, bufferInfo, memReq) {
+            return res;
+        }
+
+        throw copy BalderError ("Failed to allocate memory");
+    }
+
+    /**
+     * Tries to allocate a segment in the list
+     * @params:
+     *    - index: the index of the free list in the list of available segments
+     *    - list: the list used to try the allocation
+     *    - buf: the buffer to bind
+     *    - bufferInfo: the buffer creation information
+     *    - memReq: the memory requirements of the allocation
+     * @returns: the allocated memory segment (or none if failed)
+     * */
+    fn allocateInList (mut self, dmut list : &FreeList, type : u32,  buf : VkBuffer, bufferInfo : VkBufferCreateInfo, memReq : VkMemoryRequirements)-> (MemoryAllocation)?
+         throws BalderError
+    {
+        // Cannot allocate in mismatching allocation type
+        if (list.getType () != type) return none;
+
+        let (succ, off, segIndex) = list:.findFreeSegment (bufferInfo.size, memReq.alignment);
+        if (succ) {
+            list:.reserve (segIndex, off, bufferInfo.size);
+            let res = MemoryAllocation (
+                type-> type,
+                index-> list.getUniqId (),
+                offset-> off,
+                size-> bufferInfo.size,
+                mem-> list:.getMemory ());
+
+            if (vkBindBufferMemory (self._device:.getDeviceHandle (), buf, list:.getMemory (), off) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to bind buffer memory");
+            }
+
+            return res?;
+        }
+
+        none
+    }
+
+    /**
+     * Allocate a new memory segment
+     * @params:
+     *    - type: the type of memory to allocate
+     *    - size: the size of the memory to allocate
+     * @returns: the allocated memory segment
+     */
+    fn allocateNewMemorySegment (mut self, type : u32, size : u64)-> dmut &FreeList
+        throws BalderError
+    {
+        let mut memInfo = VkMemoryAllocateInfo ();
+        memInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memInfo.allocationSize  = size;
+        memInfo.memoryTypeIndex = type;
+
+        let dmut mem : VkDeviceMemory = null;
+        if (vkAllocateMemory (self._device:.getDeviceHandle (), &memInfo, null, alias &mem) != VkResult::VK_SUCCESS) {
+            throw copy BalderError ("Failed to allocate buffer memory."s8);
+        }
+
+        let uid = self._lastId;
+        self._lastId += 1;
+
+        let dmut memDesc = copy FreeList (uid, type, alias mem, size);
+        self._allocations [uid] = alias memDesc;
+
+        return alias memDesc;
+    }
+
+    /**
+     * Find a memory type that can be bound to the buffer
+     */
+    fn findMemoryType (mut self, typeFilter : u32, properties : VkMemoryPropertyFlags)-> u32
+        throws BalderError
+    {
+        let dmut memProperties = VkPhysicalDeviceMemoryProperties ();
+        vkGetPhysicalDeviceMemoryProperties (self._device:.getPhysicalDeviceHandle (), alias &memProperties);
+
+        for i in 0u32 .. memProperties.memoryTypeCount {
+            if ((typeFilter & (1u32 << i)) != 0u32 && ((memProperties.memoryTypes [i].propertyFlags & properties) != 0u32)) {
+                return i;
+            }
+        }
+
+        throw copy BalderError ("Failed to find suitable memory type."s8);
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =============================================   CLEANING   ===========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * Remove an allocation
+     */
+    pub fn free (mut self, dmut buf : VkBuffer, memAlloc : MemoryAllocation) {
+        vkDestroyBuffer (self._device:.getDeviceHandle (), buf, null);
+
+        if let Ok (dmut list) = alias self._allocations [memAlloc.index] {
+            list:.free (memAlloc.offset, memAlloc.size);
+            if list.isEmpty () {
+                vkFreeMemory (self._device:.getDeviceHandle (), list:.getMemory (), null);
+                self._allocations:.remove (list.getUniqId ());
+                log::debug ("Disposing allocation : ", list.getUniqId ());
+            }
+        }
+    }
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            if self._allocations.len != 0 {
+                log::debug ("Disposing pending allocators");
+            }
+
+            for _, dmut list in alias self._allocations {
+                vkFreeMemory (self._device:.getDeviceHandle (), list:.getMemory (), null);
+            }
+
+            self._allocations = copy [];
+        }
+    }
+
+    __dtor (mut self) {
+        self:.dispose ();
+    }
+
+}

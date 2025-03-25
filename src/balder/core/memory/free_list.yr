@@ -1,0 +1,229 @@
+in free_list;
+
+use vulkan::_;
+
+record FreeSegment {
+    pub let mut start : u64;
+    pub let mut end : u64;
+
+    pub self (start : u64, end : u64)
+        with start = start
+        , end = end
+    {}
+}
+
+
+@final
+pub class FreeList {
+
+    // The allocated memory segment
+    let dmut _mem : VkDeviceMemory;
+
+    // The uniq id of the list
+    let _uid : usize;
+
+    // The type of memory
+    let _type : u32;
+
+    // The size of the memory segment
+    let _size : u64;
+
+    // The memory segments
+    let dmut _segments : [FreeSegment];
+
+    pub self (uid : usize, type : u32, dmut mem : VkDeviceMemory, size : u64)
+        with _uid = uid
+        , _mem = alias mem
+        , _type = type
+        , _size = size
+        , _segments = copy [FreeSegment (0, size)]
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the uniq id of the free list
+     * */
+    pub fn getUniqId (self)-> usize {
+        self._uid
+    }
+
+    /**
+     * @returns: the type of allocation
+     * */
+    pub fn getType (self)-> u32 {
+        self._type
+    }
+
+    /**
+     * @returns: the vulkan handle of the memory
+     */
+    pub fn getMemory (mut self)-> dmut VkDeviceMemory {
+        alias self._mem
+    }
+
+    /**
+     * @returns: true if the segment is completely free
+     */
+    pub fn isEmpty (self)-> bool {
+        if (self._segments.len != 1) return false;
+        return (self._segments [0].start == 0 && self._segments [0].end == self._size);
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SEARCHING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find a free segment in the list
+     * */
+    pub fn findFreeSegment (mut self, size : u64, align : u64)-> (bool, u64, usize) {
+        let dmut best = (false, 0u64, i64::max, 0us);
+        for i, seg in self._segments {
+            let segAlign = if seg.start % align != 0 {
+                align - (seg.start % align)
+            } else { 0 };
+
+            let alignedStart = seg.start + segAlign;
+            let dist = (cast!i64 (seg.end) - cast!i64 (alignedStart)) - cast!i64 (size);
+
+            if (dist >= 0 && dist < best.2) {
+                best = (true, alignedStart, dist, i);
+            }
+        }
+
+        (best.0, best.1, best.3)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          RESERVATION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve a segment of the memory
+     * @params:
+     *    - index: the index of the free segment to reserve
+     *    - offset: the offset of the reservation
+     *    - size: the size of the reservation
+     * @assume: the segment is free
+     * @returns: the aligned offset
+     */
+    pub fn reserve (mut self, index : usize, offset : u64, size : u64) {
+        let seg = self._segments [index];
+
+        // full reservation
+        if seg.start == offset && seg.end == offset + size {
+            self._segments = self._segments [0 .. index] ~ self._segments [index + 1 .. $];
+            return;
+        }
+
+        // left reservation
+        if seg.start == offset {
+            self._segments [index].start += size;
+            return;
+        }
+
+        // Right reservation
+        if seg.end == offset + size {
+            self._segments [index].end -= size;
+            return;
+        }
+
+        // Middle reservation
+        self._segments [index].end = offset;
+        let onRight = FreeSegment (offset + size, seg.end);
+        self._segments = self._segments [0 .. index + 1] ~ [onRight] ~ self._segments [index + 1 .. $];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          FREEING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Free a segment
+     * @params:
+     *    - offset: the start of the segment
+     *    - size: the size of the segment to reserve
+     * @assume the segment was reserved
+     */
+    pub fn free (mut self, offset : u64, size : u64) {
+        if self._segments.len == 0 {
+            self._segments = copy [FreeSegment (offset, size)];
+            return;
+        }
+
+        let mut index = 0us;
+        // searching where to insert the free segment
+        for seg in self._segments {
+            if offset + size <= seg.start { break; }
+            index += 1;
+        }
+
+        // Free at the beginning
+        if index == 0 {
+            if self._segments [0].start == offset + size { // collide first free
+                self._segments [0].start = offset;
+            } else {
+                self._segments = [FreeSegment (offset, offset + size)] ~ self._segments;
+            }
+
+            return;
+        }
+
+        // Free at the end
+        if index == self._segments.len {
+            if self._segments [$ - 1].end == offset { // collide last free
+                self._segments [$ - 1].end += size;
+            } else {
+                self._segments ~= [FreeSegment (offset, offset + size)];
+            }
+
+            return;
+        }
+
+
+        // Middle insertion
+        // 1. collide with left and right
+        if self._segments [index - 1].end == offset && self._segments [index].start == offset + size {
+            self._segments [index - 1].end = self._segments [index].end;
+            self._segments = self._segments [0 .. index] ~ self._segments [index + 1 .. $];
+
+            return;
+        }
+
+        // 2. Collide with left
+        if self._segments [index - 1].end == offset {
+            self._segments [index - 1].end += size;
+            return;
+        }
+
+        // 3. Collide with right
+        if self._segments [index].start == offset + size {
+            self._segments [index].start = offset;
+            return;
+        }
+
+        // 4. new fragment
+        self._segments = self._segments [0 .. index] ~ [FreeSegment (offset, offset + size)] ~ self._segments [index .. $];
+    }
+
+}
