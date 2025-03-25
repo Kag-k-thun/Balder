@@ -2,6 +2,7 @@ in memory;
 
 pub mod ::free_list;
 pub mod ::segment;
+pub mod ::image2D;
 pub mod ::buffer;
 
 use balder::core::{_, driver::_, memory::_};
@@ -60,12 +61,12 @@ pub class MemoryAllocator {
         alias self._device
     }
 
-    /**
-     * ======================================================================================================
-     * ======================================================================================================
-     * =============================================   ALLOCATION   =========================================
-     * ======================================================================================================
-     * ======================================================================================================
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          BUFFER ALLOCATION          ================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
     /**
@@ -74,7 +75,7 @@ pub class MemoryAllocator {
      *    - size: the size of the buffer to allocate
      *    - bufferUsage: the type of buffer to allocate
      */
-    pub fn allocBuffer (mut self, size : u64, bufferUsage : u32, memoryFlags : u32)-> dmut &Buffer
+    pub fn allocBuffer (mut self, size : u64, bufferUsage : VkBufferUsageFlags, memoryFlags : VkMemoryPropertyFlags)-> dmut &Buffer
         throws BalderError
     {
         let mut isLocal = (memoryFlags & cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 1u32);
@@ -91,7 +92,7 @@ pub class MemoryAllocator {
             throw copy BalderError ("Failed to create buffer.");
         }
 
-        let memAlloc = self:.findSuitableMemory (buf, bufferInfo, memoryFlags);
+        let memAlloc = self:.findSuitableMemoryBuffer (buf, memoryFlags);
         return copy Buffer (alias self, memAlloc, alias buf, isLocal-> isLocal);
     }
 
@@ -102,7 +103,7 @@ pub class MemoryAllocator {
      *    - buf: the buffer to bind
      *    -
      */
-    fn findSuitableMemory (mut self, buf : VkBuffer, bufferInfo : VkBufferCreateInfo, memoryFlags : u32)-> MemoryAllocation
+    fn findSuitableMemoryBuffer (mut self, buf : VkBuffer, memoryFlags : VkMemoryPropertyFlags)-> MemoryAllocation
         throws BalderError
     {
         let dmut memReq = VkMemoryRequirements ();
@@ -110,14 +111,14 @@ pub class MemoryAllocator {
 
         let type = self:.findMemoryType (memReq.memoryTypeBits, memoryFlags);
         for _, dmut list in alias self._allocations {
-            if let Ok (res) = self:.allocateInList (alias list, type, buf, bufferInfo, memReq) {
+            if let Ok (res) = self:.allocateBufferInList (alias list, type, buf, memReq) {
                 return res;
             }
         }
 
-        let allocSize = max (self._memorySegmentSize, bufferInfo.size);
+        let allocSize = max (self._memorySegmentSize, memReq.size);
         let dmut mem = self:.allocateNewMemorySegment (type, allocSize);
-        if let Ok (res) = self:.allocateInList (alias mem, type, buf, bufferInfo, memReq) {
+        if let Ok (res) = self:.allocateBufferInList (alias mem, type, buf, memReq) {
             return res;
         }
 
@@ -134,20 +135,20 @@ pub class MemoryAllocator {
      *    - memReq: the memory requirements of the allocation
      * @returns: the allocated memory segment (or none if failed)
      * */
-    fn allocateInList (mut self, dmut list : &FreeList, type : u32,  buf : VkBuffer, bufferInfo : VkBufferCreateInfo, memReq : VkMemoryRequirements)-> (MemoryAllocation)?
+    fn allocateBufferInList (mut self, dmut list : &FreeList, type : u32,  buf : VkBuffer, memReq : VkMemoryRequirements)-> (MemoryAllocation)?
          throws BalderError
     {
         // Cannot allocate in mismatching allocation type
         if (list.getType () != type) return none;
 
-        let (succ, off, segIndex) = list:.findFreeSegment (bufferInfo.size, memReq.alignment);
+        let (succ, off, segIndex) = list:.findFreeSegment (memReq.size, memReq.alignment);
         if (succ) {
-            list:.reserve (segIndex, off, bufferInfo.size);
+            list:.reserve (segIndex, off, memReq.size);
             let res = MemoryAllocation (
                 type-> type,
                 index-> list.getUniqId (),
                 offset-> off,
-                size-> bufferInfo.size,
+                size-> memReq.size,
                 mem-> list:.getMemory ());
 
             if (vkBindBufferMemory (self._device:.getDeviceHandle (), buf, list:.getMemory (), off) != VkResult::VK_SUCCESS) {
@@ -159,6 +160,121 @@ pub class MemoryAllocator {
 
         none
     }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          IMAGE ALLOCATION          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Allocate a 2D image in memory
+     * @params:
+     *    - width: the width of the image
+     *    - height: the height of the image
+     *    - imageUsage: the usage of the mmeo
+     * */
+    pub fn allocImage2D (mut self, width : u32, height : u32, format : VkFormat, tiling : VkImageTiling, usage : VkImageUsageFlags, memoryFlags : VkMemoryPropertyFlags)-> dmut &Image2D
+        throws BalderError
+    {
+        let mut imageInfo = VkImageCreateInfo ();
+        imageInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VkImageType::VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = format;
+        imageInfo.tiling = tiling;
+        imageInfo.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = usage;
+        imageInfo.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
+
+        let dmut image : VkImage = null;
+        if vkCreateImage (self._device:.getDeviceHandle (), &imageInfo, null, alias &image) != VkResult::VK_SUCCESS {
+            throw copy BalderError ("Failed to create image");
+        }
+
+        let memAlloc = self:.findSuitableMemoryImage (image, memoryFlags);
+        copy Image2D (width, height, format, alias self, memAlloc, alias image)
+    }
+
+    /**
+     * Find a suitable free memory segment to bind to the image
+     * @params:
+     *    - image: the buffer to bind
+     *    -
+     */
+    fn findSuitableMemoryImage (mut self, image : VkImage, memoryFlags : VkMemoryPropertyFlags)-> MemoryAllocation
+        throws BalderError
+    {
+        let dmut memReq = VkMemoryRequirements ();
+        vkGetImageMemoryRequirements (self._device:.getDeviceHandle (), image, alias &memReq);
+
+        let type = self:.findMemoryType (memReq.memoryTypeBits, memoryFlags);
+        for _, dmut list in alias self._allocations {
+            if let Ok (res) = self:.allocateImageInList (alias list, type, image, memReq) {
+                return res;
+            }
+        }
+
+        let allocSize = max (self._memorySegmentSize, memReq.size);
+        let dmut mem = self:.allocateNewMemorySegment (type, allocSize);
+        if let Ok (res) = self:.allocateImageInList (alias mem, type, image, memReq) {
+            return res;
+        }
+
+        throw copy BalderError ("Failed to allocate memory");
+    }
+
+    /**
+     * Tries to allocate a segment in the list
+     * @params:
+     *    - index: the index of the free list in the list of available segments
+     *    - list: the list used to try the allocation
+     *    - buf: the buffer to bind
+     *    - bufferInfo: the buffer creation information
+     *    - memReq: the memory requirements of the allocation
+     * @returns: the allocated memory segment (or none if failed)
+     * */
+    fn allocateImageInList (mut self, dmut list : &FreeList, type : u32,  image : VkImage, memReq : VkMemoryRequirements)-> (MemoryAllocation)?
+    throws BalderError
+    {
+        // Cannot allocate in mismatching allocation type
+        if (list.getType () != type) return none;
+
+        let (succ, off, segIndex) = list:.findFreeSegment (memReq.size, memReq.alignment);
+        if (succ) {
+            list:.reserve (segIndex, off, memReq.size);
+            let res = MemoryAllocation (
+                type-> type,
+                index-> list.getUniqId (),
+                offset-> off,
+                size-> memReq.size,
+                mem-> list:.getMemory ());
+
+            if (vkBindImageMemory (self._device:.getDeviceHandle (), image, list:.getMemory (), off) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to bind buffer memory");
+            }
+
+            return res?;
+        }
+
+        none
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          NEW MEMORY ALLOCATION          ==============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
      * Allocate a new memory segment
@@ -216,10 +332,26 @@ pub class MemoryAllocator {
      */
 
     /**
-     * Remove an allocation
+     * Remove a buffer allocation
      */
-    pub fn free (mut self, dmut buf : VkBuffer, memAlloc : MemoryAllocation) {
+    pub fn freeBuffer (mut self, dmut buf : VkBuffer, memAlloc : MemoryAllocation) {
         vkDestroyBuffer (self._device:.getDeviceHandle (), buf, null);
+
+        if let Ok (dmut list) = alias self._allocations [memAlloc.index] {
+            list:.free (memAlloc.offset, memAlloc.size);
+            if list.isEmpty () {
+                vkFreeMemory (self._device:.getDeviceHandle (), list:.getMemory (), null);
+                self._allocations:.remove (list.getUniqId ());
+                log::debug ("Disposing allocation : ", list.getUniqId ());
+            }
+        }
+    }
+
+    /**
+     * Remove an image allocation
+     * */
+    pub fn freeImage (mut self, dmut buf : VkImage, memAlloc : MemoryAllocation) {
+        vkDestroyImage (self._device:.getDeviceHandle (), buf, null);
 
         if let Ok (dmut list) = alias self._allocations [memAlloc.index] {
             list:.free (memAlloc.offset, memAlloc.size);
