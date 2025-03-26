@@ -1,11 +1,197 @@
 in texture;
 
-@final
+use balder::core::{_, driver::_, memory::_};
+use vulkan::_;
+use std::config::_;
+
+use sdl2::{image, surface, pixels};
+
+extern (C) fn memcpy (src : *void, dst : *void, size : usize);
+
+@abstract
 pub class Texture {
 
-    // The shader associated to the texture image
-    let dmut _shader : &Shader;
+    let dmut _device : &VulkanDevice;
+
+    prot self (dmut device : &VulkanDevice)
+        with _device = alias device
+    {}
+
+    // pub fn select (mut self);
+
+    impl Disposable;
+    __dtor (mut self) {
+        self:.dispose ();
+    }
+}
+
+@final
+pub class Texture2D over Texture {
+
+    // The width of the texture image
+    let mut _width : u32 = 0;
+
+    // The height of the texture image
+    let mut _height : u32 = 0;
+
+    // The vulkan image of the texture
+    let dmut _image : (&Image2D)? = none;
+
+    pub self (dmut device : &VulkanDevice, filename : [c8])
+        with super (alias device)
+        throws BalderError
+    {
+        self:.configure (filename);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
 
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          CONFIGURATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn configure (mut self, filename : [c8])
+        throws BalderError
+    {
+        let path = balder::utils::path::projectPath (filename);
+        let dmut surf = IMG_Load (std::conv::toStringZ (path.toStr ()));
+        if surf == null {
+            throw copy BalderError ("Failed to load texture image : " ~ path.toStr ());
+        }
+
+        {
+            self:.loadStagingBuffer (alias surf);
+        } exit {
+            SDL_FreeSurface (alias surf);
+        }
+
+    } catch {
+        err => {
+            throw copy BalderError (std::format::format ("Malformed image configuration =>\n\t{}", err));
+        }
+    }
+
+    /**
+     * Allocate the texture image
+     * Load the pixel datas to a staging buffer and copy it to the image of the texture
+     * */
+    fn loadStagingBuffer (mut self, dmut surf : *SDL_Surface)
+        throws BalderError
+    {
+        self._width = cast!u32 (unsafe { (*surf).w });
+        self._height = cast!u32 (unsafe { (*surf).h });
+        let datas = unsafe { (*surf).pixels };
+        let sdlFormat = unsafe { (*(*surf).format).format };
+
+        let (pixelSize, vulkanFormat) = match sdlFormat {
+            pixels::SDL_PIXELFORMAT_RGBA32   => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
+            pixels::SDL_PIXELFORMAT_ARGB8888 => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB)  }
+            pixels::SDL_PIXELFORMAT_RGB24   => { (3u32, VkFormat::VK_FORMAT_R8G8B8_SRGB) }
+            pixels::SDL_PIXELFORMAT_BGR24    => { (3u32, VkFormat::VK_FORMAT_R8G8B8_SRGB) }
+            _ => {
+                throw copy BalderError (std::format::format ("Unknwon pixel format {} ", sdlFormat));
+            }
+        };
+
+        let dmut stagingBuf = self._device:.getMemoryAllocator ():.allocBuffer (
+            cast!u64 ((self._width * self._height) * pixelSize),
+            cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+            cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                      VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
+
+        {
+            stagingBuf:.map ();
+            match sdlFormat {
+                pixels::SDL_PIXELFORMAT_RGBA32 => {
+                    memcpy (stagingBuf:.getMapAddress (), datas, cast!usize ((self._width * self._height) * 4u32));
+                }
+                pixels::SDL_PIXELFORMAT_RGB24 => {
+                    memcpy (stagingBuf:.getMapAddress (), datas, cast!usize ((self._width * self._height) * 3));
+                }
+                pixels::SDL_PIXELFORMAT_ARGB8888 => {
+                    self.copy_ARGB_to_RGBA (cast!{dmut *u8} (stagingBuf:.getMapAddress ()), cast!{*u8} (datas), self._width, self._height);
+                }
+                pixels::SDL_PIXELFORMAT_BGR24 => {
+                    self.copy_BGR_to_RGB (cast!{dmut *u8} (stagingBuf:.getMapAddress ()), cast!{*u8} (datas), self._width, self._height);
+                }
+            }
+            stagingBuf:.unmap ();
+
+            let dmut image = self._device:.getMemoryAllocator ():.allocImage2D (self._width, self._height,
+                                                                                vulkanFormat,
+                                                                                VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+                                                                                cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
+                                                                                cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+
+            image:.copyFrom (alias stagingBuf, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
+            self._image = (alias image)?;
+        } exit {
+            stagingBuf:.dispose ();
+        }
+    }
+
+    /**
+     * Convert an image of bgr format to rgb format
+     */
+    fn copy_BGR_to_RGB (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
+        let mut src = data;
+        let dmut res = alias out;
+        for _ in 0u32 .. (w * h) {
+            unsafe {
+                res [0] = src [2];
+                res [1] = src [1];
+                res [2] = src [0];
+            }
+            src += 3us;
+            res = alias (res + 3us);
+        }
+    }
+
+    /**
+     * Convert an image of argb format to rgba format
+     */
+    fn copy_ARGB_to_RGBA (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
+        let mut src = data;
+        let dmut res = alias out;
+        for _ in 0u32 .. (w * h) {
+            unsafe {
+                res [0] = src [1];
+                res [1] = src [2];
+                res [2] = src [3];
+                res [3] = src [0];
+            }
+            src += 4us;
+            res = alias (res + 4us);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            if let Ok (dmut img) = alias self._image {
+                img:.dispose ();
+                self._image = none;
+            }
+        }
+    }
 
 }
