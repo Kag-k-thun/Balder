@@ -4,7 +4,12 @@ in shader;
 pub mod ::vbo;
 pub mod ::ubo;
 pub mod ::ibo;
-pub mod ::texture;
+
+pub mod ::layout;
+pub mod ::desc_set;
+pub mod ::config;
+
+// pub mod ::texture;
 
 use balder::core::{_, shader::_, driver::_};
 use balder::math::vector;
@@ -18,26 +23,30 @@ use std::{conv, fs::_};
 @abstract
 pub class Shader {
 
-    // The layout of the shader
-    let dmut _pipelineLayout : &PipelineLayout;
-    
     // The vulkan device holding the shader
     let dmut _device : &VulkanDevice;
 
-    // The descriptor allocator used to create descriptor sets
-    let dmut _allocator : &DescriptorAllocator;
+    // The layout of the shader
+    let dmut _pipelineLayout : &PipelineLayout;
 
-    // The uniform buffer object associated to the shader
-    let dmut _ubos : [&UniformBufferObject] = [];
+    // The uniform binding descriptor set
+    let dmut _descSet : (&DescriptorSet)? = none;
+
+    // The configuration of the shader
+    let _config : &ShaderConfig;
 
     // The vulkan handle
     let mut _program : VkPipeline = null;
 
-    prot self (dmut device : &VulkanDevice, dmut pipelineLayout : &PipelineLayout)
+    pub self (dmut device : &VulkanDevice, config : &ShaderConfig)
         with _device = alias device
-        , _pipelineLayout = alias pipelineLayout
-        , _allocator = copy DescriptorAllocator (alias pipelineLayout)
-    {}
+        , _config = config
+        , _pipelineLayout = copy PipelineLayout (alias device, config)
+        throws BalderError
+    {
+        let dmut sets = device:.getDescriptorAllocator ():.allocate (self._pipelineLayout:.getDescriptorSetLayout ());
+        self._descSet = (copy DescriptorSet (alias self, alias sets))?;
+    }
 
     /*!
      * ====================================================================================================
@@ -57,40 +66,31 @@ pub class Shader {
     /**
      * @returns: the pipeline layout of the shader
      */
-    pub fn getLayout (mut self)-> dmut &PipelineLayout {
+    pub fn getPipelineLayout (mut self)-> dmut &PipelineLayout {
         alias self._pipelineLayout
     }
 
     /**
-     * @returns: the allocator of the shader to allocate a descriptor set
-     */
-    pub fn getAllocator (mut self)-> dmut &DescriptorAllocator {
-        alias self._allocator
+     * @returns: the information about the configuration of the shader
+     * */
+    pub fn getConfig (self)-> &ShaderConfig {
+        self._config
     }
 
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * =================================          UNIFORM VALUES          =================================
+     * ====================================          UNIFORM          =====================================
      * ====================================================================================================
      * ====================================================================================================
      */
 
-    /**
-     * Create the uniform buffer object to bind uniform datas to the shader
-     * */
-    pub fn appendUniform {record UN} (mut self)
+    pub fn setUniform (mut self, name : [c8], dmut ubo : &UniformBufferObject)
         throws BalderError
     {
-        self._ubos ~= [copy UniformBufferObject!{UN} (alias self, cast!u32 (self._ubos.len))];
-    }
-
-    /**
-     * @returns: a defined uniform buffer object
-     * */
-    @field
-    pub fn uniforms (mut self)-> dmut [&UniformBufferObject] {
-        alias self._ubos
+        if let Ok (dmut d) = alias self._descSet {
+            d:.setUniform (name, alias ubo);
+        }
     }
 
     /*!
@@ -121,8 +121,8 @@ pub class Shader {
 
         vkCmdSetScissor (self._device:.getCommandBuffer (), 0u32, 1u32, &scissor);
 
-        for _, dmut u in alias self._ubos {
-            u:.select ();
+        if let Ok (dmut d) = alias self._descSet {
+            d:.select ();
         }
     }
 
@@ -163,33 +163,33 @@ pub class Shader {record IN} over Shader {
      *    - vertSrc: the path of the vertex shader
      *    - fragSrc: the path of the fragment shader
      */
-    pub self simplePass (dmut device : &VulkanDevice, vertSrc : [c8], fragSrc : [c8])
-        with super (alias device, copy PipelineLayout (alias device))
+    pub self (dmut device : &VulkanDevice, configFile : [c8])
+        with super (alias device, copy ShaderConfig (configFile))
         throws BalderError
     {
-        let vertContent = self.readFile (balder::utils::path::projectPath (vertSrc));
-        let fragContent = self.readFile (balder::utils::path::projectPath (fragSrc));
+        let dmut stages = copy [VkPipelineShaderStageCreateInfo () ; self._config.getPasses ().len];
+        let mut modules : [mut VkShaderModule] = copy [null ; self._config.getPasses ().len];
+        {
+            for i, p in self._config.getPasses () {
+                let stageContent = self.readFile (balder::utils::path::projectPath (p.shaderFile));
+                modules [i] = self:.createShaderModule (stageContent);
 
-        let vertShader = self:.createShaderModule (vertContent);
-        let fragShader = self:.createShaderModule (fragContent);
+                let mut info = VkPipelineShaderStageCreateInfo ();
+                info.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                info.stage = p.stage;
+                info.module = modules [i];
+                info.pName = std::conv::toStringZ (p.mainFunc);
+                stages [i] = info;
+            }
 
-        let mut vertShaderStageInfo = VkPipelineShaderStageCreateInfo ();
-        vertShaderStageInfo.sType  = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        vertShaderStageInfo.stage  = VkShaderStageFlagBits::VK_SHADER_STAGE_VERTEX_BIT;
-        vertShaderStageInfo.module = vertShader;
-        vertShaderStageInfo.pName  = std::conv::toStringZ ("main");
-
-        let mut fragShaderStageInfo = VkPipelineShaderStageCreateInfo ();
-        fragShaderStageInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        fragShaderStageInfo.stage = VkShaderStageFlagBits::VK_SHADER_STAGE_FRAGMENT_BIT;
-        fragShaderStageInfo.module = fragShader;
-        fragShaderStageInfo.pName = std::conv::toStringZ ("main");
-
-        let shaderStages = copy [vertShaderStageInfo, fragShaderStageInfo];
-        self._program = self:.createPipeline (shaderStages);
-        
-        vkDestroyShaderModule (self._device:.getDeviceHandle (), vertShader, null);
-        vkDestroyShaderModule (self._device:.getDeviceHandle (), fragShader, null);
+            self._program = self:.createPipeline (stages);
+        } exit {
+            for z in modules {
+                if z != null {
+                    vkDestroyShaderModule (self._device:.getDeviceHandle (), z, null);
+                }
+            }
+        }
     }
 
     /*!
@@ -372,6 +372,7 @@ pub class Shader {record IN} over Shader {
         (res, bind)
     }
 
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -382,18 +383,13 @@ pub class Shader {record IN} over Shader {
 
     impl Disposable {
         pub over dispose (mut self) {
-            for _, dmut u in alias self._ubos {
-                u:.dispose ();
-            }
-            self._ubos = [];
-
-            self._allocator:.dispose ();
             self._pipelineLayout:.dispose ();
             if (self._program != null) {
                 vkDestroyPipeline (self._device:.getDeviceHandle (), self._program, null);
                 self._program = null;
             }
-            
+
+            self._descSet = none;
         }
     }
 
