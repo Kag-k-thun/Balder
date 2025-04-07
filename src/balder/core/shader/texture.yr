@@ -1,6 +1,8 @@
 in texture;
 
 use balder::core::{_, driver::_, memory::_};
+use balder::utils::log;
+
 use vulkan::_;
 use std::config::_;
 
@@ -13,11 +15,19 @@ pub class Texture {
 
     let dmut _device : &VulkanDevice;
 
+    // The image view used to bind the texture in shaders
+    let dmut _imageView : VkImageView = null;
+
     prot self (dmut device : &VulkanDevice)
         with _device = alias device
     {}
 
-    // pub fn select (mut self);
+    /**
+     * @returns: the image view of the texture used to bind to descriptor sets
+     * */
+    pub fn getImageView (mut self)-> dmut VkImageView {
+        alias self._imageView
+    }
 
     impl Disposable;
     __dtor (mut self) {
@@ -37,15 +47,12 @@ pub class Texture2D over Texture {
     // The vulkan image of the texture
     let dmut _image : (&Image2D)? = none;
 
-    // The image view of the texture
-    let mut _imageView : VkImageView = null;
-
-    // The sampler of the image
-    let mut _sampler : VkSampler = null;
-
-    pub self (dmut shader : &Shader)
-        with super (shader:.getDevice ())
-    {}
+    pub self (dmut device : &VulkanDevice, filename : [c8])
+        with super (alias device)
+        throws BalderError
+    {
+        self:.configure (filename);
+    }
 
     /*!
      * ====================================================================================================
@@ -58,28 +65,35 @@ pub class Texture2D over Texture {
     /**
      * Configure the texture from a
      * */
-    pub fn configure (mut self, filename : [c8])
+    fn configure (mut self, filename : [c8])
         throws BalderError
     {
-        self:.
+        self:.loadFile (filename);
+        self:.createImageView ();
     }
 
     /**
      * Create the image view used to attach the texture to a descriptor set
      * */
-    fn createImageView (mut self) {
+    fn createImageView (mut self)
+        throws BalderError
+    {
         if let Ok (dmut img) = alias self._image {
             let mut info = VkImageViewCreateInfo ();
             info.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            info.image = image:.getVulkanImage ();
+            info.image = img:.getVulkanImage ();
             info.viewType = VkImageViewType::VK_IMAGE_VIEW_TYPE_2D;
-            info.subresourceRange.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
-            info.subresourceRange.baseMipLevel = 0;
-            info.subresourceRange.levelCount = 1;
-            info.subresourceRange.baseArrayLayer = 0;
-            info.subresourceRange.layerCount = 1;
+            info.format = img.getFormat ();
 
-            if vkCreateImageView (self._device:.getVulkanDevice (), &info, null, &self._imageView) != VkResult::VK_SUCCESS {
+            info.subresourceRange.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+            info.subresourceRange.levelCount = 1;
+            info.subresourceRange.layerCount = 1;
+            info.components.r = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_R;
+            info.components.g = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_G;
+            info.components.b = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_B;
+            info.components.a = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_A;
+
+            if vkCreateImageView (self._device:.getDeviceHandle (), &info, null, &self._imageView) != VkResult::VK_SUCCESS {
                 throw copy BalderError ("Failed to create image view");
             }
         }
@@ -134,12 +148,18 @@ pub class Texture2D over Texture {
         let (pixelSize, vulkanFormat) = match sdlFormat {
             pixels::SDL_PIXELFORMAT_RGBA32   => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
             pixels::SDL_PIXELFORMAT_ARGB8888 => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB)  }
-            pixels::SDL_PIXELFORMAT_RGB24   => { (3u32, VkFormat::VK_FORMAT_R8G8B8_SRGB) }
-            pixels::SDL_PIXELFORMAT_BGR24    => { (3u32, VkFormat::VK_FORMAT_R8G8B8_SRGB) }
+            pixels::SDL_PIXELFORMAT_RGB24   => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
+            pixels::SDL_PIXELFORMAT_BGR24    => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
             _ => {
                 throw copy BalderError (std::format::format ("Unknwon pixel format {} ", sdlFormat));
             }
         };
+
+        let dmut image = self._device:.getMemoryAllocator ():.allocImage2D (self._width, self._height,
+                                                                            vulkanFormat,
+                                                                            VkImageTiling::VK_IMAGE_TILING_LINEAR,
+                                                                            cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
+                                                                            cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
 
         let dmut stagingBuf = self._device:.getMemoryAllocator ():.allocBuffer (
             cast!u64 ((self._width * self._height) * pixelSize),
@@ -154,25 +174,20 @@ pub class Texture2D over Texture {
                     memcpy (stagingBuf:.getMapAddress (), datas, cast!usize ((self._width * self._height) * 4u32));
                 }
                 pixels::SDL_PIXELFORMAT_RGB24 => {
-                    memcpy (stagingBuf:.getMapAddress (), datas, cast!usize ((self._width * self._height) * 3));
+                    self.copy_RGB_to_RGBA (cast!{dmut *u8} (stagingBuf:.getMapAddress ()), cast!{*u8} (datas), self._width, self._height);
                 }
                 pixels::SDL_PIXELFORMAT_ARGB8888 => {
                     self.copy_ARGB_to_RGBA (cast!{dmut *u8} (stagingBuf:.getMapAddress ()), cast!{*u8} (datas), self._width, self._height);
                 }
                 pixels::SDL_PIXELFORMAT_BGR24 => {
-                    self.copy_BGR_to_RGB (cast!{dmut *u8} (stagingBuf:.getMapAddress ()), cast!{*u8} (datas), self._width, self._height);
+                    self.copy_BGR_to_RGBA (cast!{dmut *u8} (stagingBuf:.getMapAddress ()), cast!{*u8} (datas), self._width, self._height);
                 }
             }
             stagingBuf:.unmap ();
 
-            let dmut image = self._device:.getMemoryAllocator ():.allocImage2D (self._width, self._height,
-                                                                                vulkanFormat,
-                                                                                VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
-                                                                                cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
-                                                                                cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-
             image:.copyFrom (alias stagingBuf, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
             self._image = (alias image)?;
+            log::debug ("Image uploaded to device");
         } exit {
             stagingBuf:.dispose ();
         }
@@ -181,7 +196,7 @@ pub class Texture2D over Texture {
     /**
      * Convert an image of bgr format to rgb format
      */
-    fn copy_BGR_to_RGB (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
+    fn copy_RGB_to_RGBA (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
         let mut src = data;
         let dmut res = alias out;
         for _ in 0u32 .. (w * h) {
@@ -189,9 +204,28 @@ pub class Texture2D over Texture {
                 res [0] = src [2];
                 res [1] = src [1];
                 res [2] = src [0];
+                res [3] = 255;
             }
             src += 3us;
-            res = alias (res + 3us);
+            res = alias (res + 4us);
+        }
+    }
+
+    /**
+     * Convert an image of bgr format to rgb format
+     */
+    fn copy_BGR_to_RGBA (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
+        let mut src = data;
+        let dmut res = alias out;
+        for _ in 0u32 .. (w * h) {
+            unsafe {
+                res [0] = src [2];
+                res [1] = src [1];
+                res [2] = src [0];
+                res [3] = 255;
+            }
+            src += 3us;
+            res = alias (res + 4us);
         }
     }
 
@@ -223,7 +257,13 @@ pub class Texture2D over Texture {
 
     impl Disposable {
         pub over dispose (mut self) {
+            if self._imageView != null {
+                vkDestroyImageView (self._device:.getDeviceHandle (), self._imageView, null);
+                self._imageView = null;
+            }
+
             if let Ok (dmut img) = alias self._image {
+                log::debug ("Disposing texture image");
                 img:.dispose ();
                 self._image = none;
             }
