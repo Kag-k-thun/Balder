@@ -1,7 +1,9 @@
 in device;
 
 use vulkan::_;
-use balder::core::{_, driver::_, memory::_, application::_};
+use balder::core::{_, driver::_, memory::_, application::_,
+                   shader::texture,
+                   shader::texture::_};
 use balder::utils::log;
 use sdl2::_;
 
@@ -86,7 +88,9 @@ pub class VulkanDevice {
 
         // True when the window was resized and the swap chain needs to be recreated
         let mut _resizingWindow = false;
-        
+
+        // The depth image
+        let dmut _depthImage : (&DepthTexture)? = none;
     }
 
     prot {
@@ -174,15 +178,24 @@ pub class VulkanDevice {
 
             self:.selectPhysicalDevice (alias win);
             self:.createLogicalDevice (alias win);
-            self:.createSwapchain (alias win);
-            self:.createImageViews (alias win);
-            self:.createRenderPass (alias win);
-            self:.createFramebuffers (alias win);
-            self:.createCommandPool (alias win);
-            self:.createCommandBuffers (alias win);
-            self:.createSyncObjects ();
+
+            // allocators
             self:.createMemoryAllocator ();
             self:.createDescriptorAllocator ();
+
+            // buffer images
+            self:.createSwapchain (alias win);
+            self:.createImageViews ();
+            self:.createDepthResources ();
+
+            // rendering commands
+            self:.createRenderPass ();
+            self:.createFramebuffers ();
+
+            self:.createCommandPool ();
+            self:.createCommandBuffers ();
+            self:.createSyncObjects ();
+
         }
 
         log::info ("Device configured");
@@ -529,7 +542,7 @@ pub class VulkanDevice {
     /**
      * Create a command pool for the device used to instantiate command buffers on the graphic queue
      */
-    prv fn createCommandPool (mut self, dmut _ : &Window)
+    prv fn createCommandPool (mut self)
         throws BalderError
     {
         let mut poolInfo = VkCommandPoolCreateInfo ();
@@ -545,7 +558,7 @@ pub class VulkanDevice {
     /**
      * Create the command buffers of the device
      */
-    prv fn createCommandBuffers (mut self, dmut _ : &Window)
+    prv fn createCommandBuffers (mut self)
         throws BalderError
     {
         self._commandBuffers = copy [null ; self._swapChainFramebuffers.len];
@@ -602,7 +615,7 @@ pub class VulkanDevice {
     /**
      * Create the render pass attached to the images of the swapchain
      */
-    fn createRenderPass (mut self, dmut _ : &Window)
+    fn createRenderPass (mut self)
         throws BalderError
     {
         let mut colorAttachement = VkAttachmentDescription ();
@@ -615,26 +628,54 @@ pub class VulkanDevice {
         colorAttachement.initialLayout  = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
         colorAttachement.finalLayout    = VkImageLayout::VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
+        let mut depthAttachment = VkAttachmentDescription ();
+        depthAttachment.format = self.findDepthFormat ();
+        depthAttachment.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        depthAttachment.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
         let mut colorAttachementRef = VkAttachmentReference ();
+        colorAttachementRef.attachment = 0;
         colorAttachementRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        let mut depthAttachmentRef = VkAttachmentReference ();
+        depthAttachmentRef.attachment = 1;
+        depthAttachmentRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
         let mut subPass = VkSubpassDescription ();
         subPass.pipelineBindPoint    = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS;
         subPass.colorAttachmentCount = 1u32;
         subPass.pColorAttachments    = &colorAttachementRef;
+        if let Ok () = self._depthImage {
+            subPass.pDepthStencilAttachment = &depthAttachmentRef;
+        }
 
         let mut dependency = VkSubpassDependency ();
         dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
         dependency.dstSubpass = 0;
-        dependency.srcStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                  | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         dependency.srcAccessMask = 0;
-        dependency.dstStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dependency.dstAccessMask = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependency.dstStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                  | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.dstAccessMask = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                   | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
         let mut renderPassInfo = VkRenderPassCreateInfo ();
         renderPassInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        renderPassInfo.attachmentCount = 1u32;
-        renderPassInfo.pAttachments    = &colorAttachement;
+        //if let Ok () = self._depthImage {
+            let dmut attachment = copy [colorAttachement, depthAttachment];
+            renderPassInfo.attachmentCount = 2u32;
+            renderPassInfo.pAttachments    = attachment.ptr;
+        // } else {
+        //     renderPassInfo.attachmentCount = 1u32;
+        //     renderPassInfo.pAttachments    = &colorAttachement;
+        // }
+
         renderPassInfo.subpassCount    = 1u32;
         renderPassInfo.pSubpasses      = &subPass;
         renderPassInfo.dependencyCount = 1;
@@ -646,7 +687,7 @@ pub class VulkanDevice {
 
         self._clearColor = copy [VkClearValue () ; 2];
         self._clearColor [0].color.float32 = [0.f, 0.f, 0.f, 1.f];
-        self._clearColor [1].depthStencil.depth = 0.0f;
+        self._clearColor [1].depthStencil.depth = 1.0f;
 
         log::info ("Created render pass");
     }
@@ -662,7 +703,7 @@ pub class VulkanDevice {
     /**
      * Create the image views of each swap frame of the swapchain
      */
-    fn createImageViews (mut self, dmut _ : &Window)
+    fn createImageViews (mut self)
         throws BalderError
     {
         self._swapChainImageViews = copy [null ; self._swapChainImages.len];
@@ -694,6 +735,48 @@ pub class VulkanDevice {
         log::info ("Created image views : ", self._swapChainImages.len);
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          DEPTH RESOURCES          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the image containing depth
+     * */
+    fn createDepthResources (mut self)
+        throws BalderError
+    {
+        let format = self.findDepthFormat ();
+        let dmut image = copy DepthTexture (alias self,
+                                            format,
+                                            self._swapChainExtent.width,
+                                            self._swapChainExtent.height);
+
+        self._depthImage = (alias image)?;
+    }
+
+    /**
+     * Find the format of the depth buffer for the device
+     * */
+    pub fn findDepthFormat (self)-> VkFormat
+        throws BalderError
+    {
+        let candidates = [VkFormat::VK_FORMAT_D32_SFLOAT, VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT, VkFormat::VK_FORMAT_D24_UNORM_S8_UINT];
+        let feature = VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        for f in candidates {
+            let mut props = VkFormatProperties ();
+            vkGetPhysicalDeviceFormatProperties (self._physicalDevice, f, &props);
+            if (props.optimalTilingFeatures & feature) == feature {
+                return f;
+            }
+        }
+
+        throw copy BalderError ("No depth format available for device");
+    }
+
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -705,7 +788,7 @@ pub class VulkanDevice {
     /**
      * Create the framebuffers of the image view in the swapchain
      */
-    fn createFramebuffers (mut self, dmut _ : &Window)
+    fn createFramebuffers (mut self)
         throws BalderError
     {
         self._swapChainFramebuffers = copy [null ; self._swapChainImageViews.len];
@@ -713,8 +796,16 @@ pub class VulkanDevice {
             let mut framebufferInfo = VkFramebufferCreateInfo ();
             framebufferInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             framebufferInfo.renderPass      = self._renderPass;
-            framebufferInfo.attachmentCount = 1u32;
-            framebufferInfo.pAttachments    = &self._swapChainImageViews [i];
+
+            if let Ok (dmut dp) = alias self._depthImage {
+                let mut attachment = copy [self._swapChainImageViews [i], dp:.getImageView ()];
+                framebufferInfo.attachmentCount = 2u32;
+                framebufferInfo.pAttachments    = attachment.ptr;
+            } else {
+                framebufferInfo.attachmentCount = 1u32;
+                framebufferInfo.pAttachments    = &self._swapChainImageViews [i];
+            }
+
             framebufferInfo.width           = self._swapChainExtent.width;
             framebufferInfo.height          = self._swapChainExtent.height;
             framebufferInfo.layers          = 1u32;
@@ -871,8 +962,10 @@ pub class VulkanDevice {
             self._physicalDeviceSwapChainDetail = self.querySwapChainSupport (surface, self._physicalDevice);
 
             self:.createSwapchain (alias w);
-            self:.createImageViews (alias w);
-            self:.createFramebuffers (alias w);
+            self:.createImageViews ();
+            self:.createDepthResources ();
+
+            self:.createFramebuffers ();
         } else {
             throw copy BalderError ("Malformed device");
         }
@@ -890,6 +983,11 @@ pub class VulkanDevice {
                 vkDestroyFramebuffer (self._device, buf, null);
             }
             self._swapChainFramebuffers = [];
+
+            if let Ok (dmut depth) = alias self._depthImage {
+                depth:.dispose ();
+                self._depthImage = none;
+            }
 
             for image in self._swapChainImageViews {
                 vkDestroyImageView (self._device, image, null);
