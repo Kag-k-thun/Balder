@@ -3,7 +3,9 @@
  */
 in window;
 
-use balder::core::{_, driver::_, application::_};
+mod ::pass;
+
+use balder::core::{_, driver::_, application::_, application::window::_};
 use balder::utils::log;
 
 use vulkan::_;
@@ -12,17 +14,6 @@ use std::{io, time::_, config::_};
 use ::core::concurrency::sync::semaphore;
 
 use sdl2::_;
-
-
-/**
- * Empty indirect command buffer loading
- */
-prv fn emptyLoad (dmut _ : &IndirectCommandAllocator) {}
-
-/**
- * Empty indirect command buffer drawing
-     */
-prv fn emptyDraw (dmut _ : &IndirectCommandAllocator) {}
 
 
 /**
@@ -75,17 +66,11 @@ pub class Window {
     // The thread running the rendering loop
     prot let dmut _renderingTh : (future-> void)? = none;
 
-    // The command allocator used to allocate the indirect command buffer, and draw with it
-    prot let dmut _cmdAlloc : (&IndirectCommandAllocator)? = none;
-
     // Set to 0 when the frames have to be redrawn
     prot let mut _redrawing = 0u32;
 
-    // The delegate used to upload the buffers
-    prot let mut _loadPhase : dg (dmut &IndirectCommandAllocator)-> void = &emptyLoad;
-
-    // The delegate used to list the draw command to store
-    prot let mut _drawPhase : dg (dmut &IndirectCommandAllocator)-> void = &emptyDraw;
+    // The pass for final composition
+    prot let mut _composePass : DrawPass = DrawPass ();
 
     /*!
      * ====================================================================================================
@@ -174,8 +159,6 @@ pub class Window {
         SDL_HideWindow (alias self._sdlWindow);
 
         self._frameDuration = dur::seconds (1) / cast!u64 (fps);
-
-        self._cmdAlloc = alias (copy IndirectCommandAllocator (alias self._vkDevice))?;
 
         // Draw empty screen, to configure default command buffers
         self:.resetDrawing ();
@@ -336,14 +319,20 @@ pub class Window {
      * Clear all screen drawings
      */
     pub fn resetDrawing (mut self) {
-        self:.updateDrawing (
-            &emptyLoad,
-            &emptyDraw);
+        self._redrawing = 0u32;
+        if let Ok (dmut sh) = alias self._composePass.shader {
+            sh:.dispose ();
+            self._composePass.shader = none;
+        }
+
+        self._composePass.loadPhase = &emptyLoad;
+        self._composePass.drawPhase = &emptyDraw;
     }
 
     /**
      * Update the elements that are drawn to the window screen
      * @params:
+     *     - shader: the shader used to draw the pass
      *     - loadPhase: a callback closure for the loading phase
      *     - drawPhase: a callback closure for the drawing phase
      * @info: the command allocator is correctly set for both phases. This function can be called before the window start its rendering threads, and is thread safe.
@@ -352,10 +341,49 @@ pub class Window {
      *     The loading phase should be used to inform the command allocator of the meshes that are already loaded to buffers, but not for the real loading of the scene
      * 2. loading and drawing should be made in the same order (load mesh 1 then 2, draw mesh 1 then 2, but not load mesh 1 and 2, draw mesh 2 and 1)
      */
-    pub fn updateDrawing (mut self, loadPhase : dg (dmut &IndirectCommandAllocator)-> void, drawPhase : dg (dmut &IndirectCommandAllocator)-> void) {
+    pub fn setComposePass {record IN} (mut self,
+                                       shaderFile : [c8],
+                                       loadPhase : dg (dmut &IndirectCommandAllocator)-> void,
+                                       drawPhase : dg (dmut &IndirectCommandAllocator)-> void)
+        throws BalderError
+    {
         self._redrawing = 0u32;
-        self._loadPhase = loadPhase;
-        self._drawPhase = drawPhase;
+        if let Ok (dmut sh) = alias self._composePass.shader {
+            sh:.dispose ();
+            self._composePass.shader = none;
+        }
+
+        let dmut shader = copy Shader!{IN} (alias self._vkDevice, shaderFile);
+        self._composePass.shader = (alias shader)?;
+
+        self._composePass.loadPhase = loadPhase;
+        self._composePass.drawPhase = drawPhase;
+    }
+
+    /**
+     * @returns: the composition shader of the window
+     * */
+    pub fn getComposeShader (mut self)-> dmut &Shader
+        throws BalderError
+    {
+        if let Ok (dmut sh) = alias self._composePass.shader {
+            return alias sh;
+        }
+
+        throw copy BalderError ("No composition shader defined");
+    }
+
+
+    // pub fn registerSubPass (mut self, name : [c8],
+    //                         dmut shader : &Shader,
+    //                         loadPhase : dg (dmut &IndirectCommandAllocator)-> void,
+    //                         drawPhase : dg (dmut &IndirectCommandAllocator)-> void) {
+    //     self._redrawing = 0u32;
+    //     self._subpasses:.remove (name);
+    // }
+
+    pub fn redraw (mut self) {
+        self._redrawing = 0u32;
     }
 
     /**
@@ -375,7 +403,7 @@ pub class Window {
 
         while self._isRunning {
             if self._redrawing == 0 {
-                self:.redraw ();
+                self:.performRedraw ();
             }
 
             else {
@@ -400,9 +428,9 @@ pub class Window {
     /**
      * Redraw the frames
      * */
-    fn redraw (mut self) {
+    fn performRedraw (mut self) {
         let dmut newAlloc = copy IndirectCommandAllocator (alias self._vkDevice);
-        self._loadPhase (alias newAlloc);
+        self._composePass.loadPhase (alias newAlloc);
         {
             newAlloc:.finalizeLoading ();
         } catch {
@@ -420,13 +448,17 @@ pub class Window {
 
         while self._redrawing < self._vkDevice.getSwapchainNbFrames () && self._isRunning {
             let image = self:.startPass ();
+            log::info ("Redraw frame : ", image);
             self._vkDevice:.clearCommandBuffer ();
             if (image >= 0) {
                 newAlloc:.startRecording ();
                 self._vkDevice:.startRecording ();
                 self._vkDevice:.startRenderPass (cast!u32 (image));
 
-                self._drawPhase (alias newAlloc);
+                if let Ok (dmut sh) = alias self._composePass.shader {
+                    sh:.select ();
+                    self._composePass.drawPhase (alias newAlloc);
+                }
 
                 self._vkDevice:.stopRenderPass ();
                 self._vkDevice:.stopRecording ();
@@ -438,11 +470,11 @@ pub class Window {
             self:.waitFrame ();
         }
 
-        if let Ok (dmut all) = alias self._cmdAlloc {
+        if let Ok (dmut all) = alias self._composePass.cmdAlloc {
             all:.dispose ();
         }
 
-        self._cmdAlloc = (alias newAlloc)?;
+        self._composePass.cmdAlloc = (alias newAlloc)?;
     }
 
     /**
@@ -513,9 +545,10 @@ pub class Window {
         pub over dispose (mut self) {
             self:.killRendering ();
 
-            if let Ok (dmut cmd) = alias self._cmdAlloc {
+            self:.resetDrawing ();
+            if let Ok (dmut cmd) = alias self._composePass.cmdAlloc {
                 cmd:.dispose ();
-                self._cmdAlloc = none;
+                self._composePass.cmdAlloc = none;
             }
             
             self._vkDevice:.disposeSwapchain ();
