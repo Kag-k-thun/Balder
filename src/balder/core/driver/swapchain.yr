@@ -1,0 +1,634 @@
+in swapchain;
+
+use vulkan::_;
+use balder::core::{_,
+                   driver::_,
+                   memory::_,
+                   application::_,
+                   shader::texture};
+
+use balder::utils::log;
+use sdl2::_;
+
+use std::{io, conv, config::_, time::_};
+
+
+pub record SwapChainDetail {
+    pub let mut capabilities : VkSurfaceCapabilitiesKHR;
+    pub let mut formats : [VkSurfaceFormatKHR];
+    pub let mut presents : [VkPresentModeKHR];
+
+    pub self ()
+        with capabilities = VkSurfaceCapabilitiesKHR ()
+        , formats = []
+        , presents = []
+    {}
+
+    pub self (capabilities : VkSurfaceCapabilitiesKHR, formats : [VkSurfaceFormatKHR], presents : [VkPresentModeKHR])
+        with capabilities = capabilities
+        , formats = formats
+        , presents = presents
+    {}
+}
+
+pub class SwapChain {
+
+    let dmut _device : &VulkanDevice;
+
+    prot {
+
+        // The size of the swap chain
+        let mut _extent = VkExtent2D ();
+
+        // The format of the swap chain
+        let mut _format = VkFormat::VK_FORMAT_MAX_ENUM;
+
+        // The format of the depth attachment
+        let mut _depthFormat = VkFormat::VK_FORMAT_MAX_ENUM;
+
+        // The swap chain of the device to render, and display using different images
+        let dmut _swapChain : VkSwapchainKHR = null;
+
+        // The image attached to the swap chain
+        let dmut _images : [VkImage] = [];
+
+        // The view of the images attach to each frame of the swap chain
+        let dmut _imageViews : [VkImageView] = [];
+
+        // The framebuffers attached to the image view of the swap chain
+        let dmut _frameBuffers : [VkFramebuffer] = [];
+
+        // The detail of the capabilities of the swap chain of the physical device
+        let mut _physicalDeviceSwapChainDetail = SwapChainDetail ();
+
+        // The depth image
+        let dmut _depthImage : (&DepthTexture)? = none;
+
+        // The render pass of the device
+        let dmut _renderPass : VkRenderPass = null;
+
+        // The color used when clearing an image of the swap chain;
+        let dmut _clearColor : [VkClearValue] = [];
+
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut context : &VulkanDevice)
+        with _device = alias context
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    @field
+    pub fn extent (self)-> VkExtent2D {
+        self._extent
+    }
+
+    @field
+    pub fn format (self)-> VkFormat {
+        self._format
+    }
+
+    @field
+    pub fn depthFormat (self)-> VkFormat {
+        self._depthFormat
+    }
+
+    @field
+    pub fn framebuffers (self)-> [VkFramebuffer] {
+        self._frameBuffers
+    }
+
+    @field
+    pub fn chain (self)-> VkSwapchainKHR {
+        self._swapChain
+    }
+
+    /**
+     * @returns: true iif a depth texture is attached to the swap chain
+     * */
+    pub fn hasDepth (self)-> bool {
+        if let Ok (Bool (value-> b)) = self._device.getConfig ()["depth"]? {
+            return b;
+        }
+
+        true
+    }
+
+    @field
+    pub fn renderPass (self)-> VkRenderPass {
+        self._renderPass
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          START RENDER PASS          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start the render pass using the swap chain
+     * */
+    pub fn startRenderPass (mut self, index : u32, command : VkCommandBuffer) {
+        let mut pass = VkRenderPassBeginInfo ();
+        pass.sType             = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        pass.renderPass        = self._renderPass;
+        pass.renderArea.extent = self._extent;
+        pass.clearValueCount   = cast!{u32} (self._clearColor.len);
+        pass.pClearValues      = self._clearColor.ptr;
+        pass.framebuffer       = self._frameBuffers [index];
+
+        vkCmdBeginRenderPass (command, &pass, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
+
+        let mut viewport = VkViewport ();
+        viewport.width = cast!{f32} (self._extent.width);
+        viewport.height = cast!{f32} (self._extent.height);
+        viewport.maxDepth = 1.0f;
+
+        let mut scissor = VkRect2D ();
+        scissor.extent.width = self._extent.width;
+        scissor.extent.height = self._extent.height;
+
+        vkCmdSetViewport (command, 0, 1, &viewport);
+        vkCmdSetScissor (command, 0, 1, &scissor);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          CONFIGURATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Configure the swap chain
+     * */
+    pub fn configure (mut self, dmut win : &Window)
+        throws BalderError
+    {
+        self:.createSwapchain (alias win);
+        self:.createImageViews ();
+
+        if self.hasDepth () {
+            self:.createDepthResources ();
+        }
+
+        self:.createRenderPass ();
+        self:.createFramebuffers ();
+    }
+
+    /**
+     * Create the swap chain the allows to render to the window in a fluid way
+     */
+    fn createSwapchain (mut self, dmut win : &Window)
+        throws BalderError
+    {
+        self._physicalDeviceSwapChainDetail = self.querySwapChainSupport (win:.getVulkanSurface (), self._device.getPhysicalDeviceHandle ());
+        let surfaceFormat = self.chooseSwapSurfaceFormat (self._physicalDeviceSwapChainDetail.formats);
+        let vsync = if let Ok (Bool (value-> b)) = self._device.getConfig () ["vsync"]? { b } else { true };
+
+        let presentMode = self.chooseSwapPresentMode (self._physicalDeviceSwapChainDetail.presents, vsync);
+        let imageCount = self.chooseImageCount ();
+
+        self._format = surfaceFormat.format;
+        self._extent = self.chooseSwapChainExtent (win.getDimension (), self._physicalDeviceSwapChainDetail.capabilities);
+        self._depthFormat = self.findDepthFormat ();
+
+        let sharingMode = if (self._device.getGraphicsQueue () == self._device.getPresentQueue ()) {
+            VkSharingMode::VK_SHARING_MODE_EXCLUSIVE
+        } else { VkSharingMode::VK_SHARING_MODE_CONCURRENT };
+
+        let indices = if (self._device.getGraphicsQueue () != self._device.getPresentQueue ()) {
+            self._device.getPhysicalDeviceFamilyIndices ()
+        } else { [] };
+
+        let mut createInfo = VkSwapchainCreateInfoKHR ();
+        createInfo.sType                 = VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        createInfo.surface               = win:.getVulkanSurface ();
+        createInfo.minImageCount         = imageCount;
+        createInfo.imageFormat           = self._format;
+        createInfo.imageColorSpace       = surfaceFormat.colorSpace;
+        createInfo.imageExtent           = self._extent;
+        createInfo.imageArrayLayers      = 1u32;
+        createInfo.imageUsage            = cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        createInfo.imageSharingMode      = sharingMode;
+        createInfo.pQueueFamilyIndices   = indices.ptr;
+        createInfo.queueFamilyIndexCount = cast!u32 (indices.len);
+        createInfo.preTransform          = self._physicalDeviceSwapChainDetail.capabilities.currentTransform;
+        createInfo.compositeAlpha        = VkCompositeAlphaFlagBitsKHR::VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        createInfo.presentMode           = presentMode;
+        createInfo.clipped               = VK_TRUE;
+
+        if (vkCreateSwapchainKHR (self._device.getDeviceHandle (), &createInfo, null, alias &self._swapChain) != VkResult::VK_SUCCESS) {
+            throw copy BalderError ("Failed to create swap chain");
+        }
+
+        let mut imageCreated = 0u32;
+        vkGetSwapchainImagesKHR (self._device.getDeviceHandle (), self._swapChain, alias &imageCreated, null);
+        self._images = copy [null ; imageCreated];
+        vkGetSwapchainImagesKHR (self._device.getDeviceHandle (), self._swapChain, alias &imageCreated, alias self._images.ptr);
+
+        log::info ("Created swap chain");
+    }
+
+    /**
+     * Choose a format for swap chain
+     * @params:
+     *      - presents: the list of available swap chain formats
+     */
+    fn chooseSwapSurfaceFormat (self, formats : [VkSurfaceFormatKHR])-> VkSurfaceFormatKHR
+        throws BalderError
+    {
+        for f in formats {
+            if (f.format == VkFormat::VK_FORMAT_B8G8R8_SRGB && f.colorSpace == VkColorSpaceKHR::VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                return f;
+            }
+        }
+
+        if (formats.len != 0us) return formats [0];
+
+        throw copy BalderError ("No available format for swap chain");
+    }
+
+    /**
+     * Choose a present mode for the swap chain
+     * @params:
+     *      - presents: the list of available present mode
+     */
+    fn chooseSwapPresentMode (self, presents : [VkPresentModeKHR], vsync : bool)-> VkPresentModeKHR {
+        let mut best = VkPresentModeKHR::VK_PRESENT_MODE_FIFO_KHR;
+        for p in presents {
+            if (!vsync) {
+                if (p == VkPresentModeKHR::VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
+                    best = p;
+                } else if (best != VkPresentModeKHR::VK_PRESENT_MODE_FIFO_RELAXED_KHR &&
+                           p == VkPresentModeKHR::VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                    best = p;
+                }
+            } else {
+                if (p == VkPresentModeKHR::VK_PRESENT_MODE_MAILBOX_KHR) return p;
+            }
+        }
+
+        best
+    }
+
+    /**
+     * Choose a size for the swap chain
+     * @params:
+     *     - win: the dimension of the window
+     *     - cap: the capabilities of the physical used to create the swap chain
+     */
+    fn chooseSwapChainExtent (self, win : (u32, u32), cap : VkSurfaceCapabilitiesKHR)-> VkExtent2D {
+        let mut ext = VkExtent2D ();
+        ext.width = std::algorithm::comparison::clamp (win._0, cap.minImageExtent.width, cap.maxImageExtent.width);
+        ext.height = std::algorithm::comparison::clamp (win._1, cap.minImageExtent.height, cap.maxImageExtent.height);
+
+        ext
+    }
+
+    /**
+     * Choose the number of image in the swap chain
+     * */
+    fn chooseImageCount (self)-> u32 {
+        if (self._physicalDeviceSwapChainDetail.capabilities.maxImageCount > 0u32
+            && self._physicalDeviceSwapChainDetail.capabilities.minImageCount == self._physicalDeviceSwapChainDetail.capabilities.maxImageCount) {
+            self._physicalDeviceSwapChainDetail.capabilities.maxImageCount
+        } else {
+            self._physicalDeviceSwapChainDetail.capabilities.minImageCount + 1
+        }
+    }
+
+    /**
+     * Get information about the support for swapchain for the device
+     */
+    fn querySwapChainSupport (self, surface : VkSurfaceKHR, device : VkPhysicalDevice)-> SwapChainDetail {
+        let mut capabilities = VkSurfaceCapabilitiesKHR ();
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR (device, surface, alias &capabilities);
+
+        let mut formatCount = 0u32;
+        vkGetPhysicalDeviceSurfaceFormatsKHR (device, surface, alias &formatCount, null);
+
+        let dmut formats : [VkSurfaceFormatKHR] = [];
+        if (formatCount != 0u32) {
+            formats = copy [VkSurfaceFormatKHR () ; formatCount];
+            vkGetPhysicalDeviceSurfaceFormatsKHR (device, surface, alias &formatCount, alias formats.ptr);
+        }
+
+        let mut presentCount = 0u32;
+        vkGetPhysicalDeviceSurfacePresentModesKHR (device, surface, alias &presentCount, null);
+
+        let dmut presents : [VkPresentModeKHR] = [];
+        if (presentCount != 0u32) {
+            presents = copy [VkPresentModeKHR::VK_PRESENT_MODE_MAX_ENUM_KHR ; presentCount];
+            vkGetPhysicalDeviceSurfacePresentModesKHR (device, surface, alias &presentCount, alias presents.ptr);
+        }
+
+        SwapChainDetail (capabilities-> capabilities, formats-> formats, presents-> presents)
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * ============================================   IMAGE VIEWS  ==========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * Create the image views of each swap frame of the swapchain
+     */
+    fn createImageViews (mut self)
+        throws BalderError
+    {
+        self._imageViews = copy [null ; self._images.len];
+        let mut components = VkComponentMapping ();
+        components.r = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_IDENTITY;
+        components.g = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_IDENTITY;
+        components.b = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_IDENTITY;
+        components.a = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_IDENTITY;
+
+        let mut range = VkImageSubresourceRange ();
+        range.aspectMask = cast!u32 (VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
+        range.levelCount = 1u32;
+        range.layerCount = 1u32;
+
+        for i in 0us .. self._images.len {
+            let mut createInfo = VkImageViewCreateInfo ();
+            createInfo.sType            = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            createInfo.image            = self._images [i];
+            createInfo.viewType         = VkImageViewType::VK_IMAGE_VIEW_TYPE_2D;
+            createInfo.format           = self._format;
+            createInfo.components       = components;
+            createInfo.subresourceRange = range;
+
+            if (vkCreateImageView (self._device.getDeviceHandle (), &createInfo, null, alias &self._imageViews[i]) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to create image view");
+            }
+        }
+
+        log::info ("Created image views : ", self._images.len);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          RENDER PASS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the render pass attached to the images of the swapchain
+     */
+    fn createRenderPass (mut self)
+        throws BalderError
+    {
+        let mut colorAttachement = VkAttachmentDescription ();
+        colorAttachement.format         = self._format;
+        colorAttachement.samples        = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        colorAttachement.loadOp         = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachement.storeOp        = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachement.stencilLoadOp  = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachement.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachement.initialLayout  = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachement.finalLayout    = VkImageLayout::VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        let mut depthAttachment = VkAttachmentDescription ();
+        depthAttachment.format = self._depthFormat;
+        depthAttachment.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        depthAttachment.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        let mut colorAttachementRef = VkAttachmentReference ();
+        colorAttachementRef.attachment = 0;
+        colorAttachementRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        let mut depthAttachmentRef = VkAttachmentReference ();
+        depthAttachmentRef.attachment = 1;
+        depthAttachmentRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        let mut subPass = VkSubpassDescription ();
+        subPass.pipelineBindPoint    = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subPass.colorAttachmentCount = 1u32;
+        subPass.pColorAttachments    = &colorAttachementRef;
+
+        let dmut dependencies : [VkSubpassDependency] = [];
+        if self.hasDepth () {
+            subPass.pDepthStencilAttachment = &depthAttachmentRef;
+
+            dependencies = copy [VkSubpassDependency () ; 2];
+	        dependencies [0].srcSubpass = VK_SUBPASS_EXTERNAL;
+	        dependencies [0].dstSubpass = 0;
+	        dependencies [0].srcStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                                              | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	        dependencies [0].dstStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                                              | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+
+	        dependencies [0].srcAccessMask = VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	        dependencies [0].dstAccessMask = VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                                               | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+	        dependencies [0].dependencyFlags = 0;
+
+	        dependencies [1].srcSubpass = VK_SUBPASS_EXTERNAL;
+	        dependencies [1].dstSubpass = 0;
+	        dependencies [1].srcStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	        dependencies [1].dstStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	        dependencies [1].srcAccessMask = 0;
+	        dependencies [1].dstAccessMask = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                               | VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+
+	        dependencies [1].dependencyFlags = 0;
+        } else {
+            dependencies = copy [VkSubpassDependency () ; 1];
+            dependencies [0].srcSubpass = VK_SUBPASS_EXTERNAL;
+	        dependencies [0].srcStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	        dependencies [0].dstStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	        dependencies [0].srcAccessMask = 0;
+	        dependencies [0].dstAccessMask = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        }
+
+        let mut renderPassInfo = VkRenderPassCreateInfo ();
+        renderPassInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+
+        if self.hasDepth () {
+            let dmut attachment = copy [colorAttachement, depthAttachment];
+            renderPassInfo.attachmentCount = 2u32;
+            renderPassInfo.pAttachments    = attachment.ptr;
+        } else {
+            renderPassInfo.attachmentCount = 1u32;
+            renderPassInfo.pAttachments    = &colorAttachement;
+        }
+
+        renderPassInfo.subpassCount    = 1u32;
+        renderPassInfo.pSubpasses      = &subPass;
+        renderPassInfo.dependencyCount = cast!{u32} (dependencies.len);
+        renderPassInfo.pDependencies   = dependencies.ptr;
+
+        if (vkCreateRenderPass (self._device.getDeviceHandle (), &renderPassInfo, null, alias &self._renderPass) != VkResult::VK_SUCCESS) {
+            throw copy BalderError ("Failed to create render pass");
+        }
+
+        if self.hasDepth () {
+            self._clearColor = copy [VkClearValue () ; 2];
+            self._clearColor [0].color.float32 = [0.f, 0.f, 0.f, 1.f];
+            self._clearColor [1].depthStencil.depth = 1.0f;
+        } else {
+            self._clearColor = copy [VkClearValue () ; 1];
+            self._clearColor [0].color.float32 = [0.f, 0.f, 0.f, 1.f];
+        }
+
+        log::info ("Created render pass");
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * ============================================   FRAMEBUFFERS  =========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * Create the framebuffers of the image view in the swapchain
+     */
+    fn createFramebuffers (mut self)
+        throws BalderError
+    {
+        self._frameBuffers = copy [null ; self._imageViews.len];
+        for i in 0us .. self._imageViews.len {
+            let mut framebufferInfo = VkFramebufferCreateInfo ();
+            framebufferInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass      = self._renderPass;
+
+            if let Ok (dmut dp) = alias self._depthImage {
+                let mut attachment = copy [self._imageViews [i], dp:.getImageView ()];
+                framebufferInfo.attachmentCount = 2u32;
+                framebufferInfo.pAttachments    = attachment.ptr;
+            } else {
+                framebufferInfo.attachmentCount = 1u32;
+                framebufferInfo.pAttachments    = &self._imageViews [i];
+            }
+
+            framebufferInfo.width           = self._extent.width;
+            framebufferInfo.height          = self._extent.height;
+            framebufferInfo.layers          = 1u32;
+
+            if (vkCreateFramebuffer (self._device.getDeviceHandle (), &framebufferInfo, null, alias &self._frameBuffers[i]) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to create framebuffers");
+            }
+        }
+
+        log::info ("Created frame buffers : ", self._imageViews.len);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          DEPTH RESOURCES          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the image containing depth
+     * */
+    fn createDepthResources (mut self)
+        throws BalderError
+    {
+        let format = self._depthFormat;
+        let dmut image = copy DepthTexture (alias self._device,
+                                            format,
+                                            self._extent.width,
+                                            self._extent.height);
+
+        self._depthImage = (alias image)?;
+    }
+
+    /**
+     * Find the format of the depth buffer for the device
+     * */
+    pub fn findDepthFormat (self)-> VkFormat
+        throws BalderError
+    {
+        let candidates = [VkFormat::VK_FORMAT_D32_SFLOAT, VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT, VkFormat::VK_FORMAT_D24_UNORM_S8_UINT];
+        let feature = VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        for f in candidates {
+            let mut props = VkFormatProperties ();
+            vkGetPhysicalDeviceFormatProperties (self._device.getPhysicalDeviceHandle (), f, &props);
+            if (props.optimalTilingFeatures & feature) == feature {
+                return f;
+            }
+        }
+
+        throw copy BalderError ("No depth format available for device");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            atomic self {
+                for buf in self._frameBuffers {
+                    vkDestroyFramebuffer (self._device.getDeviceHandle (), buf, null);
+                }
+                self._frameBuffers = [];
+
+                if (self._renderPass != null) {
+                    vkDestroyRenderPass (self._device.getDeviceHandle (), self._renderPass, null);
+                    self._renderPass = null;
+                    self._clearColor = [];
+                }
+
+                if let Ok (dmut depth) = alias self._depthImage {
+                    depth:.dispose ();
+                    self._depthImage = none;
+                }
+
+                for image in self._imageViews {
+                    vkDestroyImageView (self._device.getDeviceHandle (), image, null);
+                }
+
+                self._imageViews = [];
+
+                if (self._swapChain != null) {
+                    vkDestroySwapchainKHR (self._device.getDeviceHandle (), self._swapChain, null);
+                    self._swapChain = null;
+                    self._extent = VkExtent2D ();
+                    self._format = VkFormat::VK_FORMAT_MAX_ENUM;
+                    self._images = [];
+                    log::info ("Swap chain disposed");
+                }
+            }
+        }
+    }
+
+
+
+}
