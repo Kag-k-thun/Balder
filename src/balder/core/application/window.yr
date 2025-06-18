@@ -69,9 +69,13 @@ pub class Window {
     prot let mut _redrawing = false;
 
     // The pass for final composition
-    prot let mut _composePass : DrawPass = DrawPass ();
+    prot let dmut _composePass : &DrawPass = copy DrawPass ();
 
-    prot let dmut _subpasses : [DrawPass] = [];
+    // The list of subpasses
+    prot let dmut _subpasses : [[c8] => &DrawPass] = copy [];
+
+    // The list of subpasses sorted to accomodate their dependencies
+    prot let dmut _sortedSubpasses : [&DrawPass] = [];
 
     /*!
      * ====================================================================================================
@@ -363,6 +367,7 @@ pub class Window {
      *    - drawPhase: a callback closure for the drawing phase
      * */
     pub fn addSubpass (mut self,
+                       name : [c8],
                        loadPhase : dg (dmut &IndirectCommandAllocator)-> void,
                        drawPhase : dg (dmut &IndirectCommandAllocator)-> void,
                        width : u32, height : u32, onlyDepth : bool = false)
@@ -376,29 +381,119 @@ pub class Window {
             copy VulkanColorSubpass (alias self._vkDevice, width, height)
         };
 
-        let mut subpass = DrawPass ();
+        let dmut subpass = copy DrawPass ();
         subpass.loadPhase = loadPhase;
         subpass.drawPhase = drawPhase;
         subpass.pass = (alias vkSub)?;
 
-        self._subpasses ~= [alias subpass];
+        self._subpasses [name] = alias subpass;
+        self:.sortSubpasses ();
     }
 
     /**
      * @returns: the content of a vulkan subpass
      * */
-    pub fn getSubpass (mut self, index : usize)-> dmut &VulkanSubpass
+    pub fn getSubpass (mut self, name : [c8])-> dmut &VulkanSubpass
         throws BalderError
     {
-        if index >= self._subpasses.len {
-            throw copy BalderError ("Subpass index error");
+        if let Ok (dmut p) = alias self._subpasses [name] {
+            if let Ok (dmut vk) = alias p.pass {
+                return alias vk;
+            }
+
+            throw copy BalderError ("No rendering output frame is defined for subpass " ~ name);
         }
 
-        if let Ok (dmut vk) = alias self._subpasses [index].pass {
-            return alias vk;
+        throw copy BalderError ("No subpass " ~ name);
+    }
+
+    /**
+     * @returns: the number of subpasses in the window
+     * */
+    pub fn getNbSubpass (mut self)-> usize {
+        self._subpasses.len
+    }
+
+    /**
+     * Add a dependency between two subpasses (to ensure they are executed in the correct order)
+     * */
+    pub fn addSubpassDependency (mut self, pass : [c8], toWhom : [c8])
+        throws BalderError
+    {
+        if let Ok (dmut p) = alias self._subpasses [pass] {
+            if toWhom !in self._subpasses {
+                throw copy BalderError ("No subpass " ~ toWhom);
+            }
+
+            p.dependencies [toWhom] = ();
+            self:.sortSubpasses ();
         }
 
-        throw copy BalderError ("No rendering output frame is defined for subpass");
+        else {
+            throw copy BalderError ("No subpass " ~ pass);
+        }
+    }
+
+    /**
+     * Remove a subpass from the list of subpass of the window
+     * @warning: also removed all subpass that depends on it
+     * */
+    pub fn removeSubpass (mut self, pass : [c8])
+        throws BalderError
+    {
+        self:.removeSubpassRec (pass);
+        self:.sortSubpasses ();
+    }
+
+    /**
+     * Recursive removal of a subpass
+     * */
+    fn removeSubpassRec (mut self, pass : [c8]) {
+        self._subpasses:.remove (pass);
+        for n, c in self._subpasses {
+            if pass in c.dependencies {
+                self:.removeSubpassRec (n);
+            }
+        }
+    }
+
+    /**
+     * Sort the list of subpasses to draw them in the correct order
+     * */
+    fn sortSubpasses (mut self)
+        throws BalderError
+    {
+        let dmut dones : [[c8] => ()] = copy [];
+        let dmut notDones : [[c8] => ()] = copy [];
+
+        for n in self._subpasses { notDones [n] = (); }
+
+        self._sortedSubpasses = [];
+        while notDones.len != 0 {
+            let mut added = false;
+            for n in notDones {
+                if let Ok (dmut c) = alias self._subpasses [n] {
+                    let mut add = true;
+                    for j in c.dependencies {
+                        if j !in dones {
+                            add = false;
+                            break;
+                        }
+                    }
+
+                    if add {
+                        added = true;
+                        dones [n] = ();
+                        notDones:.remove (n);
+                        self._sortedSubpasses ~= [alias c];
+                    }
+                }
+            }
+
+            if !added {
+                throw copy BalderError ("Recursive, or malformed subpass dependencies");
+            }
+        }
     }
 
     /**
@@ -425,8 +520,8 @@ pub class Window {
 
         while self._isRunning {
             if self._redrawing {
-                self:.performRedraw ();
                 self._redrawing = false;
+                self:.performRedraw ();
             }
 
             else {
@@ -466,17 +561,17 @@ pub class Window {
             log::info ("Redraw frame : ", image);
             self._vkDevice:.clearCommandBuffer ();
             if (image >= 0) {
-                self._vkDevice:.startRecording ();
+                self._vkDevice.startRecording ();
 
                 self:.drawSubpasses (alias newAllocs);
 
-                self._vkDevice:.startRenderPass (cast!u32 (image));
+                self._vkDevice.startRenderPass (cast!u32 (image));
                 newAllocs [0]:.startRecording ();
 
                 self._composePass.drawPhase (alias newAllocs [0]);
 
-                self._vkDevice:.stopRenderPass ();
-                self._vkDevice:.stopRecording ();
+                self._vkDevice.stopRenderPass ();
+                self._vkDevice.stopRecording ();
 
                 self:.presentPass (image);
                 frames += 1;
@@ -485,12 +580,12 @@ pub class Window {
             self:.waitFrame ();
         }
 
-        for i, dmut z in alias self._subpasses {
+        for i, dmut z in alias self._sortedSubpasses {
             if let Ok (dmut all) = alias z.cmdAlloc {
                 all:.dispose ();
             }
 
-            self._subpasses [i].cmdAlloc = (alias newAllocs [i + 1])?;
+            self._sortedSubpasses [i].cmdAlloc = (alias newAllocs [i + 1])?;
         }
 
         if let Ok (dmut all) = alias self._composePass.cmdAlloc {
@@ -501,9 +596,9 @@ pub class Window {
     }
 
     fn performReload (mut self)-> dmut [&IndirectCommandAllocator] {
-        let dmut cmds = copy [copy IndirectCommandAllocator (alias self._vkDevice) for _ in 0 .. (self._subpasses.len + 1)];
-        for i, _ in self._subpasses {
-            self._subpasses [i].loadPhase (alias cmds [i + 1]);
+        let dmut cmds = copy [copy IndirectCommandAllocator (alias self._vkDevice) for _ in 0 .. (self._sortedSubpasses.len + 1)];
+        for i, _ in self._sortedSubpasses {
+            self._sortedSubpasses [i].loadPhase (alias cmds [i + 1]);
             {
                 cmds [i + 1]:.finalizeLoading ();
             }?;
@@ -517,14 +612,17 @@ pub class Window {
         alias cmds
     }
 
+    /**
+     * Draw the subpasses of the window
+     * */
     fn drawSubpasses (mut self, dmut newAllocs : [&IndirectCommandAllocator]) {
-        for i, dmut z in alias self._subpasses {
+        for i, dmut z in alias self._sortedSubpasses {
             if let Ok (dmut vk) = alias z.pass {
-                vk:.startRenderPass ();
+                vk.startRenderPass ();
                 newAllocs [i + 1]:.startRecording ();
                 z.drawPhase (alias newAllocs [i + 1]);
 
-                self._vkDevice:.stopRenderPass ();
+                self._vkDevice.stopRenderPass ();
             }
         }
     }
@@ -596,11 +694,12 @@ pub class Window {
      * Clear all the subpasses of the rendering
      * */
     pub fn clearSubpasses (mut self) {
-        for i, _ in self._subpasses {
-            self._subpasses [i]:.dispose ();
+        for i, _ in self._sortedSubpasses {
+            self._sortedSubpasses [i]:.dispose ();
         }
 
-        self._subpasses = [];
+        self._sortedSubpasses = [];
+        self._subpasses = copy [];
     }
     
     impl Disposable {
