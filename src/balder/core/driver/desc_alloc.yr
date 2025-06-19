@@ -5,6 +5,27 @@ use balder::core::{error, dispose};
 use balder::utils::log;
 
 use ::vulkan::core;
+use ::std::io;
+
+class DescriptorPool {
+    pub let uid : usize;
+    pub let dmut handle : VkDescriptorPool;
+    pub let maxSet : u32;
+    pub let mult : u32;
+
+    pub let config : [VkDescriptorType];
+    pub let mut usedSet : u32;
+
+    pub self (uid : usize, dmut handle : VkDescriptorPool, maxSet : u32, multiplier : u32, config : [VkDescriptorType])
+        with uid = uid
+        , handle = alias handle
+        , maxSet = maxSet
+        , config = config
+        , usedSet = 0
+        , mult = multiplier
+    {}
+
+}
 
 @final
 pub class DescriptorAllocator {
@@ -12,11 +33,17 @@ pub class DescriptorAllocator {
     // The vulkan device used for allocation
     let dmut _device : &VulkanDevice;
 
+    // The uniq ids of the allocated pools
+    let mut _uid : usize = 0;
+
     // The set of used pools
-    let dmut _usedPools : [[VkDescriptorType] => [VkDescriptorPool]] = copy [];
+    let dmut _pools : [usize => &DescriptorPool] = copy [];
 
     // The set of free pools
-    let dmut _freePools : [[VkDescriptorType] => VkDescriptorPool] = copy [];
+    let dmut _freePools : [usize => &DescriptorPool] = copy [];
+
+    // The multiplier used for each configuration (nextPow2 when it reaches the limit of allocated pools)
+    let dmut _multiplier : [[VkDescriptorType] => u32] = copy [];
 
     /**
      * ======================================================================================================
@@ -48,35 +75,80 @@ pub class DescriptorAllocator {
     /**
      * Allocate a descriptor set
      */
-    pub fn allocate (mut self, layout : VkDescriptorSetLayout, sizes : [VkDescriptorType])-> dmut [VkDescriptorSet]
+    pub fn allocate (mut self, layout : VkDescriptorSetLayout, sizes : [VkDescriptorType])-> dmut (usize, [VkDescriptorSet])
         throws BalderError
     {
-        let dmut pool = self:.getPool (sizes);
-        let dmut set : [VkDescriptorSet] = copy [null ; self._device.getSwapchainNbFrames ()];
-        let mut layouts : [mut VkDescriptorSetLayout] = copy [layout ; self._device.getSwapchainNbFrames ()];
+        atomic self {
+            let dmut pool = self:.getPool (sizes, self._device.getSwapchainNbFrames ());
 
-        let mut allocInfo = VkDescriptorSetAllocateInfo ();
-        allocInfo.sType              = VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocInfo.descriptorPool     = pool;
-        allocInfo.descriptorSetCount = cast!u32 (layouts.len);
-        allocInfo.pSetLayouts        = layouts.ptr;
+            let dmut set : [VkDescriptorSet] = copy [null ; self._device.getSwapchainNbFrames ()];
+            let mut layouts : [mut VkDescriptorSetLayout] = copy [layout ; self._device.getSwapchainNbFrames ()];
 
-        let mut res = vkAllocateDescriptorSets (self._device.getDeviceHandle (), &allocInfo, alias set.ptr);
-        if (res == VkResult::VK_ERROR_FRAGMENTED_POOL || res == VkResult::VK_ERROR_OUT_OF_POOL_MEMORY) {
-            self:.setUsed (alias pool, sizes);
+            let mut allocInfo = VkDescriptorSetAllocateInfo ();
+            allocInfo.sType              = VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocInfo.descriptorPool     = pool.handle;
+            allocInfo.descriptorSetCount = self._device.getSwapchainNbFrames ();
+            allocInfo.pSetLayouts        = layouts.ptr;
 
-            log::debug ("Pool is full, try to reallocate in a new one");
-            allocInfo.descriptorPool = self:.getPool (forceFree-> true, sizes);
-            res = vkAllocateDescriptorSets (self._device.getDeviceHandle (), &allocInfo, alias set.ptr);
+            let mut res = vkAllocateDescriptorSets (self._device.getDeviceHandle (), &allocInfo, alias set.ptr);
+            if res == VkResult::VK_SUCCESS {
+                pool.usedSet += self._device.getSwapchainNbFrames ();
+                if pool.usedSet == pool.maxSet {
+                    self._freePools:.remove (pool.uid);
+                }
+
+                return (pool.uid, alias set);
+            }
         }
 
-        if (res != VkResult::VK_SUCCESS) {
-            throw copy BalderError ("Failed to allocate a descriptor set."s8);
-        }
-
-        return alias set;
+        throw copy BalderError ("Failed to allocate a descriptor set."s8);
     }
-    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DEALLOCATE          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Deallocate descriptor set allocated by a descriptor pool
+     * @params:
+     *    - uid: the uid of the descriptor pool that performed the allocation
+     *    - sets: the sets to free
+     * */
+    pub fn deallocate (mut self, uid : usize, dmut sets : [VkDescriptorSet]) {
+        atomic self {
+            if let Ok (dmut pool) = alias self._pools [uid] {
+                vkFreeDescriptorSets (self._device.getDeviceHandle (), pool.handle, cast!u32 (sets.len), sets.ptr);
+
+                pool.usedSet -= cast!u32 (sets.len);
+
+                if pool.usedSet == 0 {
+                    self._freePools:.remove (uid);
+                    self._pools:.remove (uid);
+                    vkDestroyDescriptorPool (self._device.getDeviceHandle (), pool.handle, null);
+
+                    let mut maxMult = 1u32, mut has = false;
+                    for _, z in self._pools {
+                        if z.config == pool.config {
+                            has = true;
+                            if maxMult < z.mult { maxMult = z.mult; }
+                        }
+                    }
+
+                    if has { self._multiplier [pool.config] = maxMult; }
+                    else { self._multiplier:.remove (pool.config); }
+                } else {
+                    self._freePools [uid] = alias pool;
+                }
+            } else {
+                log::error ("Sets not allocated by this pool?");
+            }
+        }
+    }
+
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -88,14 +160,12 @@ pub class DescriptorAllocator {
     /**
      * @returns: a usable pool for set allocation
      */
-    fn getPool (mut self, forceFree : bool = false, config : [VkDescriptorType])-> dmut VkDescriptorPool
+    fn getPool (mut self, config : [VkDescriptorType], needSet : u32)-> dmut &DescriptorPool
         throws BalderError
     {
-        if !forceFree {
-            for z, dmut p in alias self._freePools {
-                if z == config {
-                    return alias p;
-                }
+        for _, dmut p in alias self._freePools {
+            if p.config == config && p.maxSet - p.usedSet >= needSet {
+                return alias p;
             }
         }
 
@@ -103,42 +173,40 @@ pub class DescriptorAllocator {
     }
 
     /**
-     * Set the pool in the used set to be destroyed later on
-     * */
-    fn setUsed (mut self, dmut pool : VkDescriptorPool, config : [VkDescriptorType]) {
-        self._freePools:.remove (config);
-        if let Ok (dmut lst) = alias self._usedPools [config] {
-            self._usedPools [config] = lst ~ [alias pool];
-        } else {
-            self._usedPools [config] = copy [alias pool];
-        }
-    }
-
-    /**
      * Create a new descriptor pool
      */
-    fn createDescriptorPool (mut self, sizes : [VkDescriptorType])-> dmut VkDescriptorPool
+    fn createDescriptorPool (mut self, sizes : [VkDescriptorType])-> dmut &DescriptorPool
         throws BalderError
     {
+        let multiplier = if let Ok (m) = self._multiplier [sizes] { m * 2u32 } else { 1u32 };
+
         let dmut descs = copy [VkDescriptorPoolSize () ; sizes.len];
         for i, t in sizes {
             descs [i].type = t;
-            descs [i].descriptorCount = self._device.getSwapchainNbFrames ();
+            descs [i].descriptorCount = self._device.getSwapchainNbFrames () * multiplier;
         }
 
         let mut poolInfo = VkDescriptorPoolCreateInfo ();
         poolInfo.sType         = VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.poolSizeCount = cast!u32 (descs.len);
         poolInfo.pPoolSizes    = descs.ptr;
-        poolInfo.maxSets       = self._device.getSwapchainNbFrames ();
+        poolInfo.maxSets       = self._device.getSwapchainNbFrames () * multiplier;
+        poolInfo.flags = VkDescriptorPoolCreateFlagBits::VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 
         let dmut descPool : VkDescriptorPool = null;
         if (vkCreateDescriptorPool (self._device.getDeviceHandle (), &poolInfo, null, alias &descPool) != VkResult::VK_SUCCESS) {
             throw copy BalderError ("failed to create descriptor pool."s8);
         }
 
-        self._freePools [sizes] = alias descPool;
-        return alias descPool;
+        let uid = self._uid + 1;
+        self._uid += 1;
+        self._multiplier [sizes] = multiplier;
+
+        let dmut result = copy DescriptorPool (uid, alias descPool, poolInfo.maxSets, multiplier, sizes);
+        self._freePools [uid] = alias result;
+        self._pools [uid] = alias result;
+
+        return alias result;
     }
     
     /**
@@ -151,19 +219,18 @@ pub class DescriptorAllocator {
     
     impl Disposable {
         pub over dispose (mut self) {
-            log::debug ("Disposing descriptor allocator");
-            for _, z in self._freePools {
-                vkDestroyDescriptorPool (self._device.getDeviceHandle (), z, null);
-            }
+            atomic self {
+                if self._pools.len != 0 {
+                    log::debug ("Disposing descriptor allocator");
+                    for _, z in self._pools {
+                        vkDestroyDescriptorPool (self._device.getDeviceHandle (), z.handle, null);
+                    }
 
-            for _, dmut lst in alias self._usedPools {
-                for dmut z in alias lst {
-                    vkDestroyDescriptorPool (self._device.getDeviceHandle (), z, null);
+                    self._freePools = copy [];
+                    self._pools = copy [];
+                    self._multiplier = copy [];
                 }
             }
-
-            self._freePools = copy [];
-            self._usedPools = copy [];
         }
     }
 

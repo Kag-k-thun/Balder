@@ -6,7 +6,9 @@ layout (binding = 0) uniform World {
     vec2 dimension;
     vec2 translation;
     vec2 scale;
-    vec3 color;
+    float radius;
+
+    vec4 color;
     vec4 rotation;
 } world;
 
@@ -19,10 +21,10 @@ out gl_PerVertex {
 void main () {
     mat2 rot = mat2 (world.rotation.x, world.rotation.y, world.rotation.z, world.rotation.w);
     vec2 pos = (rot * (position.xy - 0.5));
-    vec2 translation = (world.translation * 10) - (world.dimension - world.scale / 2); // + (world.scale / 2);
+    vec2 translation = world.translation - (world.dimension - world.scale / 2); // + (world.scale / 2);
 
     pos = ((pos * world.scale + translation) / world.dimension);
 
     gl_Position =  vec4 (pos, 0, 1);
-    a_uv = pos.xy;
+    a_uv = position.xy - 0.5;
 }
