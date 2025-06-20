@@ -1,6 +1,6 @@
 #version 450 core
 
-layout (location = 0) in vec3 position;
+layout (location = 0) in vec2 position;
 
 layout (binding = 0) uniform World {
     vec2 dimension;
