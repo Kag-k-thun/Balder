@@ -8,6 +8,7 @@ layout (binding = 0) uniform World {
     vec2 translation;
     vec2 scale;
     float radius;
+    int level;
 
     vec4 color;
     vec4 rotation;
