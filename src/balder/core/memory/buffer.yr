@@ -6,20 +6,13 @@ use balder::utils::log;
 
 use ::vulkan::core;
 
-extern (C) fn memcpy (src : *void, dst : *void, size : usize);
-
-__version DEBUG {
-    lazy dmut __UID__ = copy [0us];
-}
+use ::etc::c::memory;
 
 @final
 pub class Buffer {
 
-    __version DEBUG {
-
-        // The uniq id of the buffer
-        let mut _uid : usize = 0;
-    }
+    // The uniq id of the buffer
+    pub let uid : usize;
 
     // The device on which the buffer is allocated
     let dmut _device : &VulkanDevice;
@@ -30,17 +23,11 @@ pub class Buffer {
     // The buffer handle
     let dmut _buffer : VkBuffer = null;
 
-    // The size of the allocation
-    let dmut _size : VkDeviceSize = 0u64;
-
     // The memory allocation of the buffer (description used by MemoryAllocator)
     let dmut _memAlloc : MemoryAllocation;
 
     // The descriptor of the buffer
     let dmut _descriptor : VkDescriptorBufferInfo = VkDescriptorBufferInfo ();
-
-    // If self._mapped, this pointer can be used to get or modified the content of the buffer
-    let dmut _mappedData : *void = null;
 
     // True if the buffer is local to host
     let _isLocal : bool;
@@ -60,25 +47,18 @@ pub class Buffer {
      *    - size: the size of the allocation
      *    - usage: the usage of the memory that will be allocated
      */
-    pub self (dmut alloc : &MemoryAllocator, memAlloc : MemoryAllocation, dmut buffer : VkBuffer, isLocal : bool)
-        with  _allocator = alias alloc
+    pub self (uid : usize, dmut alloc : &MemoryAllocator, memAlloc : MemoryAllocation, dmut buffer : VkBuffer, isLocal : bool)
+        with uid = uid
+        , _allocator = alias alloc
         , _device = alloc:.getDevice ()
-        , _size = memAlloc.size
         , _buffer = alias buffer
         , _memAlloc = memAlloc
         , _descriptor = VkDescriptorBufferInfo ()
         , _isLocal = isLocal
     {
         self._descriptor.buffer = buffer;
-        self._descriptor.offset = 0u64;
-        self._descriptor.range = memAlloc.size;
-
-        __version DEBUG {
-            atomic {
-                self._uid = __UID__ [0] + 1;
-                __UID__ [0] += 1;
-            }
-        }
+        self._descriptor.offset = 0;
+        self._descriptor.range = cast!u64 (memAlloc.size);
     }
 
     /**
@@ -113,8 +93,8 @@ pub class Buffer {
     /**
      * @returns: the size of the buffer in memory
      */
-    pub fn getSize (self)-> VkDeviceSize {
-        self._size
+    pub fn getSize (self)-> usize {
+        self._memAlloc.size
     }
 
     pub fn getMapAddress (mut self)-> dmut *void {
@@ -140,9 +120,8 @@ pub class Buffer {
      * Map the buffer onto CPU memory , so it can be updated
      * @assume: the buffer was not disposed
      */
-    pub fn map (mut self)-> bool {
-        self._mappedData = self._allocator:.getMapAddress (self._memAlloc);
-        return self._mappedData != null;
+    pub fn map (mut self)-> dmut *void {
+        self._allocator:.getMapAddress (self._memAlloc)
     }
 
     /**
@@ -166,8 +145,10 @@ pub class Buffer {
      * */
     pub fn copyMappedData {T of [U], U} (mut self, datas : T) {
         atomic self._device {
-            if (self:.map ()) {
-                memcpy (self._mappedData, cast!{*void} (datas.ptr), datas.len * U::size);
+            let dmut mptr = self:.map ();
+            if (mptr != null) {
+                memcpy (mptr, cast!{*void} (datas.ptr), datas.len * U::size);
+                self:.unmap ();
             }
         }
     }
@@ -178,8 +159,10 @@ pub class Buffer {
      * */
     pub fn copyMappedData {T} (mut self, datas : *T) {
         atomic self._device {
-            if (self:.map ()) {
-                memcpy (self._mappedData, cast!{*void} (datas), T::size);
+            let dmut mptr = self:.map ();
+            if (mptr != null) {
+                memcpy (mptr, cast!{*void} (datas), T::size);
+                self:.unmap ();
             }
         }
     }
@@ -198,37 +181,30 @@ pub class Buffer {
     pub fn update {T of [U], U} (mut self, datas : T)
         throws BalderError
     {
-        atomic self._device {
-            if (self._isLocal) {
-                if (self:.map  ()) {
-                    memcpy (self._mappedData, cast!{*void} (datas.ptr), datas.len * U::size);
+        if (self._isLocal) {
+            atomic self._device {
+                let dmut mptr = self:.map ();
+                if (mptr != null) {
+                    memcpy (mptr, cast!{*void} (datas.ptr), datas.len * U::size);
                     self:.unmap ();
                 } else throw copy BalderError ("Failed to map memory");
-            } else {
-                let dmut stagingBuf = self._device:.getMemoryAllocator ():.allocBuffer (
-                    self._size,
-                    cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
-                    cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                              VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
-
-                stagingBuf:.map ();
-                memcpy (stagingBuf._mappedData, cast!{*void} (datas.ptr), datas.len * U::size);
-                stagingBuf:.unmap ();
-
-                self:.copyFrom (alias stagingBuf);
-                stagingBuf:.dispose ();
             }
-        }
-    }
+        } else {
+            let dmut stagingBuf = self._device:.getMemoryAllocator ():.allocBuffer (
+                cast!usize (self._memAlloc.size),
+                cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+                cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                          VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
 
-    /**
-     * Update the buffer from CPU datas
-     */
-    pub fn update {T} (mut self, datas : T)
-        throws BalderError
-    {
-        let d = copy [datas];
-        self:.update (d);
+            atomic self._device {
+                let dmut mptr = stagingBuf:.map ();
+                memcpy (mptr, cast!{*void} (datas.ptr), datas.len * U::size);
+                stagingBuf:.unmap ();
+            }
+
+            self:.copyFrom (alias stagingBuf);
+            stagingBuf:.dispose ();
+        }
     }
 
     /*!
@@ -250,7 +226,7 @@ pub class Buffer {
 
         copyRegion.srcOffset = 0u64;
         copyRegion.dstOffset = 0u64;
-        copyRegion.size = self._size;
+        copyRegion.size = cast!u64 (self._memAlloc.size);
 
         vkCmdCopyBuffer (cmd, src._buffer, self._buffer, 1u32, &copyRegion);
         self._device:.endSingleTimeCommand (alias cmd);
@@ -271,7 +247,7 @@ pub class Buffer {
                 self._allocator:.freeBuffer (alias self._buffer, self._memAlloc);
 
                 self._buffer = null;
-                self._size = 0u64;
+                self._memAlloc = MemoryAllocation ();
             }
         }
     }

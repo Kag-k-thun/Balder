@@ -68,8 +68,11 @@ pub class VulkanDevice {
 
     prot {
         
-        // The command pool of the device
-        let dmut _commandPool : VkCommandPool = null;
+        // The command pool of the device used for drawing
+        let dmut _drawPool : VkCommandPool = null;
+
+        // The command pool used for single time commands
+        let dmut _memoryPool : VkCommandPool = null;
 
         // The command buffer for recording (one per frame in flight)
         let dmut _commandBuffers : [VkCommandBuffer] = [];
@@ -143,7 +146,7 @@ pub class VulkanDevice {
             // buffer images
             self:.createSwapchain (alias win);
 
-            self:.createCommandPool ();
+            self:.createCommandPools ();
             self:.createCommandBuffers ();
             self:.createSyncObjects ();
         }
@@ -158,6 +161,13 @@ pub class VulkanDevice {
      * ======================================================================================================
      * ======================================================================================================
      */
+
+    /**
+     * @returns: the configuration of the device
+     * */
+    pub fn getConfiguration (self)-> &BalderConfig {
+        self._cfg
+    }
 
     /**
      * @returns: the vulkan handle of the physical device (might be null)
@@ -238,8 +248,15 @@ pub class VulkanDevice {
     /**
      * @returns: the command pool used to create command buffers
      */
-    pub fn getCommandPool (self)-> VkCommandPool {
-        self._commandPool
+    pub fn getDrawCommandPool (self)-> VkCommandPool {
+        self._drawPool
+    }
+
+    /**
+     * @returns: the command pool used to create command buffers
+     */
+    pub fn getSingleTimeCommandPool (self)-> VkCommandPool {
+        self._memoryPool
     }
 
     /**
@@ -426,35 +443,37 @@ pub class VulkanDevice {
      */
     pub fn presentScreen (mut self, image : u32)-> VkResult {
         if let Ok (swp) = self._swapChain {
-            self._submitInfo.commandBufferCount   = 1u32;
-            self._submitInfo.pCommandBuffers      = &self._commandBuffers [self._currentFrame];
+            atomic self {
+                self._submitInfo.commandBufferCount   = 1u32;
+                self._submitInfo.pCommandBuffers      = &self._commandBuffers [self._currentFrame];
 
-            let r = vkQueueSubmit (self._graphicsQueue, 1u32, &self._submitInfo, self._inFlightFence);
-            if (r != VkResult::VK_SUCCESS) {
-                log::error ("Error present screen queue submit : ", self._currentFrame, " ", image);
-                return r;
+                let r = vkQueueSubmit (self._graphicsQueue, 1u32, &self._submitInfo, self._inFlightFence);
+                if (r != VkResult::VK_SUCCESS) {
+                    log::error ("Error present screen queue submit : ", self._currentFrame, " ", image);
+                    return r;
+                }
+
+                let chain = swp.chain;
+
+                let mut presentInfo = VkPresentInfoKHR ();
+                presentInfo.sType              = VkStructureType::VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+                presentInfo.waitSemaphoreCount = 1u32;
+                presentInfo.pWaitSemaphores    = &self._renderFinishedSem;
+                presentInfo.swapchainCount     = 1u32;
+                presentInfo.pSwapchains        = &chain;
+                presentInfo.pImageIndices      = &image;
+
+                let r2 = vkQueuePresentKHR (self._presentQueue, &presentInfo);
+                if (r2 == VkResult::VK_ERROR_OUT_OF_DATE_KHR || r2 == VkResult::VK_SUBOPTIMAL_KHR) {
+                    self._resizingWindow = true;
+                } else if (r2 != VkResult::VK_SUCCESS) {
+                    log::error ("Error present screen queue present : ", self._currentFrame, " ", image);
+                    return r2;
+                }
+
+                self._currentFrame = (self._currentFrame + 1u32) % cast!u32 (swp.framebuffers.len);
+                vkQueueWaitIdle (self._presentQueue);
             }
-
-            let chain = swp.chain;
-
-            let mut presentInfo = VkPresentInfoKHR ();
-            presentInfo.sType              = VkStructureType::VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-            presentInfo.waitSemaphoreCount = 1u32;
-            presentInfo.pWaitSemaphores    = &self._renderFinishedSem;
-            presentInfo.swapchainCount     = 1u32;
-            presentInfo.pSwapchains        = &chain;
-            presentInfo.pImageIndices      = &image;
-
-            let r2 = vkQueuePresentKHR (self._presentQueue, &presentInfo);
-            if (r2 == VkResult::VK_ERROR_OUT_OF_DATE_KHR || r2 == VkResult::VK_SUBOPTIMAL_KHR) {
-                self._resizingWindow = true;
-            } else if (r2 != VkResult::VK_SUCCESS) {
-                log::error ("Error present screen queue present : ", self._currentFrame, " ", image);
-                return r2;
-            }
-
-            self._currentFrame = (self._currentFrame + 1u32) % cast!u32 (swp.framebuffers.len);
-            vkQueueWaitIdle (self._presentQueue);
 
             return VkResult::VK_SUCCESS;
         }
@@ -469,7 +488,7 @@ pub class VulkanDevice {
         let mut allocInfo = VkCommandBufferAllocateInfo ();
         allocInfo.sType              = VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.level              = VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandPool        = self._commandPool;
+        allocInfo.commandPool        = self._memoryPool;
         allocInfo.commandBufferCount = 1u32;
 
         let dmut cmd : VkCommandBuffer = null;
@@ -496,10 +515,12 @@ pub class VulkanDevice {
         submitInfo.commandBufferCount = 1u32;
         submitInfo.pCommandBuffers    = &cmd;
 
-        vkQueueSubmit (self._graphicsQueue, 1u32, &submitInfo, null);
-        vkQueueWaitIdle (self._graphicsQueue);
+        atomic self {
+            vkQueueSubmit (self._graphicsQueue, 1u32, &submitInfo, null);
+            vkQueueWaitIdle (self._graphicsQueue);
+        }
 
-        vkFreeCommandBuffers (self._device, self._commandPool, 1u32, &cmd);
+        vkFreeCommandBuffers (self._device, self._memoryPool, 1u32, &cmd);
     }
 
     /**
@@ -529,7 +550,7 @@ pub class VulkanDevice {
     /**
      * Create a command pool for the device used to instantiate command buffers on the graphic queue
      */
-    prv fn createCommandPool (mut self)
+    prv fn createCommandPools (mut self)
         throws BalderError
     {
         let mut poolInfo = VkCommandPoolCreateInfo ();
@@ -537,7 +558,11 @@ pub class VulkanDevice {
         poolInfo.flags            = cast!u32 (VkCommandPoolCreateFlagBits::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
         poolInfo.queueFamilyIndex = self._physicalDeviceFamilyIndices [1];
 
-        if (vkCreateCommandPool (self._device, &poolInfo, null, alias &self._commandPool) != VkResult::VK_SUCCESS) {
+        if (vkCreateCommandPool (self._device, &poolInfo, null, alias &self._drawPool) != VkResult::VK_SUCCESS) {
+            throw copy BalderError ("Failed to create the command poll");
+        }
+
+        if (vkCreateCommandPool (self._device, &poolInfo, null, alias &self._memoryPool) != VkResult::VK_SUCCESS) {
             throw copy BalderError ("Failed to create the command poll");
         }
     }
@@ -552,7 +577,7 @@ pub class VulkanDevice {
             self._commandBuffers = copy [null ; swp.framebuffers.len];
             let mut allocInfo = VkCommandBufferAllocateInfo ();
             allocInfo.sType              = VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            allocInfo.commandPool        = self._commandPool;
+            allocInfo.commandPool        = self._drawPool;
             allocInfo.level              = VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_PRIMARY;
             allocInfo.commandBufferCount = cast!u32 (self._commandBuffers.len);
 
@@ -879,12 +904,17 @@ pub class VulkanDevice {
                 self._win = none;
 
                 // No need to destroy the command buffers, they are managed by the pool
-                if (self._commandPool != null) {
-                    vkDestroyCommandPool (self._device, self._commandPool, null);
-                    self._commandPool = null;
+                if (self._drawPool != null) {
+                    vkDestroyCommandPool (self._device, self._drawPool, null);
+                    self._drawPool = null;
 
                     // So they are destroyed here
                     self._commandBuffers = [];
+                }
+
+                if self._memoryPool != null {
+                    vkDestroyCommandPool (self._device, self._memoryPool, null);
+                    self._memoryPool = null;
                 }
 
                 self:.disposeSwapchain ();

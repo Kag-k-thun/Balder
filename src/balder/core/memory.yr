@@ -4,14 +4,16 @@ pub mod ::free_list;
 pub mod ::segment;
 pub mod ::image2D;
 pub mod ::buffer;
+pub mod ::dyn_buffer;
 
 use balder::core::{_, driver::_, memory::_};
 use balder::utils::log;
 
 use std::algorithm::comparison;
-use std::io;
+use std::{io, unit};
 
 use ::vulkan::core;
+use ::etc::c::memory;
 
 /**
  * Memory allocator used to manage the memory of a vulkan device
@@ -22,17 +24,40 @@ pub class MemoryAllocator {
     // The device used by the allocator
     let dmut _device : &VulkanDevice;
 
+    // The last uniq id given to a buffer (dynamic or static)
+    let mut _lastBufferId = 0us;
+
     // The last uniq id given to a free list
     let mut _lastId = 0us;
 
-    // The allocated memory segments
-    let dmut _allocations : [usize => &FreeList] = copy [];
+    // The allocated memory segments for static buffers
+    let dmut _staticAllocations : [usize => &FreeList] = copy [];
+
+    // The allocated memory segments for dynamic buffers
+    let dmut _dynamicAllocations : [usize => &FreeList] = copy [];
+
+    // Local association of dynamic buffers
+    let dmut _dynamicLocalBuffers : [usize => [u8]] = copy [];
+
+    // The list of dynamic buffer to update
+    let dmut _dynamicBufferToUpdate : [usize => (usize, usize)] = copy [];
+
+    // The list of commited dynamic buffers
+    let dmut _commitedDynamicBuffers : [usize => &DynamicBuffer] = copy [];
 
     // The list of mapped allocations
     let dmut _mapped : [usize => *void] = copy [];
 
     // The size of a memory segment
-    let mut _memorySegmentSize : u64 = 0u64;
+    let mut _memorySegmentSize : usize = 0;
+
+    // The size of a memory segment used in to allocated dynamic buffers (generally < self._memorySegmentSize)
+    let mut _dynamicMemorySegmentSize : usize = 0;
+
+    // The amount of allocated memory space
+    let mut _usedMemorySpace : usize = 0;
+
+    let mut _availableSpace : usize = 0;
 
     /**
      * @params:
@@ -46,8 +71,12 @@ pub class MemoryAllocator {
         vkGetPhysicalDeviceProperties (self._device.getPhysicalDeviceHandle (), alias &properties);
         vkGetPhysicalDeviceMemoryProperties (self._device.getPhysicalDeviceHandle (), alias &memProperties);
 
-        let nbAllocations = cast!u64 (min (4096u32, properties.limits.maxMemoryAllocationCount));
-        self._memorySegmentSize = memProperties.memoryHeaps [0us].size / nbAllocations;
+        self._dynamicMemorySegmentSize = self._device.getConfiguration ().vulkan.uboSize;
+        let remainSize = cast!usize (memProperties.memoryHeaps [0us].size) - (self._dynamicMemorySegmentSize * self._device.getConfiguration ().vulkan.uboCount);
+
+        let nbAllocations = min (4096us, cast!usize (properties.limits.maxMemoryAllocationCount)) - self._device.getConfiguration ().vulkan.uboCount;
+        self._memorySegmentSize = cast!usize (remainSize / nbAllocations);
+        self._availableSpace = cast!usize (memProperties.memoryHeaps [0us].size);
     }
 
     /**
@@ -65,21 +94,31 @@ pub class MemoryAllocator {
         alias self._device
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          MAPPING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     /**
      * Map the address of a memory segment and return its address
      * */
     pub fn getMapAddress (mut self, memAlloc : MemoryAllocation)-> dmut *void {
         atomic self {
-            if memAlloc.index in self._mapped {
-                vkUnmapMemory (self._device.getDeviceHandle (), memAlloc.mem);
+            if let Ok (dmut ptr) = alias self._mapped [memAlloc.index] {
+                return alias (ptr + cast!usize (memAlloc.offset));
             }
 
             let dmut ptr : *void = null;
-            if (vkMapMemory (self._device.getDeviceHandle (), memAlloc.mem, memAlloc.offset, memAlloc.size, 0, &ptr) == VkResult::VK_SUCCESS) {
+            if (vkMapMemory (self._device.getDeviceHandle (), memAlloc.mem, 0, cast!u64 (memAlloc.fullSize), 0, &ptr) == VkResult::VK_SUCCESS) {
                 self._mapped [memAlloc.index] = alias ptr;
-            } else { self._mapped:.remove (memAlloc.index); }
-
-            alias ptr
+                return alias (ptr + cast!usize (memAlloc.offset));
+            } else {
+                self._mapped:.remove (memAlloc.index);
+                return null;
+            }
         }
     }
 
@@ -88,10 +127,68 @@ pub class MemoryAllocator {
      * */
     pub fn unmap (mut self, memAlloc : MemoryAllocation) {
         atomic self {
-            if memAlloc.index in self._mapped{
+            if memAlloc.index in self._mapped {
                 vkUnmapMemory (self._device.getDeviceHandle (), memAlloc.mem);
                 self._mapped:.remove (memAlloc.index);
             }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          DYNAMIC UPDATES          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set a dynamic buffer for an update
+     * */
+    pub fn setDynamicForUpdate (mut self, dmut buffer : &DynamicBuffer) {
+        atomic self {
+            let alloc = buffer.getMemoryAllocation ();
+            if let Ok ((start, end)) = self._dynamicBufferToUpdate [alloc.index] {
+                self._dynamicBufferToUpdate [alloc.index] = (min (start, alloc.offset),
+                                                             max (end, alloc.offset + alloc.size));
+            } else {
+                self._dynamicBufferToUpdate [alloc.index] = (alloc.offset, alloc.offset + alloc.size);
+            }
+
+            self._commitedDynamicBuffers [buffer.uid] = alias buffer;
+        }
+    }
+
+    /**
+     * Commit the update of the dynamic buffers, and free the update list
+     * */
+    pub fn commitDynamicBuffers (mut self) {
+        atomic self {
+            for uid, range in self._dynamicBufferToUpdate {
+                if let Ok (dmut list) = alias self._dynamicAllocations [uid] {
+                    if uid in self._mapped {
+                        vkUnmapMemory (self._device.getDeviceHandle (), list:.getMemory ());
+                        self._mapped:.remove (uid);
+                    }
+
+                    if let Ok (dmut local) = alias self._dynamicLocalBuffers [uid] {
+                        let dmut ptr : *void = null;
+                        if (vkMapMemory (self._device.getDeviceHandle (), list:.getMemory (), cast!u64 (range._0), cast!u64 (range._1 - range._0), 0, alias &ptr) == VkResult::VK_SUCCESS) {
+                            memcpy (ptr, cast!{*void} (local.ptr + range._0), range._1 - range._0);
+                            vkUnmapMemory (self._device.getDeviceHandle (), list:.getMemory ());
+                        } else {
+                            log::error ("Failed to map data in dynamic buffer update");
+                        }
+                    }
+                }
+            }
+
+            for _, dmut buf in alias self._commitedDynamicBuffers {
+                buf:.wasCommit (false);
+            }
+
+            self._dynamicBufferToUpdate = copy [];
+            self._commitedDynamicBuffers = copy [];
         }
     }
 
@@ -109,7 +206,7 @@ pub class MemoryAllocator {
      *    - size: the size of the buffer to allocate
      *    - bufferUsage: the type of buffer to allocate
      */
-    pub fn allocBuffer (mut self, size : u64, bufferUsage : VkBufferUsageFlags, memoryFlags : VkMemoryPropertyFlags)-> dmut &Buffer
+    pub fn allocBuffer (mut self, size : usize, bufferUsage : VkBufferUsageFlags, memoryFlags : VkMemoryPropertyFlags)-> dmut &Buffer
         throws BalderError
     {
         atomic self {
@@ -118,7 +215,7 @@ pub class MemoryAllocator {
 
             let mut bufferInfo = VkBufferCreateInfo ();
             bufferInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            bufferInfo.size = size;
+            bufferInfo.size = cast!u64 (size);
             bufferInfo.usage = bufferUsage;
             bufferInfo.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
 
@@ -127,35 +224,118 @@ pub class MemoryAllocator {
                 throw copy BalderError ("Failed to create buffer.");
             }
 
-            let memAlloc = self:.findSuitableMemoryBuffer (buf, memoryFlags);
-            return copy Buffer (alias self, memAlloc, alias buf, isLocal-> isLocal);
+            let memAlloc = self:.findSuitableStaticMemoryBuffer (buf, memoryFlags);
+            let uid = self._lastBufferId + 1;
+            self._lastBufferId += 1;
+
+            return copy Buffer (uid, alias self, memAlloc, alias buf, isLocal-> isLocal);
         }
     }
 
+    /**
+     * Allocate a dynamic buffer (meant to be frequently updated, e.g. for uniform buffer objects)
+     * @params:
+     *    - size: the size of the buffer to allocate
+     *    - bufferUsage: the type of buffer to allocate
+     * @returns: a dynamic buffer
+     * */
+    pub fn allocDynamicBuffer (mut self, size : usize, bufferUsage : VkBufferUsageFlags, memoryFlags : VkMemoryPropertyFlags)-> dmut &DynamicBuffer
+        throws BalderError
+    {
+        atomic self {
+            let mut isLocal = (memoryFlags & cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u32);
+            isLocal = isLocal || (memoryFlags & cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u32);
+
+            if !(isLocal) {
+                throw copy BalderError ("Dynamic buffer must be local");
+            }
+
+            let mut bufferInfo = VkBufferCreateInfo ();
+            bufferInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bufferInfo.size = cast!u64 (size);
+            bufferInfo.usage = bufferUsage;
+            bufferInfo.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
+
+            let dmut buf : VkBuffer = null;
+            if (vkCreateBuffer (self._device.getDeviceHandle (), &bufferInfo, null, alias &buf) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to create buffer.");
+            }
+
+            let (dmut localData, memAlloc) = alias self:.findSuitableDynamicMemoryBuffer (buf, memoryFlags);
+            let uid = self._lastBufferId + 1;
+            self._lastBufferId += 1;
+
+            return copy DynamicBuffer (uid, alias self, memAlloc, alias buf, alias localData);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          FREELIST SEARCH          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
-     * Find a suitable free memory segment to bind to the buffer
+     * Find a suitable free memory segment to bind to the static buffer
      * @params:
      *    - buf: the buffer to bind
-     *    -
      */
-    fn findSuitableMemoryBuffer (mut self, buf : VkBuffer, memoryFlags : VkMemoryPropertyFlags)-> MemoryAllocation
+    fn findSuitableStaticMemoryBuffer (mut self, buf : VkBuffer, memoryFlags : VkMemoryPropertyFlags)-> MemoryAllocation
         throws BalderError
     {
         let dmut memReq = VkMemoryRequirements ();
         vkGetBufferMemoryRequirements (self._device.getDeviceHandle (), buf, alias &memReq);
 
         let type = self:.findMemoryType (memReq.memoryTypeBits, memoryFlags);
-        for _, dmut list in alias self._allocations {
+        for _, dmut list in alias self._staticAllocations {
             if let Ok (res) = self:.allocateBufferInList (alias list, type, buf, memReq) {
                 return res;
             }
         }
 
-        let allocSize = max (self._memorySegmentSize, memReq.size);
-        let dmut mem = self:.allocateNewMemorySegment (type, allocSize);
+        let allocSize = max (self._memorySegmentSize, cast!usize (memReq.size));
+        let dmut mem = self:.allocateNewStaticMemorySegment (type, allocSize);
         if let Ok (res) = self:.allocateBufferInList (alias mem, type, buf, memReq) {
             return res;
+        }
+
+        throw copy BalderError ("Failed to allocate memory");
+    }
+
+    /**
+     * Find a suitable free memory segment to bind to the dynamic buffer
+     * @params:
+     *    - buf: the buffer to bind
+     */
+    fn findSuitableDynamicMemoryBuffer (mut self, buf : VkBuffer, memoryFlags : VkMemoryPropertyFlags)-> dmut ([u8], MemoryAllocation)
+        throws BalderError
+    {
+        let dmut memReq = VkMemoryRequirements ();
+        vkGetBufferMemoryRequirements (self._device.getDeviceHandle (), buf, alias &memReq);
+
+        let type = self:.findMemoryType (memReq.memoryTypeBits, memoryFlags);
+        for _, dmut list in alias self._dynamicAllocations {
+            if let Ok (res) = self:.allocateBufferInList (alias list, type, buf, memReq) {
+                if let Ok (dmut localBuffer) = alias self._dynamicLocalBuffers [list.getUniqId ()] {
+                    memset (cast!{*void} (localBuffer.ptr + res.offset), 0, res.size);
+                    return (alias localBuffer [res.offset .. res.offset + res.size], res);
+                }
+
+                throw copy BalderError ("No local buffer associated to allocation??");
+            }
+        }
+
+        let allocSize = max (self._dynamicMemorySegmentSize, cast!usize (memReq.size));
+        let dmut mem = self:.allocateNewDynamicMemorySegment (type, allocSize);
+        if let Ok (res) = self:.allocateBufferInList (alias mem, type, buf, memReq) {
+            if let Ok (dmut localBuffer) = alias self._dynamicLocalBuffers [mem.getUniqId ()] {
+                memset (cast!{*void} (localBuffer.ptr + res.offset), 0, res.size);
+                return (alias localBuffer [res.offset .. res.offset + res.size], res);
+            }
+
+            throw copy BalderError ("No local buffer associated to allocation??");
         }
 
         throw copy BalderError ("Failed to allocate memory");
@@ -177,17 +357,19 @@ pub class MemoryAllocator {
         // Cannot allocate in mismatching allocation type
         if (list.getType () != type) return none;
 
-        let (succ, off, segIndex) = list:.findFreeSegment (memReq.size, memReq.alignment);
+        let (succ, off, segIndex) = list:.findFreeSegment (cast!usize (memReq.size), cast!usize (memReq.alignment));
         if (succ) {
-            list:.reserve (segIndex, off, memReq.size);
+            list:.reserve (segIndex, off, cast!usize (memReq.size));
             let res = MemoryAllocation (
                 type-> type,
                 index-> list.getUniqId (),
                 offset-> off,
-                size-> memReq.size,
+                size-> cast!usize (memReq.size),
+                fullSize-> list.getSize (),
                 mem-> list:.getMemory ());
 
-            if (vkBindBufferMemory (self._device.getDeviceHandle (), buf, list:.getMemory (), off) != VkResult::VK_SUCCESS) {
+            println ("Bind buffer : ", off, " ", memReq.size);
+            if (vkBindBufferMemory (self._device.getDeviceHandle (), buf, list:.getMemory (), cast!u64 (off)) != VkResult::VK_SUCCESS) {
                 throw copy BalderError ("Failed to bind buffer memory");
             }
 
@@ -254,14 +436,14 @@ pub class MemoryAllocator {
         vkGetImageMemoryRequirements (self._device.getDeviceHandle (), image, alias &memReq);
 
         let type = self:.findMemoryType (memReq.memoryTypeBits, memoryFlags);
-        for _, dmut list in alias self._allocations {
+        for _, dmut list in alias self._staticAllocations {
             if let Ok (res) = self:.allocateImageInList (alias list, type, image, memReq) {
                 return res;
             }
         }
 
-        let allocSize = max (self._memorySegmentSize, memReq.size);
-        let dmut mem = self:.allocateNewMemorySegment (type, allocSize);
+        let allocSize = max (self._memorySegmentSize, cast!usize (memReq.size));
+        let dmut mem = self:.allocateNewStaticMemorySegment (type, allocSize);
         if let Ok (res) = self:.allocateImageInList (alias mem, type, image, memReq) {
             return res;
         }
@@ -280,22 +462,23 @@ pub class MemoryAllocator {
      * @returns: the allocated memory segment (or none if failed)
      * */
     fn allocateImageInList (mut self, dmut list : &FreeList, type : u32,  image : VkImage, memReq : VkMemoryRequirements)-> (MemoryAllocation)?
-    throws BalderError
+        throws BalderError
     {
         // Cannot allocate in mismatching allocation type
         if (list.getType () != type) return none;
 
-        let (succ, off, segIndex) = list:.findFreeSegment (memReq.size, memReq.alignment);
+        let (succ, off, segIndex) = list:.findFreeSegment (cast!usize (memReq.size), cast!usize (memReq.alignment));
         if (succ) {
-            list:.reserve (segIndex, off, memReq.size);
+            list:.reserve (segIndex, off, cast!usize (memReq.size));
             let res = MemoryAllocation (
                 type-> type,
                 index-> list.getUniqId (),
                 offset-> off,
-                size-> memReq.size,
+                size-> cast!usize (memReq.size),
+                fullSize-> list.getSize (),
                 mem-> list:.getMemory ());
 
-            if (vkBindImageMemory (self._device.getDeviceHandle (), image, list:.getMemory (), off) != VkResult::VK_SUCCESS) {
+            if (vkBindImageMemory (self._device.getDeviceHandle (), image, list:.getMemory (), cast!u64 (off)) != VkResult::VK_SUCCESS) {
                 throw copy BalderError ("Failed to bind buffer memory");
             }
 
@@ -315,18 +498,19 @@ pub class MemoryAllocator {
      */
 
     /**
-     * Allocate a new memory segment
+     * Allocate a new memory segment for static buffers
      * @params:
      *    - type: the type of memory to allocate
      *    - size: the size of the memory to allocate
      * @returns: the allocated memory segment
      */
-    fn allocateNewMemorySegment (mut self, type : u32, size : u64)-> dmut &FreeList
+    fn allocateNewStaticMemorySegment (mut self, type : u32, size : usize)-> dmut &FreeList
         throws BalderError
     {
+
         let mut memInfo = VkMemoryAllocateInfo ();
         memInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        memInfo.allocationSize  = size;
+        memInfo.allocationSize  = cast!u64 (size);
         memInfo.memoryTypeIndex = type;
 
         let dmut mem : VkDeviceMemory = null;
@@ -338,7 +522,44 @@ pub class MemoryAllocator {
         self._lastId += 1;
 
         let dmut memDesc = copy FreeList (uid, type, alias mem, size);
-        self._allocations [uid] = alias memDesc;
+        self._staticAllocations [uid] = alias memDesc;
+
+        self._usedMemorySpace += size;
+        log::debug ("Allocate new static memory space - ", MemorySize::B (size), " - used - ", MemorySize::B (self._usedMemorySpace));
+
+        return alias memDesc;
+    }
+
+
+    /**
+     * Allocate a new memory segment for dynamic buffers
+     * @params:
+     *    - type: the type of memory to allocate
+     *    - size: the size of the memory to allocate
+     * @returns: the allocated memory segment
+     */
+    fn allocateNewDynamicMemorySegment (mut self, type : u32, size : usize)-> dmut &FreeList
+        throws BalderError
+    {
+        let mut memInfo = VkMemoryAllocateInfo ();
+        memInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memInfo.allocationSize  = cast!u64 (size);
+        memInfo.memoryTypeIndex = type;
+
+        let dmut mem : VkDeviceMemory = null;
+        if (vkAllocateMemory (self._device.getDeviceHandle (), &memInfo, null, alias &mem) != VkResult::VK_SUCCESS) {
+            throw copy BalderError ("Failed to allocate buffer memory."s8);
+        }
+
+        let uid = self._lastId;
+        self._lastId += 1;
+
+        let dmut memDesc = copy FreeList (uid, type, alias mem, size);
+        self._dynamicAllocations [uid] = alias memDesc;
+        self._dynamicLocalBuffers [uid] = copy [0u8 ; size];
+
+        self._usedMemorySpace += size;
+        log::debug ("Allocate new dynamic memory space - ", MemorySize::B (size), " - used - ", MemorySize::B (self._usedMemorySpace));
 
         return alias memDesc;
     }
@@ -376,7 +597,7 @@ pub class MemoryAllocator {
         atomic self {
             vkDestroyBuffer (self._device.getDeviceHandle (), buf, null);
 
-            if let Ok (dmut list) = alias self._allocations [memAlloc.index] {
+            if let Ok (dmut list) = alias self._staticAllocations [memAlloc.index] {
                 list:.free (memAlloc.offset, memAlloc.size);
                 if list.isEmpty () {
                     if memAlloc.index in self._mapped {
@@ -385,8 +606,40 @@ pub class MemoryAllocator {
                     }
 
                     vkFreeMemory (self._device.getDeviceHandle (), list:.getMemory (), null);
-                    self._allocations:.remove (list.getUniqId ());
+                    self._usedMemorySpace -= memAlloc.fullSize;
+                    log::debug ("Free static memory space - ", MemorySize::B (memAlloc.fullSize), " - used - ", MemorySize::B (self._usedMemorySpace));
+
+                    self._staticAllocations:.remove (list.getUniqId ());
                     log::debug ("Disposing allocation : ", list.getUniqId ());
+                }
+            }
+        }
+    }
+
+    /**
+     * Remove a dynamic buffer allocation
+     */
+    pub fn freeDynamicBuffer (mut self, dmut buf : VkBuffer, memAlloc : MemoryAllocation) {
+        atomic self {
+            vkDestroyBuffer (self._device.getDeviceHandle (), buf, null);
+
+            if let Ok (dmut list) = alias self._dynamicAllocations [memAlloc.index] {
+                list:.free (memAlloc.offset, memAlloc.size);
+
+                if list.isEmpty () {
+                    if memAlloc.index in self._mapped {
+                        vkUnmapMemory (self._device.getDeviceHandle (), memAlloc.mem);
+                        self._mapped:.remove (memAlloc.index);
+                    }
+
+                    vkFreeMemory (self._device.getDeviceHandle (), list:.getMemory (), null);
+                    self._usedMemorySpace -= memAlloc.fullSize;
+                    log::debug ("Free dynamic memory space - ", MemorySize::B (memAlloc.fullSize), " - used - ", MemorySize::B (self._usedMemorySpace));
+
+                    self._dynamicAllocations:.remove (list.getUniqId ());
+                    self._dynamicLocalBuffers:.remove (list.getUniqId ());
+
+                    log::debug ("Disposing dynamic allocation : ", list.getUniqId ());
                 }
             }
         }
@@ -399,7 +652,7 @@ pub class MemoryAllocator {
         atomic self {
             vkDestroyImage (self._device.getDeviceHandle (), buf, null);
 
-            if let Ok (dmut list) = alias self._allocations [memAlloc.index] {
+            if let Ok (dmut list) = alias self._staticAllocations [memAlloc.index] {
                 list:.free (memAlloc.offset, memAlloc.size);
                 if list.isEmpty () {
                     if memAlloc.index in self._mapped {
@@ -408,20 +661,31 @@ pub class MemoryAllocator {
                     }
 
                     vkFreeMemory (self._device.getDeviceHandle (), list:.getMemory (), null);
-                    self._allocations:.remove (list.getUniqId ());
+                    self._usedMemorySpace -= memAlloc.fullSize;
+                    log::debug ("Free image memory space - ", MemorySize::B (memAlloc.fullSize), " - used - ", MemorySize::B (self._usedMemorySpace));
+
+                    self._staticAllocations:.remove (list.getUniqId ());
                     log::debug ("Disposing allocation : ", list.getUniqId ());
                 }
             }
         }
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     impl Disposable {
         pub over dispose (mut self) {
-            if self._allocations.len != 0 {
+            if self._staticAllocations.len != 0 || self._dynamicAllocations.len != 0us {
                 log::debug ("Disposing pending allocators");
             }
 
-            for index, dmut list in alias self._allocations {
+            for index, dmut list in alias self._staticAllocations {
                 if index in self._mapped {
                     vkUnmapMemory (self._device.getDeviceHandle (), list:.getMemory ());
                     self._mapped:.remove (index);
@@ -430,7 +694,18 @@ pub class MemoryAllocator {
                 vkFreeMemory (self._device.getDeviceHandle (), list:.getMemory (), null);
             }
 
-            self._allocations = copy [];
+            for index, dmut list in alias self._dynamicAllocations {
+                if index in self._mapped {
+                    vkUnmapMemory (self._device.getDeviceHandle (), list:.getMemory ());
+                    self._mapped:.remove (index);
+                }
+
+                vkFreeMemory (self._device.getDeviceHandle (), list:.getMemory (), null);
+            }
+
+            self._dynamicAllocations = copy [];
+            self._staticAllocations = copy [];
+            self._dynamicLocalBuffers = copy [];
         }
     }
 
