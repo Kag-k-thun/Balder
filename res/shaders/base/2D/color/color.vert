@@ -25,6 +25,6 @@ void main () {
     vec2 scaledCenter = rotatedCenter * (world.scale / world.dimension);
     vec2 pos = scaledCenter + ((world.translation / (world.dimension / 2)) - 1);
 
-    gl_Position =  vec4 (pos.x, pos.y, (world.level * 0.001), 1);
+    gl_Position =  vec4 (pos.x, pos.y, 1 - (world.level * 0.001), 1);
     a_uv = position.xy / 2;
 }
