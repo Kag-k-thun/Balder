@@ -38,5 +38,5 @@ void main () {
     }
 
     vec4 texColor = texture (diffuse, a_uv);
-    out_color = vec4 (max (texColor.xyz, world.color.xyz), 1);
+    out_color = vec4 (texColor.xyz * world.color.xyz, texColor.w);
 }

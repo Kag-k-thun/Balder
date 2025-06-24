@@ -3,7 +3,7 @@ in d2;
 use balder::core::{_, driver::_, memory::_};
 use balder::utils::log;
 
-use std::config::_;
+use std::{io, config::_};
 
 use ::vulkan::core;
 use ::sdl2::{image, surface, pixels};
@@ -27,6 +27,35 @@ pub class ITexture2D over Texture {
         throws BalderError
     {
         self:.configure (filename);
+    }
+
+    /**
+     * Create a texture from an SDL Texture
+     * */
+    pub self fromSDL (dmut device : &VulkanDevice, dmut surface : *SDL_Surface)
+        with super (alias device)
+        throws BalderError
+    {
+        self:.loadStagingBuffer (alias surface);
+        self:.createImageView ();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    @field
+    pub fn width (self)-> u32 {
+        self._width
+    }
+
+    @field
+    pub fn height (self)-> u32 {
+        self._height
     }
 
     /*!
@@ -115,113 +144,60 @@ pub class ITexture2D over Texture {
     fn loadStagingBuffer (mut self, dmut surf : *SDL_Surface)
         throws BalderError
     {
-        self._width = cast!u32 (unsafe { (*surf).w });
-        self._height = cast!u32 (unsafe { (*surf).h });
-        let datas = unsafe { (*surf).pixels };
-        let sdlFormat = unsafe { (*(*surf).format).format };
-
-        let (pixelSize, vulkanFormat) = match sdlFormat {
-            pixels::SDL_PIXELFORMAT_RGBA32   => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
-            pixels::SDL_PIXELFORMAT_ARGB8888 => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB)  }
-            pixels::SDL_PIXELFORMAT_RGB24   => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
-            pixels::SDL_PIXELFORMAT_BGR24    => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
-            _ => {
-                throw copy BalderError (std::format::format ("Unknwon pixel format {} ", sdlFormat));
-            }
-        };
-
-        let dmut image = self._device:.getMemoryAllocator ():.allocImage2D (self._width, self._height,
-                                                                            vulkanFormat,
-                                                                            VkImageTiling::VK_IMAGE_TILING_LINEAR,
-                                                                            cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
-                                                                            cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-
-        let dmut stagingBuf = self._device:.getMemoryAllocator ():.allocBuffer (
-            cast!usize ((self._width * self._height) * pixelSize),
-            cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
-            cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                      VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
-
+        let (dmut converted, needFree) = alias self.convertSurface (alias surf);
         {
-            let dmut mptr = stagingBuf:.map ();
-            match sdlFormat {
-                pixels::SDL_PIXELFORMAT_RGBA32 => {
-                    memcpy (mptr, datas, cast!usize ((self._width * self._height) * 4u32));
-                }
-                pixels::SDL_PIXELFORMAT_RGB24 => {
-                    self.copy_RGB_to_RGBA (cast!{dmut *u8} (mptr), cast!{*u8} (datas), self._width, self._height);
-                }
-                pixels::SDL_PIXELFORMAT_ARGB8888 => {
-                    self.copy_ARGB_to_RGBA (cast!{dmut *u8} (mptr), cast!{*u8} (datas), self._width, self._height);
-                }
-                pixels::SDL_PIXELFORMAT_BGR24 => {
-                    self.copy_BGR_to_RGBA (cast!{dmut *u8} (mptr), cast!{*u8} (datas), self._width, self._height);
-                }
-            }
-            stagingBuf:.unmap ();
+            self._width = cast!u32 (unsafe { (*converted).w });
+            self._height = cast!u32 (unsafe { (*converted).h });
+            let datas = unsafe { (*converted).pixels };
+            let sdlFormat = unsafe { (*(*converted).format).format };
 
-            image:.copyFrom (alias stagingBuf, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
-            self._image = (alias image)?;
-            log::debug ("Image uploaded to device");
+            let (pixelSize, vulkanFormat) = match sdlFormat {
+                pixels::SDL_PIXELFORMAT_RGBA32   => { (4u32, VkFormat::VK_FORMAT_R8G8B8A8_SRGB) }
+                _ => {
+                    throw copy BalderError (std::format::format ("Conversion of pixel format {} failed", sdlFormat));
+                }
+            };
+
+            let dmut image = self._device:.getMemoryAllocator ():.allocImage2D (self._width, self._height,
+                                                                                vulkanFormat,
+                                                                                VkImageTiling::VK_IMAGE_TILING_LINEAR,
+                                                                                cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
+                                                                                cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+
+            let dmut stagingBuf = self._device:.getMemoryAllocator ():.allocBuffer (
+                cast!usize ((self._width * self._height) * pixelSize),
+                cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+                cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                          VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
+
+            {
+                let dmut mptr = stagingBuf:.map ();
+                memcpy (mptr, datas, cast!usize ((self._width * self._height) * 4u32));
+                stagingBuf:.unmap ();
+
+                image:.copyFrom (alias stagingBuf, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
+                self._image = (alias image)?;
+            } exit {
+                stagingBuf:.dispose ();
+            }
         } exit {
-            stagingBuf:.dispose ();
+            if needFree {
+                SDL_FreeSurface (alias converted);
+            }
         }
     }
 
     /**
-     * Convert an image of bgr format to rgb format
-     */
-    fn copy_RGB_to_RGBA (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
-        let mut src = data;
-        let dmut res = alias out;
-        for _ in 0u32 .. (w * h) {
-            unsafe {
-                res [0] = src [2];
-                res [1] = src [1];
-                res [2] = src [0];
-                res [3] = 255;
-            }
-            src += 3us;
-            res = alias (res + 4us);
-        }
-    }
+     * Convert the surface to the appropriate format
+     * */
+    fn convertSurface (self, dmut surf : *SDL_Surface)-> dmut (*SDL_Surface, bool) {
+        let sdlFormat = unsafe { (*(*surf).format).format };
+        if sdlFormat == pixels::SDL_PIXELFORMAT_RGBA32 { return (alias surf, false); }
 
-    /**
-     * Convert an image of bgr format to rgb format
-     */
-    fn copy_BGR_to_RGBA (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
-        let mut src = data;
-        let dmut res = alias out;
-        for _ in 0u32 .. (w * h) {
-            unsafe {
-                res [0] = src [2];
-                res [1] = src [1];
-                res [2] = src [0];
-                res [3] = 255;
-            }
-            src += 3us;
-            res = alias (res + 4us);
-        }
+        let dmut converted = SDL_ConvertSurfaceFormat (surf, pixels::SDL_PIXELFORMAT_RGBA32, 0);
+        (alias converted, true)
     }
-
-    /**
-     * Convert an image of argb format to rgba format
-     */
-    fn copy_ARGB_to_RGBA (self, dmut out : *u8, data : *u8, w : u32, h : u32) {
-        let mut src = data;
-        let dmut res = alias out;
-        for _ in 0u32 .. (w * h) {
-            unsafe {
-                res [0] = src [1];
-                res [1] = src [2];
-                res [2] = src [3];
-                res [3] = src [0];
-            }
-            src += 4us;
-            res = alias (res + 4us);
-        }
-    }
-
+    
     /*!
      * ====================================================================================================
      * ====================================================================================================
