@@ -39,6 +39,9 @@ pub class Window {
     // The device used for rendering
     prot let dmut _vkDevice : &VulkanDevice = copy VulkanDevice ();
 
+    // The garbage bin used for cleaning
+    prot let dmut _bin : &GarbageBin = copy GarbageBin ();
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -193,7 +196,7 @@ pub class Window {
         self._vkDevice:.windowResize ();
         self._w = w;
         self._h = h;
-        log::debug ("Window resize ", w, " ", h);
+        log::debug #("Window", "resize ", w, " ", h);
     }
 
     /**
@@ -253,6 +256,13 @@ pub class Window {
      */
     pub fn getVulkanDevice (mut self)-> dmut &VulkanDevice {
         alias self._vkDevice
+    }
+
+    /**
+     * @returns: the garbage bin that is cleaned after a redraw
+     * */
+    pub fn getGarbageBin (mut self)-> dmut &GarbageBin {
+        alias self._bin
     }
 
     /**
@@ -323,7 +333,7 @@ pub class Window {
             self._renderingTh = none;
         }
 
-        log::debug ("Thread killed");
+        log::debug #("Window", "Thread killed");
         self:.waitIdle ();
     }
 
@@ -343,6 +353,7 @@ pub class Window {
             self._redrawing = true;
             self._composePass.loadPhase = &emptyLoad;
             self._composePass.drawPhase = &emptyDraw;
+            self._composePass.cleanPhase = &emptyClean;
         }
     }
 
@@ -354,11 +365,13 @@ pub class Window {
      */
     pub fn setComposePass (mut self,
                            loadPhase : dg (dmut &IndirectCommandAllocator)-> void,
-                           drawPhase : dg (dmut &IndirectCommandAllocator)-> void) {
+                           drawPhase : dg (dmut &IndirectCommandAllocator)-> void,
+                           cleanPhase : dg ()-> void) {
         atomic self {
             self._redrawing = true;
             self._composePass.loadPhase = loadPhase;
             self._composePass.drawPhase = drawPhase;
+            self._composePass.cleanPhase = cleanPhase;
         }
     }
 
@@ -381,6 +394,7 @@ pub class Window {
                        name : [c8],
                        loadPhase : dg (dmut &IndirectCommandAllocator)-> void,
                        drawPhase : dg (dmut &IndirectCommandAllocator)-> void,
+                       cleanPhase : dg ()-> void,
                        dmut pass : &VulkanSubpass)
         throws BalderError
     {
@@ -390,6 +404,8 @@ pub class Window {
             let dmut subpass = copy DrawPass ();
             subpass.loadPhase = loadPhase;
             subpass.drawPhase = drawPhase;
+            subpass.cleanPhase = cleanPhase;
+
             subpass.pass = (alias pass)?;
 
             self._subpasses [name] = alias subpass;
@@ -535,7 +551,7 @@ pub class Window {
             }
         }
 
-        log::debug ("Quit thread loop");
+        log::debug #("Window", "Quit thread loop");
     }
 
 
@@ -602,9 +618,7 @@ pub class Window {
      * ====================================================================================================
      */
 
-    /**
-     * Redraw the frames
-     * */
+
     fn performRedraw (mut self) {
         atomic self {
             let dmut newAllocs = self:.performReload ();
@@ -616,26 +630,40 @@ pub class Window {
             }
 
             let mut frames = 0u32;
+            let dmut redrawn = copy [false ; self._vkDevice.getSwapchainNbFrames ()];
             while frames < self._vkDevice.getSwapchainNbFrames () && self._isRunning {
                 let image = self:.startPass ();
-                log::debug ("Redraw frame : ", image);
-                self._vkDevice:.clearCommandBuffer ();
-                if (image >= 0) {
-                    self._vkDevice.startRecording ();
+                if image >= 0 {
+                    if !redrawn [image] {
+                        log::debug #("Window", "Redraw frame : ", image);
+                        self._vkDevice:.clearCommandBuffer ();
 
-                    self:.drawSubpasses (alias newAllocs);
+                        self._vkDevice.startRecording ();
 
-                    self._vkDevice.startRenderPass (cast!u32 (image));
-                    newAllocs [0]:.startRecording ();
+                        self:.drawSubpasses (alias newAllocs);
 
-                    self._composePass.drawPhase (alias newAllocs [0]);
+                        self._vkDevice.startRenderPass (cast!u32 (image));
+                        newAllocs [0]:.startRecording ();
 
-                    self._vkDevice.stopRenderPass ();
-                    self._vkDevice.stopRecording ();
+                        self._composePass.drawPhase (alias newAllocs [0]);
+
+                        self._vkDevice.stopRenderPass ();
+                        self._vkDevice.stopRecording ();
+
+                        redrawn [image] = true;
+                        frames += 1;
+                    }
 
                     self:.presentPass (image);
-                    frames += 1;
-                } // else swap chain recreation
+                } else {
+                    self._redrawing = true;
+                    break;
+                }
+
+                if self._vkDevice.needResize () {
+                    self._redrawing = true;
+                    break;
+                }
 
                 self:.waitFrame ();
             }
@@ -646,6 +674,7 @@ pub class Window {
                 }
 
                 self._sortedSubpasses [i].cmdAlloc = (alias newAllocs [i + 1])?;
+                self._sortedSubpasses [i].cleanPhase ();
             }
 
 
@@ -654,6 +683,9 @@ pub class Window {
             }
 
             self._composePass.cmdAlloc = (alias newAllocs [0])?;
+            self._composePass.cleanPhase ();
+
+            self._bin:.emptyTrash ();
         }
     }
 
@@ -720,6 +752,7 @@ pub class Window {
             self:.resetComposePass ();
             self:.clearSubpasses ();
             self._composePass:.dispose ();
+            self._bin:.emptyTrash ();
 
             self._vkDevice:.disposeSwapchain ();
             self:.disposeSurface ();            
