@@ -11,6 +11,7 @@ layout (binding = 0) uniform World {
 
     vec4 color;
     vec4 rotation;
+    vec4 scissors;
 } world;
 
 layout (location = 0) out vec4 out_color;
@@ -34,6 +35,9 @@ void main () {
         if (length (dist_bottom_right) > world.radius && (a_pos.x > bottom_right.x && a_pos.y > bottom_right.y)) discard;
         if (length (dist_bottom_left) > world.radius  && (a_pos.x < bottom_left.x && a_pos.y > bottom_left.y)) discard;
     }
+
+    if (gl_FragCoord.x < world.scissors.x || gl_FragCoord.x > world.scissors.z) { discard; }
+    if (gl_FragCoord.y < world.scissors.y || gl_FragCoord.y > world.scissors.w) { discard; }
 
     out_color = world.color;
 }

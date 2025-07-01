@@ -12,6 +12,7 @@ layout (binding = 0) uniform World {
 
     vec4 color;
     vec4 rotation;
+    vec4 scissors;
 } world;
 
 layout (binding = 1) uniform sampler2D diffuse;
@@ -37,6 +38,9 @@ void main () {
         if (length (dist_bottom_left) > world.radius  && (a_pos.x < bottom_left.x && a_pos.y > bottom_left.y)) discard;
     }
 
+    if (gl_FragCoord.x < world.scissors.x || gl_FragCoord.x > world.scissors.z) { discard; }
+    if (gl_FragCoord.y < world.scissors.y || gl_FragCoord.y > world.scissors.w) { discard; }
+
     vec4 texColor = texture (diffuse, a_uv);
-    out_color = vec4 (texColor.xyz * world.color.xyz, texColor.w);
+    out_color = vec4 (texColor.xyz * world.color.xyz, texColor.w );
 }

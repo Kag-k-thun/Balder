@@ -66,6 +66,15 @@ pub class SwapChain {
         // The depth image
         let dmut _depthImage : (&DepthTexture)? = none;
 
+        // The texture used to perform msaa filtering
+        let dmut _msaaImage : (&ColorTexture)? = none;
+
+        // True iif msaa is enabled
+        let mut _hasMSAA = false;
+
+        // Number of samples of the msaa attachement
+        let mut _msaaNumSamples : VkSampleCountFlagBits = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+
         // The render pass of the device
         let dmut _renderPass : VkRenderPass = null;
 
@@ -134,6 +143,14 @@ pub class SwapChain {
         self._renderPass
     }
 
+    /**
+     * @returns: the number of samples in the renderpass (for msaa)
+     * */
+    @field
+    pub fn numSamples (self)-> VkSampleCountFlagBits {
+        self._msaaNumSamples
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -184,8 +201,22 @@ pub class SwapChain {
         throws BalderError
     {
         self._hasDepth = cfg.vulkan.depth;
+        self._hasMSAA = cfg.vulkan.msaaEnabled;
+        if self._hasMSAA {
+            let deviceSamples = self._device.getMaxSampleCounts ();
+            if cfg.vulkan.msaaNumSamples < deviceSamples {
+                self._msaaNumSamples = cfg.vulkan.msaaNumSamples;
+            } else {
+                self._msaaNumSamples = deviceSamples;
+            }
+        }
+
         self:.createSwapchain (alias win, cfg);
         self:.createImageViews ();
+
+        if self._hasMSAA {
+            self:.createMSAAResources ();
+        }
 
         if self._hasDepth {
             self:.createDepthResources ();
@@ -404,23 +435,37 @@ pub class SwapChain {
     {
         let mut colorAttachement = VkAttachmentDescription ();
         colorAttachement.format         = self._format;
-        colorAttachement.samples        = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        colorAttachement.samples        = self._msaaNumSamples;
         colorAttachement.loadOp         = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
         colorAttachement.storeOp        = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE;
         colorAttachement.stencilLoadOp  = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         colorAttachement.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
         colorAttachement.initialLayout  = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
-        colorAttachement.finalLayout    = VkImageLayout::VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        if self._hasMSAA {
+            colorAttachement.finalLayout    = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        } else {
+            colorAttachement.finalLayout    = VkImageLayout::VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        }
 
         let mut depthAttachment = VkAttachmentDescription ();
         depthAttachment.format = self._depthFormat;
-        depthAttachment.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.samples = self._msaaNumSamples;
         depthAttachment.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
         depthAttachment.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depthAttachment.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         depthAttachment.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depthAttachment.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
         depthAttachment.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        let mut colorAttachmentResolve = VkAttachmentDescription ();
+        colorAttachmentResolve.format = self._format;
+        colorAttachmentResolve.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        colorAttachmentResolve.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachmentResolve.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachmentResolve.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachmentResolve.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachmentResolve.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachmentResolve.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
         let mut colorAttachementRef = VkAttachmentReference ();
         colorAttachementRef.attachment = 0;
@@ -430,10 +475,18 @@ pub class SwapChain {
         depthAttachmentRef.attachment = 1;
         depthAttachmentRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+        let mut colorAttachementResolveRef = VkAttachmentReference ();
+        colorAttachementResolveRef.attachment = 2;
+        colorAttachementResolveRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
         let mut subPass = VkSubpassDescription ();
         subPass.pipelineBindPoint    = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS;
         subPass.colorAttachmentCount = 1u32;
         subPass.pColorAttachments    = &colorAttachementRef;
+
+        if self._hasMSAA {
+            subPass.pResolveAttachments = &colorAttachementResolveRef;
+        }
 
         let dmut dependencies : [VkSubpassDependency] = [];
         if self._hasDepth {
@@ -473,14 +526,17 @@ pub class SwapChain {
         let mut renderPassInfo = VkRenderPassCreateInfo ();
         renderPassInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 
-        if self.hasDepth () {
-            let dmut attachment = copy [colorAttachement, depthAttachment];
-            renderPassInfo.attachmentCount = 2u32;
-            renderPassInfo.pAttachments    = attachment.ptr;
-        } else {
-            renderPassInfo.attachmentCount = 1u32;
-            renderPassInfo.pAttachments    = &colorAttachement;
+        let dmut attachment = copy [colorAttachement];
+        if self._hasDepth {
+            attachment ~= [depthAttachment];
         }
+
+        if self._hasMSAA {
+            attachment ~= [colorAttachmentResolve];
+        }
+
+        renderPassInfo.attachmentCount = cast!u32 (attachment.len);
+        renderPassInfo.pAttachments    = attachment.ptr;
 
         renderPassInfo.subpassCount    = 1u32;
         renderPassInfo.pSubpasses      = &subPass;
@@ -491,7 +547,7 @@ pub class SwapChain {
             throw copy BalderError ("Failed to create render pass");
         }
 
-        if self.hasDepth () {
+        if self._hasDepth {
             self._clearColor = copy [VkClearValue () ; 2];
             self._clearColor [0].color.float32 = [0.f, 0.f, 0.f, 1.f];
             self._clearColor [1].depthStencil.depth = 1.0f;
@@ -523,14 +579,27 @@ pub class SwapChain {
             framebufferInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             framebufferInfo.renderPass      = self._renderPass;
 
-            if let Ok (dmut dp) = alias self._depthImage {
-                let mut attachment = copy [self._imageViews [i], dp.getImageView ()];
-                framebufferInfo.attachmentCount = 2u32;
-                framebufferInfo.pAttachments    = attachment.ptr;
-            } else {
-                framebufferInfo.attachmentCount = 1u32;
-                framebufferInfo.pAttachments    = &self._imageViews [i];
+            let mut attachment : [VkImageView] = [];
+
+            // msaa, depth, image
+            if let Ok (msaa) = self._msaaImage {
+                attachment = copy [msaa.getImageView ()];
+                if let Ok (dp) = self._depthImage {
+                    attachment ~= [dp.getImageView ()];
+                }
+                attachment ~= [self._imageViews [i]];
             }
+
+            // image, depth
+            else {
+                attachment = copy [self._imageViews [i]];
+                if let Ok (dp) = self._depthImage {
+                    attachment ~= [dp.getImageView ()];
+                }
+            }
+
+            framebufferInfo.attachmentCount = cast!u32 (attachment.len);
+            framebufferInfo.pAttachments    = attachment.ptr;
 
             framebufferInfo.width           = self._extent.width;
             framebufferInfo.height          = self._extent.height;
@@ -562,7 +631,8 @@ pub class SwapChain {
         let dmut image = copy DepthTexture (alias self._device,
                                             format,
                                             self._extent.width,
-                                            self._extent.height);
+                                            self._extent.height,
+                                            numSamples-> self._msaaNumSamples);
 
         self._depthImage = (alias image)?;
     }
@@ -589,6 +659,31 @@ pub class SwapChain {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * =================================          MSAA RESOURCE          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the msaa image
+     * */
+    fn createMSAAResources (mut self)
+        throws BalderError
+    {
+        let dmut image = copy ColorTexture (alias self._device,
+                                            self._format,
+                                            self._extent.width,
+                                            self._extent.height,
+                                            numSamples-> self._msaaNumSamples);
+
+        self._msaaImage = (alias image)?;
+        log::debug #("SwapChain", "Create msaa sample image", self._msaaNumSamples);
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ===================================          DISPOSING          ====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -610,6 +705,11 @@ pub class SwapChain {
             if let Ok (dmut depth) = alias self._depthImage {
                 depth:.dispose ();
                 self._depthImage = none;
+            }
+
+            if let Ok (dmut msaa) = alias self._msaaImage {
+                msaa:.dispose ();
+                self._msaaImage = none;
             }
 
             for image in self._imageViews {

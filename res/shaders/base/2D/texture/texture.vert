@@ -12,6 +12,7 @@ layout (binding = 0) uniform World {
 
     vec4 color;
     vec4 rotation;
+    vec4 scissors;
 } world;
 
 layout (location = 0) out vec2 a_uv;
