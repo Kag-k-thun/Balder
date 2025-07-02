@@ -8,10 +8,10 @@ use balder::math::_;
 use balder::interface::_;
 use balder::utils::_;
 
-use std::{io, conv, char, time::_};
+use std::{io, conv, char, time::_, concurrency::signal};
 use std::algorithm::_;
 
-use ::sdl2::clipboard;
+use ::sdl2::{clipboard, keyboard, keycode};
 
 pub class InputText over Widget {
 
@@ -102,6 +102,12 @@ pub class InputText over Widget {
         let dmut _backShape : (&Shape)? = none;
         let dmut _cursorShape : (&Shape)? = none;
         let dmut _selectionShape : (&Shape)? = none;
+    }
+
+    prot { // signals
+
+        let dmut _validateText = Signal!{[c8]} ();
+
     }
 
     /*!
@@ -340,46 +346,21 @@ pub class InputText over Widget {
      * ====================================================================================================
      */
 
-    pub over onClickLeft (mut self, pos : vec2) {
+    pub over onClickLeft (mut self, pos : vec2)-> dmut &Widget {
         self._hasSelection = false;
         if self._isFocused {
             self._inSelection = true;
-            self._manager:.setSlideFocus ((alias self)?);
             self._cursor = self:.mousePositionToCursor (pos);
         }
 
         self:.resetSelection ();
         self:.computeShifting ();
-        self._manager:.setLeftClickFocus ((alias self)?);
-        self._manager:.setNextClickFocus ((alias self)?);
+
+        alias self
     }
 
-    pub over onDoubleClick (mut self, pos : vec2) {
-        self:.onClickLeft (pos);
-    }
-
-    pub over onClickLeftEnd (mut self) {
-        self._manager:.setTextFocus ((alias self)?);
-        if !self._isFocused {
-            self._isFocused = true;
-            self._inSelection = false;
-
-            self:.resetCursorTimer ();
-        }
-
-        self:.computeShifting ();
-        self._manager:.setNextClickFocus ((alias self)?);
-    }
-
-    pub over onNextClick (mut self) {
-        self._manager:.setTextFocus (none);
-        self._isFocused = false;
-        self._inSelection = false;
-        self._textShiftLeft = 0.f;
-        self._cursor = 0;
-
-        self:.resetSelection ();
-        self:.onUpdateSize (self._absolutePosition, self._absoluteSize, self._depth);
+    pub over onDoubleClick (mut self, pos : vec2)-> dmut &Widget {
+        return self:.onClickLeft (pos);
     }
 
     /*!
@@ -398,11 +379,17 @@ pub class InputText over Widget {
      * ====================================================================================================
      */
 
-    pub over onTextInput (mut self, text : [c8]) {
+    fn eraseSelection (mut self) {
+        self._text = self._text [0 .. min (self._cursor, self._selectionCursor)] ~ self._text [max (self._cursor, self._selectionCursor) .. $];
+        self._cursor = min (self._cursor, self._selectionCursor);
+        self:.resetSelection ();
+        self:.setText (self._text);
+    }
+
+    pub fn onTextInput (mut self, text : [c8]) {
         let txt = if self._onlyNumbers { self.keepNumbers (text) } else { text };
         if self._hasSelection { // erase selected text
-            self._text = self._text [0 .. min (self._cursor, self._selectionCursor)] ~ self._text [max (self._cursor, self._selectionCursor) .. $];
-            self:.resetSelection ();
+            self:.eraseSelection ();
         }
 
         if text.len + self._text.len <= self._maxLen {
@@ -414,33 +401,103 @@ pub class InputText over Widget {
         }
     }
 
-    pub over onTextErase (mut self) {
+    pub fn onTextErase (mut self, _ : KeyInfo) {
         if self._hasSelection {
-            self._text = self._text [0 .. min (self._cursor, self._selectionCursor)] ~ self._text [max (self._cursor, self._selectionCursor) .. $];
-            self._cursor = min (self._cursor, self._selectionCursor);
-            self:.resetSelection ();
-
-            self:.setText (self._text);
+            self:.eraseSelection ();
         } else if self._cursor > 0 {
             self._text = self._text [0 .. self._cursor - 1] ~ self._text [self._cursor .. $];
             self._cursor -= 1;
 
             self:.setText (self._text);
         }
-
     }
 
-    pub over onTextForwardErase (mut self) {
+    pub fn onTextForwardErase (mut self, _ : KeyInfo) {
         if self._hasSelection {
-            self._text = self._text [0 .. min (self._cursor, self._selectionCursor)] ~ self._text [max (self._cursor, self._selectionCursor) .. $];
-            self._cursor = min (self._cursor, self._selectionCursor);
-            self:.resetSelection ();
-
-            self:.setText (self._text);
+            self:.eraseSelection ();
         } else if self._cursor < self._text.len {
             self._text = self._text [0 .. self._cursor] ~ self._text [self._cursor + 1 .. $];
             self:.setText (self._text);
         }
+    }
+
+    pub fn onTextEraseWord (mut self) {
+        if self._hasSelection {
+            self:.eraseSelection ();
+        } else if self._cursor > 0 {
+            let mut start = self._cursor;
+            while self._cursor > 0 {
+                if self._cursor != self._text.len && self._cursor >= 1 {
+                    if self._text [self._cursor].isPunctuation () != self._text [self._cursor - 1].isPunctuation () {
+                        break;
+                    }
+                }
+
+                self._cursor -= 1;
+            }
+
+            self._text = self._text [0 .. self._cursor] ~ self._text [start .. $];
+            self:.setText (self._text);
+        }
+    }
+
+    pub fn onTextForwardEraseWord (mut self) {
+        if self._hasSelection {
+            self:.eraseSelection ();
+        } else if self._cursor < self._text.len {
+            let mut end = self._cursor;
+            while end < self._text.len {
+                if end != self._text.len - 1 {
+                    if self._text [end].isPunctuation () != self._text [end + 1].isPunctuation () {
+                        end += 1;
+                        break;
+                    }
+                }
+
+                end += 1;
+            }
+
+            self._text = self._text [0 .. self._cursor] ~ self._text [end .. $];
+            self:.setText (self._text);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          TEXT FOCUS EVENTS          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onGainFocus (mut self) {
+        self:.startInputText ();
+
+        self._isFocused = true;
+        self._inSelection = false;
+        self._cursor = 0;
+        self:.resetCursorTimer ();
+
+        self:.resetSelection ();
+        self:.computeShifting ();
+    }
+
+    pub over onLoseFocus (mut self) {
+        self:.stopInputText ();
+
+        self._isFocused = false;
+        self._inSelection = false;
+        self._textShiftLeft = 0.f;
+        self._cursor = 0;
+
+        self:.resetSelection ();
+        self:.onUpdateSize (self._absolutePosition, self._absoluteSize, self._depth);
+
+        self._validateText.emit (self._text.to!{[c8]} ());
+    }
+
+    pub fn onTextValidate (mut self, _ : KeyInfo) {
+        self._manager:.setFocus (none);
     }
 
     /*!
@@ -451,7 +508,7 @@ pub class InputText over Widget {
      * ====================================================================================================
      */
 
-    pub over onTextForwardMove (mut self) {
+    pub fn onTextForwardMove (mut self, _ : KeyInfo) {
         if self._cursor != self._text.len {
             self._cursor += 1;
         }
@@ -460,7 +517,7 @@ pub class InputText over Widget {
         self:.computeShifting ();
     }
 
-    pub over onTextBackwardMove (mut self) {
+    pub fn onTextBackwardMove (mut self, _ : KeyInfo) {
         if self._cursor != 0 {
             self._cursor -= 1;
         }
@@ -469,7 +526,7 @@ pub class InputText over Widget {
         self:.computeShifting ();
     }
 
-    pub over onTextForwardMoveWord (mut self) {
+    pub fn onTextForwardMoveWord (mut self) {
         if (self._cursor == self._text.len) return;
 
         while self._cursor < self._text.len {
@@ -487,7 +544,7 @@ pub class InputText over Widget {
         self:.computeShifting ();
     }
 
-    pub over onTextBackwardMoveWord (mut self) {
+    pub fn onTextBackwardMoveWord (mut self) {
         if (self._cursor == 0) return;
 
         self._cursor -= 1;
@@ -517,7 +574,7 @@ pub class InputText over Widget {
     /**
      * Method called when the selection cursor is moved forward (SHIFT + right)
      * */
-    pub over onTextSelectionForwardMove (mut self) {
+    pub fn onTextSelectionForwardMove (mut self) {
         if !self._hasSelection {
             self._selectionCursor = self._cursor;
             self._hasSelection = true;
@@ -534,7 +591,7 @@ pub class InputText over Widget {
     /**
      * Method called when the selection cursor is moved forward (SHIFT + left)
      * */
-    pub over onTextSelectionBackwardMove (mut self) {
+    pub fn onTextSelectionBackwardMove (mut self) {
         if !self._hasSelection {
             self._selectionCursor = self._cursor;
             self._hasSelection = true;
@@ -551,7 +608,7 @@ pub class InputText over Widget {
     /**
      * Method called when the Ctrl+a is inputed (or selection all is triggered by hand)
      * */
-    pub over onTextSelectionAll (mut self) {
+    pub fn onTextSelectionAll (mut self) {
         if self._text.len != 0 {
             self._hasSelection = true;
             self._cursor = self._text.len;
@@ -573,7 +630,7 @@ pub class InputText over Widget {
     /**
      * Paste text from clipboard to input
      * */
-    pub over onTextPaste (mut self) {
+    pub fn onTextPaste (mut self) {
         if SDL_HasClipboardText () {
             let dmut t = SDL_GetClipboardText ();
             if t != null {
@@ -588,7 +645,7 @@ pub class InputText over Widget {
     /**
      * Copy text from input to clipboard
      * */
-    pub over onTextCopy (mut self) {
+    pub fn onTextCopy (mut self) {
         if self._hasSelection {
             let selStart = min (self._cursor, self._selectionCursor);
             let selEnd = max (self._cursor, self._selectionCursor);
@@ -601,7 +658,7 @@ pub class InputText over Widget {
     /**
      * Cut text from input to clipboard
      * */
-    pub over onTextCut (mut self) {
+    pub fn onTextCut (mut self) {
         if self._hasSelection {
             let selStart = min (self._cursor, self._selectionCursor);
             let selEnd = max (self._cursor, self._selectionCursor);
@@ -649,6 +706,40 @@ pub class InputText over Widget {
 
         self._label:.setText (text)?;
         self:.onUpdateSize (self._absolutePosition, self._absoluteSize, self._depth);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over isFocusableLeftClick (self)-> bool {
+        true
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Connect to the event emitted when the text input is validated
+     * */
+    pub fn connectTextValidate (mut self, f : dg ([c8])-> void) {
+        self._validateText:.connect (f);
+    }
+
+    /**
+     * Disconnect the event emitted when the text input is validated
+     * */
+    pub fn disconnectTextValidate (mut self, f : dg ([c8])-> void) {
+        self._validateText:.disconnect (f);
     }
 
     /*!
@@ -791,6 +882,10 @@ pub class InputText over Widget {
 
     impl Disposable {
         pub over dispose (mut self) {
+            if self._isFocused {
+                self:.onLoseFocus ();
+            }
+
             self._label:.dispose ();
 
             if let Ok (dmut b) = alias self._backShape {
@@ -809,6 +904,89 @@ pub class InputText over Widget {
             }
         }
     }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          TEXT MODE TOGGLE STATE          =============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Change the input mode
+     * */
+    fn startInputText (mut self) {
+        let dmut man = self._manager:.getInputManager ();
+
+        man:.startInputText ();
+        man:.connectTextInput (&self:.onTextInput);
+
+        man:.connect (KeyInfo (SDLK_BACKSPACE, KeyEvent::DOWN), &self:.onTextErase);
+        man:.connect (KeyInfo (SDLK_DELETE, KeyEvent::DOWN), &self:.onTextForwardErase);
+        man:.connect (KeyInfo (SDLK_BACKSPACE, KeyEvent::REPEAT), &self:.onTextErase);
+        man:.connect (KeyInfo (SDLK_DELETE, KeyEvent::REPEAT), &self:.onTextForwardErase);
+
+        man:.connect (copy [SDLK_LCTRL, SDLK_BACKSPACE], &self:.onTextEraseWord);
+        man:.connect (copy [SDLK_LCTRL, SDLK_DELETE], &self:.onTextForwardEraseWord);
+
+        man:.connect (KeyInfo (SDLK_LEFT, KeyEvent::DOWN), &self:.onTextBackwardMove);
+        man:.connect (KeyInfo (SDLK_RIGHT, KeyEvent::DOWN), &self:.onTextForwardMove);
+        man:.connect (KeyInfo (SDLK_LEFT, KeyEvent::REPEAT), &self:.onTextBackwardMove);
+        man:.connect (KeyInfo (SDLK_RIGHT, KeyEvent::REPEAT), &self:.onTextForwardMove);
+
+        man:.connect (KeyInfo (SDLK_RETURN, KeyEvent::RELEASE), &self:.onTextValidate);
+        man:.connect (KeyInfo (SDLK_ESCAPE, KeyEvent::RELEASE), &self:.onTextValidate);
+
+        man:.connect (copy [SDLK_LCTRL, SDLK_RIGHT], &self:.onTextForwardMoveWord);
+        man:.connect (copy [SDLK_LCTRL, SDLK_LEFT], &self:.onTextBackwardMoveWord);
+
+        man:.connect (copy [SDLK_LCTRL, SDLK_v], &self:.onTextPaste);
+        man:.connect (copy [SDLK_LCTRL, SDLK_c], &self:.onTextCopy);
+        man:.connect (copy [SDLK_LCTRL, SDLK_x], &self:.onTextCut);
+        man:.connect (copy [SDLK_LCTRL, SDLK_a], &self:.onTextSelectionAll);
+
+        man:.connect (copy [SDLK_LSHIFT, SDLK_RIGHT], &self:.onTextSelectionForwardMove);
+        man:.connect (copy [SDLK_LSHIFT, SDLK_LEFT], &self:.onTextSelectionBackwardMove);
+    }
+
+    /**
+     * Change the input mode
+     * */
+    fn stopInputText (mut self) {
+        let dmut man = self._manager:.getInputManager ();
+
+        man:.startInputText ();
+        man:.disconnectTextInput (&self:.onTextInput);
+
+        man:.disconnect (KeyInfo (SDLK_BACKSPACE, KeyEvent::DOWN), &self:.onTextErase);
+        man:.disconnect (KeyInfo (SDLK_DELETE, KeyEvent::DOWN), &self:.onTextForwardErase);
+        man:.disconnect (KeyInfo (SDLK_BACKSPACE, KeyEvent::REPEAT), &self:.onTextErase);
+        man:.disconnect (KeyInfo (SDLK_DELETE, KeyEvent::REPEAT), &self:.onTextForwardErase);
+
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_BACKSPACE], &self:.onTextEraseWord);
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_DELETE], &self:.onTextForwardEraseWord);
+
+        man:.disconnect (KeyInfo (SDLK_LEFT, KeyEvent::DOWN), &self:.onTextBackwardMove);
+        man:.disconnect (KeyInfo (SDLK_RIGHT, KeyEvent::DOWN), &self:.onTextForwardMove);
+        man:.disconnect (KeyInfo (SDLK_LEFT, KeyEvent::REPEAT), &self:.onTextBackwardMove);
+        man:.disconnect (KeyInfo (SDLK_RIGHT, KeyEvent::REPEAT), &self:.onTextForwardMove);
+
+        man:.disconnect (KeyInfo (SDLK_RETURN, KeyEvent::RELEASE), &self:.onTextValidate);
+        man:.disconnect (KeyInfo (SDLK_ESCAPE, KeyEvent::RELEASE), &self:.onTextValidate);
+
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_RIGHT], &self:.onTextForwardMoveWord);
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_LEFT], &self:.onTextBackwardMoveWord);
+
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_v], &self:.onTextPaste);
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_c], &self:.onTextCopy);
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_x], &self:.onTextCut);
+        man:.disconnect (copy [SDLK_LCTRL, SDLK_a], &self:.onTextSelectionAll);
+
+        man:.disconnect (copy [SDLK_LSHIFT, SDLK_RIGHT], &self:.onTextSelectionForwardMove);
+        man:.disconnect (copy [SDLK_LSHIFT, SDLK_LEFT], &self:.onTextSelectionBackwardMove);
+    }
+
 
 
 
