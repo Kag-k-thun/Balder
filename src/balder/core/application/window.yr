@@ -56,6 +56,9 @@ pub class Window {
     // Set to true when the frames have to be redrawn
     prot let mut _redrawing = false;
 
+    // True iif must wait frame on redrawing
+    prot let mut _mustWaitFrameRedraw = true;
+
     // The pass for final composition
     prot let dmut _composePass : &DrawPass = copy DrawPass ();
 
@@ -82,8 +85,14 @@ pub class Window {
     // The timer of a second, for nb frame per second computation
     prot let dmut _secondTimer = Timer ();
 
+    // Semaphore used to wait for the next frame
+    prot let dmut _frameSemaphore : &Semaphore = copy Semaphore ();
+
     // The duration of a frame in ms, by fnault 60 frame per seconds
     prot let mut _frameDuration : Duration = dur::millis (16u64) + dur::micros (666u64);
+
+    // If true, wait frames by triggers instead of timed
+    let mut _interactive : bool = false;
 
     /// The number of frame in the current second
     prot let mut _nbFrame : u32 = 0;
@@ -151,7 +160,13 @@ pub class Window {
         self._vkDevice:.configure (alias self, cfg);
         SDL_HideWindow (alias self._sdlWindow);
 
-        self._frameDuration = dur::seconds (1) / cast!{u64} (cfg.timer.fps);
+        if cfg.timer.fps == 0 || cfg.timer.interactive {
+            self._frameDuration = dur::minutes (1);
+            self._interactive = true;
+        } else {
+            self._frameDuration = dur::seconds (1) / cast!{u64} (cfg.timer.fps);
+            self._interactive = false;
+        }
 
         // Draw empty screen, to configure default command buffers
         self:.resetComposePass ();
@@ -539,7 +554,7 @@ pub class Window {
                     self._redrawing = true;
                 }
 
-                self:.waitFrame ();
+                self:.waitFrame (false);
             }
         }
 
@@ -547,11 +562,48 @@ pub class Window {
     }
 
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TIMER          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     /**
      * Wait until the next frame should be drawn.
      * @info: update the frame count.
      */
-    fn waitFrame (mut self) {
+    fn waitFrame (mut self, redraw : bool) {
+        if self._interactive {
+            self:.waitInteractive (redraw);
+        } else {
+            self:.waitTimed ();
+        }
+    }
+
+    /**
+     * Interactive wait of the next frame
+     * */
+    fn waitInteractive (mut self, redraw : bool) {
+        // In redraw interactive will redraw every swapchain frames in one go
+        if redraw && !self._mustWaitFrameRedraw {
+            return;
+        }
+
+        if !self._frameSemaphore:.wait (timeout-> self._frameDuration) {
+            // semaphore not posted, timeout
+            self._mustWaitFrameRedraw = true;
+        } else {
+            // semaphore posted
+            self._mustWaitFrameRedraw = false;
+        }
+    }
+
+    /**
+     * Timed wait of the next frame
+     * */
+    fn waitTimed (mut self) {
         self._nbFrame += 1u32;
 
         if (self._secondTimer.timeSinceStart () >= dur::seconds (1u64)) {
@@ -576,6 +628,52 @@ pub class Window {
             self._frameTimer:.reset (z);
         }
     }
+
+    /**
+     * Change the mode of frame waiting from timer to interactive
+     * @warning: it will happen in the next frame
+     * */
+    pub fn setInteractiveWait (mut self) {
+        if !self._interactive {
+            self._interactive = true;
+            self._mustWaitFrameRedraw = false;
+        }
+    }
+
+    /**
+     * Change the mode of frame waiting from interactive to timer
+     * */
+    pub fn setTimedWait (mut self) {
+        if self._interactive {
+            self._interactive = false;
+            self._frameSemaphore:.post ();
+        }
+    }
+
+    /**
+     * Force the next frame to be drawn as soon as possible
+     * @info: only works in interactive mode
+     * */
+    pub fn forceFrame (mut self) {
+        if self._interactive {
+            self._frameSemaphore:.post ();
+        }
+    }
+
+    /**
+     * @returns: true iif the window is in interactive mode rendering (false if in timer mode)
+     * */
+    pub fn isInteractive (self)-> bool {
+        self._interactive
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          RENDER PASS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
      * Start a new vulkan rendering pass
@@ -657,7 +755,7 @@ pub class Window {
                     break;
                 }
 
-                self:.waitFrame ();
+                self:.waitFrame (true);
             }
 
             for i, dmut z in alias self._sortedSubpasses {
