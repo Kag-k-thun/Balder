@@ -2,11 +2,13 @@
 
 layout (location = 0) in vec2 a_pos;
 
+
 layout (binding = 0) uniform World {
     vec2 dimension;
     vec2 translation;
     vec2 scale;
-    float radius;
+
+    int radius;
     int level;
 
     vec4 color;
@@ -16,28 +18,23 @@ layout (binding = 0) uniform World {
 
 layout (location = 0) out vec4 out_color;
 
+float sdRountRect (vec2 pos, vec2 ext, vec2 cr) {
+    vec2 s = step (pos, vec2 (0.0));
+    float r = mix (mix (cr.x, cr.y, s.y),
+                   mix (cr.x, cr.y, s.y),
+                   s.x);
+
+    return length (max (abs (pos) + vec2 (r) - ext, 0.0)) - r;
+}
+
 void main () {
-    if (world.radius > 0) {
-        mat2 rot = mat2 (world.rotation.x, world.rotation.y, world.rotation.z, world.rotation.w);
-
-        vec2 top_left = vec2 (-0.5 + world.radius, -0.5 + world.radius);
-        vec2 top_right = vec2 (0.5 - world.radius, -0.5 + world.radius);
-        vec2 bottom_left = vec2 (-0.5 + world.radius, 0.5 - world.radius);
-        vec2 bottom_right = vec2 (0.5 - world.radius, 0.5 - world.radius);
-
-        vec2 dist_top_left = (a_pos - top_left);
-        vec2 dist_top_right = (a_pos - top_right);
-        vec2 dist_bottom_right = (a_pos - bottom_right);
-        vec2 dist_bottom_left = (a_pos - bottom_left);
-
-        if (length (dist_top_left) > world.radius     && (a_pos.x < top_left.x && a_pos.y < top_left.y)) discard;
-        if (length (dist_top_right) > world.radius    && (a_pos.x > top_right.x && a_pos.y < top_right.y)) discard;
-        if (length (dist_bottom_right) > world.radius && (a_pos.x > bottom_right.x && a_pos.y > bottom_right.y)) discard;
-        if (length (dist_bottom_left) > world.radius  && (a_pos.x < bottom_left.x && a_pos.y > bottom_left.y)) discard;
-    }
-
     if (gl_FragCoord.x < world.scissors.x || gl_FragCoord.x > world.scissors.z) { discard; }
     if (gl_FragCoord.y < world.scissors.y || gl_FragCoord.y > world.scissors.w) { discard; }
+
+    vec2 pos = a_pos * world.scale / world.dimension.yy;
+    vec2 size = vec2 (0.5, 0.5) * world.scale / world.dimension.yy;
+    float dist = sdRountRect (pos, size, vec2 (world.radius) / world.dimension);
+    if (dist > 0.0) discard;
 
     out_color = world.color;
 }
