@@ -1,0 +1,557 @@
+in parser;
+
+use std::{conv, syntax::_, stream};
+use std::algorithm::searching;
+
+use balder::core::_;
+use balder::interface::{_, style::_};
+
+use balder::math::_;
+use balder::utils::_;
+
+enum
+| LACC         = "{"
+| RACC         = "}"
+| SEMI_COLON   = ";"
+| COLON        = ":"
+| DCOLON       = "::"
+| EXCLAM_COLON = "!:"
+| POINT        = "."
+| SQUOTE       = "'"
+ -> Tokens;
+
+enum
+| SINGLE_LINE = ("#", "\n")
+-> Comments;
+
+/**
+ * Class parsing a style sheet string
+ * */
+pub record StyleParser {
+
+    // The content parsed by the parser
+    let mut _content : [c8] = "";
+
+    // The style manager
+    let dmut _styleManager : &StyleManager;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager : &StyleManager, content : [c8])
+        with _styleManager = alias manager
+        , _content = content
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PARSING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load a style sheet string and register the style into the parser
+     * */
+    pub fn load (mut self)
+        throws BalderError
+    {
+        let dmut lex = copy Lexer!{c8} (self._content,
+                                        tokens-> copy Tokens::__members__,
+                                        comments-> copy Comments::__members__);
+
+        self:.readWidgetStyle (alias lex);
+    }
+
+    /**
+     * Read a widget style
+     * */
+    fn readWidgetStyle (mut self, dmut lexer : &Lexer!{c8})
+        throws BalderError
+    {
+        let (widgetName, line, col) = lexer:.next ();
+        self.verifyIdentifier (widgetName, line, col);
+        let mut classes : [[c8]] = [];
+        let mut subItem = "";
+        let dmut state = [false ; 6];
+        let mut readClass = false;
+
+        loop {
+            match lexer:.next () {
+                (_ = Tokens::COLON, l, c) => {
+                    if (readClass) { self.unexpected (Tokens::COLON, l, c); }
+
+                    self.readStyleState (ref state, alias lexer);
+                }
+                (_ = Tokens::EXCLAM_COLON, l, c) => {
+                    if (readClass) { self.unexpected (Tokens::COLON, l, c); }
+
+                    self.readStyleState (ref state, alias lexer, not-> true);
+                }
+                (_ = Tokens::DCOLON, l, c) => {
+                    if subItem != "" || readClass {
+                        self.unexpected (Tokens::DCOLON, l, c);
+                    }
+
+                    let (ident, l2, c2) = lexer:.next ();
+                    self.verifyIdentifier (ident, l2, c2);
+                    subItem = ident;
+                }
+                (_ = Tokens::POINT, _, _) => {
+                    let (ident, l2, c2) = lexer:.next ();
+                    self.verifyIdentifier (ident, l2, c2);
+
+                    classes = classes ~ [ident];
+                    readClass = true;
+                }
+                (_ = Tokens::LACC, _, _) => { break; }
+                (v, l, c) => {
+                    self.unexpected (v, l, c);
+                }
+            }
+        }
+
+        let dmut result = self.readStyleContent (alias lexer);
+        if subItem != "" {
+            let dmut inner = copy Style ();
+            inner.subItems [subItem] = result;
+            result = alias inner;
+        }
+
+        let hover = state [0] || !state [3];
+        let focus = state [1] || !state [4];
+        let check = state [2] || !state [5];
+        let default = (!state [0] && !state [1] && !state [2]);
+
+        if classes.len == 0 {
+            classes ~= [""];
+        }
+
+        for c in classes {
+            if hover {
+                self._styleManager:.insertHover (widgetName, c, result);
+            }
+            if focus {
+                self._styleManager:.insertFocus (widgetName, c, result);
+            }
+            if check {
+                self._styleManager:.insertCheck (widgetName, c, result);
+            }
+            if default {
+                self._styleManager:.insertDefault (widgetName, c, result);
+            }
+        }
+    }
+
+    /**
+     * Read the style state
+     * */
+    fn readStyleState (self, ref dmut state : [bool ; 6], dmut lexer : &Lexer!{c8}, not : bool = false)
+        throws BalderError
+    {
+        let (name, l, c) = lexer:.next ();
+        match name {
+            "hover" => {
+                if not {
+                    if state[0] || state [1] || state [2] { self.unexpected (name, l, c); }
+                    state [3] = true;
+                } else {
+                    if state[3] || state [4] || state [5] { self.unexpected (name, l, c); }
+                    state [0] = true;
+                }
+            }
+            "focus" => {
+                if not {
+                    if state[0] || state [1] || state [2] { self.unexpected (name, l, c); }
+                    state [4] = true;
+                } else {
+                    if state[3] || state [4] || state [5] { self.unexpected (name, l, c); }
+                    state [1] = true;
+                }
+            }
+            "check" => {
+                if not {
+                    if state[0] || state [1] || state [2] { self.unexpected (name, l, c); }
+                    state [5] = true;
+                } else {
+                    if state[3] || state [4] || state [5] { self.unexpected (name, l, c); }
+                    state [2] = true;
+                }
+            }
+            _ => {
+                self.unexpected (name, l, c);
+            }
+        }
+    }
+
+    /**
+     * Read the content of a style
+     * @params:
+     *    - lexer: the lexer tokenizing the style sheet string
+     * */
+    fn readStyleContent (self, dmut lexer : &Lexer!{c8})-> dmut &Style
+        throws BalderError
+    {
+        let dmut result = copy Style ();
+
+        loop {
+            let (n, l, c) = lexer:.next ();
+            match n {
+                Tokens::RACC => { break; }
+                "color" => {
+                    result.color.0 = true;
+                    result.color.1 = self.readColor (alias lexer);
+                }
+                "border-color" => {
+                    result.borderColor.0 = true;
+                    result.borderColor.1 = self.readColor (alias lexer);
+                }
+                "background-color" => {
+                    result.backgroundColor.0 = true;
+                    result.backgroundColor.1 = self.readColor (alias lexer);
+                }
+                "text-color" => {
+                    result.textColor.0 = true;
+                    result.textColor.1 = self.readColor (alias lexer);
+                }
+                "selection-color" => {
+                    result.selectionColor.0 = true;
+                    result.selectionColor.1 = self.readColor (alias lexer);
+                }
+                "font" => {
+                    result.font.0 = true;
+                    result.font.1 = self.readString (alias lexer);
+                }
+                "font-size" => {
+                    result.fontSize.0 = true;
+                    result.fontSize.1 = self.readPixelSize (alias lexer);
+                }
+                "radius" => {
+                    result.radius.0 = true;
+                    result.radius.1 = self.readPixelSize (alias lexer);
+                }
+                "padding" => {
+                    result.paddingSize [0].0 = true;
+                    result.paddingSize [0].1 = self.readSize (alias lexer);
+                }
+                "padding-top" => {
+                    result.paddingSize [1].0 = true;
+                    result.paddingSize [1].1 = self.readSize (alias lexer);
+                }
+                "padding-bottom" => {
+                    result.paddingSize [2].0 = true;
+                    result.paddingSize [2].1 = self.readSize (alias lexer);
+                }
+                "padding-left" => {
+                    result.paddingSize [3].0 = true;
+                    result.paddingSize [3].1 = self.readSize (alias lexer);
+                }
+                "padding-right" => {
+                    result.paddingSize [4].0 = true;
+                    result.paddingSize [4].1 = self.readSize (alias lexer);
+                }
+                "margin" => {
+                    result.marginSize [0].0 = true;
+                    result.marginSize [0].1 = self.readSize (alias lexer);
+                }
+                "margin-top" => {
+                    result.marginSize [1].0 = true;
+                    result.marginSize [1].1 = self.readSize (alias lexer);
+                }
+                "margin-bottom" => {
+                    result.marginSize [2].0 = true;
+                    result.marginSize [2].1 = self.readSize (alias lexer);
+                }
+                "margin-left" => {
+                    result.marginSize [3].0 = true;
+                    result.marginSize [3].1 = self.readSize (alias lexer);
+                }
+                "margin-right" => {
+                    result.marginSize [4].0 = true;
+                    result.marginSize [4].1 = self.readSize (alias lexer);
+                }
+                _ => {
+                    self.unexpected (n, l, c);
+                }
+            }
+        }
+
+        alias result
+    }
+
+    /**
+     * Read a color
+     * */
+    fn readColor (self, dmut lexer : &Lexer!{c8})-> vec4
+        throws BalderError
+    {
+        let colon = lexer:.next ();
+        if colon._0 != Tokens::COLON { self.unexpected (expand colon); }
+
+        let mut color = vec4 ();
+        let (colorS, l, c) = lexer:.next ();
+        {
+            if colorS.len != 0 && colorS [0] == '#' {
+                color = palette::colorFromHex (std::conv::to!{u32} (colorS [1 .. $]));
+            }
+
+            else if let Ok (pos) = colorS.find ('!') {
+                let level = std::conv::to!{u32} (colorS [pos + 1 .. $]);
+                color = ColorPalette.get (colorS [0 .. pos], cast!f32 (level) / 100.f);
+            }
+
+            else {
+                color = ColorPalette.get (colorS, 0.f);
+            }
+        } catch {
+            _ => { self.unexpected (colorS, l, c); }
+        }
+
+        let (end, l2, c2) = lexer:.next ();
+        let (end2, l4, c4) = if end == Tokens::COLON {
+            let (alphaS, l3, c3) = lexer:.next ();
+            {
+                color.w = cast!f32 (std::conv::to!{u32} (alphaS)) / 255.f;
+            } catch {
+                _ => { self.unexpected (alphaS, l3, c3); }
+            }
+
+            lexer:.next ()
+        } else {
+            (end, l2, c2)
+        };
+
+        if end2 != Tokens::SEMI_COLON {
+            self.unexpected (end2, l4, c4);
+        }
+
+        color
+    }
+
+    /**
+     * Read a pixel size
+     * */
+    fn readPixelSize (self, dmut lexer : &Lexer!{c8})-> u32
+        throws BalderError
+    {
+        let colon = lexer:.next ();
+        if colon._0 != Tokens::COLON { self.unexpected (expand colon); }
+
+        let pix = lexer:.next ();
+        let mut size = 0u32;
+
+        {
+            size = std::conv::to!{u32} (pix._0);
+        } catch {
+            _ => { self.unexpected (expand pix); }
+        };
+
+        let semi = lexer:.next ();
+        if semi._0 != Tokens::SEMI_COLON { self.unexpected (expand semi); }
+
+        size
+    }
+
+    /**
+     * Read a pixel size
+     * */
+    fn readRelativeSize (self, dmut lexer : &Lexer!{c8})-> f32
+        throws BalderError
+    {
+        let colon = lexer:.next ();
+        if colon._0 != Tokens::COLON { self.unexpected (expand colon); }
+
+        let pix = lexer:.next ();
+        let point = lexer:.next ();
+
+        let mut size = 0.f;
+        {
+            if point._0 == Tokens::SEMI_COLON {
+                size = std::conv::to!{f32} (pix._0);
+            } else {
+                let end = lexer:.next ();
+                size = std::conv::to!{f32} (pix._0 ~ "." ~ end._0);
+            }
+        } catch {
+            _ => { self.unexpected (expand pix); }
+        }
+
+        if point._0 != Tokens::SEMI_COLON {
+            let semi = lexer:.next ();
+            if semi._0 != Tokens::SEMI_COLON { self.unexpected (expand semi); }
+        }
+
+        size
+    }
+
+    /**
+     * Read a string
+     * */
+    fn readString (self, dmut lexer : &Lexer!{c8})-> [c8]
+        throws BalderError
+    {
+        let colon = lexer:.next ();
+        if colon._0 != Tokens::COLON { self.unexpected (expand colon); }
+
+        let openQuote = lexer:.next ();
+        if openQuote._0 != Tokens::SQUOTE { self.unexpected (expand openQuote); }
+
+        let dmut result = copy StringStream ();
+        lexer:.setSkipTokens (false);
+        {
+            loop {
+                let n = lexer:.next ();
+                if n._0 == Tokens::SQUOTE { break; }
+                result:.write (n._0);
+            }
+        } exit {
+            lexer:.setSkipTokens (true);
+        }
+
+        let semi = lexer:.next ();
+        if semi._0 != Tokens::SEMI_COLON { self.unexpected (expand semi); }
+
+        result[]
+    }
+
+
+    /**
+     * Read a widget size
+     * */
+    fn readSize (self, dmut lexer : &Lexer!{c8})-> WidgetSize
+        throws BalderError
+    {
+        let colon = lexer:.next ();
+        if colon._0 != Tokens::COLON { self.unexpected (expand colon); }
+
+        let pix = lexer:.next ();
+        let mut size = WidgetSize ();
+
+        if pix._0 == Tokens::LACC {
+            size = self.readComplexSize (alias lexer);
+        } else {
+            {
+                size = WidgetSize (pix-> std::conv::to!{u32} (pix._0));
+            } catch {
+                _ => {
+                    self.unexpected (expand pix);
+                }
+            }
+        }
+
+        let semi = lexer:.next ();
+        if semi._0 != Tokens::SEMI_COLON { self.unexpected (expand semi); }
+
+        size
+    }
+
+    /**
+     * Read a complex size
+     * */
+    fn readComplexSize (self, dmut lexer : &Lexer!{c8})-> WidgetSize
+        throws BalderError
+    {
+        let mut result = WidgetSize ();
+        loop {
+            let (n, l, c) = lexer:.next ();
+            match n {
+                Tokens::RACC => { break; }
+                "relative" => {
+                    result.relative = self.readRelativeSize (alias lexer);
+                }
+                "min" => {
+                    result.minPix = self.readPixelSize (alias lexer);
+                }
+                "max" => {
+                    result.maxPix = self.readPixelSize (alias lexer);
+                }
+                _ => {
+                    self.unexpected (n, l, c);
+                }
+            }
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHECKING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Throw an unexpected token exception
+     * @params:
+     *    - tok: the read token
+     *    - line: the line of the reading
+     *    - col: the column of the reading
+     * */
+    fn unexpected (self, tok : [c8], line : usize, col : usize)
+        throws BalderError
+    {
+        let msg = if let Ok (m) = (std::format::format ("Unexpected '{}' at ({}:{})", tok, col, line))? {
+            m
+        } else {
+            ("Unexpected '" ~ tok ~ "'")
+        };
+
+        throw copy BalderError (msg);
+    }
+
+    /**
+     * Verify that the name is a identifier
+     * */
+    fn verifyIdentifier (self, name : [c8], line : usize, col : usize)
+        throws BalderError
+    {
+        if !self.isIdentifier (name) {
+            let msg = if let Ok (m) = (std::format::format ("Invalid identifier '{}' at ({}:{})", name, col, line))? {
+                m
+            } else {
+                ("Invalid identifier '" ~ name ~ "'")
+            };
+
+            throw copy BalderError (msg);
+        }
+    }
+
+    /**
+     * @returns: true if name is an identifier
+     * */
+    fn isIdentifier (self, str : [c8])-> bool {
+        let mut i = 0u64;
+        let mut found = false;
+        for j in str { // must start by a letter, but can be preceded by as many _ as wanted
+            if (j >= 'a' && j <= 'z') || (j >= 'A' && j <= 'Z') {
+                found = true;
+                break;
+            } else if (j != '_') {
+                return false;
+            }
+            i += 1u64;
+        }
+
+        i += 1u64;
+        if (i < str.len) { // the rest of the identifier must be composed of letters, numbers, or _
+            for j in str [cast!usize (i) .. $] {
+                if (j < 'a' || j > 'z') && (j < 'A' || j > 'Z') && (j != '_') && (j < '0' || j > '9') {
+                    return false;
+                }
+            }
+        } else {
+            return found;
+        }
+
+        true
+    }
+
+}
