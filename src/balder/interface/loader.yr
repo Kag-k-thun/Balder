@@ -1,6 +1,541 @@
 in loader;
 
-mod ::parser;
+mod ::keys;
 
+use balder::core::{_, application::_};
+use balder::interface::_;
+use balder::math::_;
 
-pub def GUIParser : parser::GUIParser;
+use std::{config,
+          config::_,
+          conv,
+          conv::_,
+          traits,
+          stream,
+          syntax::_};
+
+use balder::interface::widget::{_,
+                                text::_,
+                                layout::_};
+
+use balder::interface::loader::keys;
+
+pub def WidgetKeys : keys::Keywords;
+
+/**
+ * GUI parser to parse a string content containing the description of widgets
+ * */
+pub record GUIParser {
+
+    let dmut _manager : &WidgetManager;
+    let _content : [c8];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager : &WidgetManager, content : [c8])
+        with _manager = alias manager
+        , _content = content
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          LOADING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load a root configuration and returns the loaded widget
+     * */
+    pub fn load (mut self)
+        throws BalderError
+    {
+        let dmut lexer = copy Lexer!{c8} (self._content,
+                                          tokens-> copy Tokens::__members__,
+                                          comments-> copy Comments::__members__);
+
+        let dmut widget = self:.readWidget (alias lexer);
+        self._manager:.setContent (alias widget);
+    }
+
+    /**
+     * Read the configuration of a widget
+     * @returns: the created widget
+     * */
+    fn readWidget (mut self, dmut lexer : &Lexer!{c8})-> dmut &Widget
+        throws BalderError
+    {
+        let kind = lexer:.next ();
+        self:.readWidget (alias lexer, kind)
+    }
+
+    /**
+     * Read the configuration of a widget
+     * @params:
+     *    - lexer: the lexer tokenizing the content
+     *    - kind: the word read in the lexer defining the kind of widget to read
+     * */
+    fn readWidget (mut self, dmut lexer : &Lexer!{c8}, kind : ([c8], usize, usize))-> dmut &Widget
+        throws BalderError
+    {
+        let name = lexer:.next ();
+        self.verifyIdentifier (expand name);
+
+        match kind._0 {
+            Keywords::LINEAR_LAYOUT   => { return self:.readLinearLayout (name._0, alias lexer); }
+            Keywords::GRID_LAYOUT     => { return self:.readGridLayout (name._0, alias lexer); }
+            Keywords::FLOATING_LAYOUT => { return self:.readFloatingLayout (name._0, alias lexer); }
+            Keywords::BOX             => { return self:.readBox (name._0, alias lexer); }
+            Keywords::LABEL           => { return self:.readLabel (name._0, alias lexer); }
+            Keywords::INPUT_TEXT      => { return self:.readInputText (name._0, alias lexer); }
+        }
+
+        throw self.unexpected (expand kind);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          LINEAR-LAYOUT          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the configuration of a linear layout
+     * @params:
+     *    - name: the name of the widget
+     *    - lexer: the lexer tokenizing the content
+     * @returns: a linear layout
+     * */
+    fn readLinearLayout (mut self, name : [c8], dmut lexer : &Lexer!{c8})-> dmut &Widget
+        throws BalderError
+    {
+        self.readTokens (alias lexer, Tokens::LPAR);
+        let (cl, scrollable, vertical, scrollSpeed) = self:.readLinearLayoutHeader (alias lexer);
+        self.readTokens (alias lexer, Tokens::LACC);
+
+        let dmut line = copy LinearLayout (alias self._manager, name, vertical-> vertical);
+        {
+            let mut level : u32 = 0;
+            loop {
+                let c = lexer:.next ();
+                match c._0 {
+                    Tokens::RACC => { break; }
+                    _ => {
+                        let dmut child = self:.readWidget (alias lexer, c);
+                        line:.insertChild (alias child, level-> level);
+                        level += 1;
+
+                        self.readTokens (alias lexer, Tokens::SEMI_COLON);
+                    }
+                }
+            }
+
+            line:.setStyleClasses (cl);
+            if scrollable {
+                let dmut result = copy ScrollLayout (alias self._manager, name, alias line, scrollSpeed-> scrollSpeed);
+                result:.setStyleClasses (cl);
+                return alias result;
+            }
+
+            alias line
+        } catch {
+            b => {
+                line:.dispose ();
+                throw b;
+            }
+        }
+    }
+
+    /**
+     * Read the header part of a linear layout
+     * @params:
+     *    - lexer: the lexer tokenizing the content
+     * @returns:
+     *    - .0: the style class
+     *    - .1: true iif scrollable
+     *    - .2: true iif vertical
+     *    - .3: the speed of the scroll (iif .1)
+     * */
+    fn readLinearLayoutHeader (mut self, dmut lexer : &Lexer!{c8})-> ([c8], bool, bool, f32)
+        throws BalderError
+    {
+        let mut cl : [c8] = [], mut vertical = false, mut scrollable = false, mut speed = 2.f;
+        let mut readCl = false, mut readVert = false, mut readScroll = false, mut readSpeed = false;
+        loop {
+            let ident = lexer:.next ();
+            match ident._0 {
+                Tokens::RPAR => { break; }
+                Keywords::CLASS => {
+                    if readCl { throw self.unexpected (expand ident); }
+                    readCl = true;
+
+                    self.readTokens (alias lexer, Tokens::COLON);
+                    cl = self.readString (alias lexer);
+
+                    if (self.readTokens (alias lexer, Tokens::COMA, Tokens::RPAR)._0 == Tokens::RPAR) break;
+                }
+                Keywords::ORIENTATION => {
+                    if readVert { throw self.unexpected (expand ident); }
+                    readVert = true;
+
+                    self.readTokens (alias lexer, Tokens::COLON);
+                    let hor = self.readTokens (alias lexer, Keywords::VERTICAL, Keywords::HORIZONTAL);
+                    vertical = (hor._0 == Keywords::HORIZONTAL);
+
+                    if (self.readTokens (alias lexer, Tokens::COMA, Tokens::RPAR)._0 == Tokens::RPAR) break;
+                }
+                Keywords::SCROLLABLE => {
+                    if readScroll { throw self.unexpected (expand ident); }
+                    readScroll = true;
+
+                    self.readTokens (alias lexer, Tokens::COLON);
+                    let hor = self.readTokens (alias lexer, Keywords::TRUE, Keywords::FALSE);
+                    if hor._0 == Keywords::TRUE { scrollable = true; }
+
+                    if (self.readTokens (alias lexer, Tokens::COMA, Tokens::RPAR)._0 == Tokens::RPAR) break;
+                }
+                Keywords::SCROLL_SPEED => {
+                    if readSpeed { throw self.unexpected (expand ident); }
+                    readSpeed = true;
+
+                    self.readTokens (alias lexer, Tokens::COLON);
+                    speed = self.readFloat!{f32} (alias lexer);
+
+                    if (self.readTokens (alias lexer, Tokens::COMA, Tokens::RPAR)._0 == Tokens::RPAR) break;
+                }
+                _ => {
+                    throw self.unexpected (expand ident);
+                }
+            }
+        }
+
+        (cl, scrollable, vertical, speed)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          GRID-LAYOUT          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the configuration of a grid layout
+     * @params:
+     *    - name: the name of the widget
+     *    - lexer: the lexer tokenizing the content
+     * @returns: a grid layout
+     * */
+    fn readGridLayout (mut self, name : [c8], dmut lexer : &Lexer!{c8})-> dmut &GridLayout
+        throws BalderError
+    {
+        name;
+        lexer;
+        throw copy BalderError ("TODO");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          FLOATING-LAYOUT          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the configuration of a floating layout
+     * @params:
+     *    - name: the name of the widget
+     *    - lexer: the lexer tokenizing the content
+     * @returns: a floating layout
+     * */
+    fn readFloatingLayout (mut self, name : [c8], dmut lexer : &Lexer!{c8})-> dmut &FloatingLayout
+        throws BalderError
+    {
+        name;
+        lexer;
+        throw copy BalderError ("TODO");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          BOX          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the configuration of a grid layout
+     * @params:
+     *    - name: the name of the widget
+     *    - lexer: the lexer tokenizing the content
+     * @returns: a grid layout
+     * @example:
+     * ```
+     * Box mybox [class: 'foo.bar'];
+     * ```
+     * @grammar:
+     * ```
+     * box := 'Box' Identifier ('[' 'class' ':' String ']')? ';'
+     * ```
+     * */
+    fn readBox (mut self, name : [c8], dmut lexer : &Lexer!{c8})-> dmut &Box
+        throws BalderError
+    {
+        let config = self.readTokens (alias lexer, Tokens::SEMI_COLON, Tokens::LPAR);
+        let dmut result = copy Box (alias self._manager, name);
+
+        {
+            if config._0 == Tokens::LPAR  {
+                self.readTokens (alias lexer, Keywords::CLASS);
+                self.readTokens (alias lexer, Tokens::COLON);
+
+                let str = self.readString (alias lexer);
+                self.readTokens (alias lexer, Tokens::RPAR);
+
+                result:.setStyleClasses (str);
+            }
+        } catch {
+            b => {
+                result:.dispose ();
+                throw b;
+            }
+        }
+
+        alias result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          LABEL          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the configuration of a grid layout
+     * @params:
+     *    - name: the name of the widget
+     *    - lexer: the lexer tokenizing the content
+     * @returns: a grid layout
+     * */
+    fn readLabel (mut self, name : [c8], dmut lexer : &Lexer!{c8})-> dmut &Label
+        throws BalderError
+    {
+        name;
+        lexer;
+        throw copy BalderError ("TODO");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INPUT-TEXT          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the configuration of a grid layout
+     * @params:
+     *    - name: the name of the widget
+     *    - lexer: the lexer tokenizing the content
+     * @returns: a grid layout
+     * */
+    fn readInputText (mut self, name : [c8], dmut lexer : &Lexer!{c8})-> dmut &InputText
+        throws BalderError
+    {
+        name;
+        lexer;
+        throw copy BalderError ("TODO");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          COMMON          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a string
+     * */
+    fn readString (self, dmut lexer : &Lexer!{c8})-> [c8]
+        throws BalderError
+    {
+        let beg = self.readTokens (alias lexer, Tokens::SQUOTE, Tokens::DQUOTE);
+
+        let dmut result = copy StringStream ();
+        lexer:.setSkipTokens (false);
+        {
+            loop {
+                let n = lexer:.next ();
+                if n._0 == beg._0 { break; }
+                result:.write (n._0);
+            }
+        } exit {
+            lexer:.setSkipTokens (true);
+        }
+
+        result[]
+    }
+
+    /**
+     * Read a float
+     * */
+    fn if isFloating!{T} readFloat {T} (self, dmut lexer : &Lexer!{c8})-> T
+        throws BalderError
+    {
+        let pix = lexer:.next ();
+        let cursor = lexer.getCursor ();
+
+        let point = lexer:.next ();
+
+        let mut result = cast!{T} (0.f);
+        {
+            if point._0 == Tokens::POINT {
+                let end = lexer:.next ();
+                result = std::conv::to!{T} (pix._0 ~ "." ~ end._0);
+            } else {
+                lexer:.rewind (expand cursor);
+                result = std::conv::to!{T} (pix._0);
+            }
+        } catch {
+            _ => { throw self.unexpected (expand pix); }
+        }
+
+        result
+    }
+
+    /**
+     * Read a int
+     * */
+    fn if isIntegral!{T} readInt {T} (self, dmut lexer : &Lexer!{c8})-> T
+        throws BalderError
+    {
+        let pix = lexer:.next ();
+
+        let mut result = cast!{T} (0);
+        {
+            result = std::conv::to!{T} (pix._0);
+        } catch {
+            _ => { throw self.unexpected (expand pix); }
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHECKING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the next token in the lexer and check that it correspond to one of the expected tokens
+     * */
+    fn readTokens {T...} (self, dmut lexer : &Lexer!{c8}, expect : T)-> ([c8], usize, usize)
+        throws BalderError
+    {
+        let n = lexer:.next ();
+        cte for j in expect {
+            if n._0 == j { return n; }
+        }
+
+        throw self.unexpected (expand n);
+    }
+
+    /**
+     * Read the next token in the lexer and check that it correspond to one of the expected tokens
+     * */
+    fn readTokens (self, dmut lexer : &Lexer!{c8}, expect : [c8])-> ([c8], usize, usize)
+        throws BalderError
+    {
+        let n = lexer:.next ();
+        if expect == n._0 {
+            return n;
+        }
+
+        throw self.unexpected (expand n);
+    }
+
+    /**
+     * Throw an unexpected token exception
+     * @params:
+     *    - tok: the read token
+     *    - line: the line of the reading
+     *    - col: the column of the reading
+     * */
+    fn unexpected (self, tok : [c8], line : usize, col : usize)-> &BalderError {
+        let msg = if let Ok (m) = (std::format::format ("Unexpected '{}' at ({}:{})", tok, col, line))? {
+            m
+        } else {
+            ("Unexpected '" ~ tok ~ "'")
+        };
+
+        copy BalderError (msg)
+    }
+
+    /**
+     * Verify that the name is a identifier
+     * */
+    fn verifyIdentifier (self, name : [c8], line : usize, col : usize)
+        throws BalderError
+    {
+        if !self.isIdentifier (name) {
+            let msg = if let Ok (m) = (std::format::format ("Invalid identifier '{}' at ({}:{})", name, col, line))? {
+                m
+            } else {
+                ("Invalid identifier '" ~ name ~ "'")
+            };
+
+            throw copy BalderError (msg);
+        }
+    }
+
+    /**
+     * @returns: true if name is an identifier
+     * */
+    fn isIdentifier (self, str : [c8])-> bool {
+        let mut i = 0u64;
+        let mut found = false;
+                for j in str { // must start by a letter, but can be preceded by as many _ as wanted
+            if (j >= 'a' && j <= 'z') || (j >= 'A' && j <= 'Z') {
+                found = true;
+                break;
+            } else if (j != '_' && j != '-') {
+                return false;
+            }
+            i += 1u64;
+        }
+
+        i += 1u64;
+        if (i < str.len) { // the rest of the identifier must be composed of letters, numbers, or _
+            for j in str [cast!usize (i) .. $] {
+                if (j < 'a' || j > 'z') && (j < 'A' || j > 'Z') && (j != '_') && (j < '0' || j > '9') && (j != '-') {
+                    return false;
+                }
+            }
+        } else {
+            return found;
+        }
+
+        true
+    }
+
+}
