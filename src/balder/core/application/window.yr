@@ -8,10 +8,14 @@ use balder::utils::log;
 
 use std::{io, time::_, config::_};
 
-use ::core::concurrency::sync::semaphore;
+use ::core::concurrency::sync::{mutex, semaphore};
 
 use ::vulkan::core;
 use ::sdl2::_;
+
+
+// Boolean set to false when a window is created
+lazy dmut __FIRST_WINDOW__ = copy [true];
 
 /**
  * Class managing a window and vulkan devices to enable 3D rendering
@@ -27,6 +31,9 @@ pub class Window {
     // The name (displayed on the window bar) of the window
     let mut _name : [c8] = "";
 
+    // The application containing the window
+    let dmut _app : &Application;
+
     // The sdl handler of the window
     prot let dmut _sdlWindow : *SDL_Window = null;
 
@@ -41,6 +48,12 @@ pub class Window {
 
     // The garbage bin used for cleaning
     prot let dmut _bin : &GarbageBin = copy GarbageBin ();
+
+    // The drawer of 2D shapes
+    prot let dmut _drawer : (&ShapeDrawer)? = none;
+
+    // Mutex locked when starting/killing rendering thread
+    let dmut _startStopMutex = copy Mutex ();
 
     /*!
      * ====================================================================================================
@@ -111,7 +124,9 @@ pub class Window {
     /**
      * Create an empty window
      */
-    pub self () {}
+    pub self (dmut app : &Application)
+        with _app = alias app
+    {}
 
     /**
      * Configure the window to use vulkan for 3D rendering
@@ -124,12 +139,17 @@ pub class Window {
     pub fn configureVulkan (mut self, cfg : &BalderConfig)
         throws BalderError
     {
-        if (SDL_Init (SDL_INIT_EVERYTHING) < 0) {
-            throw copy BalderError ("Failed to init SDL2");
-        }
+        atomic {
+            if __FIRST_WINDOW__ [0] {
+                if (SDL_Init (SDL_INIT_EVERYTHING) < 0) {
+                    throw copy BalderError ("Failed to init SDL2");
+                }
 
-        if (TTF_Init () < 0) {
-            throw copy BalderError ("Failed to init ttf");
+                if (TTF_Init () < 0) {
+                    throw copy BalderError ("Failed to init ttf");
+                }
+                __FIRST_WINDOW__ [0] = false;
+            }
         }
 
 	    self._sdlWindow = SDL_CreateWindow (
@@ -161,21 +181,44 @@ pub class Window {
         SDL_HideWindow (alias self._sdlWindow);
 
         if cfg.timer.interactive {
-            self._frameDuration = dur::minutes (1);
             self._interactive = true;
+            self._frameDuration = dur::minutes (1);
         } else {
+            self._interactive = false;
             if cfg.timer.fps == 0 {
-                log::error #("Window", "Fps must be positive in timer mode");
+                log::error #("Window", "Fps must be a positive number");
                 throw copy BalderError ("Invalid fps configuration");
             }
 
             self._frameDuration = dur::seconds (1) / cast!{u64} (cfg.timer.fps);
-            self._interactive = false;
         }
 
         // Draw empty screen, to configure default command buffers
         self:.resetComposePass ();
         self._redrawing = true;
+    }
+
+    /**
+     * Configure the 2D shape drawer for the window
+     * */
+    pub fn configureShapeDrawer (mut self)
+        throws BalderError
+    {
+        let dmut dr = copy ShapeDrawer (alias self);
+        dr:.configure ();
+        self._drawer = (alias dr)?;
+    }
+
+
+    /**
+     * Connecting the basic input event slots for the window
+     * */
+    pub fn configureInputEvents (mut self) {
+        let dmut input = self:.getInputManager ();
+
+        input:.connectResize (&self:.onResize);
+        input:.connectExpose (&self:.onExpose);
+        input:.connectHideShow (&self:.onHideShow);
     }
 
     /**
@@ -212,11 +255,32 @@ pub class Window {
         }
     }
 
+    /**
+     * Slot called when the window is resized
+     * */
     pub fn onResize (mut self, w : u32, h : u32) {
         self._vkDevice:.windowResize ();
         self._w = w;
         self._h = h;
-        log::debug #("Window", "resize ", w, " ", h);
+        self:.forceFrame ();
+    }
+
+    /**
+     * Slot called when the window is exposed
+     * */
+    pub fn onExpose (mut self) {
+        self:.forceFrame ();
+    }
+
+    /**
+     * Slot called when the window is minimized
+     * */
+    pub fn onHideShow (mut self, b : bool) {
+        if b {
+            self:.startRendering ();
+        } else {
+            self:.killRendering ();
+        }
     }
 
     /**
@@ -293,6 +357,54 @@ pub class Window {
     }
 
     /**
+     * @returns: the input manager of the window
+     * */
+    pub fn getInputManager (mut self)-> dmut &WindowInputSignals {
+        if self._sdlWindow != null {
+            return self._app:.getInputManager ():.getWindowSignals (SDL_GetWindowID (self._sdlWindow));
+        }
+
+        log::error #("Window", "malformed window");
+        panic;
+    }
+
+    /**
+     * @returns: the drawer used to draw basic shapes on the final composition pass of the window
+     * */
+    pub fn getShapeDrawer (mut self)-> dmut &ShapeDrawer {
+        if let Ok (dmut w) = alias self._drawer {
+            return alias w;
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: the drawer used to draw basic shapes on the final composition pass of the window
+     * */
+    pub fn getShapeDrawer (self)-> &ShapeDrawer {
+        if let Ok (w) = self._drawer {
+            return w;
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: the application to which the window is attached
+     * */
+    pub fn getApplication (mut self)-> dmut &Application {
+        alias self._app
+    }
+
+    /**
+     * @returns: the application to which the window is attached
+     * */
+    pub fn getApplication (self)-> &Application {
+        self._app
+    }
+
+    /**
      * ======================================================================================================
      * ======================================================================================================
      * =============================================   USAGE  ===============================================
@@ -314,7 +426,7 @@ pub class Window {
      */
     pub fn hide (mut self) {
         if (self._sdlWindow != null) {
-            SDL_ShowWindow (alias self._sdlWindow);
+            SDL_HideWindow (alias self._sdlWindow);
         }
     }
 
@@ -329,25 +441,44 @@ pub class Window {
     /**
      * Launch the thread that draws on the window at a given framerate
      */
-    pub fn startRendering (mut self) {
-        if let Err () = self._renderingTh && !self._isRunning {
-            self._isRunning = true;
-            self._renderingTh = (spawn self:.renderingThread ())?;
+    fn startRendering (mut self) {
+        {
+            self._startStopMutex:.lock ();
+            if let Err () = self._renderingTh && !self._isRunning {
+                self._isRunning = true;
+                self._renderingTh = (spawn self:.renderingThread ())?;
+            }
+        } exit {
+            self._startStopMutex:.unlock ();
         }
     }
 
     /**
      * Kill the rendering thread
      * */
-    pub fn killRendering (mut self) {
-        self._isRunning = false;
-        if let Ok (th) = self._renderingTh {
-            th.value; // join thread
-            self._renderingTh = none;
-        }
+    fn killRendering (mut self) {
+        {
+            __version DEBUG {
+                if let Ok (t) = self._renderingTh {
+                    if etc::runtime::threads::_yrt_thread_self_id () == t.tid {
+                        log::error #("Window", "Killing rendering thread within itself!!");
+                    }
+                }
+            }
 
-        log::debug #("Window", "Thread killed");
-        self:.waitIdle ();
+            self._startStopMutex:.lock ();
+            self._isRunning = false;
+            self:.forceFrame ();
+
+            if let Ok (th) = self._renderingTh {
+                th.value; // join thread
+                self._renderingTh = none;
+            }
+
+            log::debug #("Window", "Thread killed");
+        } exit {
+            self._startStopMutex:.unlock ();
+        }
     }
 
     /*!
@@ -540,6 +671,8 @@ pub class Window {
         self._secondTimer:.reset ();
         self._frameTimer:.reset ();
 
+        log::debug #("Window", "start rendering thread");
+
         while self._isRunning {
             if self._redrawing {
                 self._redrawing = false;
@@ -563,6 +696,7 @@ pub class Window {
             }
         }
 
+        self:.waitIdle ();
         log::debug #("Window", "Quit thread loop");
     }
 
@@ -580,6 +714,8 @@ pub class Window {
      * @info: update the frame count.
      */
     fn waitFrame (mut self, redraw : bool) {
+        if !self._isRunning { return; }
+
         if self._interactive {
             self:.waitInteractive (redraw);
         } else {
@@ -592,7 +728,13 @@ pub class Window {
      * */
     fn waitInteractive (mut self, redraw : bool) {
         // In redraw interactive will redraw every swapchain frames in one go
-        if redraw && !self._mustWaitFrameRedraw {
+        if redraw {
+            return;
+        }
+
+        // Semaphore posted in previous frame
+        if !self._mustWaitFrameRedraw {
+            self._mustWaitFrameRedraw = true;
             return;
         }
 
@@ -713,7 +855,6 @@ pub class Window {
      * ====================================================================================================
      */
 
-
     fn performRedraw (mut self) {
         atomic self {
             let dmut newAllocs = self:.performReload ();
@@ -721,7 +862,9 @@ pub class Window {
             if (self._vkDevice.needResize ()) {
                 self._vkDevice:.recreateSwapchain ();
             } catch {
-                err => println ("Fail swap chain recreation : ", err);
+                err => {
+                    log::error #("Fail swap chain recreation : ", err);
+                }
             }
 
             let mut frames = 0u32;
@@ -771,7 +914,6 @@ pub class Window {
                 self._sortedSubpasses [i].cmdAlloc = (alias newAllocs [i + 1])?;
                 self._sortedSubpasses [i].cleanPhase ();
             }
-
 
             if let Ok (dmut all) = alias self._composePass.cmdAlloc {
                 all:.dispose ();
@@ -843,6 +985,11 @@ pub class Window {
     impl Disposable {
         pub over dispose (mut self) {
             self:.killRendering ();
+
+            if let Ok (dmut d) = alias self._drawer {
+                d:.dispose ();
+                self._drawer = none;
+            }
 
             self:.resetComposePass ();
             self:.clearSubpasses ();

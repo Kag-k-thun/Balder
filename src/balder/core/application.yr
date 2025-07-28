@@ -38,9 +38,6 @@ use balder::core::driver::_;
 @final
 pub class Application {
 
-    // The window rendering the application 
-    let dmut _window = copy Window ();
-
     // The timer to cap the activity update frequency
     let mut _timer = Timer ();
 
@@ -56,14 +53,21 @@ pub class Application {
     // The list of input manager for each activities
     let dmut _input : &InputManager = copy InputManager ();
 
-    // The list of activities that controlling the application
-    let dmut _activity : (&Activity)? = none;
+    prot { // activities
 
-    // The widget drawer used to generate the final 2D composition of the window
-    let dmut _drawer : (&ShapeDrawer)? = none;
+        // The list of activities that controlling the application
+        let dmut _running : [usize => (&Activity, &Window)] = copy [];
 
-    // The configuration of the application
-    let mut _cfg : &BalderConfig;
+        // The list of activity opened but not started
+        let dmut _opened : [usize => (&Activity, &Window)] = copy [];
+
+        // The list of activities to close (in running)
+        let dmut _closed : [usize => ()] = copy [];
+
+        // The uid of the last open activity
+        let mut _lastActId : usize = 0us;
+
+    }
 
     prot { // Signals
 
@@ -78,58 +82,71 @@ pub class Application {
      * ======================================================================================================
      * ======================================================================================================
      */
-    
-    prot self empty ()
-        with _cfg = copy BalderConfig::default ()
-    {}
-    
+
     /**
-     * Create a new application from a file configuration
+     * Create a new application
      * @params:
-     *    - path: the path of the configuration file
+     *    - ips: the duration of a step between activity updates
      */
-    pub self {T over &Activity} (cfg : &BalderConfig)
-        with _cfg = cfg
+    pub self (ips : u64 = 144) {
+        self._stepDuration = dur::seconds (1) / ips;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          OPEN ACTIVITY          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Open a new activity
+     * @params:
+     *    - cfg: the configuration of the window
+     * */
+    pub fn open {T over &Activity} (mut self, cfg : &BalderConfig)-> dmut T
         throws BalderError
     {
-        self:.configure ();
-        let dmut act = copy T (alias self);
-        self._activity = (alias act)?;
-    }    
+        atomic self {
+            self._lastActId += 1;
+            let uid = self._lastActId;
+
+            let dmut win = self:.openWindow (cfg);
+            let dmut act = copy T (uid, alias self, alias win);
+            self._opened [uid] = (alias act, alias win);
+
+            alias act
+        }
+    }
+
+    /**
+     * Close a running activity
+     * */
+    pub fn close (mut self, dmut t : &Activity) {
+        atomic self {
+            self._closed [t.uid] = ();
+        }
+    }
 
     /**
      * Configure the application with a given configuration
      * @params:
      *    - conf: the configuration of the window
      */
-    prv fn configure (mut self)
+    fn openWindow (mut self, cfg : &BalderConfig)-> dmut &Window
         throws BalderError
     {
-        self:.configureWindow ();
-        self:.configureShapeDrawer ();
-        self._stepDuration = dur::seconds (1) / cast!{u64} (self._cfg.timer.ips);
-    }
+        let dmut win = copy Window (alias self);
 
-    /**
-     * Configure the window of the application using the configuration `conf["window"]`
-     * @params:
-     *    - conf: the configuration of the application
-     */
-    prv fn configureWindow (mut self)
-        throws BalderError
-    {
-        self._window:.setDimension (self._cfg.window.width, self._cfg.window.height);
-        self._window:.setName (self._cfg.window.name);
-        self._window:.configureVulkan (self._cfg);
-        self._input:.connectResize (&self._window:.onResize);
-    }
+        win:.setDimension (cfg.window.width, cfg.window.height);
+        win:.setName (cfg.window.name);
+        win:.configureVulkan (cfg);
+        win:.configureShapeDrawer ();
 
-    prv fn configureShapeDrawer (mut self)
-        throws BalderError
-    {
-        let dmut draw = copy ShapeDrawer (alias self);
-        draw:.configure ();
-        self._drawer = (alias draw)?;
+        win:.configureInputEvents ();
+
+        alias win
     }
 
     /**
@@ -143,30 +160,82 @@ pub class Application {
      * Start the application
      */
     pub fn run (mut self) {
-        if let Ok (dmut act) = alias self._activity {
-            self._window:.show ();
-            self._window:.startRendering ();
-            act:.onStart ();
+        self._timer:.reset ();
+        self._stepTimer:.reset ();
 
-            self._timer:.reset ();
+        while self._isRunning {
+            self:.performActivityOpening ();
+
+            let delta = self._stepTimer.timeSinceStart ();
             self._stepTimer:.reset ();
-            while self._isRunning {
-                let delta = self._stepTimer.timeSinceStart ();
-                self._stepTimer:.reset ();
+            self._uiTick.emit (delta);
 
-                self._uiTick.emit (delta);
-                act:.onUpdate (delta);
-
-                self._input:.pollEvents ();
-                if let Ok (dmut shape) = alias self._drawer && shape.hasUpdated () {
-                    self._window:.forceFrame ();
+            // No need for atomic, this collection cannot be changed within this call
+            for _, dmut w in alias self._running {
+                w._0:.onUpdate (delta);
+                let dmut shape = alias w._1:.getShapeDrawer ();
+                if shape.hasUpdated () {
+                    w._1:.forceFrame ();
                     shape:.interactiveUpdate (set-> false);
                 }
-
-                self:.waitClock ();
             }
 
-            self._window:.forceFrame ();
+            self._input:.pollEvents ();
+            self:.performActivityClose ();
+            self:.waitClock ();
+        }
+
+        self:.dispose ();
+    }
+
+    /**
+     * Open the activity opened in previous iteration
+     * */
+    fn performActivityOpening (mut self) {
+        if self._opened.len != 0 {
+            let dmut toOpen = atomic self {
+                let dmut res = alias self._opened;
+                self._opened = copy [];
+                alias res
+            };
+
+            for _, dmut t in alias toOpen {
+                let (dmut a, dmut w) = alias t;
+                a:.onStart ();
+                w:.show ();
+
+                // No need for atomic, this is only called in run iteration
+                self._running [a.uid] = alias t;
+            }
+        }
+    }
+
+    /**
+     * Close the activities that are marked to be closed
+     * */
+    fn performActivityClose (mut self) {
+        if self._closed.len != 0 {
+            let toClose = atomic self {
+                let res = self._closed;
+                self._closed = copy [];
+                res
+            };
+
+            for uid in toClose {
+                if let Ok ((dmut act, dmut win)) = alias self._running [uid] {
+                    act:.onClose ();
+                    act:.dispose ();
+                    win:.dispose ();
+
+                    // No need for atomic, this is only called in run iteration
+                    self._running:.remove (uid);
+                }
+            }
+
+            // Quit when no activity are left
+            if self._running.len == 0us {
+                self:.quit ();
+            }
         }
     }
 
@@ -204,7 +273,6 @@ pub class Application {
      * ======================================================================================================
      */
 
-
     /**
      * @returns: the input manager of the current activity
      */
@@ -217,49 +285,6 @@ pub class Application {
      */
     pub fn getInputManager (self) -> &InputManager {
         self._input
-    }
-
-    /**
-     * @returns: the drawer used to draw basic shapes on the final composition pass of the window
-     * */
-    pub fn getShapeDrawer (mut self)-> dmut &ShapeDrawer {
-        if let Ok (dmut w) = alias self._drawer {
-            return alias w;
-        }
-
-        panic;
-    }
-
-    /**
-     * @returns: the drawer used to draw basic shapes on the final composition pass of the window
-     * */
-    pub fn getShapeDrawer (self)-> &ShapeDrawer {
-        if let Ok (w) = self._drawer {
-            return w;
-        }
-
-        panic;
-    }
-
-    /**
-     * @returns: the window of the application
-     */
-    pub fn getWindow (mut self)-> dmut &Window {
-        alias self._window
-    }
-
-    /**
-     * @returns: the window of the application
-     */
-    pub fn getWindow (self)-> &Window {
-        self._window
-    }
-
-    /**
-     * @returns: the configuration of the application
-     * */
-    pub fn getConfiguration (self)-> &BalderConfig {
-        self._cfg
     }
 
     /*!
@@ -296,19 +321,19 @@ pub class Application {
     
     impl Disposable {
         pub over dispose (mut self) {
-            self._window:.killRendering ();
-
-            if let Ok (dmut act) = alias self._activity {
-                act:.dispose ();
-                self._activity = none;
+            for _, dmut w in alias self._opened {
+                w._0:.dispose ();
+                w._1:.dispose ();
             }
 
-            if let Ok (dmut d) = alias self._drawer {
-                d:.dispose ();
-                self._drawer = none;
+            for _, dmut w in alias self._running {
+                w._0:.dispose ();
+                w._1:.dispose ();
             }
 
-            self._window:.dispose ();
+            self._opened = copy [];
+            self._running = copy [];
+            self._closed = copy [];
         }        
     }
 
