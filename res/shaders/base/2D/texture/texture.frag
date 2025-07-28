@@ -23,5 +23,5 @@ void main () {
     if (gl_FragCoord.y < world.scissors.y || gl_FragCoord.y > world.scissors.w) { discard; }
 
     vec4 texColor = texture (diffuse, a_uv);
-    out_color = vec4 (texColor.xyz * world.color.xyz, texColor.w );
+    out_color = texColor * world.color;
 }
