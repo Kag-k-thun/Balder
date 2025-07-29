@@ -1,6 +1,12 @@
 in raster;
 
-use balder::core::{_, config::_, shader::_, driver::_};
+use balder::core::{_,
+                   application::_,
+                   config::_,
+                   shader::_,
+                   driver::_};
+
+use balder::utils::_;
 use balder::math::vector;
 
 use ::vulkan::core;
@@ -20,21 +26,46 @@ pub class RasterShader over Shader {
      * ======================================================================================================
      */
 
-    /**
-     * @params:
-     *    - device: the device used to allocate the shader
-     *    - config: the shader configuration to generate
-     *    - renderPass: the render pass to associate to the shader (for subpasses), null means composition pass of the window
-     *    - dimension: the dimension of the viewport of the pipeline (0, 0) means dimension of the composition pass of the window
+    pub self (dmut device : &VulkanDevice)
+        with super (alias device)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CONFIGURE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-    pub self (dmut device : &VulkanDevice, config : &ShaderConfig, renderPass : VkRenderPass = null, dimension : (u32, u32) = (0, 0))
-        with super (alias device, config)
+
+    /**
+     * Configure the shader from a toml file
+     * */
+    pub fn configure (mut self, file : [c8])
         throws BalderError
     {
-        let dmut stages = copy [VkPipelineShaderStageCreateInfo () ; self._config.getPasses ().len];
-        let mut modules : [mut VkShaderModule] = copy [null ; self._config.getPasses ().len];
+        let cfg = copy ShaderConfig (file);
+        self:.configure (file, cfg, null, 0u32, 0u32)
+    }
+
+    /**
+     * Configure the shader from a preloaded configuration
+     * */
+    pub fn configure (mut self, name : [c8], cfg : &ShaderConfig, renderPass : VkRenderPass, w : u32, h : u32)
+        throws BalderError
+    {
+        log::debug #("RasterShader", "Configure shader from", name);
+        self:.dispose ();
+
+        self._uniformInfos = (cfg.getUniforms ())?;
+        self._textureInfos = (cfg.getTextures ())?;
+
+        self._pipelineLayout:.configure (cfg);
+
+        let dmut stages = copy [VkPipelineShaderStageCreateInfo () ; cfg.getPasses ().len];
+        let mut modules : [mut VkShaderModule] = copy [null ; cfg.getPasses ().len];
         {
-            for i, p in self._config.getPasses () {
+            for i, p in cfg.getPasses () {
                 let stageContent = self.readFile (balder::utils::path::projectPath (p.shaderFile));
                 modules [i] = self:.createShaderModule (stageContent);
 
@@ -50,17 +81,22 @@ pub class RasterShader over Shader {
                 throw copy BalderError ("Cannot create shader with no stages");
             }
 
-            let pass = if (renderPass == null) { self._device.getRenderPass () } else { renderPass };
-            let extent = if (dimension._0 == 0 || dimension._1 == 0) {
+            let pass = if renderPass != null {
+                renderPass
+            } else {
+                self._device.getRenderPass ()
+            };
+
+            let extent = if (w == 0 || h == 0) {
                 self._device.getSwapchainExtent ()
             } else {
                 let mut ext = VkExtent2D ();
-                ext.width = dimension._0;
-                ext.height = dimension._1;
+                ext.width = w;
+                ext.height = h;
                 ext
             };
 
-            self._program = self:.createPipeline (stages, pass, extent, forSubPass-> (renderPass != null));
+            self._program = self:.createPipeline (cfg, stages, pass, extent, forSubPass-> (renderPass != null));
 
         } exit {
             for z in modules {
@@ -116,10 +152,15 @@ pub class RasterShader over Shader {
     /**
      * Create the pipeline of the shader
      */
-    fn createPipeline (mut self, stages : [VkPipelineShaderStageCreateInfo], renderPass : VkRenderPass, extent : VkExtent2D, forSubPass : bool)-> dmut VkPipeline
+    fn createPipeline (mut self,
+                       cfg : &ShaderConfig,
+                       stages : [VkPipelineShaderStageCreateInfo],
+                       renderPass : VkRenderPass,
+                       extent : VkExtent2D,
+                       forSubPass : bool)-> dmut VkPipeline
         throws BalderError
     {
-        let (attrDescr, bindDescr) = self.createAttributeDescription ();
+        let (attrDescr, bindDescr) = self.createAttributeDescription (cfg);
 
         let mut vertexInputInfo = VkPipelineVertexInputStateCreateInfo ();
         vertexInputInfo.sType                           = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -186,7 +227,7 @@ pub class RasterShader over Shader {
 
         let mut depthStencil = VkPipelineDepthStencilStateCreateInfo ();
         depthStencil.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        if self._config.depth {
+        if cfg.depth {
             depthStencil.depthTestEnable = VK_TRUE;
             depthStencil.depthWriteEnable = VK_TRUE;
             depthStencil.depthCompareOp = VkCompareOp::VK_COMPARE_OP_LESS;
@@ -201,18 +242,18 @@ pub class RasterShader over Shader {
                                                               VkColorComponentFlagBits::VK_COLOR_COMPONENT_G_BIT |
                                                               VkColorComponentFlagBits::VK_COLOR_COMPONENT_B_BIT |
                                                               VkColorComponentFlagBits::VK_COLOR_COMPONENT_A_BIT);
-        if self._config.hasBlend () {
+        if cfg.hasBlend () {
             colorBlendAttachement.blendEnable         = VK_TRUE;
         } else {
             colorBlendAttachement.blendEnable         = VK_FALSE;
         }
 
-        colorBlendAttachement.srcColorBlendFactor = self._config.blend.srcColorBlendFactor;
-        colorBlendAttachement.dstColorBlendFactor = self._config.blend.dstColorBlendFactor;
-        colorBlendAttachement.srcAlphaBlendFactor = self._config.blend.srcAlphaBlendFactor;
-        colorBlendAttachement.dstAlphaBlendFactor = self._config.blend.dstAlphaBlendFactor;
-        colorBlendAttachement.colorBlendOp        = self._config.blend.colorBlendOp;
-        colorBlendAttachement.alphaBlendOp        = self._config.blend.alphaBlendOp;
+        colorBlendAttachement.srcColorBlendFactor = cfg.blend.srcColorBlendFactor;
+        colorBlendAttachement.dstColorBlendFactor = cfg.blend.dstColorBlendFactor;
+        colorBlendAttachement.srcAlphaBlendFactor = cfg.blend.srcAlphaBlendFactor;
+        colorBlendAttachement.dstAlphaBlendFactor = cfg.blend.dstAlphaBlendFactor;
+        colorBlendAttachement.colorBlendOp        = cfg.blend.colorBlendOp;
+        colorBlendAttachement.alphaBlendOp        = cfg.blend.alphaBlendOp;
 
         let mut colorBlending = VkPipelineColorBlendStateCreateInfo ();
         colorBlending.sType           = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -250,8 +291,8 @@ pub class RasterShader over Shader {
     /**
      * Create the vertex description of the input vertex type of the shader
      */
-    fn createAttributeDescription (self)-> ([VkVertexInputAttributeDescription], VkVertexInputBindingDescription) {
-        let (infos, stride) = self.generateFieldInfos ();
+    fn createAttributeDescription (self, cfg : &ShaderConfig)-> ([VkVertexInputAttributeDescription], VkVertexInputBindingDescription) {
+        let (infos, stride) = self.generateFieldInfos (cfg);
         let dmut res = copy [VkVertexInputAttributeDescription () ; infos.len];
 
         for i in 0us .. infos.len {
@@ -280,11 +321,11 @@ pub class RasterShader over Shader {
      * ====================================================================================================
      */
 
-    fn generateFieldInfos (self)-> ([(u32, VkFormat)], u32) {
+    fn generateFieldInfos (self, cfg : &ShaderConfig)-> ([(u32, VkFormat)], u32) {
         let dmut result : [(u32, VkFormat)] = [];
         let mut currOffset = 0u32;
         for entry in VertexEntry::__members__ {
-            let (format, size) = self._config.vertexEntry (entry);
+            let (format, size) = cfg.vertexEntry (entry);
             if size != 0 {
                 result ~= [(currOffset, format)];
                 currOffset += size;
@@ -309,6 +350,9 @@ pub class RasterShader over Shader {
                 vkDestroyPipeline (self._device.getDeviceHandle (), self._program, null);
                 self._program = null;
             }
+
+            self._uniformInfos = none;
+            self._textureInfos = none;
         }
     }
 

@@ -1,0 +1,313 @@
+in refcount;
+
+use std::fs::path;
+
+use balder::core::application::_;
+
+use balder::core::_;
+use balder::core::driver::_;
+use balder::utils::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===============================          REFERENCE COUNTING          ===============================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+@abstract
+pub class IResourceReference {
+
+    pub let mut uid : usize;
+    let dmut _loader : &IResourceLoader;
+
+    pub self (uid : usize, dmut loader : &IResourceLoader)
+        with _loader = alias loader
+        , uid = uid
+    {
+        if self.uid != 0 {
+            self._loader:.register (self.uid);
+        }
+    }
+
+    pub fn clone (mut self)-> &IResourceReference;
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            if self.uid != 0 {
+                self._loader:.release (self.uid);
+                self.uid = 0;
+            }
+        }
+    }
+
+}
+
+@{final}
+pub class RefCount {T} over IResourceReference {
+    pub self (uid : usize, dmut loader : &ResourceLoader!{T})
+        with super (uid, alias loader)
+    {}
+
+    pub over clone (mut self)-> &(RefCount!{T}) {
+        if let dmut rsc : &ResourceLoader!{T} = alias self._loader {
+            return copy RefCount!{T} (self.uid, alias rsc);
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: the resource referenced by this counter
+     * @throws: if the resource is empty
+     * */
+    pub fn get (mut self)-> dmut T
+        throws BalderError
+    {
+        if let dmut rsc : &ResourceLoader!{T} = alias self._loader {
+            return rsc:.get (self.uid);
+        }
+
+        panic;
+    }
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =============================          LOADER IMPLEMENTATIONS          =============================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+
+@abstract
+pub class IResourceLoader {
+    let dmut _lastUniqId : usize = 0;
+    let dmut _window : &Window;
+
+    let dmut _counts : [usize => usize] = copy [];
+
+    pub self (dmut win : &Window)
+        with _window = alias win
+    {}
+
+    @{final}
+    pub fn register (mut self, uid : usize) {
+        if uid == 0 { return; } // empty reference
+
+        if let Ok (c) = self._counts [uid] {
+            self._counts [uid] = c + 1;
+        } else {
+            self._counts [uid] = 1;
+        }
+    }
+
+    @{final}
+    pub fn release (mut self, uid : usize) {
+        if uid == 0 { return; } // empty reference
+
+        if let Ok (c) = self._counts [uid] {
+            if c == 1 {
+                self._counts:.remove (uid);
+                self:.clean (uid);
+            } else {
+                self._counts [uid] = c - 1;
+            }
+
+        } else {
+            log::error #("ResourceLoader", "Release an undefined resource : ", self.__typeinfo__.name);
+        }
+    }
+
+    /**
+     * Remove a loaded resource from memory
+     * */
+    fn clean (mut self, uid : usize);
+}
+
+@{final}
+pub class ResourceLoader {T impl Disposable} over IResourceLoader {
+
+    let dmut _empty : (&RefCount!{T})? = none;
+
+    let dmut _object : [usize => T] = copy [];
+    let dmut _names : [[c8] => usize] = copy [];
+    let mut _invNames : [usize => mut [c8]] = copy [];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut win : &Window)
+        with super (alias win)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          EMPTY          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create an empty reference
+     * */
+    pub fn empty (mut self)-> dmut &(RefCount!{T}) {
+        if let Ok (dmut e) = alias self._empty {
+            return alias e;
+        }
+
+        let dmut e = copy RefCount!{T} (0, alias self);
+        self._empty = (alias e)?;
+
+        alias e
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          LOADING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load a resource from a file
+     * */
+    pub fn load (mut self, resName : [c8])-> dmut &(RefCount!{T})
+        throws BalderError
+    {
+        if let Ok (uid) = self._names [resName] {
+            return copy RefCount!{T} (uid, alias self);
+        }
+
+        self._lastUniqId += 1;
+
+        let dmut result = copy T (alias self._window:.getVulkanDevice ());
+        result:.configure (resName);
+
+        self._object [self._lastUniqId] = alias result;
+        self._names [resName] = self._lastUniqId;
+        self._invNames [self._lastUniqId] = resName;
+
+        copy RefCount!{T} (self._lastUniqId, alias self)
+    }
+
+    /**
+     * Load a resource from a file with extra ctor parameters
+     * */
+    pub fn load {P...} (mut self, resName : [c8], params : P)-> dmut &(RefCount!{T})
+        throws BalderError
+    {
+        if let Ok (uid) = self._names [resName] {
+            return copy RefCount!{T} (uid, alias self);
+        }
+
+        self._lastUniqId += 1;
+
+        let dmut result = copy T (alias self._window:.getVulkanDevice ());
+        result:.configure (resName, expand params);
+
+        self._object [self._lastUniqId] = alias result;
+        self._names [resName] = self._lastUniqId;
+        self._invNames [self._lastUniqId] = resName;
+
+        copy RefCount!{T} (self._lastUniqId, alias self)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          ACCESS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Get a loaded value
+     * */
+    pub fn get (mut self, uid : usize)-> dmut T
+        throws BalderError
+    {
+        if let Ok (dmut x) = alias self._object [uid] {
+            return alias x;
+        }
+
+        throw copy BalderError ("Empty resource");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CLEANING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    over clean (mut self, uid : usize) {
+        if let Ok (dmut x) = alias self._object [uid] {
+            self._window:.insertBin (alias x);
+            self._object:.remove (uid);
+
+            if let Ok (n) = self._invNames [uid] {
+                self._names:.remove (n);
+                self._invNames:.remove (uid);
+            }
+        }
+    }
+
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =================================          GLOBAL MANAGER          =================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+@final
+pub class ResourceManager {
+
+    let dmut _window : &Window;
+    let dmut _manager : [[c8] => &IResourceLoader] = copy [];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut window : &Window)
+        with _window = alias window
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          REGISTRATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub fn get {T over &IResourceLoader} (mut self)-> dmut T {
+        if let Ok (dmut x : T) = self._manager [T::__typeinfo__.name] {
+            return alias x;
+        }
+
+        let dmut result = copy T (alias self._window);
+        self._manager [T::__typeinfo__.name] = alias result;
+
+        alias result
+    }
+
+}

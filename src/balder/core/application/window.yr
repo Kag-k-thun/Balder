@@ -53,6 +53,9 @@ pub class Window {
     // The garbage bin used for cleaning
     prot let dmut _bin : &GarbageBin = copy GarbageBin ();
 
+    // The resource manager to load resource from files
+    prot let dmut _loader : (&ResourceManager)? = none;
+
     // Mutex locked when starting/killing rendering thread
     let dmut _startStopMutex = copy Mutex ();
 
@@ -66,6 +69,9 @@ pub class Window {
 
     // The thread running the rendering loop
     prot let dmut _renderingTh : (future-> void)? = none;
+
+    // Set to true when the window is displayed the first time
+    pub let mut _started = false;
 
     // Set to true when the frames have to be redrawn
     prot let mut _redrawing = false;
@@ -179,7 +185,7 @@ pub class Window {
         }
         
         self._vkDevice:.configure (alias self, cfg);
-        SDL_HideWindow (alias self._sdlWindow);
+        self:.hide ();
 
         if cfg.timer.interactive {
             self._interactive = true;
@@ -207,7 +213,6 @@ pub class Window {
 
         input:.connectResize (&self:.onResize);
         input:.connectExpose (&self:.onExpose);
-        input:.connectHideShow (&self:.onHideShow);
     }
 
     /**
@@ -259,17 +264,6 @@ pub class Window {
      * */
     pub fn onExpose (mut self) {
         self:.forceFrame ();
-    }
-
-    /**
-     * Slot called when the window is minimized
-     * */
-    pub fn onHideShow (mut self, b : bool) {
-        if b {
-            self:.startRendering ();
-        } else {
-            self:.killRendering ();
-        }
     }
 
     /**
@@ -347,6 +341,73 @@ pub class Window {
     }
 
     /**
+     * Load a resource from a file
+     * @params:
+     *    - path: the path of the file to load (project path are accepted)
+     * */
+    pub fn loadResource {T} (mut self, path : [c8])-> dmut &(RefCount!{T})
+        throws BalderError
+    {
+        if let Ok (dmut ld) = alias self._loader {
+            let dmut loader = ld:.get!{&ResourceLoader!{T}} ();
+            return loader:.load (path);
+        } else {
+            let dmut ld = copy ResourceManager (alias self);
+
+            let dmut loader = ld:.get!{&ResourceLoader!{T}} ();
+            let dmut ret = alias loader:.load (path);
+
+            self._loader = (alias ld)?;
+
+            alias ret
+        }
+    }
+
+    /**
+     * Load a resource from a file
+     * @params:
+     *    - path: the path of the file to load (project path are accepted)
+     * */
+    pub fn loadResource {T, P...} (mut self, path : [c8], params : P)-> dmut &(RefCount!{T})
+        throws BalderError
+    {
+        if let Ok (dmut ld) = alias self._loader {
+            let dmut loader = ld:.get!{&ResourceLoader!{T}} ();
+            return loader:.load (path, expand params);
+        } else {
+            let dmut ld = copy ResourceManager (alias self);
+
+            let dmut loader = ld:.get!{&ResourceLoader!{T}} ();
+            let dmut ret = alias loader:.load (path, expand params);
+
+            self._loader = (alias ld)?;
+
+            alias ret
+        }
+    }
+
+    /**
+     * Load a resource from a file
+     * @params:
+     *    - path: the path of the file to load (project path are accepted)
+     * */
+    pub fn emptyResource {T} (mut self)-> dmut &(RefCount!{T}) {
+        if let Ok (dmut ld) = alias self._loader {
+            let dmut loader = ld:.get!{&ResourceLoader!{T}} ();
+            return loader:.empty ();
+        } else {
+            let dmut ld = copy ResourceManager (alias self);
+
+            let dmut loader = ld:.get!{&ResourceLoader!{T}} ();
+            let dmut ret = loader:.empty ();
+
+            self._loader = (alias ld)?;
+
+            alias ret
+        }
+    }
+
+    /**
      * @returns: the number of subpasses in the window
      * */
     pub fn getNbSubpass (mut self)-> usize {
@@ -393,6 +454,12 @@ pub class Window {
     pub fn show (mut self) {
         if (self._sdlWindow != null) {
             SDL_ShowWindow (alias self._sdlWindow);
+
+            if !self._renderingTh.hasValue {
+                self:.startRendering ();
+            }
+
+            self._started = true;
         }
     }
 
@@ -402,6 +469,10 @@ pub class Window {
     pub fn hide (mut self) {
         if (self._sdlWindow != null) {
             SDL_HideWindow (alias self._sdlWindow);
+
+            if self._renderingTh.hasValue {
+                self:.killRendering ();
+            }
         }
     }
 
@@ -423,6 +494,8 @@ pub class Window {
                 self._isRunning = true;
                 self._renderingTh = (spawn self:.renderingThread ())?;
             }
+
+            log::debug #("Window", "Thread launched");
         } exit {
             self._startStopMutex:.unlock ();
         }
@@ -433,14 +506,6 @@ pub class Window {
      * */
     fn killRendering (mut self) {
         {
-            __version DEBUG {
-                if let Ok (t) = self._renderingTh {
-                    if etc::runtime::threads::_yrt_thread_self_id () == t.tid {
-                        log::error #("Window", "Killing rendering thread within itself!!");
-                    }
-                }
-            }
-
             self._startStopMutex:.lock ();
             self._isRunning = false;
             self:.forceFrame ();
@@ -838,7 +903,8 @@ pub class Window {
                 self._vkDevice:.recreateSwapchain ();
             } catch {
                 err => {
-                    log::error #("Fail swap chain recreation : ", err);
+                    log::error #("Window", "Fail swap chain recreation : ", err);
+                    return;
                 }
             }
 
@@ -848,7 +914,6 @@ pub class Window {
                 let image = self:.startPass ();
                 if image >= 0 {
                     if !redrawn [image] {
-                        log::debug #("Window", "Redraw frame : ", image);
                         self._vkDevice:.clearCommandBuffer ();
 
                         self._vkDevice.startRecording ();
