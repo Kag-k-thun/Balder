@@ -1,20 +1,67 @@
 in activity;
 
 use balder::core::{application,
-                   application::window,
+                   application::{window, timer, signal},
                    dispose};
 
+use ::core::concurrency::sync::{mutex, semaphore};
+use balder::interface;
+
+use std::io;
 use std::time::_;
 
 /**
  * Ancestor of all activities in an application
- */
+ * An activity is running its own window and input manager in a separated thread
+ *
+ * Signals emitted by other activities are put in the activity mailbox and
+ * executed during activity iteration in its own separated thread
+ * @example:
+ * ```
+ * // Simple activity doing nothing but waiting for the Window closing signal
+ * class MyActivity over Activity {
+ *     pub self (uid : usize, dmut app : &Application, dmut win : &Window)
+ *         with super (uid, alias app, alias win)
+ *     {}
+ *
+ *     over onStart (mut self) {
+ *          self:.input:.quit ():.connect (self:.box, &self:.onQuit);
+ *     }
+ *
+ *     fn onQuit (mut self) {
+ *        log::info #("MyActivity", "Closing activity");
+ *        self:.close ();
+ *     }
+ * }
+ *
+ *
+ * fn main ()
+ *    throws BalderError
+ * {
+ *    let dmut app = copy Application ();
+ *    app:.open!{&MyActivity} ("res:/config/MyActivity.toml");
+ *
+ *    app:.run ();
+ * }
+ * ```
+ * */
 @abstract
 pub class Activity {
 
     pub let uid : usize;
-    let dmut _app : &Application;
-    let dmut _window : &Window;
+
+    prv { // accessible by fields
+        let dmut _app : &Application;
+        let dmut _window : &Window;
+        let dmut _widgetManager : (&WidgetManager)? = none;
+        let dmut _box : (&SlotEmitter)? = none;
+        let dmut _running = false;
+    }
+
+    prv { // Thread management, not accessible in children classes
+        let mut _th : (future-> void)? = none;
+        let dmut _sem : &Semaphore = copy Semaphore ();
+    }
 
     /*!
      * ====================================================================================================
@@ -24,6 +71,12 @@ pub class Activity {
      * ====================================================================================================
      */
 
+    /**
+     * @params:
+     *    - uid: the uniq id of the activity
+     *    - app: the main application
+     *    - window: the window used to display the activity
+     * */
     pub self (uid : usize, dmut app : &Application, dmut window : &Window)
         with uid = uid
         , _app = alias app
@@ -39,21 +92,115 @@ pub class Activity {
      */
 
     /**
+     * Method called by the application upon activity starting
+     * */
+    @{final}
+    pub fn start (mut self) {
+        if self._th.hasValue {
+            self:.close ();
+        }
+
+        atomic self {
+            self._running = true;
+            self:.onStart ();
+
+            self._th = (spawn self:.workerThread ())?;
+        }
+    }
+
+    /**
      * Method called by the application when the activity is created for the first time
      */
-    pub fn onStart (mut self)-> void {}
+    prot fn onStart (mut self)-> void {}
+
+
+    /**
+     * Method called by application at each UI iteration
+     * */
+    @{final}
+    pub fn iterate (mut self)-> void {
+        self._sem:.post ();
+    }
 
     /**
      * Method called by the application each frame (before rendering)
      */
-    pub fn onUpdate (mut self, delta : Duration)-> void {
+    prot fn onUpdate (mut self, delta : Duration)-> void {
         delta;
+    }
+
+    /**
+     * Method called by the application uppon activity closing
+     * */
+    @{final}
+    pub fn close (mut self) {
+        let toWait = atomic self {
+            if self._running {
+                self._running = false;
+                self._app:.close (alias self);
+
+                self:.onClose ();
+                if let Ok (dmut w) = alias self._widgetManager {
+                    w:.dispose ();
+                }
+
+                self._sem:.post ();
+
+                let toWait = self._th;
+                self._th = none;
+
+                toWait
+            } else {
+                none
+            }
+        };
+
+        if let Ok (t) = toWait {
+            t.value;
+        }
     }
 
     /**
      * Method called by the application when the activity is closed
      * */
-    pub fn onClose (mut self) {}
+    prot fn onClose (mut self) {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SPAWN          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Thread function of the activity
+     * */
+    fn workerThread (mut self) {
+        let dmut stepTimer = Timer ();
+        loop {
+            if self._sem:.wait () {
+                if !self._window:.getInputManager ().isFreezed () {
+
+                    let delta = stepTimer.timeSinceStart ();
+                    atomic self {
+                        if let Ok (dmut w) = alias self._widgetManager {
+                            w:.onTick (delta);
+                        }
+
+                        if let Ok (dmut b) = alias self._box {
+                            b:.emit ();
+                        }
+
+                        self:.onUpdate (delta);
+                    }
+                }
+            }
+
+            if !self._running { break; }
+            stepTimer:.reset ();
+        }
+    }
 
     /*!
      * ====================================================================================================
@@ -63,10 +210,75 @@ pub class Activity {
      * ====================================================================================================
      */
 
-    @field
+    /**
+     * @returns: the input manager connected to the activity
+     * */
+    @{field}
     prot fn input (mut self)-> dmut &application::input::WindowInputSignals {
         alias self._window:.getInputManager ()
     }
+
+    /**
+     * @returns: the application context of the activity
+     * */
+    @{field}
+    prot fn app (mut self)-> dmut &Application {
+        alias self._app
+    }
+
+    /**
+     * @returns: the window displayed by the activity
+     * */
+    @{field}
+    prot fn window (mut self)-> dmut &Window {
+        alias self._window
+    }
+
+    /**
+     * @returns: the widget manager of the window
+     * */
+    @{field}
+    prot fn gui (mut self)-> dmut &WidgetManager {
+        if let Ok (dmut t) = alias self._widgetManager {
+            return alias t;
+        }
+
+        let dmut ret = copy WidgetManager (alias self._window);
+        self._widgetManager = (alias ret)?;
+
+        alias ret
+    }
+
+    /**
+     * @returns: the slot emitter executed in the thread of the activity
+     * */
+    @{field}
+    prot fn box (mut self)-> dmut &SlotEmitter {
+        if let Ok (dmut b) = alias self._box {
+            return alias b;
+        }
+
+        let dmut b = copy SlotEmitter ();
+        self._box = (alias b)?;
+
+        alias b
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the slot emitter executed in the thread of the activity
+     * */
+    pub fn getSlotEmitter (mut self)-> dmut &SlotEmitter {
+        self:.box
+    }
+
 
     /*!
      * ====================================================================================================
