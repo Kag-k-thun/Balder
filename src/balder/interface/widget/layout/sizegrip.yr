@@ -15,14 +15,473 @@ use balder::interface::widget::layout::linear;
 use ::sdl2::mouse;
 use ::sdl2::events;
 
-pub class SizeGrip over Widget {
 
-    let dmut _parent : &LinearLayout;
+record Child {
+    pub let dmut widget : &Widget;
+    pub let dmut relPos : vec2;
+    pub let dmut relSize : vec2;
+    pub let dmut level : u32;
+    pub let dmut size : WidgetSize;
 
-    // The index of the sizegrip in the parent layout
-    // Resizing (index - 1) and (index + 1) widgets
-    let mut _index : u32;
+    pub self (dmut widget : &Widget, relPos : vec2 = vec2 (), relSize : vec2 = vec2 (), level : u32 = 0, size : WidgetSize = WidgetSize (relative-> 0.5))
+        with widget = alias widget
+        , relPos = relPos
+        , relSize = relSize
+        , level = level
+        , size = size
+    {}
+}
+
+pub class SizeGripLayout over Widget {
+
+    let dmut _childs : [Child ; 2];
+
+    let mut _vertical : bool;
 
 
+    prot { // Shapes
+
+        // The shape displaying the grip
+        let dmut _sizeGripShape : (&Shape)? = none;
+
+        // The relative size of the grip
+        let dmut _relGripSize : vec2 = vec2 ();
+
+        // The relative position of the grip
+        let dmut _relGripPos : vec2 = vec2 ();
+
+        // The relative size and position of the bounding box of the grip (larger than displayed size)
+        let dmut _relGripBoxPos : vec2 = vec2 ();
+        let dmut _relGripBoxSize : vec2 = vec2 ();
+
+    }
+
+    prot {
+
+        // The size of the left widget from the grip
+        let dmut _default : [(WidgetSize, vec2) ; 2] = [(WidgetSize (), vec2 ()) ; 2];
+
+        // The mouse position start when sliding event starts in pixels
+        let mut _slideStart : vec2 = vec2 ();
+
+    }
+
+    prot { // mouse events
+
+        // The widget that was hovered the last (to send onHoverEnd)
+        let dmut _lastHover : (&Widget)? = none;
+
+        // Set to true iif the cursor if over the grip
+        let mut _lastHoverGrip : bool = false;
+
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+    pub self (dmut manager : &WidgetManager, name : [c8], dmut left : &Widget, dmut right : &Widget, vertical : bool)
+        with super (alias manager, name, WidgetKeys::SIZE_GRIP)
+        , _childs = [Child (alias left), Child (alias right)]
+        , _vertical = vertical
+    {
+        if self._vertical && left.getStyle ().hasWidth () {
+            self._childs [0].size = left.getStyle ().getWidth ();
+        }
+
+        if !self._vertical && left.getStyle ().hasHeight () {
+            self._childs [0].size = left.getStyle ().getHeight ();
+        }
+
+        if self._vertical && right.getStyle ().hasWidth () {
+            self._childs [1].size = right.getStyle ().getWidth ();
+        }
+
+        if !self._vertical && right.getStyle ().hasHeight () {
+            self._childs [1].size = right.getStyle ().getHeight ();
+        }
+
+        // Normalization of the sizes to keep the sum = 1
+        let relL = self._childs [0].size.relative;
+        let relR = self._childs [1].size.relative;
+
+        self._childs [0].size = WidgetSize (relative-> relL / (relL + relR));
+        self._childs [1].size = WidgetSize (relative-> 1.f - (relL / (relL + relR)));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          ATTACH/DETACH          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onAttach (mut self) {
+        self._attached = true;
+        self._childs [0].widget:.onAttach ();
+        self._childs [1].widget:.onAttach ();
+
+        let dmut shDr = self._manager:.getShapeDrawer ();
+        {
+            let dmut shape = shDr:.registerColorQuad ();
+            shape:.setRadius (self.getStyle ().getSubStyle ("grip").radius._1);
+
+            self._sizeGripShape = (alias shape)?;
+        } catch {
+            err => {
+                log::error #("SizeGrip", "Failed to construct shapes : ", err);
+            }
+        }
+    }
+
+    pub over onDetach (mut self) {
+        self._attached = false;
+        self._childs [0].widget:.onDetach ();
+        self._childs [1].widget:.onDetach ();
+
+        self:.dispose ();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    over onUpdateSize (mut self) {
+        let mut current = 0.f;
+
+        let gripStyle = self.getStyle ().getSubStyle ("grip");
+        let gripBoxStyle = self.getStyle ().getSubStyle ("bbox");
+
+        let (maxS, gripSize, gripBoxSize) = if self._vertical {
+            (self._absoluteSize.x, gripStyle.getWidth (), gripBoxStyle.getWidth ())
+        } else {
+            (self._absoluteSize.y, gripStyle.getHeight (), gripBoxStyle.getHeight ())
+        };
+
+        self._relGripSize = if self._vertical { makeVec2 (self.clampSize (gripSize, maxS), 1.f) } else { makeVec2 (1.f, self.clampSize (gripSize, maxS)) };
+        self._relGripBoxSize = if self._vertical { makeVec2 (self.clampSize (gripBoxSize, maxS), 1.f) } else { makeVec2 (1.f, self.clampSize (gripBoxSize, maxS)) };
+
+        for i in 0 .. self._childs.len {
+            let (wpos, wsize) = if self._vertical {
+                let relColumnSize = self.clampSize (self._childs [i].size, self._absoluteSize.x) - (self._relGripSize.x / 2.f);
+                let wpos = makeVec2 (current, 0.f) * self._absoluteSize + self._absolutePosition;
+                let wsize = makeVec2 (relColumnSize, 1.f) * self._absoluteSize;
+
+                current  += relColumnSize + self._relGripSize.x;
+                (wpos, wsize)
+            } else {
+                let relColumnSize = self.clampSize (self._childs [i].size, self._absoluteSize.y) - (self._relGripSize.y / 2.f);
+                let wpos =  makeVec2 (0.f, current) * self._absoluteSize + self._absolutePosition;
+                let wsize = makeVec2 (1.f, relColumnSize) * self._absoluteSize;
+
+                current  += relColumnSize + self._relGripSize.y;
+                (wpos, wsize)
+            };
+
+            self._childs [i].widget:.setSize (wpos, wsize, self._depth + 1);
+
+            let sciPos = makeVec2 (max (wpos.x, self._scissorPos.x),
+                                   max (wpos.y, self._scissorPos.y));
+
+            let sciEnd = makeVec2 (min (wpos.x + wsize.x, self._scissorPos.x + self._scissorSize.x),
+                                   min (wpos.y + wsize.y, self._scissorPos.y + self._scissorSize.y));
+
+            self._childs [i].widget:.setScissors (sciPos, sciEnd - sciPos);
+
+            self._childs [i].relPos = (wpos - self._absolutePosition) / self._absoluteSize;
+            self._childs [i].relSize = wsize / self._absoluteSize;
+        }
+
+        let shift = if self._vertical {
+            (makeVec2 (self._childs [0].relSize.x, 0.f),
+             makeVec2 (self._childs [0].relSize.x + (self._relGripSize.x/2.f) - (self._relGripBoxSize.x/2.f), 0.f))
+        } else {
+            (makeVec2 (0.f, self._childs [0].relSize.y),
+             makeVec2 (0.f, self._childs [0].relSize.y + (self._relGripSize.y/2.f) - (self._relGripBoxSize.y/2.f)))
+        };
+
+        self._relGripPos = self._childs [0].relPos + shift._0;
+        self._relGripBoxPos = self._childs [0].relPos + shift._1;
+
+        if let Ok (dmut s) = alias self._sizeGripShape {
+            s:.setPosition (self._relGripPos * self._absoluteSize);
+            s:.setSize (self._relGripSize * self._absoluteSize);
+            s:.setLevel (self.getMaxDepth ());
+            s:.show ();
+        }
+
+    }
+
+    over onUpdateScissors (mut self) {
+        for dmut i in alias self._childs {
+            let wpos = (i.relPos * self._absoluteSize) + self._absolutePosition;
+            let wsize = (i.relSize * self._absoluteSize);
+
+            let sciPos = makeVec2 (max (wpos.x, self._scissorPos.x),
+                                   max (wpos.y, self._scissorPos.y));
+
+            let sciEnd = makeVec2 (min (wpos.x + wsize.x, self._scissorPos.x + self._scissorSize.x),
+                                   min (wpos.y + wsize.y, self._scissorPos.y + self._scissorSize.y));
+
+            i.widget:.setScissors (sciPos, sciEnd - sciPos);
+        }
+    }
+
+    over onHide (mut self) {
+        for dmut i in alias self._childs {
+            i.widget:.hide ();
+        }
+
+        if let Ok (dmut s) = alias self._sizeGripShape {
+            s:.hide ();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over getMaxDepth (self)-> u32 {
+        let mut max = self._depth;
+        for i in self._childs {
+            let chD = i.widget.getMaxDepth ();
+            if chD > max { max = chD; }
+        }
+
+        max + 1
+    }
+
+    /**
+     * @returns: true iif the widgets in the layout are rendered left to right (up to bottom otherwise)
+     * */
+    pub fn isVertical (self)-> bool {
+        self._vertical
+    }
+
+    pub over find (mut self, names : [[c8]])-> dmut (&Widget)? {
+        if names.len == 0 { return none; }
+
+        for dmut c in alias self._childs {
+            if c.widget.name == names [0] {
+                if names.len == 1 { return (alias c.widget)?; }
+                else return c.widget:.find (names [1 .. $]);
+            }
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TICK EVENTS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Propagate the tick events to childrens
+     * */
+    pub over onTick (mut self, delta : Duration) {
+        for dmut c in alias self._childs {
+            c.widget:.onTick (delta);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onHover (mut self, pos : vec2)-> dmut (&Widget)? {
+        if self.mouseOnGrip (pos) {
+            if let Ok (dmut w) = alias self._lastHover {
+                w:.onLoseHoverFocus ();
+                self._lastHover = none;
+            }
+
+            self:.setHover (true);
+            if self._vertical {
+                self._manager:.getCursorManager ():.setCursor (SDL_SystemCursor::SDL_SYSTEM_CURSOR_SIZEWE);
+            } else {
+                self._manager:.getCursorManager ():.setCursor (SDL_SystemCursor::SDL_SYSTEM_CURSOR_SIZENS);
+            }
+
+            return (alias self)?;
+        }
+
+        self._manager:.getCursorManager ():.setCursor (SDL_SystemCursor::SDL_SYSTEM_CURSOR_ARROW);
+        self:.setHover (false);
+
+        if let Ok ((dmut c, v)) = alias self:.mouseToWidget (pos) {
+            if let Ok (dmut w) = alias self._lastHover && c !is w {
+                w:.onLoseHoverFocus ();
+            }
+
+            self._lastHover = (alias c)?;
+            return c:.onHover (v);
+        }
+
+        if let Ok (dmut w) = alias self._lastHover {
+            w:.onLoseHoverFocus ();
+            self._lastHover = none;
+        }
+
+        none
+    }
+
+    pub over onLoseHoverFocus (mut self) {
+        if let Ok (dmut w) = alias self._lastHover {
+            w:.onLoseHoverFocus ();
+        } else if self._lastHoverGrip {
+            self:.setHover (false);
+            self._manager:.getCursorManager ():.setCursor (SDL_SystemCursor::SDL_SYSTEM_CURSOR_ARROW)
+        }
+    }
+
+    pub over onClick (mut self, pos : vec2, button : u8)-> dmut (&Widget)? {
+        if self.mouseOnGrip (pos) {
+            self._slideStart = self._manager.getMousePosition ();
+            self._default [0] = (self._childs [0].size, self._childs [0].relSize * self._absoluteSize);
+            self._default [1] = (self._childs [1].size, self._childs [1].relSize * self._absoluteSize);
+
+            println ("Starting slide ?");
+
+            return (alias self)?;
+        }
+
+        if let Ok ((dmut c, v)) = alias self:.mouseToWidget (pos) {
+            return c:.onClick (v, button);
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          SLIDING EVENT          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onSliding (mut self, _pos_ : vec2, _speed_ : vec2, _ : u8) {
+        let pos = self._manager.getMousePosition ();
+        println ("Position : ", pos, " ", self._slideStart);
+    }
+
+    pub over onGainFocus (mut self) {
+        if self._vertical {
+            self._manager:.getCursorManager ():.setCursor (SDL_SystemCursor::SDL_SYSTEM_CURSOR_SIZEWE);
+        } else {
+            self._manager:.getCursorManager ():.setCursor (SDL_SystemCursor::SDL_SYSTEM_CURSOR_SIZENS);
+        }
+    }
+
+    pub over onLoseFocus (mut self) {
+        self._manager:.getCursorManager ():.setCursor (SDL_SystemCursor::SDL_SYSTEM_CURSOR_ARROW);
+        self:.onLoseHoverFocus ();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over isFocusableLeftClick (self)-> bool {
+        true
+    }
+
+    pub over loseFocusOnReleaseLeft (self)-> bool {
+        true
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            if let Ok (dmut s) = alias self._sizeGripShape {
+                let dmut shDr = self._manager:.getShapeDrawer ();
+                shDr:.removeShape (s.uid);
+                self._sizeGripShape = none;
+            }
+
+            for dmut i in alias self._childs {
+                i.widget:.dispose ();
+            }
+
+            self._super_:.dispose ();
+        }
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          MOUSE BBOX          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true if the mouse is over the size grip
+     * */
+    fn mouseOnGrip (self, pos : vec2)-> bool {
+        if let Ok (_) = self.isInPadding (pos) {
+            if let Ok (_) = self.isInSquare (pos, self._relGripBoxPos, self._relGripBoxPos + self._relGripBoxSize) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns:
+     *  - .1 : the widget on which the mouse is positionned
+     *  - .2 : the position of the mouse relative to the widget
+     */
+    fn mouseToWidget (mut self, pos : vec2)-> dmut (&Widget, vec2)? {
+        if let Ok (inPaddingPos) = self.isInPadding (pos) {
+            for i in 0 .. self._childs.len {
+                let a = self._childs [i].relPos;
+                let b = a + self._childs [i].relSize;
+
+                if let Ok (relPos) = self.isInSquare (inPaddingPos, a, b) {
+                    if let Ok (_) = self._childs [i].widget.isInBorder (relPos) {
+                        return (alias self._childs [i].widget, relPos)?
+                    }
+                }
+            }
+        }
+
+        none
+    }
 
 }
