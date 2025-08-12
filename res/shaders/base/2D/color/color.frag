@@ -36,5 +36,5 @@ void main () {
     float dist = sdRountRect (pos, size, vec2 (world.radius) / world.dimension);
     if (dist > 0.0) discard;
 
-    out_color = world.color;
+    out_color = vec4 (world.color.xyz, world.color.w);
 }
