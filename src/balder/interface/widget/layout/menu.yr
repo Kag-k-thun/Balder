@@ -1,0 +1,693 @@
+in menu;
+
+use balder::interface::_;
+use balder::utils::_;
+use balder::core::_;
+use balder::math::_;
+
+use balder::interface::widget::text::label;
+use balder::interface::widget::layout::floating;
+use balder::interface::widget::alignement;
+
+use ::std::{io,
+          time::_,
+          algorithm::comparison,
+          fs::path};
+
+record Child {
+    pub let dmut widget : &Widget;
+
+    // The path of the widget that opened the menu
+    pub let mut openedBy : Path;
+    pub let mut pos : vec2 = vec2 ();
+    pub let mut size : vec2 = vec2 ();
+    pub let mut fromBar : bool = false;
+    pub let mut level : usize;
+
+    pub let x : WidgetSize;
+    pub let y : WidgetSize;
+
+    pub self (dmut widget : &Widget, openedBy : Path = Path (), x : WidgetSize, y : WidgetSize, fromMenuBar : bool = false, level : usize = 0)
+        with widget = alias widget
+        , fromBar = fromMenuBar
+        , openedBy = openedBy
+        , x = x
+        , y = y
+        , level = level
+    {}
+
+}
+
+/**
+ * A menu layout is a layout able to display menu items and that can have a menubar composed of menu buttons
+ * */
+pub class MenuLayout over Layout {
+
+    // The menu bar of the floating layout
+    let dmut _menuBar : (Child)? = none;
+
+    // Set when to display a menu layout overriding any events until it loses focus
+    let dmut _menuLayouts : [usize => Child] = copy [];
+
+    // The menu layout sorted by level
+    let dmut _sortedMenus : [Child] = [];
+
+    // The uniq id of the menu layouts
+    let mut _menuLayoutId : usize = 0us;
+
+    // The widget that was hovered the last
+    let dmut _lastHover : (&Widget)? = none;
+
+    // The inner layout
+    let dmut _layout : (Child)? = none;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager : &WidgetManager, name : [c8])
+        with super (alias manager, name, WidgetKeys::MENU_LAYOUT)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          ATTACH/DETACH          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onAttach (mut self, parentPath : Path) {
+        self.__super__:.onAttach (parentPath);
+        self:.closeAllMenu ();
+
+        if let Ok (dmut menu) = alias self._menuBar {
+            menu.widget:.onAttach (self._path);
+            menu.widget:.setMenuContext (alias self);
+        }
+
+        if let Ok (dmut l) = alias self._layout {
+            l.widget:.onAttach (self._path);
+            l.widget:.setMenuContext (alias self);
+        }
+    }
+
+    pub over setMenuContext (mut self, dmut menu : &MenuLayout) {
+        self._menuContext = (alias menu)?;
+        if let Ok (dmut l) = alias self._layout {
+            l.widget:.setMenuContext (alias self);
+        }
+
+        if let Ok (dmut m) = alias self._menuBar {
+            m.widget:.setMenuContext (alias self);
+        }
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the drawing size of the inner widgets
+     * Floating layout are computed in last by the widget manager, and can be attached to another widget to be relative from it
+     */
+    over onUpdateSize (mut self) {
+        let mut currentMaxDepth = self._depth;
+
+        let menuSize = if let Ok (dmut menu) = alias self._menuBar {
+            self.clampSize (menu.widget.getStyle ().getHeight (), self._absoluteSize.y) * self._absoluteSize.y
+        } else {
+            0.f
+        };
+
+        if let Ok (dmut lay) = alias self._layout {
+            let absPos = self._absolutePosition + makeVec2 (0.f, menuSize);
+            let absSize = self._absoluteSize - makeVec2 (0.f, menuSize);
+
+            let (sciPos, sciEnd) = self.getScissors (absPos, absSize);
+
+            lay.widget:.setSize (absPos, absSize, self._depth + 1);
+            lay.widget:.setScissors (sciPos, sciEnd);
+
+            lay.pos = (absPos - self._absolutePosition) / self._absoluteSize;
+            lay.size = absSize / self._absoluteSize;
+
+            self._layout = (alias lay)?;
+            currentMaxDepth = lay.widget.getMaxDepth ();
+        }
+
+        if let Ok (dmut menu) = alias self._menuBar {
+            let w = self.clampSize (menu.widget.getStyle ().getWidth (), self._absoluteSize.x) * self._absoluteSize.x;
+            let h = self.clampSize (menu.widget.getStyle ().getHeight (), self._absoluteSize.y) * self._absoluteSize.y;
+
+            let (sciPos, sciEnd) = self.getScissors (self._absolutePosition, makeVec2 (w, h));
+            menu.widget:.setSize (self._absolutePosition, makeVec2 (w, h), currentMaxDepth + 1);
+            menu.widget:.setScissors (sciPos, sciEnd);
+
+            menu.pos = vec2 ();
+            menu.size = (makeVec2 (w, h)) / self._absoluteSize;
+            self._menuBar = (alias menu)?;
+            currentMaxDepth = menu.widget.getMaxDepth ();
+        }
+
+        for col in 0 .. self._sortedMenus.len {
+            let w = self.clampSize (self._sortedMenus [col].widget.getStyle ().getWidth (), self._absoluteSize.x);
+            let h = self.clampSize (self._sortedMenus [col].widget.getStyle ().getHeight (), self._absoluteSize.y);
+
+            let x = self.clampSize (self._sortedMenus [col].x, self._absoluteSize.x);
+            let y = self.clampSize (self._sortedMenus [col].y, self._absoluteSize.y);
+
+            let wpos = makeVec2 (x, y) * self._absoluteSize + self._absolutePosition;
+            let wsize = makeVec2 (w, h) * self._absoluteSize;
+            let (sciPos, sciEnd) = self.getScissors (wpos, wsize);
+
+            self._sortedMenus [col].widget:.setSize (wpos, wsize, currentMaxDepth + 1);
+            self._sortedMenus [col].widget:.setScissors (sciPos, sciEnd);
+
+            self._sortedMenus [col].pos = (wpos - self._absolutePosition) / self._absoluteSize;
+            self._sortedMenus [col].size = wsize / self._absoluteSize;
+            currentMaxDepth = self._sortedMenus [col].widget.getMaxDepth ();
+        }
+    }
+
+    over onUpdateScissors (mut self) {
+        if let Ok (dmut i) = alias self._layout {
+            let wpos = (i.pos * self._absoluteSize) + self._absolutePosition;
+            let wsize = (i.size * self._absoluteSize);
+            let (sciPos, sciEnd) = self.getScissors (wpos, wsize);
+
+            i.widget:.setScissors (sciPos, sciEnd);
+        }
+
+        if let Ok (dmut i) = alias self._menuBar {
+            let wpos = (i.pos * self._absoluteSize) + self._absolutePosition;
+            let wsize = (i.size * self._absoluteSize);
+            let (sciPos, sciEnd) = self.getScissors (wpos, wsize);
+
+            i.widget:.setScissors (sciPos, sciEnd);
+        }
+
+        for dmut i in alias self._sortedMenus {
+            let wpos = (i.pos * self._absoluteSize) + self._absolutePosition;
+            let wsize = (i.size * self._absoluteSize);
+            let (sciPos, sciEnd) = self.getScissors (wpos, wsize);
+
+            i.widget:.setScissors (sciPos, sciEnd);
+        }
+    }
+
+    over onHide (mut self) {
+        if let Ok (dmut i) = alias self._layout {
+            i.widget:.hide ();
+        }
+
+        if let Ok (dmut i) = alias self._menuBar {
+            i.widget:.hide ();
+        }
+
+        self:.closeAllMenu ();
+    }
+
+    over onShow (mut self) {
+        if let Ok (dmut i) = alias self._layout {
+            i.widget:.show ();
+        }
+
+        if let Ok (dmut i) = alias self._menuBar {
+            i.widget:.show ();
+        }
+
+        self:.closeAllMenu ();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          INSERT CHILDS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the menu bar widget
+     * */
+    pub fn setMenuBar (mut self, dmut ch : &Widget) {
+        if let Ok (dmut menu) = alias self._menuBar {
+            menu.widget:.dispose ();
+        }
+
+        self._menuBar = Child (alias ch, WidgetSize (pix-> 0), WidgetSize (pix-> 0))?;
+        self._manager:.updateWidgets ();
+    }
+
+    /**
+     * Set the child displayed under the menu bar
+     * */
+    pub fn setChild (mut self, dmut ch : &Widget) {
+        if let Ok (dmut l) = alias self._layout {
+            l.widget:.dispose ();
+        }
+
+        self._layout = Child (alias ch, WidgetSize (pix-> 0), WidgetSize (pix-> 0))?;
+        self._manager:.updateWidgets ();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==============================          OPEN CLOSE FLOATING          ===============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Open a menu layout in the floating layout
+     * @returns: the uniq id of the menu layout (to remove it)
+     * */
+    pub fn openMenu (mut self, dmut ch : &Widget, x : WidgetSize, y : WidgetSize, fromMenuBar : bool = false, by : Path = Path (""))-> usize {
+        if !self._attached {
+            log::error #("FloatingLayout", "Cannot open a menu layout on an unattached floating layout");
+            return 0;
+        }
+
+        let id = self._menuLayoutId + 1;
+        self._menuLayoutId += 1;
+        self._menuLayouts [id] = Child (alias ch, x, y,
+                                        openedBy-> by,
+                                        fromMenuBar-> fromMenuBar,
+                                        level-> id);
+
+        self._sortedMenus = copy [alias i for _, dmut i in alias self._menuLayouts];
+        std::algorithm::sorting::sort (alias self._sortedMenus, |x, y| => { x.level < y.level });
+
+        if by.isEmpty () {
+            ch:.onAttach (self._path);
+        } else {
+            ch:.onAttach (by);
+        }
+
+        ch:.setMenuContext (alias self);
+
+        // Reset the focus
+        self._manager:.setFocus (none);
+        self._manager:.updateWidgets ();
+
+        id
+    }
+
+    /**
+     * Close a menu layout
+     * @params:
+     *   - id: the uniq id of the menu widget
+     * */
+    pub fn closeMenu (mut self, id : usize) {
+        if let Ok (dmut w) = alias self._menuLayouts [id] {
+            self._menuLayouts:.remove (id);
+
+            w.widget:.dispose ();
+
+            self._sortedMenus = copy [alias i for _, dmut i in alias self._menuLayouts];
+            std::algorithm::sorting::sort (alias self._sortedMenus, |x, y| => { x.level < y.level });
+
+            self._manager:.updateWidgets ();
+        }
+    }
+
+    pub fn closeChildMenus (mut self, path : Path) {
+        let dmut keep : [usize => Child] = copy [];
+        let dmut rm : [usize => Child] = copy [];
+
+        for id, dmut i in alias self._menuLayouts {
+            if i.openedBy.isEmpty () || !path.isPrefix (i.openedBy) || path == i.openedBy {
+                keep [id] = alias i;
+            } else {
+                rm [id] = alias i;
+            }
+        }
+
+        self._menuLayouts = alias keep;
+        self._sortedMenus = copy [alias i for _, dmut i in alias self._menuLayouts];
+        std::algorithm::sorting::sort (alias self._sortedMenus, |x, y| => { x.level < y.level });
+
+        for _, dmut r in alias rm {
+            r.widget:.dispose ();
+        }
+
+        self._manager:.updateWidgets ();
+        self._manager:.updateWidgets ();
+        self._manager:.getShapeDrawer ():.redraw ();
+    }
+
+    /**
+     * Close all menus of the floating layout
+     * */
+    pub fn closeAllMenu (mut self) {
+        let dmut v = alias self._menuLayouts;
+        let notEmpty = (self._sortedMenus.len != 0);
+
+        self._sortedMenus = [];
+        self._menuLayouts = copy [];
+
+        for _, dmut i in alias v {
+            i.widget:.dispose ();
+        }
+
+        if notEmpty {
+            self._manager:.setFocus (none);
+        }
+
+        self._manager:.updateWidgets ();
+        self._manager:.getShapeDrawer ():.redraw ();
+    }
+
+    /**
+     * Close all menus not opened by parent widgets
+     * */
+    pub fn closeAllNonParentMenu (mut self, widgetPath : Path) {
+        let dmut keep : [usize => Child] = copy [];
+        let dmut rm : [usize => Child] = copy [];
+        for id, dmut i in alias self._menuLayouts {
+            if !i.openedBy.isEmpty () && !i.openedBy.isPrefix (widgetPath) {
+                rm [id] = alias i;
+            } else {
+                keep [id] = alias i;
+            }
+        }
+
+        let notEmpty = (self._sortedMenus.len != 0);
+
+        self._menuLayouts = alias keep;
+        self._sortedMenus = copy [alias i for _, dmut i in alias self._menuLayouts];
+        std::algorithm::sorting::sort (alias self._sortedMenus, |x, y| => { x.level < y.level });
+
+        for _, dmut r in alias rm {
+            r.widget:.dispose ();
+        }
+
+        if notEmpty && self._menuLayouts.len == 0 {
+            self._manager:.setFocus (none);
+        }
+
+        self._manager:.updateWidgets ();
+        self._manager:.getShapeDrawer ():.redraw ();
+    }
+
+    /**
+     * @returns: true if the menu is actually open
+     * */
+    pub fn isMenuOpened (self, uid : usize)-> bool {
+        uid in self._menuLayouts
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over getMaxDepth (self)-> u32 {
+        let mut max = self._depth;
+        if let Ok (i) = self._layout {
+            let chD = i.widget.getMaxDepth ();
+            if chD > max { max = chD; }
+        }
+
+        if let Ok (i) = self._menuBar {
+            let chD = i.widget.getMaxDepth ();
+            if chD > max { max = chD; }
+        }
+
+        for i in self._sortedMenus {
+            let chD = i.widget.getMaxDepth ();
+            if chD > max { max = chD; }
+        }
+
+        max
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TICK EVENTS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Propagate the tick events to childrens
+     * */
+    pub over onTick (mut self, delta : Duration) {
+        if let Ok (dmut b) = alias self._menuBar {
+            b.widget:.onTick (delta);
+        }
+
+        if let Ok (dmut b) = alias self._layout {
+            b.widget:.onTick (delta);
+        }
+
+        for dmut b in alias self._sortedMenus {
+            b.widget:.onTick (delta);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Propagate the signal to the childs
+     * @params:
+     *   - pos: the relative position of the cursor within the layout
+     */
+    pub over onHover (mut self, pos : vec2)-> dmut (&Widget)? {
+        let mut canBeSelf = true;
+        if let Ok ((dmut c, v)) = alias self:.mouseToWidget (pos, ref canBeSelf) {
+            if let Ok (dmut w) = alias self._lastHover && c !is w {
+                w:.onLoseHoverFocus ();
+            }
+
+            self._lastHover = (alias c)?;
+            return c:.onHover (v);
+        }
+
+        if let Ok (dmut w) = alias self._lastHover {
+            w:.onLoseHoverFocus ();
+            self._lastHover = none;
+        }
+
+        if canBeSelf {
+            self:.setHover (true);
+            (alias self)?
+        } else {
+            none
+        }
+    }
+
+    pub over onLoseHoverFocus (mut self) {
+        if let Ok (dmut c) = alias self._lastHover {
+            c:.onLoseHoverFocus ();
+            self._lastHover = none;
+        }
+
+        self:.setHover (false);
+    }
+
+    /**
+     * Propagate the signal to the childrens
+     */
+    pub over onDoubleClick (mut self, pos : vec2)-> dmut (&Widget)? {
+        let mut canBeSelf = true;
+        if let Ok ((dmut c, v)) = alias self:.mouseToWidget (pos, ref canBeSelf) {
+            return c:.onDoubleClick (v);
+        }
+
+        if self._menuLayouts.len != 0 {
+            self:.closeAllMenu ();
+        }
+
+        if canBeSelf {
+            (alias self)?
+        } else {
+            none
+        }
+    }
+
+    /**
+     * Propagate the signal to the childrens
+     */
+    pub over onClick (mut self, pos : vec2, button : u8)-> dmut (&Widget)? {
+        let mut canBeSelf = true;
+        if let Ok ((dmut c, v)) = alias self:.mouseToWidget (pos, ref canBeSelf) {
+            return c:.onClick (v, button);
+        }
+
+        if self._menuLayouts.len != 0 {
+            self:.closeAllMenu ();
+        }
+
+        if canBeSelf {
+            (alias self)?
+        } else {
+            none
+        }
+    }
+
+    /**
+     * Propagate the scrolling signal to children
+     * */
+    pub over onScroll (mut self, pos : vec2, amountX : i32, amountY : i32)-> bool {
+        let mut ignore = false;
+        let res = if let Ok ((dmut c, v)) = alias self:.mouseToWidget (pos, ref ignore) {
+            c:.onScroll (v, amountX, amountY)
+        } else { false };
+
+        self:.onHover (pos);
+        res
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over find (mut self, names : [[c8]])-> dmut (&Widget)? {
+        if names.len == 0 { return none; }
+
+        if let Ok (dmut l) = alias self._layout {
+            if l.widget.name == names [0] {
+                if names.len == 1 { return (alias l.widget)?; }
+                else return l.widget:.find (names [1 .. $]);
+            }
+        }
+
+        if let Ok (dmut m) = alias self._menuBar {
+            if m.widget.name == names [0] {
+                if names.len == 1 { return (alias m.widget)?; }
+                else return m.widget:.find (names [1 .. $]);
+            }
+        }
+
+        for dmut c in alias self._sortedMenus {
+            if c.widget.name == names [0] {
+                if names.len == 1 { return (alias c.widget)?; }
+                else return c.widget:.find (names [1 .. $]);
+            }
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            self._attached = false;
+
+            self:.closeAllMenu ();
+            if let Ok (dmut l) = alias self._layout {
+                l.widget:.dispose ();
+            }
+
+            if let Ok (dmut l) = alias self._menuBar {
+                l.widget:.dispose ();
+            }
+
+            self._super_:.dispose ();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns:
+     *  - .1 : the widget on which the mouse is positionned
+     *  - .2 : the position of the mouse relative to the widget
+     */
+    fn mouseToWidget (mut self, pos : vec2, ref mut canBeSelf : bool)-> dmut (&Widget, vec2)? {
+        canBeSelf = false;
+        if let Ok (inPaddingPos) = self.isInPadding (pos) {
+            canBeSelf = true;
+
+            let mut menuFromBar = true;
+
+            // Try propagating the events on menu layout first
+            for dmut w in alias self._sortedMenus {
+                let a = w.pos;
+                let b = a + w.size;
+                menuFromBar = menuFromBar && w.fromBar;
+
+                if let Ok (relPos) = self.isInSquare (inPaddingPos, a, b) {
+                    canBeSelf = false;
+                    if let Ok (_) = w.widget.isInBorder (relPos) {
+                        return (alias w.widget, relPos)?
+                    }
+                }
+            }
+
+            if self._menuLayouts.len == 0 || menuFromBar { // no menu open, or the menu was opened from the menu bar
+                if let Ok (dmut menu) = alias self._menuBar {
+                    let a = menu.pos;
+                    let b = a + menu.size;
+
+                    if let Ok (relPos) = self.isInSquare (inPaddingPos, a, b) {
+                        canBeSelf = false;
+                        if let Ok (_) = menu.widget.isInBorder (relPos) {
+                            return (alias menu.widget, relPos)?;
+                        }
+                    }
+                }
+            }
+
+
+            if self._menuLayouts.len == 0 { // no menu opened
+
+                // Otherwise propagate the events on sub layouts
+                // iterate in reverse order to get the widget on top first
+                if let Ok (dmut i) = alias self._layout {
+                    let a = i.pos;
+                    let b = a + i.size;
+
+                    if let Ok (relPos) = self.isInSquare (inPaddingPos, a, b) {
+                        canBeSelf = false;
+                        if let Ok (_) = i.widget.isInBorder (relPos) {
+                            return (alias i.widget, relPos)?
+                        }
+                    }
+                }
+            }
+        }
+
+        none
+    }
+
+}
