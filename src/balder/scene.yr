@@ -24,6 +24,12 @@ pub class Scene {
         // The texture in which the scene is drawn
         let dmut _subpassTextures : [&Texture] = [];
 
+        // The reference to the color texture
+        let dmut _color : (&RefCount!{&Texture})? = none;
+
+        // The reference to the depth texture
+        let dmut _depth : (&RefCount!{&Texture})? = none;
+
         // The name of the scene
         let _name : [c8];
 
@@ -61,6 +67,19 @@ pub class Scene {
 
         // The list of nodes in the scene (flattened out)
         let dmut _nodes : [Path => &Node] = copy [];
+
+        // The list of node loaded during drawing phase
+        let dmut _nodeToDraw : [[c8] => [usize => &VisualInstance3D]] = copy [];
+    }
+
+    prot { // Shadow pass
+
+        // The shadow pass
+        let dmut _shadowVK : (&VulkanSubpass)? = none;
+
+        // The shader drawing shadows
+        let dmut _shadowShader : (&RefCount!{&Shader})? = none;
+
     }
 
     /*!
@@ -104,11 +123,14 @@ pub class Scene {
         if self._height != 0 && self._width != 0 {
             let dmut device = self._window:.getVulkanDevice ();
             let dmut color = copy ColorTexture (alias device, device.getSwapchainFormat (), self._width, self._height, forSubpass-> true);
-            let dmut depth = copy ColorTexture (alias device, device.getDepthFormat (), self._width, self._height, forSubpass-> true);
+            let dmut depth = copy DepthTexture (alias device, device.getDepthFormat (), self._width, self._height, forSubpass-> true);
 
             self._subpassTextures = copy [alias color, alias depth];
 
-            let dmut vk = copy VulkanSubpass (alias device, self._width, self._height, self._subpassTextures);
+            self._color = (alias self._window:.insertResource (alias color))?;
+            self._depth = (alias self._window:.insertResource (alias depth))?;
+
+            let dmut _vk_ = copy VulkanSubpass (alias device, self._width, self._height, self._subpassTextures);
 
             self._id += 1;
             {
@@ -120,10 +142,11 @@ pub class Scene {
             }
 
             self._window:.addSubpass (name-> self._passName,
-                                      loadPhase-> &self:.composeLoadPhase,
-                                      drawPhase-> &self:.composeDrawPhase,
-                                      cleanPhase-> &self:.composeCleanPhase,
-                                      alias vk);
+                                      loadPhase-> &self:.loadPhase,
+                                      drawPhase-> &self:.drawPhase,
+                                      cleanPhase-> &self:.cleanPhase,
+                                      alias _vk_);
+            self._vk = (alias _vk_)?;
         }
 
     }
@@ -161,23 +184,15 @@ pub class Scene {
     /**
      * @returns: the generated color texture of the scene
      * */
-    pub fn getColorTexture (mut self)-> dmut &ColorTexture {
-        if let dmut vk : &ColorTexture = alias self._subpassTextures [0] {
-            return alias vk;
-        }
-
-        panic;
+    pub fn getColorTexture (mut self)-> dmut (&RefCount!{&Texture})? {
+        alias self._color
     }
 
     /**
      * @returns: the generated depth texture of the scene
      * */
-    pub fn getDepthTexture (mut self)-> dmut &DepthTexture {
-        if let dmut vk : &DepthTexture = alias self._subpassTextures [1] {
-            return alias vk;
-        }
-
-        panic;
+    pub fn getDepthTexture (mut self)-> dmut (&RefCount!{&Texture})? {
+        alias self._depth
     }
 
     /*!
@@ -191,18 +206,47 @@ pub class Scene {
     /**
      * Update the indirect command buffer to draw the correct number of triangles
      * */
-    fn composeLoadPhase (mut self, dmut cmd : &IndirectCommandAllocator) {
-        cmd;
+    fn loadPhase (mut self, dmut cmd : &IndirectCommandAllocator) atomic self {
+        for sh, dmut c in alias self._nodeAssoc {
+            let dmut lst : [usize => &VisualInstance3D] = copy [];
+            for u, dmut v in alias c {
+                v:.register (alias cmd);
+                lst [u] = alias v;
+            }
+
+            self._nodeToDraw [sh] = alias lst;
+        }
     }
 
     /**
      * Draw the visual instances on the output compose texture
      * */
-    fn composeDrawPhase (mut self, dmut cmd : &IndirectCommandAllocator) {
-        cmd;
+    fn drawPhase (mut self, dmut cmd : &IndirectCommandAllocator) atomic self {
+        for s, lst in self._nodeToDraw {
+            if let Ok (dmut shO) = alias self._shaders [s] {
+                let dmut sh = alias shO:.get ();
+                sh.select ();
+                for _, c in lst {
+                    c.draw (alias sh, alias cmd);
+                }
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to use shader :", s, " ", err);
+                }
+            }
+        }
     }
 
-    fn composeCleanPhase (mut self) {}
+
+    fn cleanPhase (mut self) atomic self {
+        for _, dmut lst in alias self._nodeToDraw {
+            for _, dmut c in alias lst {
+                c:.clean ();
+            }
+        }
+
+        self._nodeToDraw = copy [];
+    }
 
     /*!
      * ====================================================================================================
@@ -215,8 +259,9 @@ pub class Scene {
     /**
      * Attach a node in the rendering scene
      * */
-    pub fn attach (mut self, dmut node : &Node) {
+    pub fn attach (mut self, dmut node : &Node) atomic self {
         self._nodes [node.getName ()] = alias node;
+
         if let Ok (dmut sub) = alias self._vk {
             if let dmut vi : &VisualInstance3D = alias node {
                 let dmut uid = self._uniqInstanceIds;
@@ -257,19 +302,23 @@ pub class Scene {
                     }
                 }
             }
-        }
 
-        self._window:.redraw ();
+            if self._shadowMeshes.len != 0 {
+                self:.registerShadowPass ();
+            }
+
+            self._window:.redraw ();
+        }
     }
 
     /**
      * Detach a node from the rendering scene
      * */
-    pub fn detach (mut self, dmut node : &Node) {
+    pub fn detach (mut self, dmut node : &Node) atomic self {
         self._nodes:.remove (node.getName ());
+
         if let dmut vi : &VisualInstance3D = alias node {
             let shCfg = vi.material.shaderConfig;
-            vi:.detach ();
 
             self._shadowMeshes:.remove (vi.uid);
             if let Ok (dmut inner) = alias self._nodeAssoc [shCfg.name] {
@@ -285,9 +334,29 @@ pub class Scene {
             }
         }
 
+        node:.dispose ();
+        if self._shadowMeshes.len == 0 {
+            self:.removeShadowPass ();
+        }
+
         self._window:.redraw ();
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          SHADOW PASS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn registerShadowPass (mut self) {
+        log::error #("Scene", "TODO");
+    }
+
+    fn removeShadowPass (mut self) {
+        log::error #("Scene", "TODO");
+    }
 
     /*!
      * ====================================================================================================
@@ -306,8 +375,14 @@ pub class Scene {
                 self._vk = none;
             }
 
-            for dmut j in alias self._subpassTextures {
-                self._window:.insertBin (alias j);
+            if let Ok (dmut cl) = alias self._color {
+                cl:.dispose ();
+                self._color = none;
+            }
+
+            if let Ok (dmut dp) = alias self._depth {
+                dp:.dispose ();
+                self._depth = none;
             }
 
             self._subpassTextures = [];
