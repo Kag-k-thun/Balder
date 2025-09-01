@@ -12,6 +12,8 @@ use balder::math::_;
 
 use balder::scene::node::node3D::visual::_;
 
+use balder::utils::log;
+
 /**
  * Mesh with two buffers, one for vertices, and one for indices
  */
@@ -25,6 +27,18 @@ pub class IndexedMesh3D over VisualInstance3D {
 
     // The buffer containing simpler version of the vertices of the mesh
     let dmut _shadowVBO : &VertexBufferObject;
+
+    // The material used to draw the node
+    let dmut _material : &Material;
+
+    // The buffer containing the world transformation of the visual instance
+    let dmut _world : &UniformBufferObject;
+
+    // The descriptor set used to attach buffers
+    let dmut _descSet : (&DescriptorSet)? = none;
+
+    // The descriptor set used to attach buffers
+    let dmut _shadowDescSet : (&DescriptorSet)? = none;
 
     /*!
      * ====================================================================================================
@@ -40,18 +54,20 @@ pub class IndexedMesh3D over VisualInstance3D {
      *    - device: the device used to allocate and render the mesh
      *    - indices: the indices of the points forming the mesh
      */
-    pub self  (dmut window : &Window,
-               name : [c8],
+    pub self  (name : [c8],
+               dmut scene : &Scene,
                indices : [u32],
                array : MeshArray,
                dmut material : &Material,
                shadow : bool = true)
-        with super (alias window, name, array.aabb (), alias material, shadow)
-        , _ibo = copy IndexBufferObject!{u32} (window:.getVulkanDevice (), indices)
+        with super (name, alias scene, array.aabb (), shadow)
+        , _ibo = copy IndexBufferObject!{u32} (scene:.getWindow ():.getVulkanDevice (), indices)
         , _shadowVBO = alias self._vbo
+        , _material = alias material
+        , _world = copy UniformBufferObject (scene:.getWindow ():.getVulkanDevice (), mat4::size)
         throws BalderError
     {
-        self:.configure (window:.getVulkanDevice (), array, material, shadow);
+        self:.configure (alias scene, array, material, shadow);
     }
 
     /**
@@ -60,18 +76,20 @@ pub class IndexedMesh3D over VisualInstance3D {
      *    - device: the device used to allocate and render the mesh
      *    - indices: the indices of the points forming the mesh
      */
-    pub self (dmut window : &Window,
-              name : [c8],
+    pub self (name : [c8],
+              dmut scene : &Scene,
               indices : [u16],
               dmut material : &Material,
               array : MeshArray,
               shadow : bool = true)
-        with super (alias window, name, array.aabb (), alias material, shadow)
-        , _ibo = copy IndexBufferObject!{u16} (window:.getVulkanDevice (), indices)
+        with super (name, alias scene, array.aabb (), shadow)
+        , _ibo = copy IndexBufferObject!{u16} (scene:.getWindow ():.getVulkanDevice (), indices)
         , _shadowVBO = alias self._vbo
+        , _material = alias material
+        , _world = copy UniformBufferObject (scene:.getWindow ():.getVulkanDevice (), mat4::size)
         throws BalderError
     {
-        self:.configure (window:.getVulkanDevice (), array, material, shadow);
+        self:.configure (alias scene, array, material, shadow);
     }
 
     __dtor (mut self) {
@@ -87,9 +105,19 @@ pub class IndexedMesh3D over VisualInstance3D {
      */
 
     /**
-     * Configure the points of the mesh
+     * Configure the points of the mesh and shader association for material
      * */
-    fn configure (mut self, dmut device : &VulkanDevice, array : MeshArray, material : &Material, shadow : bool)
+    fn configure (mut self, dmut scene : &Scene, array : MeshArray, material : &Material, shadow : bool)
+        throws BalderError
+    {
+        self:.configureVertices (scene:.getWindow ():.getVulkanDevice (), array, material, shadow);
+        self:.configureShader (alias scene);
+    }
+
+    /**
+     * Configure the buffers containing the points of the mesh
+     * */
+    fn configureVertices (mut self, dmut device : &VulkanDevice, array : MeshArray, material : &Material, shadow : bool)
         throws BalderError
     {
         let data = array.compactVertices (material, forShadow-> false);
@@ -102,10 +130,44 @@ pub class IndexedMesh3D over VisualInstance3D {
         }
     }
 
+    /**
+     * Configure the shader association to the node
+     * @params:
+     *    - scene: the scene containing the node
+     * */
+    fn configureShader (mut self, dmut scene : &Scene)
+        throws BalderError
+    {
+        let dmut shader = scene:.registerShaderRef (self._material.shaderConfig, alias self):.get ();
+        log::info #("IndexedMesh3D", "Registered shader to draw");
+
+        let dmut set = shader:.allocateDescriptorSet ();
+
+        self._world:.setData (0, self._transformation, commit-> true);
+        set:.setUniform (UniformNames::WORLD, self._world);
+
+        if let Ok (cam) = scene:.getCamera () {
+            cam.bind (alias set);
+        }
+
+        self._material:.attach (scene:.getWindow (), alias set);
+        self._descSet = (alias set)?;
+
+        // if self._castShadow {
+        //     let dmut shadowShader = scene:.registerShadowShaderRef (alias self);
+
+        //     let dmut shadowSet = shadowShader:.allocateDescriptorSet ();
+        //     shadowSet:.setUniform (UniformNames::WORLD, world);
+        //     self._shadowDescSet = (alias shadowSet)?;
+        // }
+
+        self:.transformationChanged ():.connect (scene:.getWindow ():.getSlotEmitter (), &self:.updateUBO);
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * =====================================          USAGE          ======================================
+     * ====================================          DRAWING          =====================================
      * ====================================================================================================
      * ====================================================================================================
      */
@@ -161,6 +223,35 @@ pub class IndexedMesh3D over VisualInstance3D {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The material used to draw the object
+     * */
+    @field
+    pub fn material (self)-> &Material {
+        self._material
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TRIGGERS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn updateUBO (mut self) {
+        self._world:.setData (0, self._transformation, commit-> true);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ===================================          DISPOSING          ====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -169,10 +260,26 @@ pub class IndexedMesh3D over VisualInstance3D {
     impl Disposable {
         pub over dispose (mut self) {
             self.__super__:.dispose ();
+            let dmut win = self._scene:.getWindow ();
 
-            self._window:.insertBin (alias self._vbo);
-            self._window:.insertBin (alias self._shadowVBO);
-            self._window:.insertBin (alias self._ibo);
+            win:.insertBin (alias self._vbo);
+            win:.insertBin (alias self._shadowVBO);
+            win:.insertBin (alias self._ibo);
+            win:.insertBin (alias self._world);
+
+            self._scene:.freeShaderRef (self._material.shaderConfig, alias self);
+            if let Ok (dmut s) = alias self._descSet {
+                win:.insertBin (alias s);
+                self._descSet = none;
+            }
+
+            if let Ok (dmut s) = alias self._shadowDescSet {
+                win:.insertBin (alias s);
+                self._shadowDescSet = none;
+            }
+
+            self._material:.detach ();
+            self:.transformationChanged ():.disconnect (&self:.updateUBO);
         }
     }
 
