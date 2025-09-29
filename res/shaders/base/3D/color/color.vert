@@ -23,6 +23,6 @@ out gl_PerVertex {
 };
 
 void main () {
-    gl_Position = camera.viewProj * world.model* vec4 (inPosition, 1.0);
+    gl_Position = camera.proj * camera.view * world.model* vec4 (inPosition, 1.0);
     outColor = color.color;
 }

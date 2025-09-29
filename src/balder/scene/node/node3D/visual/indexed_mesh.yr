@@ -11,6 +11,7 @@ use balder::scene::node::_;
 use balder::math::_;
 
 use balder::scene::node::node3D::visual::_;
+use balder::scene::node::node3D::camera;
 
 use balder::utils::log;
 
@@ -19,26 +20,46 @@ use balder::utils::log;
  */
 pub class IndexedMesh3D over VisualInstance3D {
 
-    // The buffer containing the indices of the mesh
-    let dmut _ibo : &IndexBufferObject;
-
-    // The buffer containing the vertices of the mesh
-    let dmut _vbo : &VertexBufferObject = copy VertexBufferObject ();
-
-    // The buffer containing simpler version of the vertices of the mesh
-    let dmut _shadowVBO : &VertexBufferObject;
-
     // The material used to draw the node
     let dmut _material : &Material;
 
-    // The buffer containing the world transformation of the visual instance
-    let dmut _world : &UniformBufferObject;
+    prot { // Local data
 
-    // The descriptor set used to attach buffers
-    let dmut _descSet : (&DescriptorSet)? = none;
+        // The data of the mesh to upload on device
+        let mut _array : (MeshArray)? = none;
 
-    // The descriptor set used to attach buffers
-    let dmut _shadowDescSet : (&DescriptorSet)? = none;
+        // The list of points defining the triangles of the mesh
+        let mut _indices : [u32] = [];
+
+        // Destroy the array after uploading (meaning it can be detached and reattached to the scene)
+        let mut _destroyOnUpload : bool = false;
+
+    }
+
+    prot { // Remote data
+
+        // The buffer containing the indices of the mesh
+        let dmut _ibo : (&IndexBufferObject)? = none;
+
+        // The buffer containing simpler version of the vertices of the mesh
+        let dmut _shadowVBO : (&VertexBufferObject)? = none;
+
+        // The buffer containing the vertices of the mesh
+        let dmut _vbo : (&VertexBufferObject)? = none;
+
+    }
+
+    prot { // shader binding
+
+        // The buffer containing the world transformation of the visual instance
+        let dmut _world : (&UniformBufferObject)? = none;
+
+        // The descriptor set used to attach buffers
+        let dmut _descSet : (&DescriptorSet)? = none;
+
+        // The descriptor set used to attach buffers
+        let dmut _shadowDescSet : (&DescriptorSet)? = none;
+    }
 
     /*!
      * ====================================================================================================
@@ -55,45 +76,21 @@ pub class IndexedMesh3D over VisualInstance3D {
      *    - indices: the indices of the points forming the mesh
      */
     pub self  (name : [c8],
-               dmut scene : &Scene,
+               dmut parent : &Node,
                indices : [u32],
                array : MeshArray,
                dmut material : &Material,
-               shadow : bool = true)
-        with super (name, alias scene, array.aabb (), shadow)
-        , _ibo = copy IndexBufferObject!{u32} (scene:.getWindow ():.getVulkanDevice (), indices)
-        , _shadowVBO = alias self._vbo
-        , _material = alias material
-        , _world = copy UniformBufferObject (scene:.getWindow ():.getVulkanDevice (), mat4::size)
-        throws BalderError
-    {
-        self:.configure (alias scene, array, material, shadow);
-    }
+               shadow : bool = true,
+               destroyOnUpload : bool = true)
 
-    /**
-     * Create a new indexed mesh
-     * @params:
-     *    - device: the device used to allocate and render the mesh
-     *    - indices: the indices of the points forming the mesh
-     */
-    pub self (name : [c8],
-              dmut scene : &Scene,
-              indices : [u16],
-              dmut material : &Material,
-              array : MeshArray,
-              shadow : bool = true)
-        with super (name, alias scene, array.aabb (), shadow)
-        , _ibo = copy IndexBufferObject!{u16} (scene:.getWindow ():.getVulkanDevice (), indices)
-        , _shadowVBO = alias self._vbo
+        with super (name, alias parent, array.aabb (), shadow)
         , _material = alias material
-        , _world = copy UniformBufferObject (scene:.getWindow ():.getVulkanDevice (), mat4::size)
-        throws BalderError
-    {
-        self:.configure (alias scene, array, material, shadow);
-    }
+        , _array = (array)?
+    , _indices = indices
+        , _destroyOnUpload = destroyOnUpload
 
-    __dtor (mut self) {
-        self:.dispose ();
+    {
+        std::io::println ("CTOR", name, " ", material);
     }
 
     /*!
@@ -104,15 +101,74 @@ pub class IndexedMesh3D over VisualInstance3D {
      * ====================================================================================================
      */
 
-    /**
-     * Configure the points of the mesh and shader association for material
-     * */
-    fn configure (mut self, dmut scene : &Scene, array : MeshArray, material : &Material, shadow : bool)
-        throws BalderError
-    {
-        self:.configureVertices (scene:.getWindow ():.getVulkanDevice (), array, material, shadow);
-        self:.configureShader (alias scene);
+    pub over onEnter (mut self, dmut scene : &Scene) {
+        self:.destroyBuffers (alias scene);
+
+        {
+            if let Ok (array) = self._array && self._indices.len != 0 {
+                let dmut win = scene:.getWindow ();
+
+                self:.transformationChanged ():.connect (win:.getSlotEmitter (), &self:.updateUBO);
+
+                let dmut ibo = copy IndexBufferObject!{u32} (win:.getVulkanDevice (), self._indices);
+                self._ibo = (alias ibo)?;
+
+                let dmut vbo = copy VertexBufferObject ();
+                self._vbo = (alias vbo)?;
+
+                let dmut world = copy UniformBufferObject (win:.getVulkanDevice (), mat4::size);
+                self._world = (alias world)?;
+
+                self:.configureVertices (win:.getVulkanDevice (), array, self._material, self._castShadow);
+                self:.configureShader ();
+            } else {
+                log::warn #("IndexBufferObject", "Empty mesh");
+            }
+        } catch {
+            err => {
+                log::error #("IndexedMesh3D", "Failed to upload mesh data to device", err);
+                self:.destroyBuffers (alias scene);
+            }
+        }
+
+        if self._destroyOnUpload {
+            self._array = none;
+            self._indices = [];
+        }
     }
+
+    pub over onExit (mut self, dmut scene : &Scene) {
+        log::info #("IndexedMesh3D", "onExit");
+        self:.destroyBuffers (alias scene);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CAMERA          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over setCamera (mut self, dmut cam : &Camera) {
+        if let Ok (dmut set) = alias self._descSet {
+            if let Ok (dmut ubo) = alias cam:.getUBO () {
+                set:.setUniform (UniformNames::CAMERA, ubo);
+            }
+        } catch {
+            err => {
+                log::error #("IndexedMesh3D", "Failed to set camera", err);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =========================          UPLOAD DATA TO REMOTE BUFFERS          ==========================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
      * Configure the buffers containing the points of the mesh
@@ -121,12 +177,16 @@ pub class IndexedMesh3D over VisualInstance3D {
         throws BalderError
     {
         let data = array.compactVertices (material, forShadow-> false);
-        self._vbo:.update (alias device, cast!{u32} (array.positions.len), data);
+        if let Ok (dmut vbo) = alias self._vbo {
+            vbo:.update (alias device, cast!{u32} (array.positions.len), data);
 
-        if (shadow && data.len != array.positions.len * 3u32) {
-            self._shadowVBO = copy VertexBufferObject ();
-            let shadowData = array.compactVertices (material, forShadow-> true);
-            self._shadowVBO:.update (alias device, cast!{u32} (array.positions.len), shadowData);
+            if (shadow && data.len != array.positions.len * 3u32) {
+                let dmut shadowVBO = copy VertexBufferObject ();
+                let shadowData = array.compactVertices (material, forShadow-> true);
+                shadowVBO:.update (alias device, cast!{u32} (array.positions.len), shadowData);
+
+                self._shadowVBO = (alias shadowVBO)?;
+            }
         }
     }
 
@@ -135,33 +195,31 @@ pub class IndexedMesh3D over VisualInstance3D {
      * @params:
      *    - scene: the scene containing the node
      * */
-    fn configureShader (mut self, dmut scene : &Scene)
+    fn configureShader (mut self)
         throws BalderError
     {
-        let dmut shader = scene:.registerShaderRef (self._material.shaderConfig, alias self):.get ();
-        log::info #("IndexedMesh3D", "Registered shader to draw");
+        if let Ok (dmut scene) = alias self:.getScene () {
+            let dmut shader = scene:.registerShaderRef (self._material.shaderConfig, alias self):.get ();
+            log::info #("IndexedMesh3D", "Registered shader to draw");
 
-        let dmut set = shader:.allocateDescriptorSet ();
+            let dmut set = shader:.allocateDescriptorSet ();
 
-        self._world:.setData (0, self._transformation, commit-> true);
-        set:.setUniform (UniformNames::WORLD, self._world);
+            if let Ok (dmut w) = alias self._world {
+                w:.setData (0, self._transformation, commit-> true);
+                set:.setUniform (UniformNames::WORLD, w);
+            }
 
-        if let Ok (cam) = scene:.getCamera () {
-            cam.bind (alias set);
+            self._material:.attach (scene:.getWindow (), alias set);
+            self._descSet = (alias set)?;
+
+            // if self._castShadow {
+            //     let dmut shadowShader = scene:.registerShadowShaderRef (alias self);
+
+            //     let dmut shadowSet = shadowShader:.allocateDescriptorSet ();
+            //     shadowSet:.setUniform (UniformNames::WORLD, world);
+            //     self._shadowDescSet = (alias shadowSet)?;
+            // }
         }
-
-        self._material:.attach (scene:.getWindow (), alias set);
-        self._descSet = (alias set)?;
-
-        // if self._castShadow {
-        //     let dmut shadowShader = scene:.registerShadowShaderRef (alias self);
-
-        //     let dmut shadowSet = shadowShader:.allocateDescriptorSet ();
-        //     shadowSet:.setUniform (UniformNames::WORLD, world);
-        //     self._shadowDescSet = (alias shadowSet)?;
-        // }
-
-        self:.transformationChanged ():.connect (scene:.getWindow ():.getSlotEmitter (), &self:.updateUBO);
     }
 
     /*!
@@ -179,7 +237,9 @@ pub class IndexedMesh3D over VisualInstance3D {
      *    - cmd: the command allocator in which the mesh has to be registered
      */
     pub over register (mut self, dmut cmd : &IndirectCommandAllocator) {
-        cmd:.registerIndexedObject (self._ibo.getNbPoints ());
+        if let Ok (ibo) = self._ibo {
+            cmd:.registerIndexedObject (ibo.getNbPoints ());
+        }
     }
 
     /**
@@ -194,11 +254,17 @@ pub class IndexedMesh3D over VisualInstance3D {
     pub over draw (self, dmut _ : &Shader, dmut cmd : &IndirectCommandAllocator) {
         if let Ok (s) = self._descSet {
             s.select ();
-            self._vbo.select ();
-            self._ibo.select ();
-
-            cmd:.drawNextIndexed ();
         }
+
+        if let Ok (v) = self._vbo {
+            v.select ();
+        }
+
+        if let Ok (i) = self._ibo {
+            i.select ();
+        }
+
+        cmd:.drawNextIndexed ();
     }
 
     /**
@@ -213,11 +279,17 @@ pub class IndexedMesh3D over VisualInstance3D {
     pub over drawShadow (self, dmut _ : &Shader, dmut cmd : &IndirectCommandAllocator) {
         if let Ok (s) = self._shadowDescSet {
             s.select ();
-            self._shadowVBO.select ();
-            self._ibo.select ();
-
-            cmd:.drawNextIndexed ();
         }
+
+        if let Ok (v) = self._shadowVBO {
+            v.select ();
+        }
+
+        if let Ok (i) = self._ibo {
+            i.select ();
+        }
+
+        cmd:.drawNextIndexed ();
     }
 
     /*!
@@ -246,41 +318,58 @@ pub class IndexedMesh3D over VisualInstance3D {
      */
 
     fn updateUBO (mut self) {
-        self._world:.setData (0, self._transformation, commit-> true);
+        if let Ok (dmut world) = alias self._world {
+            world:.setData (0, self._transformation, commit-> true);
+        }
     }
 
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * ===================================          DISPOSING          ====================================
+     * ====================================          BUFFERS          =====================================
      * ====================================================================================================
      * ====================================================================================================
      */
 
-    impl Disposable {
-        pub over dispose (mut self) {
-            self.__super__:.dispose ();
-            let dmut win = self._scene:.getWindow ();
-
-            win:.insertBin (alias self._vbo);
-            win:.insertBin (alias self._shadowVBO);
-            win:.insertBin (alias self._ibo);
-            win:.insertBin (alias self._world);
-
-            self._scene:.freeShaderRef (self._material.shaderConfig, alias self);
-            if let Ok (dmut s) = alias self._descSet {
-                win:.insertBin (alias s);
-                self._descSet = none;
-            }
-
-            if let Ok (dmut s) = alias self._shadowDescSet {
-                win:.insertBin (alias s);
-                self._shadowDescSet = none;
-            }
-
-            self._material:.detach ();
-            self:.transformationChanged ():.disconnect (&self:.updateUBO);
+    /**
+     * Destroy all allocated buffers on device
+     * */
+    fn destroyBuffers (mut self, dmut scene : &Scene) {
+        let dmut win = scene:.getWindow ();
+        if let Ok (dmut ibo) = alias self._ibo {
+            win:.insertBin (alias ibo);
+            self._ibo = none;
         }
+
+        if let Ok (dmut vbo) = alias self._vbo {
+            win:.insertBin (alias vbo);
+            self._vbo = none;
+        }
+
+        if let Ok (dmut vbo) = alias self._shadowVBO {
+            win:.insertBin (alias vbo);
+            self._shadowVBO = none;
+        }
+
+        if let Ok (dmut world) = alias self._world {
+            win:.insertBin (alias world);
+            self._world = none;
+        }
+
+        if let Ok (dmut s) = alias self._descSet {
+            win:.insertBin (alias s);
+            self._descSet = none;
+            scene:.freeShaderRef (self._material.shaderConfig, alias self);
+        }
+
+        // if let Ok (dmut s) = alias self._shadowDescSet {
+        //     win:.insertBin (alias s);
+        //     self._shadowDescSet = none;
+        //     scene:.freeSadowShaderRef (self._material.shaderConfig, alias self);
+        // }
+
+        self._material:.detach ();
+        self:.transformationChanged ():.disconnect (&self:.updateUBO);
     }
 
 }
