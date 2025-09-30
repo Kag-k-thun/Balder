@@ -33,6 +33,9 @@ pub class VulkanDevice {
         // The graphics queue
         let dmut _graphicsQueue : VkQueue = null;
 
+        // The transfer queue
+        let dmut _transferQueue : VkQueue = null;
+
         // The present queue
         let dmut _presentQueue : VkQueue = null;
 
@@ -324,9 +327,24 @@ pub class VulkanDevice {
      * @returns: the number of uniq family indices
      */
     pub fn getPhysicalDeviceFamilyIndiceCounts (self)-> u32 {
-        if (self._physicalDeviceFamilyIndices [0] == self._physicalDeviceFamilyIndices [1]) {
-            1u32
-        } else 2u32
+        let mut res = 0u32;
+
+        for i in 1 .. self._physicalDeviceFamilyIndices.len {
+            let mut j = 0us;
+            while j < i {
+                if self._physicalDeviceFamilyIndices [i] == self._physicalDeviceFamilyIndices [j] {
+                    break;
+                }
+
+                j += 1;
+            }
+
+            if i == j {
+                res += 1;
+            }
+        }
+
+        res
     }
 
     /**
@@ -472,6 +490,7 @@ pub class VulkanDevice {
                 self._submitInfo.pCommandBuffers      = &self._commandBuffers [self._currentFrame];
 
                 let r = vkQueueSubmit (self._graphicsQueue, 1u32, &self._submitInfo, self._inFlightFence);
+
                 if (r != VkResult::VK_SUCCESS) {
                     log::error #("Device", "Error present screen queue submit : ", self._currentFrame, " ", image);
                     return r;
@@ -497,8 +516,8 @@ pub class VulkanDevice {
 
                 // self._currentFrame = (self._currentFrame + 1u32) % cast!u32 (swp.framebuffers.len);
                 vkQueueWaitIdle (self._presentQueue);
+                vkQueueWaitIdle (self._graphicsQueue);
             }
-
             return VkResult::VK_SUCCESS;
         }
 
@@ -539,10 +558,12 @@ pub class VulkanDevice {
         submitInfo.commandBufferCount = 1u32;
         submitInfo.pCommandBuffers    = &cmd;
 
-        vkQueueSubmit (self._graphicsQueue, 1u32, &submitInfo, null);
-        vkQueueWaitIdle (self._graphicsQueue);
+        atomic self {
+            vkQueueSubmit (self._transferQueue, 1u32, &submitInfo, null);
+            vkQueueWaitIdle (self._transferQueue);
+            vkFreeCommandBuffers (self._device, self._memoryPool, 1u32, &cmd);
+        }
 
-        vkFreeCommandBuffers (self._device, self._memoryPool, 1u32, &cmd);
     }
 
     // /**
@@ -589,17 +610,26 @@ pub class VulkanDevice {
     prv fn createCommandPools (mut self)
         throws BalderError
     {
-        let mut poolInfo = VkCommandPoolCreateInfo ();
-        poolInfo.sType            = VkStructureType::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        poolInfo.flags            = cast!u32 (VkCommandPoolCreateFlagBits::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
-        poolInfo.queueFamilyIndex = self._physicalDeviceFamilyIndices [1];
+        {
+            let mut poolInfo = VkCommandPoolCreateInfo ();
+            poolInfo.sType            = VkStructureType::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            poolInfo.flags            = cast!u32 (VkCommandPoolCreateFlagBits::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+            poolInfo.queueFamilyIndex = self._physicalDeviceFamilyIndices [1];
 
-        if (vkCreateCommandPool (self._device, &poolInfo, null, alias &self._drawPool) != VkResult::VK_SUCCESS) {
-            throw copy BalderError ("Failed to create the command poll");
+            if (vkCreateCommandPool (self._device, &poolInfo, null, alias &self._drawPool) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to create the draw pool");
+            }
         }
 
-        if (vkCreateCommandPool (self._device, &poolInfo, null, alias &self._memoryPool) != VkResult::VK_SUCCESS) {
-            throw copy BalderError ("Failed to create the command poll");
+        {
+            let mut poolInfo = VkCommandPoolCreateInfo ();
+            poolInfo.sType            = VkStructureType::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            poolInfo.flags            = cast!u32 (VkCommandPoolCreateFlagBits::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+            poolInfo.queueFamilyIndex = self._physicalDeviceFamilyIndices [2];
+
+            if (vkCreateCommandPool (self._device, &poolInfo, null, alias &self._memoryPool) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to create the memory pool");
+            }
         }
     }
 
@@ -773,12 +803,15 @@ pub class VulkanDevice {
 
         vkGetDeviceQueue (self._device, self._physicalDeviceFamilyIndices [0], 0u32, alias &self._graphicsQueue);
         vkGetDeviceQueue (self._device, self._physicalDeviceFamilyIndices [1], 0u32, alias &self._presentQueue);
+        vkGetDeviceQueue (self._device, self._physicalDeviceFamilyIndices [2], 0u32, alias &self._transferQueue);
 
         if (self._graphicsQueue == null) throw copy BalderError ("Failed to retreive graphics queue");
         if (self._presentQueue == null) throw copy BalderError ("Failed to retreive present queue");
+        if (self._transferQueue == null) throw copy BalderError ("Failed to retreive transfer queue");
 
         log::debug #("Device", "Created logical device");
     }
+
     
     /**
      * ======================================================================================================
@@ -865,15 +898,15 @@ pub class VulkanDevice {
         }
 
         log::debug #("Device", "Rating physical device : ", name, " = ", score);
-        (name, score, copy [family._1, family._2])
+        (name, score, copy [family._1, family._2, family._3])
     }
 
     /**
-     * Find the indices of the queue family (graphics and present)
+     * Find the indices of the queue family (graphics, present and transfer)
      */
-    fn findQueueFamily (self, surface : VkSurfaceKHR, device : VkPhysicalDevice)-> (bool, u32, u32) {
-        let mut gr = 0u32, mut pr = 0u32;
-        let mut foundGr = false, mut foundPr = false;
+    fn findQueueFamily (self, surface : VkSurfaceKHR, device : VkPhysicalDevice)-> (bool, u32, u32, u32) {
+        let mut gr = 0u32, mut pr = 0u32, mut tr = 0u32;
+        let mut foundGr = false, mut foundPr = false, mut foundTr = false;
 
         let mut queueFamilyCount = 0u32;
         vkGetPhysicalDeviceQueueFamilyProperties (device, alias &queueFamilyCount, null);
@@ -888,6 +921,11 @@ pub class VulkanDevice {
                     foundGr = true;
                 }
 
+                if (q.queueFlags & cast!u32 (VkQueueFlagBits::VK_QUEUE_TRANSFER_BIT) != 0u32) {
+                    tr = cast!u32 (i);
+                    foundTr = true;
+                }
+
                 let mut presentSupport = VK_FALSE;
                 vkGetPhysicalDeviceSurfaceSupportKHR (device, cast!u32 (i), surface, alias &presentSupport);
                 if (presentSupport != VK_FALSE) {
@@ -895,11 +933,11 @@ pub class VulkanDevice {
                     foundPr = true;
                 }
 
-                if (foundPr && foundGr) break;
+                if (foundPr && foundGr && foundTr) break;
             }
         }
 
-        return (foundGr && foundPr, gr, pr);
+        return (foundGr && foundPr && foundTr, gr, pr, tr);
     }
 
     /**
