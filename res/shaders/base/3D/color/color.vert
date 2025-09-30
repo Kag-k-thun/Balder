@@ -16,7 +16,9 @@ layout(binding = 2) uniform Color {
     vec4 color;
 } color;
 
-layout (location = 0) out vec4 outColor;
+layout (location = 0) out vec4 outPosition;
+layout (location = 1) out vec3 outColor;
+layout (location = 2) out vec3 outNormals;
 
 out gl_PerVertex {
     vec4 gl_Position;
@@ -24,5 +26,7 @@ out gl_PerVertex {
 
 void main () {
     gl_Position = camera.proj * camera.view * world.model* vec4 (inPosition, 1.0);
-    outColor = color.color;
+    outColor = color.color.xyz;
+    outPosition = gl_Position;
+    outNormals = vec3 (1);
 }
