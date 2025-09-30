@@ -5,10 +5,9 @@ layout (location = 1) in vec3 inNormals;
 layout (location = 2) in vec3 inColor;
 
 layout (location = 0) out vec3 position;
-layout (location = 1) out float depth;
-layout (location = 2) out vec3 normals;
-layout (location = 3) out vec4 albedo;
-layout (location = 4) out uint materialID;
+layout (location = 1) out vec3 normals;
+layout (location = 2) out vec4 albedo;
+layout (location = 3) out uint materialID;
 
 void main() {
     int id = gl_PrimitiveID * 7907 % 256;
@@ -21,10 +20,9 @@ void main() {
     g = (id2 / 255.0f);
     b = (id3 / 255.0f);
 
-    position = vec3 (r, g, b);
-    depth = (gl_FragCoord.z / gl_FragCoord.w) / 200.f;
-
+    // depth = (gl_FragCoord.z / gl_FragCoord.w) / 200.f;
+    position = vec3 (inPosition.xyz);
     normals = vec3 (inNormals);
-    albedo = vec4 (inColor, 1);
+    albedo = vec4 (r, g, b, 1);
     materialID = 1;
 }
