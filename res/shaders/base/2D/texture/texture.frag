@@ -39,19 +39,21 @@ void main () {
     float dist = sdRountRect (pos, size, vec2 (world.radius) / world.dimension);
     if (dist > 0.0) discard;
 
+    // float lowR = 0.99;
+    // float highR = 1.0;
 
-    float lowR = -13.17188;
-    float highR = 14.14844;
+    // float lowG = -27.84375;
+    // float highG = 29.53125;
 
-    float lowG = -27.84375;
-    float highG = 29.53125;
+    // float lowB = 0;
+    // float highB = 77.6875;
 
-    float lowB = 0;
-    float highB = 77.6875;
+    // vec3 low = vec3 (lowR, lowG, lowB);
+    // vec3 high = vec3 (highR, highG, highB);
 
-    vec3 low = vec3 (lowR, lowG, lowB);
-    vec3 high = vec3 (highR, highG, highB);
-
-    vec3 texColor = (texture (diffuse, a_uv).xyz - low) / (high - low);
-    out_color = vec4 (texColor * world.color.xyz, 1);
+    // float r = (texture (diffuse, a_uv).r - lowR) / (highR - lowR);
+    // vec3 texColor = vec3 (r);
+     
+    vec4 texColor = texture (diffuse, a_uv);
+    out_color = texColor * world.color;
 }
