@@ -21,7 +21,7 @@ void main() {
     b = (id3 / 255.0f);
 
     // depth = (gl_FragCoord.z / gl_FragCoord.w) / 200.f;
-    position = vec3 (inPosition.xyz);
+    position = vec3 (r, g, b); //inPosition.xyz);
     normals = vec3 (inNormals);
     albedo = vec4 (r, g, b, 1);
     materialID = 1;
