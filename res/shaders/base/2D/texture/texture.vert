@@ -7,12 +7,10 @@ layout (binding = 0) uniform World {
     vec2 dimension;
     vec2 translation;
     vec2 scale;
-
-    int radius;
+    
     int level;
 
-    vec4 color;
-    vec4 rotation;
+    vec4 color;    
     vec4 scissors;
 } world;
 
@@ -23,9 +21,8 @@ out gl_PerVertex {
     vec4 gl_Position;
 };
 
-void main () {
-    mat2 rot = mat2 (world.rotation.x, world.rotation.y, world.rotation.z, world.rotation.w);
-    vec2 rotatedCenter = (rot * position.xy) + 1;
+void main () {    
+    vec2 rotatedCenter = (position.xy) + 1;
     vec2 scaledCenter = rotatedCenter * (world.scale / world.dimension);
     vec2 pos = scaledCenter + ((world.translation / (world.dimension / 2)) - 1);
 

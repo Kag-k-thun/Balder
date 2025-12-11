@@ -14,7 +14,7 @@ pub class VulkanSubpass {
     prot { // Rendering pass
 
         // The frame buffer attached to the rendering texture
-        let dmut _framebuffer : VkFramebuffer = null;
+        let dmut _framebuffers : [VkFramebuffer] = [];
 
         // The render pass of the subpass
         let dmut _renderPass : VkRenderPass = null;
@@ -42,7 +42,7 @@ pub class VulkanSubpass {
      * ====================================================================================================
      */
 
-    pub self (dmut device : &VulkanDevice, width : u32, height : u32, attachments : [&Texture])
+    pub self (dmut device : &VulkanDevice, width : u32, height : u32, attachments : [&OutputTexture])
         with _device = alias device
         , _width = width
         , _height = height
@@ -66,7 +66,7 @@ pub class VulkanSubpass {
     /**
      * Configure the
      * */
-    fn configure (mut self, attachments : [&Texture])
+    fn configure (mut self, attachments : [&OutputTexture])
         throws BalderError
     {
         self:.createRenderPass (attachments);
@@ -76,7 +76,7 @@ pub class VulkanSubpass {
     /**
      * Create the render pass for the subpass
      * */
-    fn createRenderPass (mut self, textures : [&Texture])
+    fn createRenderPass (mut self, textures : [&OutputTexture])
         throws BalderError
     {
         if textures.len == 0 { throw copy BalderError ("Empty subpass"); }
@@ -86,8 +86,8 @@ pub class VulkanSubpass {
         let mut depthRef = VkAttachmentReference ();
         let mut hasDepth = false;
 
-        for i, t in textures match t {
-            tx : &DepthTexture => {
+        for i, tx in textures {
+            if tx.isDepth () {
                 if hasDepth throw copy BalderError ("Multiple depth attachments");
                 hasDepth = true;
 
@@ -104,12 +104,13 @@ pub class VulkanSubpass {
                 attachments ~= [depthAttachment];
                 depthRef.attachment = cast!u32 (i);
                 depthRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                
                 let mut color = VkClearValue ();
                 color.depthStencil.depth = 1.f;
                 self._clearColor ~= [color];
             }
 
-            tx : &ColorTexture => {
+            else {
                 let mut colorAttachement = VkAttachmentDescription ();
                 colorAttachement.format = tx.format;
                 colorAttachement.samples        = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
@@ -130,9 +131,6 @@ pub class VulkanSubpass {
                 color.color.float32 = [0.f, 0.f, 0.f, 0.f];
                 self._clearColor ~= [color];
             }
-            _ => {
-                throw copy BalderError ("Invalid texture attachment : " ~ t.__typeinfo__.name);
-            }
         }
 
         let mut subPass = VkSubpassDescription ();
@@ -140,10 +138,12 @@ pub class VulkanSubpass {
         if hasDepth {
             subPass.pDepthStencilAttachment = &depthRef;
         }
-
+        
         subPass.colorAttachmentCount = cast!u32 (colorRefs.len);
         subPass.pColorAttachments    = colorRefs.ptr;
 
+        std::io::println ("=========", subPass.colorAttachmentCount);
+        
         let dependencies = self.createPassDependencies (colorRefs.len != 0, hasDepth);
 
         let mut renderPassInfo = VkRenderPassCreateInfo ();
@@ -239,25 +239,28 @@ pub class VulkanSubpass {
     /**
      * Create the frame buffer of the subpass
      * */
-    fn createFramebuffer (mut self, textures : [&Texture])
+    fn createFramebuffer (mut self, textures : [&OutputTexture])
         throws BalderError
     {
-        let attachment : [VkImageView] = copy [tex.getImageView () for tex in textures];
+        self._framebuffers = copy [null ; self._device.getSwapchainNbFrames ()];        
+        for i in 0 .. self._device.getSwapchainNbFrames () {            
+            let attachment : [VkImageView] = copy [tex.getImageViews ()[i] for tex in textures];
 
-        let mut framebufferInfo = VkFramebufferCreateInfo ();
-        framebufferInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        framebufferInfo.renderPass = self._renderPass;
-        framebufferInfo.attachmentCount = cast!{u32} (attachment.len);
-        framebufferInfo.pAttachments = attachment.ptr;
-        framebufferInfo.width = self._width;
-        framebufferInfo.height = self._height;
-        framebufferInfo.layers = 1u32;
+            let mut framebufferInfo = VkFramebufferCreateInfo ();
+            framebufferInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = self._renderPass;
+            framebufferInfo.attachmentCount = cast!{u32} (attachment.len);
+            framebufferInfo.pAttachments = attachment.ptr;
+            framebufferInfo.width = self._width;
+            framebufferInfo.height = self._height;
+            framebufferInfo.layers = 1u32;
 
-        if vkCreateFramebuffer (self._device.getDeviceHandle (), &framebufferInfo, null, alias &self._framebuffer) != VkResult::VK_SUCCESS {
-            throw copy BalderError ("Failed to create framebuffer");
+            if vkCreateFramebuffer (self._device.getDeviceHandle (), &framebufferInfo, null, alias &self._framebuffers [i]) != VkResult::VK_SUCCESS {
+                throw copy BalderError ("Failed to create framebuffer");
+            }
+
+            log::debug #("VulkanSubpass", "Created frame buffer for subpass");
         }
-
-        log::debug #("VulkanSubpass", "Created frame buffer for subpass");
     }
 
     /*!
@@ -300,7 +303,7 @@ pub class VulkanSubpass {
         pass.renderArea.extent.height = self._height;
         pass.clearValueCount   = cast!{u32} (self._clearColor.len);
         pass.pClearValues      = self._clearColor.ptr;
-        pass.framebuffer = self._framebuffer;
+        pass.framebuffer = self._framebuffers [self._device.getCurrentFrameIndex ()];
 
         vkCmdBeginRenderPass (self._device.getCommandBuffer (), &pass, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
         let mut viewport = VkViewport ();
@@ -329,11 +332,11 @@ pub class VulkanSubpass {
 
     impl Disposable {
         pub over dispose (mut self) {
-            if self._framebuffer != null {
-                vkDestroyFramebuffer (self._device.getDeviceHandle (), self._framebuffer, null);
-                self._framebuffer = null;
+            for i in 0 .. self._framebuffers.len {
+                vkDestroyFramebuffer (self._device.getDeviceHandle (), self._framebuffers [i], null);                
             }
-
+            self._framebuffers = [];
+            
             if self._renderPass != null {
                 vkDestroyRenderPass (self._device.getDeviceHandle (), self._renderPass, null);
                 self._renderPass = null;

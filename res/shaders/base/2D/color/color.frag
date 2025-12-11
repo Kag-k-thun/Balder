@@ -7,12 +7,10 @@ layout (binding = 0) uniform World {
     vec2 dimension;
     vec2 translation;
     vec2 scale;
-
-    int radius;
+    
     int level;
 
     vec4 color;
-    vec4 rotation;
     vec4 scissors;
 } world;
 
@@ -31,10 +29,10 @@ void main () {
     if (gl_FragCoord.x < world.scissors.x || gl_FragCoord.x > world.scissors.z) { discard; }
     if (gl_FragCoord.y < world.scissors.y || gl_FragCoord.y > world.scissors.w) { discard; }
 
-    vec2 pos = a_pos * world.scale / world.dimension.yy;
-    vec2 size = vec2 (0.5, 0.5) * world.scale / world.dimension.yy;
-    float dist = sdRountRect (pos, size, vec2 (world.radius) / world.dimension);
-    if (dist > 0.0) discard;
+    // vec2 pos = a_pos * world.scale / world.dimension.yy;
+    // vec2 size = vec2 (0.5, 0.5) * world.scale / world.dimension.yy;
+    // float dist = sdRountRect (pos, size, vec2 (world.radius) / world.dimension);
+    // if (dist > 0.0) discard;
 
     out_color = vec4 (world.color.xyz, world.color.w);
 }

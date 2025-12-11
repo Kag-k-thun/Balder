@@ -81,10 +81,10 @@ pub class Window {
         let dmut _composePass : &DrawPass = copy DrawPass ();
 
         // The list of subpasses
-        let dmut _subpasses : [[c8] => &DrawPass] = copy [];
+        let dmut _subpasses : [[c8] => &SubPass] = copy [];
 
         // The list of subpasses sorted to accomodate their dependencies
-        let dmut _sortedSubpasses : [&DrawPass] = [];
+        let dmut _sortedSubpasses : [&SubPass] = [];
 
     }
 
@@ -567,9 +567,7 @@ pub class Window {
     pub fn resetComposePass (mut self) {
         atomic self {
             self._redrawing = true;
-            self._composePass.loadPhase = &emptyLoad;
-            self._composePass.drawPhase = &emptyDraw;
-            self._composePass.cleanPhase = &emptyClean;
+            self._composePass:.reset ();            
         }
     }
 
@@ -580,8 +578,8 @@ pub class Window {
      *     - drawPhase: a callback closure for the drawing phase
      */
     pub fn setComposePass (mut self,
-                           loadPhase : dg (dmut &IndirectCommandAllocator)-> void,
-                           drawPhase : dg (dmut &IndirectCommandAllocator)-> void,
+                           loadPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
+                           drawPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
                            cleanPhase : dg ()-> void) {
         atomic self {
             self._redrawing = true;
@@ -621,8 +619,8 @@ pub class Window {
      * */
     pub fn addSubpass (mut self,
                        name : [c8],
-                       loadPhase : dg (dmut &IndirectCommandAllocator)-> void,
-                       drawPhase : dg (dmut &IndirectCommandAllocator)-> void,
+                       loadPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
+                       drawPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
                        cleanPhase : dg ()-> void,
                        dmut pass : &VulkanSubpass)
         throws BalderError
@@ -950,10 +948,11 @@ pub class Window {
      * ====================================================================================================
      */
 
+    /**
+     * Update observed in the rendering pipeline needed a redrawing
+     * */
     fn performRedraw (mut self) {
         atomic self {
-            let dmut newAllocs = self:.performReload ();
-
             if (self._vkDevice.needResize ()) {
                 self._vkDevice:.recreateSwapchain ();
             } catch {
@@ -962,101 +961,149 @@ pub class Window {
                     return;
                 }
             }
-
-            let mut frames = 0u32;
-            let dmut redrawn = copy [false ; self._vkDevice.getSwapchainNbFrames ()];
-            while frames < self._vkDevice.getSwapchainNbFrames () && self._isRunning {
-                self._box:.emit ();
-
-                let image = self:.startPass ();
-                if image >= 0 {
-                    if !redrawn [image] {
-                        self._vkDevice:.clearCommandBuffer ();
-
-                        self._vkDevice.startRecording ();
-
-                        self:.drawSubpasses (alias newAllocs);
-
-                        self._vkDevice.startRenderPass (cast!u32 (image));
-                        newAllocs [0]:.startRecording ();
-
-                        self._composePass.drawPhase (alias newAllocs [0]);
-
-                        self._vkDevice.stopRenderPass ();
-                        self._vkDevice.stopRecording ();
-
-                        redrawn [image] = true;
-                        frames += 1;
-                    }
-
-                    self:.presentPass (image);
-                } else {
-                    self._redrawing = true;
-                    break;
-                }
-
-                if self._vkDevice.needResize () {
-                    self._redrawing = true;
-                    break;
-                }
-
-                self:.waitFrame (true);
-            }
-
-            for i, dmut z in alias self._sortedSubpasses {
-                if let Ok (dmut all) = alias z.cmdAlloc {
-                    all:.dispose ();
-                }
-
-                self._sortedSubpasses [i].cmdAlloc = (alias newAllocs [i + 1])?;
-                self._sortedSubpasses [i].cleanPhase ();
-            }
-
-            if let Ok (dmut all) = alias self._composePass.cmdAlloc {
-                all:.dispose ();
-            }
-
-            self._composePass.cmdAlloc = (alias newAllocs [0])?;
-            self._composePass.cleanPhase ();
-
-            self._bin:.emptyTrash ();
+            
+            let dmut newAllocs = self:.performReload ();                    
+            self:.performRedraw (alias newAllocs);
+            self:.performClean (alias newAllocs);
         }
     }
-
-    fn performReload (mut self)-> dmut [&IndirectCommandAllocator] {
-        let dmut cmds = copy [copy IndirectCommandAllocator (alias self._vkDevice) for _ in 0 .. (self._sortedSubpasses.len + 1)];
-        for i, _ in self._sortedSubpasses {
-            self._sortedSubpasses [i].loadPhase (alias cmds [i + 1]);
-            {
-                cmds [i + 1]:.finalizeLoading ();
-            }?;
+    
+    /**
+     * Allocate the new command allocators, and initialize the buffers
+     * @returns: the newly allocated command buffers
+     * */
+    fn performReload (mut self)-> dmut [&CommandAllocator] {
+        let dmut composeCmd = copy IndexedDrawCommandAllocator (alias self._vkDevice);
+        let dmut cmds : [&CommandAllocator] = copy [alias composeCmd];
+        
+        for dmut p in alias self._sortedSubpasses {
+            if let dmut pass : &DrawPass = alias p {
+                let dmut icmd = copy IndexedDrawCommandAllocator (alias self._vkDevice);
+                pass.loadPhase (alias icmd);
+                {
+                    icmd:.finalizeLoading ();
+                }?;
+                
+                cmds ~= [icmd];
+            }
+            else if let dmut pass : &ComputePass = alias p {
+                pass;
+                let dmut ccmd = copy ComputeCommandAllocator (alias self._vkDevice);
+                cmds ~= [ccmd];
+            }
         }
 
-        self._composePass.loadPhase (alias cmds [0]);
+        self._composePass.loadPhase (alias composeCmd);
         {
-            cmds [0]:.finalizeLoading ();
+            composeCmd:.finalizeLoading ();
         }?;
 
         alias cmds
     }
 
     /**
-     * Draw the subpasses of the window
+     * Fill the newly allocated command buffers with the drawing commands
+     * @params:
+     *    - newAllocs: the command buffers
      * */
-    fn drawSubpasses (mut self, dmut newAllocs : [&IndirectCommandAllocator]) {
-        for i, dmut z in alias self._sortedSubpasses {
-            if let Ok (dmut vk) = alias z.pass {
-                vk.startRenderPass ();
-                newAllocs [i + 1]:.startRecording ();
-                z.drawPhase (alias newAllocs [i + 1]);
+    fn performRedraw (mut self, dmut newAllocs : [&CommandAllocator]) {                        
+        let mut frames = 0u32;
+        let dmut redrawn = copy [false ; self._vkDevice.getSwapchainNbFrames ()];
+        while frames < self._vkDevice.getSwapchainNbFrames () && self._isRunning {
+            self._box:.emit ();
 
-                self._vkDevice.stopRenderPass ();
+            let image = self:.startPass ();
+            if image >= 0 {
+                if !redrawn [image] {
+                    self._vkDevice:.clearCommandBuffer ();
+
+                    self._vkDevice.startRecording ();
+                    self:.drawSubpasses (cast!u32 (image), alias newAllocs);                
+                    self._vkDevice.stopRecording ();
+                    
+                    redrawn [image] = true;
+                    frames += 1;
+                }
+
+                self:.presentPass (image);
+            } else {
+                self._redrawing = true;
+                break;
             }
+
+            if self._vkDevice.needResize () {
+                self._redrawing = true;
+                break;
+            }
+
+            self:.waitFrame (true);
         }
     }
 
+    /**
+     * Draw the subpasses of the window
+     * @params:
+     *    - newAllocs: the command allocated used to register the draw commands
+     * */
+    fn drawSubpasses (mut self, image : u32, dmut newAllocs : [&CommandAllocator]) {
+        for i, dmut z in alias self._sortedSubpasses {
+            if let (dmut pass : &DrawPass, dmut icmd : &IndexedDrawCommandAllocator) = (alias z, alias newAllocs [i + 1]) {
+                if let Ok (dmut vk) = alias pass.pass {
+                    vk.startRenderPass ();
+                    icmd:.startRecording ();
+                    pass.drawPhase (alias icmd);
 
+                    self._vkDevice.stopRenderPass ();
+                }
+            }
 
+            else if let (dmut pass : &ComputePass, dmut ccmd : &ComputeCommandAllocator) = (alias z, alias newAllocs [i + 1]) {
+                pass;
+                ccmd;
+            }
+        }
+
+        /**
+         * Draw the composition pass
+         * */
+        if let dmut icmd : &IndexedDrawCommandAllocator = alias newAllocs [0] {
+            self._vkDevice.startRenderPass (image);                                        
+            icmd:.startRecording ();
+            self._composePass.drawPhase (alias icmd);
+            self._vkDevice.stopRenderPass ();
+        } else {
+            log::error #("Window", "Malformed command allocator in compose phase");
+        }
+
+    }
+    
+    /**
+     * Clean the command buffers of the old drawings and replace them with the newly allocated ones
+     * @params:
+     *    - newAllocs: the command buffers
+     * */
+    fn performClean (mut self, dmut newAllocs : [&CommandAllocator]) {
+        for i, dmut z in alias self._sortedSubpasses {
+            if let Ok (dmut all) = alias z.cmdAlloc {
+                all:.dispose ();
+            }
+
+            z.cmdAlloc = (alias newAllocs [i + 1])?;
+            if let dmut pass : &DrawPass = alias z { 
+                pass.cleanPhase ();
+            }
+        }
+
+        if let Ok (dmut all) = alias self._composePass.cmdAlloc {
+            all:.dispose ();
+        }
+        
+        self._composePass.cmdAlloc = (alias newAllocs [0])?;
+        self._composePass.cleanPhase ();
+        
+        self._bin:.emptyTrash ();
+    }    
+    
     /**
      * ======================================================================================================
      * ======================================================================================================
