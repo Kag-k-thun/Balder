@@ -1,0 +1,551 @@
+in draw;
+
+use ::vulkan::core;
+
+use balder::core::{_, driver::_, memory::_, application::_, shader::_};
+use balder::utils::log;
+
+@final
+pub class DrawSubpass over VulkanSubpass {
+
+    prot { // Rendering pass
+
+        // The frame buffer attached to the rendering texture
+        let dmut _framebuffers : [VkFramebuffer] = [];        
+
+        // The render pass of the subpass
+        let dmut _renderPass : VkRenderPass = null;
+
+        // The color used when clearing an image of the swap chain;
+        let dmut _clearColor : [VkClearValue] = [];
+
+    }
+
+    prot { // Output buffers
+
+        // The width of the subpass texture
+        let dmut _width : u32;
+
+        // The height of the subpass texture
+        let dmut _height : u32;
+
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create a draw subpass used to render to textures
+     * */
+    pub self toTextures (dmut device : &VulkanDevice, width : u32, height : u32, attachments : [&OutputTexture])
+        with super (alias device)
+        , _width = width
+        , _height = height
+        throws BalderError
+    {
+        self:.configureToTextures (attachments);
+    }
+
+    /**
+     * Create a draw subpass used to render to swapchain
+     * */
+    pub self toScreen (dmut device : &VulkanDevice, width : u32, height : u32, dmut swp : &SwapChain)
+        with super (alias device)
+        , _width = width
+        , _height = height
+        throws BalderError
+    {
+        self:.configureToScreen (alias swp);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the render pass of the subpass
+     * */
+    pub fn getRenderPass (self)-> VkRenderPass {
+        self._renderPass
+    }
+
+    /**
+     * @returns: the dimension of the subpass
+     *     - .0: the width
+     *     - .1: the height
+     * */
+    pub fn getDimension (self)-> (u32, u32) {
+        (self._width, self._height)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          RENDERING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start the drawing pass
+     * */
+    prot over startRecording (mut self, frame : u32) {        
+        self.__super__:.startRecording (frame);
+        
+        let mut pass = VkRenderPassBeginInfo ();
+        pass.sType = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        pass.renderPass = self._renderPass;
+        pass.renderArea.extent.width = self._width;
+        pass.renderArea.extent.height = self._height;
+        pass.clearValueCount   = cast!{u32} (self._clearColor.len);
+        pass.pClearValues      = self._clearColor.ptr;
+        pass.framebuffer = self._framebuffers [self._currentFrame];
+
+        vkCmdBeginRenderPass (self._nextCommandBuffer [self._currentFrame], &pass, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
+
+        let mut viewport = VkViewport ();
+        viewport.width = cast!{f32} (self._width);
+        viewport.height = cast!{f32} (self._height);
+        viewport.maxDepth = 1.0f;
+
+        let mut scissor = VkRect2D ();
+        scissor.extent.width = self._width;
+        scissor.extent.height = self._height;
+
+        vkCmdSetViewport (self._nextCommandBuffer [self._currentFrame], 0, 1, &viewport);
+        vkCmdSetScissor (self._nextCommandBuffer [self._currentFrame], 0, 1, &scissor);
+
+        vkCmdSetDepthBias (self._nextCommandBuffer [self._currentFrame], 1.25f, 0.0f, 1.75f);
+    }
+
+    /**
+     * Stop the drawing pass
+     * */
+    prot over stopRecording (mut self) {
+        vkCmdEndRenderPass (self._nextCommandBuffer [self._currentFrame]);
+        
+        self.__super__:.stopRecording ();
+    }
+    
+    /**
+     * Submit the pass to the graphics queue
+     * */
+    prot over submit (mut self, frame : u32, previousPassStages : [u32], previousPass : [VkSemaphore])-> VkResult {
+        let cmd = self:.getCommandBuffer (frame);
+        if cmd != null {                
+            let mut submitInfo = VkSubmitInfo ();
+            submitInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            
+            submitInfo.waitSemaphoreCount = cast!u32 (previousPass.len);
+            submitInfo.pWaitSemaphores = previousPass.ptr;
+            submitInfo.pWaitDstStageMask = previousPassStages.ptr;    
+            
+            submitInfo.signalSemaphoreCount = 1u32;        
+            submitInfo.pSignalSemaphores = &self._finishSemaphore [frame];
+
+            submitInfo.commandBufferCount   = 1u32;
+            submitInfo.pCommandBuffers      = &cmd;
+            
+            atomic self._device {
+                let r = vkQueueSubmit (self._device.getGraphicsQueue (), 1u32, &submitInfo, self._fences [frame]);                
+                if (r != VkResult::VK_SUCCESS) {
+                    log::error #("DrawPass", "Error submitting pass to queue : ", frame);
+                    return r;
+                }
+                
+                return r;
+            }                    
+        } else {
+            VkResult::VK_NOT_READY
+        }
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          CONFIGURATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Configure the render pass to render inside textures instead of screen
+     * */
+    fn configureToTextures (mut self, attachments : [&OutputTexture])
+        throws BalderError
+    {
+        self:.createRenderPassToTextures (attachments);
+        self:.createFramebufferToTextures (attachments);
+    }
+
+    /**
+     * Configure the render pass to render directly to swap chain     
+     * */
+    fn configureToScreen (mut self, dmut swp : &SwapChain)
+        throws BalderError
+    {
+        self:.createRenderPassToScreen (alias swp);
+        self:.createFramebufferToScreen (alias swp);
+    }
+
+    /**
+     * Reconfigure the render pass after a swap chain recreation
+     * */
+    pub fn reconfigureToScreen (mut self, width : u32, height : u32, dmut swp : &SwapChain)
+        throws BalderError
+    {
+        self._width = width;
+        self._height = height;
+
+        // No need to change renderpass, it shouldn't have change for swap chain (only a size change trigger the recreation)
+        self:.createRenderPassToScreen (alias swp);
+        self:.createFramebufferToScreen (alias swp);
+        self:.forceRedraw ();
+    }    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          TO SCREEN          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Create the subpass used to render to screen
+     * */
+    fn createRenderPassToScreen (mut self, dmut swp : &SwapChain)
+        throws BalderError
+    {    
+        let mut colorAttachement = VkAttachmentDescription ();
+        colorAttachement.format         = swp.format;
+        colorAttachement.samples        = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        colorAttachement.loadOp         = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachement.storeOp        = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachement.stencilLoadOp  = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachement.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachement.initialLayout  = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;        
+        colorAttachement.finalLayout    = VkImageLayout::VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;        
+        
+        let mut depthAttachment = VkAttachmentDescription ();
+        depthAttachment.format = swp.depthFormat;
+        depthAttachment.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        depthAttachment.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        let mut colorAttachementRef = VkAttachmentReference ();
+        colorAttachementRef.attachment = 0;
+        colorAttachementRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        let mut depthAttachmentRef = VkAttachmentReference ();
+        depthAttachmentRef.attachment = 1;
+        depthAttachmentRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        let mut subPass = VkSubpassDescription ();
+        subPass.pipelineBindPoint    = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subPass.colorAttachmentCount = 1u32;
+        subPass.pColorAttachments    = &colorAttachementRef;        
+
+        let dependencies = self.createPassDependencies (true, true);
+        let dmut attachment = copy [colorAttachement, depthAttachment];                    
+
+        let mut renderPassInfo = VkRenderPassCreateInfo ();
+        renderPassInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;                
+        renderPassInfo.attachmentCount = cast!u32 (attachment.len);
+        renderPassInfo.pAttachments    = attachment.ptr;
+        renderPassInfo.subpassCount    = 1u32;
+        renderPassInfo.pSubpasses      = &subPass;
+        renderPassInfo.dependencyCount = cast!{u32} (dependencies.len);
+        renderPassInfo.pDependencies   = dependencies.ptr;
+
+        if (vkCreateRenderPass (self._device.getDeviceHandle (), &renderPassInfo, null, alias &self._renderPass) != VkResult::VK_SUCCESS) {
+            throw copy BalderError ("Failed to create render pass");
+        }
+        
+        self._clearColor = copy [VkClearValue () ; 2];
+        self._clearColor [0].color.float32 = [0.f, 0.f, 0.f, 1.f];
+        self._clearColor [1].depthStencil.depth = 1.0f;        
+
+        log::debug #("DrawPass", "Created render pass for swapchain");
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TO TEXTURES          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the render pass for the subpass
+     * */
+    fn createRenderPassToTextures (mut self, textures : [&OutputTexture])
+        throws BalderError
+    {
+        if textures.len == 0 { throw copy BalderError ("Empty subpass"); }
+
+        let dmut attachments : [VkAttachmentDescription] = [];
+        let dmut colorRefs : [VkAttachmentReference] = [];
+        let mut depthRef = VkAttachmentReference ();
+        let mut hasDepth = false;
+
+        for i, tx in textures {
+            if tx.isDepth () {
+                if hasDepth throw copy BalderError ("Multiple depth attachments");
+                hasDepth = true;
+
+                let mut depthAttachment = VkAttachmentDescription ();
+                depthAttachment.format = tx.format;
+                depthAttachment.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+                depthAttachment.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+                depthAttachment.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                depthAttachment.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                depthAttachment.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                depthAttachment.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+                depthAttachment.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+                attachments ~= [depthAttachment];
+                depthRef.attachment = cast!u32 (i);
+                depthRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                
+                let mut color = VkClearValue ();
+                color.depthStencil.depth = 1.f;
+                self._clearColor ~= [color];
+            }
+
+            else {
+                let mut colorAttachement = VkAttachmentDescription ();
+                colorAttachement.format = tx.format;
+                colorAttachement.samples        = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
+                colorAttachement.loadOp         = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+                colorAttachement.storeOp        = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE;
+                colorAttachement.stencilLoadOp  = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                colorAttachement.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                colorAttachement.initialLayout  = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+                colorAttachement.finalLayout    = VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                attachments ~= [colorAttachement];
+                let mut colorRef = VkAttachmentReference ();
+                colorRef.attachment = cast!u32 (i);
+                colorRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                colorRefs ~= [colorRef];
+
+                let mut color = VkClearValue ();
+                color.color.float32 = [0.f, 0.f, 0.f, 0.f];
+                self._clearColor ~= [color];
+            }
+        }
+
+        let mut subPass = VkSubpassDescription ();
+        subPass.pipelineBindPoint    = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS;
+        if hasDepth {
+            subPass.pDepthStencilAttachment = &depthRef;
+        }
+        
+        subPass.colorAttachmentCount = cast!u32 (colorRefs.len);
+        subPass.pColorAttachments    = colorRefs.ptr;
+        
+        let dependencies = self.createPassDependencies (colorRefs.len != 0, hasDepth);
+
+        let mut renderPassInfo = VkRenderPassCreateInfo ();
+        renderPassInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = cast!{u32} (attachments.len);
+        renderPassInfo.pAttachments = attachments.ptr;
+
+        renderPassInfo.subpassCount = 1u32;
+        renderPassInfo.pSubpasses = &subPass;
+        renderPassInfo.dependencyCount = cast!u32 (dependencies.len);
+        renderPassInfo.pDependencies = dependencies.ptr;
+
+        if vkCreateRenderPass (self._device.getDeviceHandle (), &renderPassInfo, null, alias &self._renderPass) != VkResult::VK_SUCCESS {
+            throw copy BalderError ("Failed to create render pass");
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==========================          COMMON TO SCREEN/TO TEXTURES          ==========================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Create the dependencies of the subpass
+     * */
+    fn createPassDependencies (self, hasColors : bool, hasDepth : bool)-> [VkSubpassDependency] {
+        let dmut dependencies = copy [VkSubpassDependency () ; 2];
+        dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+		dependencies[0].dstSubpass = 0;
+		dependencies[0].srcStageMask    = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dependencies[0].dependencyFlags = VkDependencyFlagBits::VK_DEPENDENCY_BY_REGION_BIT;
+		dependencies[1].srcSubpass = 0;
+		dependencies[1].dstSubpass      = VK_SUBPASS_EXTERNAL;
+        dependencies[1].dstStageMask    = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		dependencies[1].dependencyFlags = VkDependencyFlagBits::VK_DEPENDENCY_BY_REGION_BIT;
+
+        if hasColors && hasDepth {
+            dependencies[0].srcAccessMask = VkAccessFlagBits::VK_ACCESS_NONE_KHR;
+		    dependencies[0].dstStageMask  = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                        | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                                        | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+
+		    dependencies[0].dstAccessMask  = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+
+
+            dependencies[1].dstAccessMask   = VkAccessFlagBits::VK_ACCESS_MEMORY_READ_BIT;
+		    dependencies[1].srcStageMask    = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                        | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                                        | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+
+		    dependencies[1].srcAccessMask   = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        }
+
+        else if hasDepth {
+            dependencies[0].srcAccessMask   = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
+            dependencies [0].dstStageMask  = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+            dependencies [0].dstAccessMask = VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+            dependencies [1].srcAccessMask = VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            dependencies [1].dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
+            dependencies [1].srcStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+		    dependencies [1].dstStageMask = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }
+
+        else {
+            dependencies[0].srcAccessMask   = VkAccessFlagBits::VK_ACCESS_NONE_KHR;
+		    dependencies[0].dstStageMask   = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+		    dependencies[0].dstAccessMask  = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+            dependencies[1].dstAccessMask   = VkAccessFlagBits::VK_ACCESS_MEMORY_READ_BIT;
+		    dependencies[1].srcStageMask    = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+		    dependencies[1].srcAccessMask   = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                        | VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        }
+
+        dependencies
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          FRAMEBUFFER          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the frame buffer of the subpass
+     * A subpass to textures has to create its own framebuffers, toScreen will use the ones created by the swap chain
+     * */
+    fn createFramebufferToTextures (mut self, textures : [&OutputTexture])
+        throws BalderError
+    {
+        self._framebuffers = copy [null ; self._device:.getSwapchain ().nbFrames];        
+        for i in 0 .. self._framebuffers.len {            
+            let attachment : [VkImageView] = copy [tex.getImageViews ()[i] for tex in textures];
+
+            let mut framebufferInfo = VkFramebufferCreateInfo ();
+            framebufferInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = self._renderPass;
+            framebufferInfo.attachmentCount = cast!{u32} (attachment.len);
+            framebufferInfo.pAttachments = attachment.ptr;
+            framebufferInfo.width = self._width;
+            framebufferInfo.height = self._height;
+            framebufferInfo.layers = 1u32;
+
+            if vkCreateFramebuffer (self._device.getDeviceHandle (), &framebufferInfo, null, alias &self._framebuffers [i]) != VkResult::VK_SUCCESS {
+                throw copy BalderError ("Failed to create framebuffer");
+            }
+
+            log::debug #("DrawPass", "Created frame buffer for subpass to textures");            
+        }
+    }
+
+    /**
+     * Create the framebuffers used to render to the swap chain
+     * */
+    fn createFramebufferToScreen (mut self, dmut swp : &SwapChain)
+        throws BalderError
+    {        
+        self._framebuffers = copy [null ; swp.nbFrames];
+        
+        for i in 0us .. self._framebuffers.len {
+            let mut framebufferInfo = VkFramebufferCreateInfo ();
+            framebufferInfo.sType           = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass      = self._renderPass;
+            
+            let mut attachment : [VkImageView] = copy [swp:.getColorImageViews ()[i],
+                                                       swp:.getDepthImageViews ()[i]];
+            
+            framebufferInfo.attachmentCount = cast!u32 (attachment.len);
+            framebufferInfo.pAttachments    = attachment.ptr;
+
+            framebufferInfo.width           = self._width;
+            framebufferInfo.height          = self._height;
+            framebufferInfo.layers          = 1u32;
+
+            if (vkCreateFramebuffer (self._device.getDeviceHandle (), &framebufferInfo, null, alias &self._framebuffers[i]) != VkResult::VK_SUCCESS) {
+                throw copy BalderError ("Failed to create framebuffers");
+            }
+        }
+        
+        log::debug #("DrawPass", "Created frame buffer for subpass to screen");        
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Destroy the frame buffers without destroying the synchronization utils
+     * */
+    pub fn destroy (mut self) {
+        for i in 0 .. self._framebuffers.len {
+            vkDestroyFramebuffer (self._device.getDeviceHandle (), self._framebuffers [i], null);                
+        }    
+        self._framebuffers = [];
+        
+        if self._renderPass != null {
+            vkDestroyRenderPass (self._device.getDeviceHandle (), self._renderPass, null);
+            self._renderPass = null;
+            self._clearColor = [];
+        }
+    }
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            self:.destroy ();                        
+            self._super_:.dispose ();
+        }
+    }
+}

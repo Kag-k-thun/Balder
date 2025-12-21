@@ -58,6 +58,11 @@ pub class Window {
         // The resource manager to load resource from files
         let dmut _loader : (&ResourceManager)? = none;
 
+        // The drawing pipeline of the window
+        let dmut _pipeline : (&VulkanPipeline)? = none;
+
+        // The final pass of the pipeline
+        let dmut _swapPass : (&DrawSubpass)? = none;
     }
 
     prot { // drawing
@@ -71,20 +76,8 @@ pub class Window {
         // Set to true when the window is displayed the first time
         let mut _started : bool = false;
 
-        // Set to true when the frames have to be redrawn
-        let mut _redrawing : bool = false;
-
         // True iif must wait frame on redrawing
         let mut _mustWaitFrameRedraw : bool = true;
-
-        // The pass for final composition
-        let dmut _composePass : &DrawPass = copy DrawPass ();
-
-        // The list of subpasses
-        let dmut _subpasses : [[c8] => &SubPass] = copy [];
-
-        // The list of subpasses sorted to accomodate their dependencies
-        let dmut _sortedSubpasses : [&SubPass] = [];
 
     }
 
@@ -197,9 +190,8 @@ pub class Window {
             self._frameDuration = dur::seconds (1) / cast!{u64} (cfg.timer.fps);
         }
 
-        // Draw empty screen, to configure default command buffers
-        self:.resetComposePass ();
-        self._redrawing = true;
+        // Draw empty screen, to configure default command buffers                
+        self:.configureRenderPipeline ();
     }
 
     /**
@@ -212,6 +204,16 @@ pub class Window {
         input:.windowExposed ():.connect (alias self._app:.getRootSlotEmitter (), &self:.onExpose);
     }
 
+    /**
+     * Configure the rendering pipeline of the window
+     * */
+    fn configureRenderPipeline (mut self) {
+        let dmut pipeline = copy VulkanPipeline (alias self._vkDevice);
+        self._pipeline = (alias pipeline)?;
+
+        self._swapPass = (alias self._vkDevice:.getSwapchain ():.getRenderPass ())?;
+    }
+    
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -330,12 +332,33 @@ pub class Window {
     }
 
     /**
+     * @returns: the rendering pipeline of the window
+     * */
+    pub fn getVulkanPipeline (mut self)-> dmut &VulkanPipeline {
+        if let Ok (dmut pipe) = alias self._pipeline {
+            return alias pipe;
+        }
+
+        log::error #("Window", "Window configuration is uncomplete");
+        panic;
+    }
+    
+    /**
      * @returns: the garbage bin that is cleaned after a redraw
      * */
     pub fn getGarbageBin {T impl Disposable} (mut self)-> dmut &IResourceBin {
         alias self._bin:.get!{&ResourceBin!{T}} ()
     }
 
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          RESOURCES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
     /**
      * Insert an element in the garbage bin
      * */
@@ -432,13 +455,14 @@ pub class Window {
         }
     }
 
-    /**
-     * @returns: the number of subpasses in the window
-     * */
-    pub fn getNbSubpass (mut self)-> usize {
-        self._subpasses.len
-    }
-
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==============================          APPLICATION GETTERS          ===============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
     /**
      * @returns: the input manager of the window
      * */
@@ -553,185 +577,6 @@ pub class Window {
         }
     }
 
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ==================================          COMPOSITION          ===================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Clear all screen drawings
-     */
-    pub fn resetComposePass (mut self) {
-        atomic self {
-            self._redrawing = true;
-            self._composePass:.reset ();            
-        }
-    }
-
-    /**
-     * Update the elements that are drawn to the window screen
-     * @params:
-     *     - loadPhase: a callback closure for the loading phase
-     *     - drawPhase: a callback closure for the drawing phase
-     */
-    pub fn setComposePass (mut self,
-                           loadPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
-                           drawPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
-                           cleanPhase : dg ()-> void) {
-        atomic self {
-            self._redrawing = true;
-            self._composePass.loadPhase = loadPhase;
-            self._composePass.drawPhase = drawPhase;
-            self._composePass.cleanPhase = cleanPhase;
-        }
-    }
-
-    /**
-     * Reset the window drawing
-     * */
-    pub fn resetDrawing (mut self) atomic self {
-        self:.resetComposePass ();
-        for dmut s in alias self._sortedSubpasses {
-            self:.insertBin (alias s);
-        }
-
-        self._sortedSubpasses = [];
-        self._subpasses = copy [];
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ===================================          SUBPASSES          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Add a sub pass in the drawing pipeline that will be executed before the composition pass
-     * @params:
-     *    - name: the name of the subpass
-     *    - loadPhase: a callback closure for the loading phase
-     *    - drawPhase: a callback closure for the drawing phase
-     * */
-    pub fn addSubpass (mut self,
-                       name : [c8],
-                       loadPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
-                       drawPhase : dg (dmut &IndexedDrawCommandAllocator)-> void,
-                       cleanPhase : dg ()-> void,
-                       dmut pass : &VulkanSubpass)
-        throws BalderError
-    {
-        atomic self {
-            self._redrawing = true;
-
-            let dmut subpass = copy DrawPass ();
-            subpass.loadPhase = loadPhase;
-            subpass.drawPhase = drawPhase;
-            subpass.cleanPhase = cleanPhase;
-
-            subpass.pass = (alias pass)?;
-
-            self._subpasses [name] = alias subpass;
-            self:.sortSubpasses ();
-        }
-    }
-
-    /**
-     * Add a dependency between two subpasses (to ensure they are executed in the correct order)
-     * */
-    pub fn addSubpassDependency (mut self, pass : [c8], toWhom : [c8])
-        throws BalderError
-    {
-        atomic self {
-            if let Ok (dmut p) = alias self._subpasses [pass] {
-                if toWhom !in self._subpasses {
-                    throw copy BalderError ("No subpass " ~ toWhom);
-                }
-
-                p.dependencies [toWhom] = ();
-                self:.sortSubpasses ();
-            }
-
-            else {
-                throw copy BalderError ("No subpass " ~ pass);
-            }
-        }
-    }
-
-    /**
-     * Remove a subpass from the list of subpass of the window
-     * @warning: also removed all subpass that depends on it
-     * */
-    pub fn removeSubpass (mut self, name : [c8])
-        throws BalderError
-    {
-        atomic self {
-            self._redrawing = true;
-
-            self:.removeSubpassRec (name);
-            self:.sortSubpasses ();
-        }
-    }
-
-    /**
-     * Recursive removal of a subpass
-     * */
-    fn removeSubpassRec (mut self, pass : [c8]) {
-        if let Ok (dmut p) = alias self._subpasses [pass] {
-            self:.insertBin (alias p);
-        }
-
-        self._subpasses:.remove (pass);
-        for n, c in self._subpasses {
-            if pass in c.dependencies {
-                self:.removeSubpassRec (n);
-            }
-        }
-    }
-
-    /**
-     * Sort the list of subpasses to draw them in the correct order
-     * */
-    fn sortSubpasses (mut self)
-        throws BalderError
-    {
-        let dmut dones : [[c8] => ()] = copy [];
-        let dmut notDones : [[c8] => ()] = copy [];
-
-        for n in self._subpasses { notDones [n] = (); }
-
-        self._sortedSubpasses = [];
-        while notDones.len != 0 {
-            let mut added = false;
-            for n in notDones {
-                if let Ok (dmut c) = alias self._subpasses [n] {
-                    let mut add = true;
-                    for j in c.dependencies {
-                        if j !in dones {
-                            add = false;
-                            break;
-                        }
-                    }
-
-                    if add {
-                        added = true;
-                        dones [n] = ();
-                        notDones:.remove (n);
-                        self._sortedSubpasses ~= [alias c];
-                    }
-                }
-            }
-
-            if !added {
-                throw copy BalderError ("Recursive, or malformed subpass dependencies");
-            }
-        }
-    }
-
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -741,12 +586,16 @@ pub class Window {
      */
 
     /**
-     * Force the redrawing of the scene (updating index command buffers)
+     * Reset the drawing pipeline
      * */
-    pub fn redraw (mut self) {
-        self._redrawing = true;
+    pub fn resetDrawingPipeline (mut self) {
+        if let Ok (dmut p) = alias self._pipeline {
+            self:.insertBin (alias p);
+        }
+        
+        self:.configureRenderPipeline ();  
     }
-
+    
     /**
      * Content of the rendering thread, updating the window at a given framerate
      */
@@ -759,25 +608,19 @@ pub class Window {
         log::debug #("Window", "start rendering thread");
 
         while self._isRunning {
-            if self._redrawing {
-                self._redrawing = false;
-                self:.performRedraw ();
-            }
-
-            else {
+            {
                 self._box:.emit ();
-                let image = self:.startPass ();
-
+                let image = self:.startFrame ();
+                
                 if (image >= 0) {
-                    self:.presentPass (image);
+                    self:.submitFrame ();
+                    self:.presentFrame (image);
                 } else {
-                    self._redrawing = true;
-                }// else swap chain recreation
-
-                if (self._vkDevice.needResize ()) {
-                    self._redrawing = true;
-                }
-
+                    if let Ok (dmut pass) = alias self._swapPass {
+                        pass:.forceRedraw ();
+                    }                                        
+                } // else swap chain recreation
+                
                 self:.waitFrame (false);
             }
         }
@@ -918,19 +761,32 @@ pub class Window {
     /**
      * Start a new vulkan rendering pass
      */
-    fn startPass (mut self)-> i32 {
-        self._vkDevice:.waitPreviousFrame ();
-        let image = self._vkDevice:.acquireNextImage ();
-        self._vkDevice:.getMemoryAllocator ():.commitDynamicBuffers ();
-
-        image
+    fn startFrame (mut self)-> i32 {
+        return if let Ok (dmut pipe) = alias self._pipeline {                        
+            pipe:.waitPreviousFrame ();
+            let image = self._vkDevice:.acquireNextImage ();
+            
+            self._vkDevice:.getMemoryAllocator ():.commitDynamicBuffers ();
+            
+            image
+        } else {
+            -1
+        };    
     }
 
     /**
+     * Submit the drawing queues
+     * */
+    fn submitFrame (mut self) {
+        if let Ok (dmut pipe) = alias self._pipeline {
+            pipe:.submitFrame ();
+        }
+    }
+    
+    /**
      * Present the pass that was rendered on the GPU
      */
-    fn presentPass (mut self, image : i32) {
-        self._vkDevice:.submitGraphicsRecord ();
+    fn presentFrame (mut self, image : i32) {        
         self._vkDevice:.presentScreen (cast!u32 (image));
     }
 
@@ -940,171 +796,7 @@ pub class Window {
     fn waitIdle (mut self) {
         self._vkDevice:.waitIdle ();
     }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ===================================          REDRAWING          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Update observed in the rendering pipeline needed a redrawing
-     * */
-    fn performRedraw (mut self) {
-        atomic self {
-            if (self._vkDevice.needResize ()) {
-                self._vkDevice:.recreateSwapchain ();
-            } catch {
-                err => {
-                    log::error #("Window", "Fail swap chain recreation : ", err);
-                    return;
-                }
-            }
             
-            let dmut newAllocs = self:.performReload ();                    
-            self:.performRedraw (alias newAllocs);
-            self:.performClean (alias newAllocs);
-        }
-    }
-    
-    /**
-     * Allocate the new command allocators, and initialize the buffers
-     * @returns: the newly allocated command buffers
-     * */
-    fn performReload (mut self)-> dmut [&CommandAllocator] {
-        let dmut composeCmd = copy IndexedDrawCommandAllocator (alias self._vkDevice);
-        let dmut cmds : [&CommandAllocator] = copy [alias composeCmd];
-        
-        for dmut p in alias self._sortedSubpasses {
-            if let dmut pass : &DrawPass = alias p {
-                let dmut icmd = copy IndexedDrawCommandAllocator (alias self._vkDevice);
-                pass.loadPhase (alias icmd);
-                {
-                    icmd:.finalizeLoading ();
-                }?;
-                
-                cmds ~= [icmd];
-            }
-            else if let dmut pass : &ComputePass = alias p {
-                pass;
-                let dmut ccmd = copy ComputeCommandAllocator (alias self._vkDevice);
-                cmds ~= [ccmd];
-            }
-        }
-
-        self._composePass.loadPhase (alias composeCmd);
-        {
-            composeCmd:.finalizeLoading ();
-        }?;
-
-        alias cmds
-    }
-
-    /**
-     * Fill the newly allocated command buffers with the drawing commands
-     * @params:
-     *    - newAllocs: the command buffers
-     * */
-    fn performRedraw (mut self, dmut newAllocs : [&CommandAllocator]) {                        
-        let mut frames = 0u32;
-        let dmut redrawn = copy [false ; self._vkDevice.getSwapchainNbFrames ()];
-        while frames < self._vkDevice.getSwapchainNbFrames () && self._isRunning {
-            self._box:.emit ();
-
-            let image = self:.startPass ();
-            if image >= 0 {
-                if !redrawn [image] {
-                    self._vkDevice:.clearCommandBuffer ();
-
-                    self._vkDevice.startRecording ();
-                    self:.drawSubpasses (cast!u32 (image), alias newAllocs);                
-                    self._vkDevice.stopRecording ();                    
-                    
-                    redrawn [image] = true;
-                    frames += 1;
-                }
-
-                self:.presentPass (image);
-            } else {
-                self._redrawing = true;
-                break;
-            }
-
-            if self._vkDevice.needResize () {
-                self._redrawing = true;
-                break;
-            }
-
-            self:.waitFrame (true);
-        }
-    }
-
-    /**
-     * Draw the subpasses of the window
-     * @params:
-     *    - newAllocs: the command allocated used to register the draw commands
-     * */
-    fn drawSubpasses (mut self, image : u32, dmut newAllocs : [&CommandAllocator]) {
-        for i, dmut z in alias self._sortedSubpasses {
-            if let (dmut pass : &DrawPass, dmut icmd : &IndexedDrawCommandAllocator) = (alias z, alias newAllocs [i + 1]) {
-                if let Ok (dmut vk) = alias pass.pass {
-                    vk.startRenderPass ();
-                    icmd:.startRecording ();
-                    pass.drawPhase (alias icmd);
-
-                    self._vkDevice.stopRenderPass ();
-                }
-            }
-
-            else if let (dmut pass : &ComputePass, dmut ccmd : &ComputeCommandAllocator) = (alias z, alias newAllocs [i + 1]) {
-                pass;
-                ccmd;
-            }
-        }
-
-        /**
-         * Draw the composition pass
-         * */
-        if let dmut icmd : &IndexedDrawCommandAllocator = alias newAllocs [0] {
-            self._vkDevice.startRenderPass (image);                                        
-            icmd:.startRecording ();
-            self._composePass.drawPhase (alias icmd);
-            self._vkDevice.stopRenderPass ();
-        } else {
-            log::error #("Window", "Malformed command allocator in compose phase");
-        }
-
-    }
-    
-    /**
-     * Clean the command buffers of the old drawings and replace them with the newly allocated ones
-     * @params:
-     *    - newAllocs: the command buffers
-     * */
-    fn performClean (mut self, dmut newAllocs : [&CommandAllocator]) {
-        for i, dmut z in alias self._sortedSubpasses {
-            if let Ok (dmut all) = alias z.cmdAlloc {
-                all:.dispose ();
-            }
-
-            z.cmdAlloc = (alias newAllocs [i + 1])?;
-            if let dmut pass : &DrawPass = alias z { 
-                pass.cleanPhase ();
-            }
-        }
-
-        if let Ok (dmut all) = alias self._composePass.cmdAlloc {
-            all:.dispose ();
-        }
-        
-        self._composePass.cmdAlloc = (alias newAllocs [0])?;
-        self._composePass.cleanPhase ();
-        
-        self._bin:.emptyTrash ();
-    }    
-    
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -1113,35 +805,23 @@ pub class Window {
      * ======================================================================================================
      */
 
-    /**
-     * Clear all the subpasses of the rendering
-     * */
-    pub fn clearSubpasses (mut self) {
-        atomic self {
-            for i, _ in self._sortedSubpasses {
-                self._sortedSubpasses [i]:.dispose ();
-            }
-
-            self._sortedSubpasses = [];
-            self._subpasses = copy [];
-        }
-    }
     
     impl Disposable {
         pub over dispose (mut self) {
-            self:.killRendering ();
-
-            self:.resetComposePass ();
-            self:.clearSubpasses ();
-            self._composePass:.dispose ();
+            self:.killRendering ();                    
             self._bin:.emptyTrash ();
 
+            if let Ok (dmut pipe) = alias self._pipeline {
+                pipe:.dispose ();
+                self._pipeline = none;
+            }
+            
             self._vkDevice:.disposeSwapchain ();
             self:.disposeSurface ();            
             
             self._vkDevice:.dispose ();
             self._vkInstance:.dispose ();
-            
+                    
             if (self._sdlWindow != null) {
                 SDL_DestroyWindow  (self._sdlWindow);
                 self._sdlWindow = null;
