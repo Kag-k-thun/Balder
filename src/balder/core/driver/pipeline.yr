@@ -5,6 +5,22 @@ use ::vulkan::core;
 use balder::core::{_, driver::_, memory::_, application::_, shader::_};
 use balder::utils::log;
 
+enum
+| REDRAW    = 1
+| DRAWING   = 2
+| SWAPPED   = 3
+ -> FrameDrawing;
+
+class PassContent {
+    pub let dmut pass : &VulkanSubpass;
+    pub let mut sems : [mut [VkSemaphore]] = [];
+    pub let dmut stages : [u32] = [];
+
+    pub self (dmut pass : &VulkanSubpass)
+        with pass = alias pass
+    {}            
+}
+
 
 /**
  * A pass pipeline is a DAG of subpasses ending with the swapchain renderpass
@@ -16,33 +32,33 @@ pub class VulkanPipeline {
     let dmut _device : &VulkanDevice;
 
 
-    prot { // Synchronization between passes
+    prot { // pass redrawing
+        
+        // The frames that have been swapped already
+        let dmut _updated : [FrameDrawing] = [];
 
-        // Semaphore to waits before submitting the swapchain render pass to graphics queue
-        let mut _swapChainWaits : [[VkSemaphore]] = [];
-
-        // Stages of semaphore to wait before submitting the swapchain render pass to graphics queue
-        let dmut _swapChainStages : [u32] = [];
-
-        // True if the swapchain draw pass need a redraw before submit
-        let mut _swapNeedRedraw : bool = false;
+        // The number of frames to redraw
+        let mut _redrawFrames : u32 = 0;
     }
 
-    prot { // passes
+    prot { // pass graph
 
         // The list of subpasses (name => index in passgraph)
         let dmut _passes : [[c8] => u32] = copy [];
 
-        // The DAG of passes sorted by priority
-        // (.0 => the pass,
-        //  .1 => the list of semaphore to wait for the pass,
-        //  .2 => the state of the previous passes to wait
-        //  .3 => true iif need a redraw)        
-        let dmut _passGraph : [(&VulkanSubpass, [[VkSemaphore]], [u32])] = [];
-
-        // The draw pass of the swap chain
-        let dmut _composePass : &VulkanSubpass;
+        // The pass Directed Acyclic Graph
+        let dmut _DAG : [[c8] => [[c8]]] = copy []; 
         
+        // The DAG of passes sorted by dependences
+        let dmut _passGraph : [&PassContent] = [];
+
+        // The compose pass (out node of the pipeline DAG)
+        let dmut _compose : &PassContent;        
+    }
+
+    prot {
+        // The garbage bin used for cleaning
+        let dmut _bin : &GarbageBin = copy GarbageBin ();
     }
 
     
@@ -56,16 +72,34 @@ pub class VulkanPipeline {
     
     pub self (dmut device : &VulkanDevice)
         with _device = alias device
-        , _composePass = alias self._device:.getSwapchain ():.getRenderPass ()
+        , _compose = copy PassContent (alias self._device:.getSwapchain ():.getRenderPass ())
     {
         let sems = self._device.getImageAvailableSemaphores ();
-        self._swapChainStages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-        self._swapChainWaits = copy [copy [sems [i]] for i in 0 .. sems.len];
+        
+        self._compose.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
+        self._compose.sems = copy [copy [sems [i]] for i in 0 .. sems.len];
+
+        self._updated = copy [FrameDrawing::REDRAW ; sems.len];
     }    
 
     __dtor (mut self) {
         self:.dispose ();
     }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          TRASH BIN          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @return: the garbage bin used to recycle resources when all their references have disappeared
+     * */
+    pub fn getBin (mut self)-> dmut &GarbageBin {
+        alias self._bin
+    }    
     
     /*!
      * ====================================================================================================
@@ -81,15 +115,20 @@ pub class VulkanPipeline {
     pub fn waitPreviousFrame (mut self) {                        
         if self._device.needResize () {
             self._device:.recreateSwapchain ();
-            self._composePass:.forceRedraw ();
+            self:.forceRedraw ();
         } catch {
             err => {
                 log::error #("VulkanPipeline", "Failed to recreate swapchain", err);
                 return;
             }
         }
+
+        let frame = self._device.getCurrentFrameIndex ();
+        // for dmut pass in alias self._passGraph {
+        //     pass.pass:.await (frame);
+        // }
         
-        self._composePass:.await (self._device.getCurrentFrameIndex ());        
+        self._compose.pass:.await (frame);        
     }
 
     /**
@@ -97,11 +136,68 @@ pub class VulkanPipeline {
      * */
     pub fn submitFrame (mut self) {
         let frame = self._device.getCurrentFrameIndex ();
-                
-        self._composePass:.execute (frame,
-                                    self._swapChainStages,
-                                    self._swapChainWaits [frame]);    
+
+        if self._updated [frame] != FrameDrawing::SWAPPED {
+            log::debug #("VulkanPipeline", "Outdated frame : ", frame);
+            if (self:.submitRedraw (frame)) {
+                self._bin:.emptyTrash ();
+            }            
+        } else {
+            self:.submitNoDraw (frame);
+
+        }
     }
+
+    /**
+     * Redraw the current frame in the pipeline and submit the rendering 
+     * */
+    prot fn submitRedraw (mut self, frame : u32)-> bool {
+        atomic self {
+            self._updated [frame] = FrameDrawing::DRAWING;
+        }
+                        
+        { // Redraw all subpasses for the current frame
+            for dmut pass in alias self._passGraph {
+                pass.pass:.redraw (frame);
+            }
+            self._compose.pass:.redraw (frame);
+        }
+
+        {
+            self._updated [frame] = FrameDrawing::SWAPPED;        
+            self._redrawFrames -= 1;            
+        }
+        
+        self:.submitNoDraw (frame);
+                
+        return self._redrawFrames == 0;                    
+    }
+
+    /**
+     * Submit the frame to be drawn on screen without needing to redraw it
+     * */
+    prot fn submitNoDraw (mut self, frame : u32) {
+        for dmut pass in alias self._passGraph {
+            pass.pass:.submit (frame, pass.stages, pass.sems [frame]);
+        }
+        
+        self._compose.pass:.submit (frame,                                   
+                                    self._compose.stages,
+                                    self._compose.sems [frame]);
+    }
+    
+    /**
+     * Force the subpass to be redrawn
+     * */
+    pub fn forceRedraw (mut self) {
+        atomic self {
+            for i in 0 .. self._updated.len {
+                self._updated [i] = FrameDrawing::REDRAW;
+                self._redrawFrames = cast!u32 (self._updated.len);
+            }
+        }
+    }
+
     
     /*!
      * ====================================================================================================
@@ -110,8 +206,25 @@ pub class VulkanPipeline {
      * ====================================================================================================
      * ====================================================================================================
      */
-
+    
     impl Disposable {
-        pub over dispose (mut self) {}
+        pub over dispose (mut self) {        
+            atomic self {
+                self._device:.waitIdle ();
+                for dmut pass in alias self._passGraph {
+                    pass.pass:.dispose ();
+                }
+                self._compose.pass:.resetCommands ();
+                self._compose.pass:.resetDrawSignal ();
+                
+                self._passGraph = [];
+                self._passes = copy [];
+                self._DAG = copy [];
+                
+                self:.forceRedraw ();
+            }
+            
+            self._bin:.emptyTrash ();
+        }
     }
 }

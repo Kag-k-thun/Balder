@@ -8,20 +8,15 @@ use balder::utils::log;
 
 mod ::draw;
 
-
-enum
-| REDRAW    = 1
-| DRAWING   = 2
-| GENERATED = 3
-| SWAPPED   = 4
- -> FrameDrawing;
-
 @abstract
 pub class VulkanSubpass {
 
     // The vulkan device used to render the subpass
     let dmut _device : &VulkanDevice;
 
+    // The window to which the subpass is associated
+    let dmut _window : &Window;
+    
     // The semaphore emited when the subpass is finished (one per swap chain frame)
     let dmut _finishSemaphore : [VkSemaphore] = []; 
 
@@ -35,10 +30,7 @@ pub class VulkanSubpass {
 
         // The list of command buffer to reset 
         let dmut _nextCommandBuffer : [VkCommandBuffer] = [];
-        
-        // The frames that have been swapped already
-        let dmut _updated : [FrameDrawing] = [];
-
+                
         // The signal emitted by the subpass when it is redrawn
         let dmut _onRedraw : &DirectSignal!{()} = copy DirectSignal!{()} ();
 
@@ -50,7 +42,7 @@ pub class VulkanSubpass {
         let mut _currentFrame : u32 = 0;
 
         // The allocators used to record draw/compute commands 
-        let dmut _allocators : [[c8] => &CommandAllocator] = copy [];
+        let dmut _allocators : [[&CommandAllocator]] = [];
         
     }
     
@@ -64,7 +56,8 @@ pub class VulkanSubpass {
      */
 
     pub self (dmut device : &VulkanDevice)
-        with _device = alias device        
+        with _device = alias device  
+        , _window = alias  device:.getWindow ()
         throws BalderError
     {
         self:.configureSyncObjects ();
@@ -149,17 +142,30 @@ pub class VulkanSubpass {
     pub fn onDraw (mut self)-> dmut &DirectSignal!{()} {
         alias self._onRedraw
     }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          GARBAGE BIN          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
-     * Force the subpass to be redrawn
+     * @returns: the garbage bin that is cleaned after a redraw
      * */
-    pub fn forceRedraw (mut self) {
-        atomic self {
-            for i in 0 .. self._updated.len {
-                self._updated [i] = FrameDrawing::REDRAW;
-            }
-        }
+    pub fn getGarbageBin {T impl Disposable} (mut self)-> dmut &IResourceBin {
+        alias self._bin:.get!{&ResourceBin!{T}} ()
     }
+
+    /**
+     * Insert an element in the garbage bin
+     * */
+    pub fn insertBin {T impl Disposable} (mut self, dmut obj : T) {
+        let dmut bin = alias self._bin:.get!{&ResourceBin!{T}} ();
+        bin:.insert (alias obj);
+    }
+
     
     /*!
      * ====================================================================================================
@@ -172,17 +178,14 @@ pub class VulkanSubpass {
     /**
      * Start the recording of the subpass     
      * */
-    prot fn startRecording (mut self, currentFrame : u32) {
-        atomic self { // Allocated a new command buffer
-            self._currentFrame = currentFrame;
-            self._updated [self._currentFrame] = FrameDrawing::DRAWING;           
-            vkResetCommandBuffer (self._nextCommandBuffer [currentFrame], 0u32);
-            
-            let mut cmdBegin = VkCommandBufferBeginInfo ();
-            cmdBegin.sType = VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            
-            vkBeginCommandBuffer (self._nextCommandBuffer [currentFrame], &cmdBegin);        
-        }
+    prot fn startRecording (mut self) {
+        // Allocated a new command buffer                
+        vkResetCommandBuffer (self._nextCommandBuffer [self._currentFrame], 0u32);
+        
+        let mut cmdBegin = VkCommandBufferBeginInfo ();
+        cmdBegin.sType = VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        
+        vkBeginCommandBuffer (self._nextCommandBuffer [self._currentFrame], &cmdBegin);                
     }
 
     /**
@@ -190,9 +193,6 @@ pub class VulkanSubpass {
      * */
     prot fn stopRecording (mut self) {
         vkEndCommandBuffer (self._nextCommandBuffer [self._currentFrame]);
-        atomic self {
-            self._updated [self._currentFrame] = FrameDrawing::GENERATED;               
-        }
     }
     
     /**
@@ -202,26 +202,8 @@ pub class VulkanSubpass {
      *    - previousPass: the list of semaphores to wait emited by previous passes
      *    - previousPassStages: the flags of the pass considered finished when reaching the stage (example: VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
      * */
-    prot fn submit (mut self, frame : u32, previousPassStages : [u32], previousPass : [VkSemaphore])-> VkResult;
+    pub fn submit (mut self, frame : u32, previousPassStages : [u32], previousPass : [VkSemaphore])-> VkResult;
 
-
-    /**
-     * Execute the subpass
-     * @params:
-     *    - frame: the frame to draw
-     *    - previousPass: the list of semaphores to wait emited by previous passes
-     *    - previousPassStages: the flags of the pass considered finished when reaching the stage (example: VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
-     * */
-    pub fn execute (mut self, frame : u32, previousPassStages : [u32], previousPass : [VkSemaphore]) {
-        atomic self {
-            if self._updated [frame] != FrameDrawing::SWAPPED {
-                self:.redraw (frame);                
-            }
-
-            self:.submit (frame, previousPassStages, previousPass);
-        }
-    }
-    
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -237,7 +219,8 @@ pub class VulkanSubpass {
         throws BalderError
     {
         let nbFrames = self._device:.getSwapchain ().nbFrames;
-        
+
+        self._allocators = copy [[] ; nbFrames];
         self._commandBuffers = copy [null ; nbFrames];
         self._nextCommandBuffer = copy [null ; nbFrames];
 
@@ -255,36 +238,29 @@ pub class VulkanSubpass {
         if (vkAllocateCommandBuffers (self._device.getDeviceHandle (), &allocInfo, alias self._nextCommandBuffer.ptr) != VkResult::VK_SUCCESS) {
             log::error #("VulkanSubpass", "Failed to allocate swap command buffers");
             throw copy BalderError ("Failed to allocate swap command buffers");        
-        }
-                             
-        self._updated = copy [FrameDrawing::REDRAW ; nbFrames];                
-    }
-
-    /**
-     * @returns: the command buffer to submit for frame 'frame'
-     * */
-    prot fn getCommandBuffer (mut self, frame : u32)-> VkCommandBuffer {
-        atomic self {
-            if self._updated [frame] == FrameDrawing::GENERATED {
-                self._updated [frame] = FrameDrawing::SWAPPED;
-                let dmut aux = alias self._commandBuffers [frame];
-                self._commandBuffers [frame] = alias self._nextCommandBuffer [frame];
-                self._nextCommandBuffer [frame] = alias aux;
-                
-                vkResetCommandBuffer (aux, 0u32);
-            }
-        }
-
-        self._commandBuffers [frame]
+        }                                                    
     }
 
     /**
      * Redraw the pass     
      * */
-    prot fn redraw (mut self, frame : u32) atomic self {
-        self:.startRecording (frame);
+    pub fn redraw (mut self, frame : u32) atomic self {
+        self._currentFrame = frame;
+
+        for dmut alloc in alias self._allocators [frame] {
+            self._window:.insertBin (alias alloc);
+        }
+        self._allocators [frame] = [];
+        
+        self:.startRecording ();
         self._onRedraw:.emit ();
         self:.stopRecording ();
+
+        let dmut aux = alias self._commandBuffers [frame];
+        self._commandBuffers [frame] = alias self._nextCommandBuffer [frame];
+        self._nextCommandBuffer [frame] = alias aux;
+        
+        vkResetCommandBuffer (aux, 0u32);         
     }
     
     /*!
@@ -300,13 +276,9 @@ pub class VulkanSubpass {
      * @params:
      *    - currentFrame: the frame being drawn
      * */
-    pub fn getCommandAllocator {T over CommandAllocator} (mut self)-> T {
-        if let Ok (dmut cmd) = alias self._allocators [T::typeinfo.name] {
-            return alias cmd;
-        }
-
+    pub fn createCommandAllocator {T over &CommandAllocator} (mut self)-> dmut T {
         let dmut cmd = copy T (alias self._device, alias self);
-        self._allocators [T::typeinfo.name] = alias cmd;        
+        self._allocators [self._currentFrame] ~= [alias cmd];        
         alias cmd
     }    
     
@@ -318,8 +290,35 @@ pub class VulkanSubpass {
      * ====================================================================================================
      */
 
+    /**
+     * Reset all the command buffers of the subpass
+     * */
+    pub fn resetCommands (mut self) atomic self {
+        for i, dmut lst in alias self._allocators {
+            for dmut cmd in alias lst {
+                cmd:.dispose ();
+            }
+            self._allocators [i] = [];
+        }        
+        
+        for i in 0 .. self._commandBuffers.len {
+            vkResetCommandBuffer (self._commandBuffers [i], 0u32);
+        }
+
+        for i in 0 .. self._nextCommandBuffer.len {
+            vkResetCommandBuffer (self._nextCommandBuffer [i], 0u32);
+        }
+    }
+
+    /**
+     * Reset the onRedraw signal (disconnect every slots)
+     * */
+    pub fn resetDrawSignal (mut self) {
+        self._onRedraw = copy DirectSignal!{()} ();
+    }
+
     impl Disposable {
-        pub over dispose (mut self) {
+        pub over dispose (mut self) {            
             for i in 0 .. self._finishSemaphore.len {
                 vkDestroySemaphore (self._device.getDeviceHandle (), self._finishSemaphore [i], null);
             }
@@ -328,19 +327,10 @@ pub class VulkanSubpass {
                 vkDestroyFence (self._device.getDeviceHandle (), self._fences [i], null);
             }
 
-            for _, dmut cmd in alias self._allocators {                
-                cmd:.dispose ();            
-            }
-
-            for i in 0 .. self._commandBuffers.len if self._commandBuffers [i] != null {
-                vkResetCommandBuffer (self._commandBuffers [i], 0u32);                
-            }
-
-            for i in 0 .. self._commandBuffers.len if self._nextCommandBuffer [i] != null {
-                vkResetCommandBuffer (self._nextCommandBuffer [i], 0u32);                
-            }
+            self:.resetCommands ();
+            self:.resetDrawSignal ();
             
-            self._allocators = copy [];
+            self._allocators = [];
             self._finishSemaphore = [];
             self._fences = [];
             self._commandBuffers = [];
