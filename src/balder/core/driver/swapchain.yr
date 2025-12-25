@@ -217,7 +217,7 @@ pub class SwapChain {
     pub fn configure (mut self, dmut win : &Window, cfg : &BalderConfig)
         throws BalderError
     {            
-        self:.createSwapchain (alias win, cfg.window.vsync);
+        self:.createSwapchain (alias win, cfg.vulkan.vsync, cfg.vulkan.imageCount);
         self:.createImageViews ();        
         self:.createDepthResources ();        
         
@@ -233,7 +233,7 @@ pub class SwapChain {
     {
         self:.destroy ();
         
-        self:.createSwapchain (alias win, cfg.window.vsync);
+        self:.createSwapchain (alias win, cfg.vulkan.vsync, cfg.vulkan.imageCount);
         self:.createImageViews ();        
         self:.createDepthResources ();    
 
@@ -245,11 +245,11 @@ pub class SwapChain {
     /**
      * Create the swap chain the allows to render to the window in a fluid way
      */
-    fn createSwapchain (mut self, dmut win : &Window, vsync : bool)
+    fn createSwapchain (mut self, dmut win : &Window, vsync : bool, imageCount : u32)
         throws BalderError
     {        
         self._physicalDeviceSwapChainDetail = self.querySwapChainSupport (win:.getVulkanSurface (), self._device.getPhysicalDeviceHandle ());        
-        self._imageCount = self.chooseImageCount ();
+        self._imageCount = self.chooseImageCount (imageCount);
 
         self._surfaceFormat = self.chooseSwapSurfaceFormat (self._physicalDeviceSwapChainDetail.formats);
         self._depthFormat = self.findDepthFormat ();        
@@ -269,15 +269,18 @@ pub class SwapChain {
         let mut createInfo = VkSwapchainCreateInfoKHR ();
         createInfo.sType                 = VkStructureType::VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         createInfo.surface               = win:.getVulkanSurface ();
-        createInfo.minImageCount         = self._imageCount;
+        
+        createInfo.minImageCount         = self._imageCount;                
         createInfo.imageFormat           = self._surfaceFormat.format;
         createInfo.imageColorSpace       = self._surfaceFormat.colorSpace;
-        createInfo.imageExtent           = self._extent;
+        createInfo.imageExtent           = self._extent;        
         createInfo.imageArrayLayers      = 1u32;
         createInfo.imageUsage            = cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         createInfo.imageSharingMode      = sharingMode;
+
         createInfo.pQueueFamilyIndices   = indices.ptr;
         createInfo.queueFamilyIndexCount = cast!u32 (indices.len);
+        
         createInfo.preTransform          = self._physicalDeviceSwapChainDetail.capabilities.currentTransform;
         createInfo.compositeAlpha        = VkCompositeAlphaFlagBitsKHR::VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         createInfo.presentMode           = presentMode;
@@ -293,7 +296,10 @@ pub class SwapChain {
         self._images = copy [null ; imageCreated];
         vkGetSwapchainImagesKHR (self._device.getDeviceHandle (), self._swapChain, alias &imageCreated, alias self._images.ptr);
         
-        log::debug #("Swapchain", "Created swap chain");
+        log::debug #("Swapchain", "Created swap chain with :", self._images.len, "images");
+        if (self._images.len != imageCount) {
+            log::warn #("Swapchain", "Number of requested image count was not respected");
+        }
     }
 
     /*!
@@ -328,24 +334,30 @@ pub class SwapChain {
      * @params:
      *      - presents: the list of available present mode
      */
-    fn chooseSwapPresentMode (self, presents : [VkPresentModeKHR], vsync : bool)-> VkPresentModeKHR {
-        let mut best = VkPresentModeKHR::VK_PRESENT_MODE_FIFO_KHR;
-        for p in presents {
-            if (vsync) {
-                if (p == VkPresentModeKHR::VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
-                    best = p;
-                } else if (p == VkPresentModeKHR::VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
-                    best = p;
-                } else if (best != VkPresentModeKHR::VK_PRESENT_MODE_FIFO_RELAXED_KHR &&
-                           p == VkPresentModeKHR::VK_PRESENT_MODE_IMMEDIATE_KHR) {
-                    best = p;
-                }
-            } else {
-                if (p == VkPresentModeKHR::VK_PRESENT_MODE_MAILBOX_KHR) return p;
-            }
-        }
+    fn chooseSwapPresentMode (self, presents : [VkPresentModeKHR], vsync : bool)-> VkPresentModeKHR
+        throws BalderError
+    {                    
+        let bestVsync = [VkPresentModeKHR::VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+                         VkPresentModeKHR::VK_PRESENT_MODE_FIFO_KHR,
+                         VkPresentModeKHR::VK_PRESENT_MODE_MAILBOX_KHR];
 
-        best
+        if vsync {
+            for i in bestVsync {
+                for z in presents { if z == i { return z; } }
+            }
+
+            log::warn #("Swapchain", "Vsync is activated but no available present mode manage vsync");
+        }
+        
+        let bestNoVsync = [VkPresentModeKHR::VK_PRESENT_MODE_IMMEDIATE_KHR,
+                           VkPresentModeKHR::VK_PRESENT_MODE_MAILBOX_KHR];
+
+        for i in bestNoVsync {
+            for z in presents { if z == i { return z; } }
+        }        
+
+        log::error #("Swapchain", "No available present mode");
+        throw copy BalderError ("No available present mode");
     }
 
     /**
@@ -355,9 +367,14 @@ pub class SwapChain {
      *     - cap: the capabilities of the physical used to create the swap chain
      */
     fn chooseSwapChainExtent (self, win : (u32, u32), cap : VkSurfaceCapabilitiesKHR)-> VkExtent2D {
+        use std::algorithm::comparison;
+        
         let mut ext = VkExtent2D ();
-        ext.width = std::algorithm::comparison::clamp (win._0, cap.minImageExtent.width, cap.maxImageExtent.width);
-        ext.height = std::algorithm::comparison::clamp (win._1, cap.minImageExtent.height, cap.maxImageExtent.height);
+        let minExt = cap.minImageExtent;
+        let maxExt = cap.maxImageExtent;
+        
+        ext.width = clamp (win._0, minExt.width, maxExt.width);
+        ext.height = clamp (win._1, minExt.height, maxExt.height);
 
         ext
     }
@@ -365,13 +382,17 @@ pub class SwapChain {
     /**
      * Choose the number of image in the swap chain
      * */
-    fn chooseImageCount (self)-> u32 {
-        if (self._physicalDeviceSwapChainDetail.capabilities.maxImageCount > 0u32
-            && self._physicalDeviceSwapChainDetail.capabilities.minImageCount == self._physicalDeviceSwapChainDetail.capabilities.maxImageCount) {
-            self._physicalDeviceSwapChainDetail.capabilities.maxImageCount
-        } else {
-            self._physicalDeviceSwapChainDetail.capabilities.minImageCount + 1
+    fn chooseImageCount (self, imageCount : u32)-> u32 {
+        use std::algorithm::comparison;        
+        
+        let max = self._physicalDeviceSwapChainDetail.capabilities.maxImageCount;
+        let min = self._physicalDeviceSwapChainDetail.capabilities.minImageCount;
+    
+        if max == 0 {
+            return comparison::max (imageCount, min);
         }
+                                
+        return clamp (imageCount, min, max);          
     }
 
     /**
