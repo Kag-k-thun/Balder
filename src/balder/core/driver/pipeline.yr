@@ -5,17 +5,20 @@ use ::vulkan::core;
 use balder::core::{_, driver::_, memory::_, application::_, shader::_};
 use balder::utils::log;
 
+use std::io;
+
 enum
 | REDRAW    = 1
 | DRAWING   = 2
 | SWAPPED   = 3
  -> FrameDrawing;
 
-class PassContent {
+record PassContent {    
     pub let dmut pass : &VulkanSubpass;
     pub let mut sems : [mut [VkSemaphore]] = [];
     pub let dmut stages : [u32] = [];
-
+    pub let mut isEntry : bool = false;
+    
     pub self (dmut pass : &VulkanSubpass)
         with pass = alias pass
     {}            
@@ -45,16 +48,19 @@ pub class VulkanPipeline {
     prot { // pass graph
 
         // The list of subpasses (name => index in passgraph)
-        let dmut _passes : [[c8] => u32] = copy [];
+        let dmut _passes : [[c8] => &VulkanSubpass] = copy [];
 
         // The pass Directed Acyclic Graph
-        let dmut _DAG : [[c8] => [c8]] = copy []; 
+        let mut _DAG : [[c8] => mut [c8]] = copy [];        
         
         // The DAG of passes sorted by dependences
-        let dmut _passGraph : [&PassContent] = [];
+        let dmut _passGraph : [PassContent] = [];
+
+        // The list of entry passes
+        let dmut _entryPasses : [PassContent] = [];
 
         // The compose pass (out node of the pipeline DAG)
-        let dmut _compose : &PassContent;        
+        let dmut _compose : &VulkanSubpass;        
     }
 
     prot {
@@ -73,15 +79,10 @@ pub class VulkanPipeline {
     
     pub self (dmut device : &VulkanDevice)
         with _device = alias device
-        , _compose = copy PassContent (alias self._device:.getSwapchain ():.getRenderPass ())
+        , _compose = alias self._device:.getSwapchain ():.getRenderPass ()
     {
-        let sems = self._device.getImageAvailableSemaphores ();
-        
-        self._compose.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-        self._compose.sems = copy [copy [sems [i]] for i in 0 .. sems.len];
-
-        self._updated = copy [FrameDrawing::REDRAW ; sems.len];
-    }    
+        self:.resetToDefault ();
+    }        
 
     __dtor (mut self) {
         self:.dispose ();
@@ -124,12 +125,10 @@ pub class VulkanPipeline {
             }
         }
 
-        let frame = self._device.getCurrentFrameIndex ();
-        // for dmut pass in alias self._passGraph {
-        //     pass.pass:.await (frame);
-        // }
-        
-        self._compose.pass:.await (frame);        
+        let frame = self._device.getCurrentFrameIndex ();                
+        for dmut pass in alias self._entryPasses {
+            pass.pass:.await (frame);
+        }                    
     }
 
     /**
@@ -160,8 +159,7 @@ pub class VulkanPipeline {
         { // Redraw all subpasses for the current frame
             for dmut pass in alias self._passGraph {
                 pass.pass:.redraw (frame);
-            }
-            self._compose.pass:.redraw (frame);
+            }            
         }
 
         {
@@ -179,12 +177,12 @@ pub class VulkanPipeline {
      * */
     prot fn submitNoDraw (mut self, frame : u32) {
         for dmut pass in alias self._passGraph {
+            if !pass.isEntry {
+                pass.pass:.await (frame);
+            }
+            
             pass.pass:.submit (frame, pass.stages, pass.sems [frame]);
-        }
-        
-        self._compose.pass:.submit (frame,                                   
-                                    self._compose.stages,
-                                    self._compose.sems [frame]);
+        }        
     }
     
     /**
@@ -213,29 +211,60 @@ pub class VulkanPipeline {
     pub fn registerSubPass (mut self, name : [c8], dmut pass : &VulkanSubpass)
         throws BalderError
     {
-        name;
-        pass;
-        throw copy BalderError ("TODO"); 
-    }    
+        atomic self {        
+            if name == "" {
+                throw copy BalderError ("Empty pass name");
+            }
+            
+            self._passes [name] = alias pass;
+            self._DAG [name] = ""; // compose pass
+        }
+    }
 
     /**
      * Remove a subpass in the DAG
      * @warning: connect the passes having 'name' as output to the output of 'name'
      * */
-    pub fn removeSubPass (mut self, name : [c8]) {
-        name;
+    pub fn removeSubPass (mut self, name : [c8])
+        throws BalderError
+    {
+        atomic self {                
+            self._passes:.remove (name);        
+
+            // Connect the predecessor of 'name' to the output of 'name'        
+            if let Ok (out) = self._DAG [name] {
+                
+                let mut result : [[c8] => mut [c8]] = copy [];
+                for i, o in self._DAG if i != name {                
+                    if o == name {
+                        result [i] = out;
+                    } else {
+                        result [i] = o;
+                    }
+                }
+                self._DAG = alias result;
+                self:.constructGraph ();
+            }                
+        }
     }
 
     /**
      * Change the output pass of the pass 'name'
      * @throws: if a cycle is detected or the pass don't exist
      * */
-    pub fn setPassOutput (mut self, name : [c8], output : [c8])
+    pub fn setPassOutput (mut self, name : [c8], output : [c8]) 
         throws BalderError
     {
-        name;
-        output;
-        throw copy BalderError ("TODO");
+        atomic self {
+            if name == "" throw copy BalderError ("Empty pass name");
+            if output == "" throw copy BalderError ("Empty pass name");
+            
+            if output !in self._passes throw copy BalderError ("No pass named " ~ output);
+            if name !in self._passes throw copy BalderError ("No pass named " ~ name);
+            
+            self._DAG [name] = output;
+            self:.constructGraph (); 
+        }
     }
 
     /**
@@ -245,8 +274,149 @@ pub class VulkanPipeline {
     pub fn setPassOutputToSwap (mut self, name : [c8])
         throws BalderError
     {
-        name;
-        throw copy BalderError ("TODO");
+        atomic self {
+            if name == "" throw copy BalderError ("Empty pass name");
+            if name !in self._passes throw copy BalderError ("No pass named " ~ name);
+            
+            self._DAG [name] = "";
+            self:.constructGraph ();        
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          CONSTRUCTION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reset the drawing pipeline to its default state (only the final compose pass)
+     * */
+    fn resetToDefault (mut self) atomic self {                                
+        let dmut content = PassContent (alias self._compose);        
+        let sems = self._device.getImageAvailableSemaphores ();
+        
+        content.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
+        content.sems = copy [copy [sems [i]] for i in 0 .. sems.len];
+        content.isEntry = true;
+        
+        self._entryPasses = copy [alias content];
+        self._passGraph = copy [content];    
+        self._updated = copy [FrameDrawing::REDRAW ; sems.len];
+        self._passes [""] = alias self._compose;
+    }
+    
+    /**
+     * Construct the graph of pass dependencies, and construct the semaphores lists
+     * */
+    fn constructGraph (mut self)
+        throws BalderError
+    {        
+        let (sortedPass, deps) = self.constructSortedList ();
+        let nbFrames = self._device:.getSwapchain ().nbFrames;
+        let dmut result : [PassContent] = [];
+        let dmut entryPasses : [PassContent] = [];        
+        
+        for pname in sortedPass {
+            let mut sems : [mut [VkSemaphore]] = copy [[] ; nbFrames];
+            let dmut stages : [u32] = [];
+
+            // List the semaphores of predecessor passes
+            if let Ok (lst) = deps [pname] for previous in lst {
+                if let Ok (pass : &DrawSubpass) = self._passes [previous] {
+                    stages ~= [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
+                    for f in 0 .. nbFrames {                    
+                        sems [f] ~= [pass.getSemaphore (f)];
+                    }
+                }
+            }            
+
+            let mut entry = false;
+            // Then it's an entry node, and it depends on image available
+            if stages.len == 0 {
+                let deviceSems = self._device.getImageAvailableSemaphores ();                                
+                stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
+                sems = copy [copy [deviceSems [f]] for f in 0 .. deviceSems.len];
+                entry = true;
+            }
+
+            // Adding it on the result graph
+            if let Ok (dmut p) = alias self._passes [pname] {
+                let dmut content = PassContent (alias p);
+                content.sems = alias sems;
+                content.stages = alias stages;
+                content.isEntry = entry;
+                
+                result ~= [alias content];
+                if entry { entryPasses ~= [alias content]; }
+            } else {
+                log::error #("VulkanPipeline", "malformed graph", self._passes, '(', pname, ')');
+                panic;
+            }             
+        }
+
+        self:.forceRedraw ();
+        self._passGraph = alias result;
+        self._entryPasses = alias entryPasses;
+    }
+
+    /**
+     * Sorted the passes by dependencies
+     * */
+    fn constructSortedList (self)-> ([[c8]], [[c8] => [[c8] => ()]])
+        throws BalderError
+    {
+        let dmut reversed = self.reverseGraph (self._DAG);
+        let dmut deps = dcopy reversed;
+                
+        let dmut result : [[c8]] = [];
+
+        while reversed.len != 0 {
+            let mut fnd : [c8] = "";
+            let mut hasFnd = false;
+            for i, lst in reversed {
+                if lst.len == 0 {
+                    result ~= [i];
+                    hasFnd = true;
+                    fnd = i;
+                    break;
+                }
+            }
+                
+            if !hasFnd {
+                throw copy BalderError ("Failed to construct graph, cycle detected");
+            }
+
+            // Remove the node from dependencies
+            reversed:.remove (fnd);            
+            for _, dmut lst in alias reversed {                
+                lst:.remove (fnd);            
+            }                                
+        }
+
+        (result, deps)
+    }
+
+    /**
+     * @returns: the reversed graph, where every node list its predecessors
+     * */
+    fn reverseGraph (self, graph : [[c8] => [c8]])-> dmut [[c8] => [[c8] => ()]] {
+        let dmut result : [[c8] => [[c8] => ()]] = copy [];
+        for i, out in graph {
+            if let Ok (dmut lst) = alias result [i] {
+                lst [i] = ();                 
+            } else {
+                result [out] = copy [i => ()];
+            }
+
+            if i !in result {
+                result [i] = copy [];
+            }
+        }
+
+        alias result
     }
     
     /*!
@@ -262,15 +432,15 @@ pub class VulkanPipeline {
             atomic self {
                 self._device:.waitIdle ();
                 for dmut pass in alias self._passGraph {
-                    pass.pass:.dispose ();
-                }
-                self._compose.pass:.resetCommands ();
-                self._compose.pass:.resetDrawSignal ();
+                    if pass.pass !is self._compose {
+                        pass.pass:.dispose ();
+                    }
+                }                
                 
-                self._passGraph = [];
-                self._passes = copy [];
-                self._DAG = copy [];
-                
+                self:.resetToDefault ();
+                self._compose:.resetCommands ();
+                self._compose:.resetDrawSignal ();
+                                                
                 self:.forceRedraw ();
             }
             
