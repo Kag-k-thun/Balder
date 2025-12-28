@@ -37,6 +37,12 @@ pub class Image2D {
     // The format of the image
     let _format : VkFormat;
 
+    prot { // information about image memory access stage
+        let mut _currentLayout : VkImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        let mut _currentAccess : u32 = 0;
+        let mut _currentStage : u32 = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    }
+
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -112,36 +118,41 @@ pub class Image2D {
      *    - src: the buffer to copy from
      */
     pub fn copyFrom (mut self, dmut src : &Buffer, aspect : VkImageAspectFlags) {
-        atomic self._device {
-            self:.transitionLayout (VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED, VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, aspect);
+        atomic self._device {                    
             let dmut cmd = self._device:.beginSingleTimeCommand ();
-            let mut copyRegion = VkBufferImageCopy ();
-
+            self:.transitionToTransfer (cmd, aspect);            
+                        
+            let mut copyRegion = VkBufferImageCopy ();                
             copyRegion.imageSubresource.aspectMask = aspect;
             copyRegion.imageSubresource.mipLevel = 0u64;
             copyRegion.imageSubresource.layerCount = 1;
             copyRegion.imageExtent.width = self._width;
             copyRegion.imageExtent.height = self._height;
             copyRegion.imageExtent.depth = 1;
-
-            vkCmdCopyBufferToImage (cmd, src.getVulkanBuffer (), self._image, VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u32, &copyRegion);
-
+            
+            vkCmdCopyBufferToImage (cmd,
+                                    src.getVulkanBuffer (),
+                                    self._image,
+                                    VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    1u32, &copyRegion);
+            
+            self:.transitionToRead (cmd, aspect);
             self._device:.endSingleTimeCommand (alias cmd);
-            self:.transitionLayout (VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, aspect);
         }
     }
 
     /**
-     * Make the image transition stage to be copiable
+     * Transition the image to be used to write content in the texture from a copy transfer
      * */
-    prv fn transitionLayout (mut self, oldLayout : VkImageLayout, newLayout : VkImageLayout, aspect : VkImageAspectFlags) {
-        let dmut cmd = self._device:.beginSingleTimeCommand ();
+    pub fn transitionToTransfer (mut self, cmd : VkCommandBuffer, aspect : VkImageAspectFlags) {                
         let mut barrier = VkImageMemoryBarrier ();
         barrier.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.oldLayout = oldLayout;
-        barrier.newLayout = newLayout;
+        barrier.oldLayout = self._currentLayout;
+        barrier.newLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        
         barrier.image = alias self._image;
         barrier.subresourceRange.aspectMask = aspect;
         barrier.subresourceRange.baseMipLevel = 0;
@@ -149,26 +160,100 @@ pub class Image2D {
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
 
-        let mut srcStage : VkPipelineStageFlags = 0;
-        let mut dstStage : VkPipelineStageFlags = 0;
+        barrier.srcAccessMask = self._currentAccess;
+        barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT;
 
-        if oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL {
-            barrier.srcAccessMask = 0;
-            barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT;
-            srcStage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-            dstStage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
+        let oldStage = self._currentStage;
+        self._currentAccess = barrier.dstAccessMask;
+        self._currentLayout = barrier.newLayout;
+        self._currentStage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT;
+        
+        vkCmdPipelineBarrier (cmd,
+                              oldStage,
+                              self._currentStage,
+                              0, 0,
+                              null,
+                              0,
+                              null,
+                              1,
+                              &barrier);
+    }
 
-        else if oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL {
-            barrier.srcAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
+    /**
+     * Transition the image to be used to read content in the texture
+     * */
+    pub fn transitionToRead (mut self, cmd : VkCommandBuffer, aspect : VkImageAspectFlags) {                
+        let mut barrier = VkImageMemoryBarrier ();
+            
+        barrier.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = self._currentLayout;
+        barrier.newLayout = VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        
+        barrier.image = alias self._image;
+        barrier.subresourceRange.aspectMask = aspect;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
 
-            srcStage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT;
-            dstStage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        }
+        barrier.srcAccessMask = self._currentAccess;
+        barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
 
-        vkCmdPipelineBarrier (cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
-        self._device:.endSingleTimeCommand (alias cmd);
+        let oldStage = self._currentStage;
+        self._currentAccess = barrier.dstAccessMask;
+        self._currentLayout = barrier.newLayout;
+        self._currentStage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        
+        vkCmdPipelineBarrier (cmd,                              
+                              oldStage,
+                              self._currentStage,
+                              0, 0,
+                              null,
+                              0,
+                              null,
+                              1,
+                              &barrier);                
+    }
+    
+    /**
+     * Transition to the image to be writable from a compute shader
+     * */
+    pub fn transitionToWrite (mut self, cmd : VkCommandBuffer, aspect : VkImageAspectFlags) {                
+        let mut barrier = VkImageMemoryBarrier ();
+        barrier.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = self._currentLayout;
+        barrier.newLayout = VkImageLayout::VK_IMAGE_LAYOUT_GENERAL;
+        
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        
+        barrier.image = alias self._image;
+        barrier.subresourceRange.aspectMask = aspect;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        barrier.srcAccessMask = self._currentAccess;
+        barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT;
+
+        let oldStage = self._currentStage;
+        self._currentAccess = barrier.dstAccessMask;
+        self._currentLayout = barrier.newLayout;
+        self._currentStage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        
+        vkCmdPipelineBarrier (cmd,
+                              oldStage,
+                              self._currentStage,
+                              0, 0,
+                              null,
+                              0,
+                              null,
+                              1,
+                              &barrier);
     }
 
     /**

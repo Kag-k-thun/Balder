@@ -168,29 +168,71 @@ record DeferredRenderScene {
 
 record ComposeRenderScene {
     pub let dmut output : (&RefCount!{&Texture})? = none;
-    pub let dmut shader : (&RefCount!{&Shader})? = none;
-    // pub let dmut pass : (&ComputePass)? = none;
+    pub let dmut shader : (&RefCount!{&Shader})? = none;    
+    pub let dmut set : (&DescriptorSet)? = none;
 
+    pub let dmut pass : (&ComputeSubpass)? = none;
+    pub let dmut computeShader : (&ComputeShader)? = none;
+    pub let dmut outputTex : (&OutputTexture)? = none;
+    
     pub self () {}
 
-    pub fn configure (mut self, dmut win : &Window, width : u32, height : u32)
+    pub fn configure (mut self, passName : [c8], dmut win : &Window, width : u32, height : u32, defer : DeferredRenderScene)-> dmut &ComputeSubpass
         throws BalderError
     {
         let dmut device = alias win:.getVulkanDevice ();
         
-        let dmut output = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R8G8B8A8_UNORM, width, height);
+        let dmut output = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R8G8B8A8_UNORM, width, height, forStorage-> true);
         self.output = (alias win:.insertResource (alias output))?;
+        self.outputTex = (alias output)?;
+
+        let dmut pass = copy ComputeSubpass (alias device, width, height, 1);
+        self.pass = (alias pass)?;
         
         let dmut shader = win:.loadResource!{&ComputeShader} (DefaultShaders::COMPOSE_3D);
         self.shader = (alias shader)?;
+        if let Ok (dmut c : &ComputeShader) = (alias shader:.get ())? {
+            self.computeShader = (alias c)?;
+        }
+
+        {
+            let dmut set = shader:.get ():.allocateDescriptorSet ();
+            self.set = (alias set)?;
+            
+            set:.setTexture ("positions", defer.position.value.get ());
+            set:.setTexture ("normals", defer.normal.value.get ());
+            set:.setTexture ("binormals", defer.binormal.value.get ());
+            set:.setTexture ("albedo", defer.albedo.value.get ());
+            set:.setTexture ("materialID", defer.materialID.value.get ());
+            set:.setTexture ("depth", defer.depth.value.get ());  
+            
+            set:.setStorageTexture ("output", output);                        
+        } catch {
+            err => {
+                log::error #("Scene", "Malformed deferred textures", err);
+                throw copy BalderError ("Failed to configure compose pass");
+            }
+        }
+    
+        {            
+            let dmut pipeline = win:.getVulkanPipeline ();        
+            pipeline:.registerSubPass (passName, alias pass);            
+        } catch {
+            err => {
+                log::error #("Scene", "Failed to register deferred subpass", err);
+                throw copy BalderError ("Failed to configure compose pass");
+            }
+        }
+
+        alias pass
     }
 
     impl Disposable {
         pub over dispose (mut self) {            
-            // if let Ok (dmut pass) = alias self.pass {
-            //     pass:.dispose ();
-            //     self.pass = none;
-            // }
+            if let Ok (dmut pass) = alias self.pass {
+                pass:.dispose ();
+                self.pass = none;
+            }
             
             if let Ok (dmut output) = alias self.output {
                 output:.dispose ();
@@ -200,6 +242,11 @@ record ComposeRenderScene {
             if let Ok (dmut shader) = alias self.shader {
                 shader:.dispose ();
                 self.shader = none;
+            }
+
+            if let Ok (dmut set)= alias self.set {
+                set:.dispose ();
+                self.set = none;
             }
             
         }
@@ -296,16 +343,16 @@ pub class Scene {
             
             let dmut pipeline = self._window:.getVulkanPipeline ();
             let dname = "deferred_" ~ self._name;
-            // let cname = "compose_" ~ self._name;
+            let cname = "compose_" ~ self._name;
             
-            let dmut dpass = self._deferred:.configure (dname, alias self._window, self._width, self._height);
-            dpass:.onDraw ():.connect (&self:.onDeferredDraw);
-            
-            // let dmut cpass = self._compose.configure (alias self._window, self._width, self._height);
-            //
-            // pipeline:.setPassOutput (dname, cname);
+            let dmut dpass = self._deferred:.configure (dname, alias self._window, self._width, self._height);                        
+            let dmut cpass = self._compose:.configure (cname, alias self._window, self._width, self._height, self._deferred);        
 
-            pipeline:.setPassOutputToSwap (dname);
+            dpass:.onDraw ():.connect (&self:.onDeferredDraw);
+            cpass:.onDraw ():.connect (&self:.onComposeDraw);
+            
+            pipeline:.setPassOutput (dname, cname);
+            // pipeline:.setPassOutputToSwap (cname);
             
             self:.setAspect (width, height);
         }
@@ -474,8 +521,8 @@ pub class Scene {
             return;
         }
         
-        if let Ok (dmut subpass) = alias self._deferred.pass {        
-            let dmut cmd = subpass:.createCommandAllocator!{&IndexedDrawCommandAllocator} ();
+        if let Ok (dmut subpass : &DrawSubpass) = alias self._deferred.pass {        
+            let dmut cmd = copy IndexedDrawCommandAllocator (alias subpass);
             atomic self {
                 for _, dmut c in alias self._shaderToNode.nodeAssoc {
                     for _, dmut v in alias c { v:.register (alias cmd); }
@@ -518,8 +565,36 @@ pub class Scene {
      * ====================================================================================================
      */
 
-    fn onComposeCall (mut self) {
-        log::debug #("Scene", "Calling compose compute shader");
+    fn onComposeDraw (mut self) {
+        {
+            let dmut pass = alias self._compose.pass.value;
+            let dmut sh = alias self._compose.computeShader.value;                            
+            let dmut set = alias self._compose.set.value;
+            let dmut output = alias self._compose.outputTex.value;
+            
+            let frame = pass.getCurrentFrame ();            
+            let sizes = sh.getGroupSizes ();            
+            let cmdV = pass.getDrawingCommandBuffer ();
+            
+            log::debug #("Scene", "Calling compose compute shader");
+            
+            let dmut cmd = copy ComputeDispatchCommandAllocator (alias pass);
+            
+            output:.getImages ()[frame]:.transitionToWrite (cmdV, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
+            
+            cmd:.registerDispatch (groupX-> sizes [0], groupY-> sizes [1], groupZ-> sizes [2]);
+            cmd:.finalizeRegister ();
+            
+            sh.select (cmd.getCommandBuffer ());                                        
+            set.select (cmd.getCommandBuffer ());
+            
+            cmd:.dispatchNext ();
+            output:.getImages ()[frame]:.transitionToRead (cmdV, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
+        } catch {
+            err => {
+                log::error #("Scene", "Failed to compose scene", err);                
+            }
+        }
     }
     
     /*!

@@ -1,4 +1,4 @@
-in indexed;
+in compute;
 
 use balder::core::{memory::_, driver::_};
 use balder::core::{error, dispose};
@@ -8,36 +8,44 @@ use std::io;
 
 enum
 | LOADING = 0u32
-| DRAWING = 1u32
+| DISPATCH = 1u32
  -> CommandAllocatorPhase;
 
 /**
- * The indirect command allocator is used to allocate indirect command, and generate the indirect command buffer used to draw indirect
+ * The indirect command allocator is used to call compute shaders
  */
 @final
-pub class IndexedDrawCommandAllocator over CommandAllocator {
+pub class ComputeDispatchCommandAllocator over CommandAllocator {
 
     // The phase of the command allocator
     let mut _phase : CommandAllocatorPhase = CommandAllocatorPhase::LOADING;
     
-    // The list of indexed indirect commands
-    let mut _indexedCmds : [mut VkDrawIndexedIndirectCommand] = [];
+    // The list of dispatch indirect commands
+    let mut _dispatchCmds : [mut VkDispatchIndirectCommand] = [];
 
-    // The id of the current index being drawn
-    let mut _currentIndexed : u32 = 0;
+    // The id of the current command being dispatched
+    let mut _current : u32 = 0;
 
-    // The buffer storing information about the indirect drawing
-    let dmut _indexedCmdBuffer : (&Buffer)? = none;
+    // The buffer storing information about the indirect dispatch
+    let dmut _dispatchCmdBuffer : (&Buffer)? = none;
+
+    let mut _width : u32 = 1;
+    let mut _height : u32 = 1;
+    let mut _depth : u32 = 1;
+    
     
     /**
      * Crete an empty indirect command allocator
      * @params:
      *    - device: the device used to allocate and draw
      */
-    pub self (dmut pass : &DrawSubpass)
+    pub self (dmut pass : &ComputeSubpass)
         with super (alias pass)
-    {}        
-    
+        , _width = pass.getDimension ()._0
+        , _height = pass.getDimension ()._1
+        , _depth = pass.getDimension ()._2    
+    {}                   
+
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -49,21 +57,17 @@ pub class IndexedDrawCommandAllocator over CommandAllocator {
     /**
      * Register an indexed mesh that will be drawn during the draw phase
      * @params:
-     *    - nbPoints: the number of points to draw
-     *    - nbInstance: the number of instance to draw
-     *    - firstIndex: the offset of the first index in the ibo buffer
-     *    - vertexOffset: the offset of the first vertex in the vbo buffer
-     *    - firstInstance: the offset of the first instance in the instance buffer
+     *    - groupX : the size of the local groups in the compute shader being called
+     *    - groupY : the size of the local groups in the compute shader being called
+     *    - groupZ : the size of the local groups in the compute shader being called
      */
-    pub fn registerIndexedObject (mut self, nbPoints : u32, nbInstance : u32 = 1u32, firstIndex : u32 = 0u32, vertexOffset : i32 = 0, firstInstance : u32 = 0u32) {
-        let mut cmd = VkDrawIndexedIndirectCommand ();
-        cmd.indexCount    = nbPoints;
-        cmd.instanceCount = nbInstance;
-        cmd.firstIndex    = firstIndex;
-        cmd.vertexOffset  = vertexOffset;
-        cmd.firstInstance = firstInstance;
-
-        self._indexedCmds ~= [cmd];
+    pub fn registerDispatch (mut self, groupX : u32 = 1, groupY : u32 = 1, groupZ : u32 = 1) {
+        let mut cmd = VkDispatchIndirectCommand ();
+        cmd.x = self._width / groupX  + if (self._width % groupX != 0) { 1u32 } else { 0u32 };
+        cmd.y = self._height / groupY + if (self._width % groupX != 0) { 1u32 } else { 0u32 };
+        cmd.z = self._depth / groupZ  + if (self._width % groupX != 0) { 1u32 } else { 0u32 };        
+        
+        self._dispatchCmds ~= [cmd];
     }
 
     /**
@@ -72,19 +76,19 @@ pub class IndexedDrawCommandAllocator over CommandAllocator {
     pub fn finalizeRegister (mut self)
         throws BalderError
     {
-        self._phase = CommandAllocatorPhase::DRAWING;
-        if (self._indexedCmds.len != 0us) {
+        self._phase = CommandAllocatorPhase::DISPATCH;
+        if (self._dispatchCmds.len != 0us) {
             let flag = cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                  VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
-            let dmut buf = self._device:.getMemoryAllocator ():.allocBuffer (self._indexedCmds.len * VkDrawIndexedIndirectCommand::size,
+            let dmut buf = self._device:.getMemoryAllocator ():.allocBuffer (self._dispatchCmds.len * VkDispatchIndirectCommand::size,
                                                                              flag,
                                                                              cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
 
-            buf:.update (self._indexedCmds);
-            self._indexedCmdBuffer = alias (alias buf)?;
-            self._indexedCmds = [];
-            self._currentIndexed = 0;
+            buf:.update (self._dispatchCmds);
+            self._dispatchCmdBuffer = alias (alias buf)?;
+            self._dispatchCmds = [];
+            self._current = 0;
         }
     }
 
@@ -95,20 +99,18 @@ pub class IndexedDrawCommandAllocator over CommandAllocator {
      * ======================================================================================================
      * ======================================================================================================
      */
-    
+
     /**
      * Draw the next indexed buffer
      * @assume: associated buffers, shaders and descriptor set are correctly bound
      */
-    pub fn drawNextIndexed (mut self) {
-        if let Ok (dmut buf) = alias self._indexedCmdBuffer {
-            vkCmdDrawIndexedIndirect (commandBuffer-> self.getCommandBuffer (),
-                                      buffer-> buf.getVulkanBuffer (),
-                                      offset-> cast!u64 (self._currentIndexed * VkDrawIndexedIndirectCommand::size),
-                                      drawCount-> 1u32,
-                                      stride-> VkDrawIndexedIndirectCommand::size);
+    pub fn dispatchNext (mut self) {
+        if let Ok (dmut buf) = alias self._dispatchCmdBuffer {
+            vkCmdDispatchIndirect (commandBuffer-> self.getCommandBuffer (),
+                                   buffer-> buf.getVulkanBuffer (),
+                                   offset-> cast!u64 (self._current * VkDispatchIndirectCommand::size));
             
-            self._currentIndexed += 1;
+            self._current += 1;
         }
     }
 
@@ -122,13 +124,13 @@ pub class IndexedDrawCommandAllocator over CommandAllocator {
 
     impl Disposable {
         pub over dispose (mut self) {
-            if let Ok (dmut buf) = alias self._indexedCmdBuffer {
+            if let Ok (dmut buf) = alias self._dispatchCmdBuffer {
                 buf:.dispose ();
-                self._indexedCmdBuffer = none;
+                self._dispatchCmdBuffer = none;
             }
 
-            self._indexedCmds = [];
-            self._currentIndexed = 0;
+            self._dispatchCmds = [];
+            self._current = 0;
             self._phase = CommandAllocatorPhase::LOADING;
             
             self.__super__:.dispose ();
