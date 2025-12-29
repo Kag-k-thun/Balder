@@ -1,17 +1,17 @@
 in scene;
 
 pub mod ::node;
+mod ::deferred;
+mod ::compose;
 
 use balder::core::_;
 use balder::core::{application::_, shader::_, driver::_, config::_};
-use balder::scene::node::node3D::{camera, visual};
-
 use balder::utils::_;
 
-use std::fs::path;
-use ::std::time::_;
+use balder::scene::node::node3D::{camera, visual};
+use balder::scene::{deferred, compose};
 
-use std::io;
+use ::std::{io, time, time::_, fs::path};
 
 use ::vulkan::core;
 
@@ -48,209 +48,6 @@ record NodeTreeScene {
     pub let dmut rootNode : (&Node)? = none;
     pub let dmut nodes : [usize => &Node] = copy [];
     pub self () {}
-}
-
-
-/*!
- * ====================================================================================================
- * ====================================================================================================
- * =================================          DEFERRED PASS          ==================================
- * ====================================================================================================
- * ====================================================================================================
- */
-
-/**
- * The record holding the data of the deferred textures and subpass
- * */
-record DeferredRenderScene {
-    pub let dmut position : (&RefCount!{&Texture})? = none;    
-    pub let dmut normal : (&RefCount!{&Texture})? = none;
-    pub let dmut binormal : (&RefCount!{&Texture})? = none;    
-    pub let dmut albedo : (&RefCount!{&Texture})? = none;
-    pub let dmut materialID : (&RefCount!{&Texture})? = none;    
-    pub let dmut depth : (&RefCount!{&Texture})? = none;
-    
-    pub let dmut subpassTextures : [&OutputTexture] = [];
-    pub let dmut pass : (&DrawSubpass)? = none;
-    
-    pub self () {}
-
-    pub fn configure (mut self, passName : [c8], dmut win : &Window, width : u32, height : u32)-> dmut &DrawSubpass
-        throws BalderError
-    {                
-        let dmut device = win:.getVulkanDevice ();
-        
-        let dmut position = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R16G16B16_SFLOAT, width, height);        
-        let dmut normal = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R16G16B16_SFLOAT, width, height);
-        let dmut binormal = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R16G16B16_SFLOAT, width, height);
-        let dmut albedo = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R8G8B8A8_UNORM, width, height);
-        let dmut materialID = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R32_UINT, width, height);
-        let dmut depth = copy OutputTexture (alias device, device.getDepthFormat (), width, height, depth-> true);
-        
-        self.subpassTextures = copy [alias position,                                     
-                                     alias normal,
-                                     alias binormal,
-                                     alias albedo,
-                                     alias materialID,
-                                     alias depth];
-
-        self.position = (alias win:.insertResource (alias position))?;
-        self.depth = (alias win:.insertResource (alias depth))?;
-        self.normal = (alias win:.insertResource (alias normal))?;
-        self.binormal = (alias win:.insertResource (alias binormal))?;
-        self.albedo = (alias win:.insertResource (alias albedo))?;
-        self.materialID = (alias win:.insertResource (alias materialID))?;
-
-        let dmut pass = copy DrawSubpass::toTextures (alias device, width, height, self.subpassTextures);
-        self.pass = (alias pass)?;
-
-        {            
-            let dmut pipeline = win:.getVulkanPipeline ();        
-            pipeline:.registerSubPass (passName, alias pass);            
-        } catch {
-            err => {
-                log::error #("Scene", "Failed to register deferred subpass", err);                
-            }
-        }
-
-        alias pass
-    }
-
-    impl Disposable {
-        pub over dispose (mut self) {
-            if let Ok (dmut pass) = alias self.pass {
-                pass:.dispose ();
-                self.pass = none;
-            }
-            
-            if let Ok (dmut cl) = alias self.position {
-                cl:.dispose ();
-                self.position = none;
-            }
-
-            if let Ok (dmut cl) = alias self.normal {
-                cl:.dispose ();
-                self.normal = none;
-            }
-            
-            if let Ok (dmut cl) = alias self.binormal {
-                cl:.dispose ();
-                self.binormal = none;
-            }
-
-            if let Ok (dmut cl) = alias self.albedo {
-                cl:.dispose ();
-                self.albedo = none;
-            }
-
-            if let Ok (dmut cl) = alias self.materialID {
-                cl:.dispose ();
-                self.materialID = none;
-            }
-
-            if let Ok (dmut dp) = alias self.depth {
-                dp:.dispose ();
-                self.depth = none;
-            }            
-            
-            self.subpassTextures = [];
-        }    
-    }    
-}
-
-/*!
- * ====================================================================================================
- * ====================================================================================================
- * ==================================          COMPOSE PASS          ==================================
- * ====================================================================================================
- * ====================================================================================================
- */
-
-record ComposeRenderScene {
-    pub let dmut output : (&RefCount!{&Texture})? = none;
-    pub let dmut shader : (&RefCount!{&Shader})? = none;    
-    pub let dmut set : (&DescriptorSet)? = none;
-
-    pub let dmut pass : (&ComputeSubpass)? = none;
-    pub let dmut computeShader : (&ComputeShader)? = none;
-    pub let dmut outputTex : (&OutputTexture)? = none;
-    
-    pub self () {}
-
-    pub fn configure (mut self, passName : [c8], dmut win : &Window, width : u32, height : u32, defer : DeferredRenderScene)-> dmut &ComputeSubpass
-        throws BalderError
-    {
-        let dmut device = alias win:.getVulkanDevice ();
-        
-        let dmut output = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R8G8B8A8_UNORM, width, height, forStorage-> true);
-        self.output = (alias win:.insertResource (alias output))?;
-        self.outputTex = (alias output)?;
-
-        let dmut pass = copy ComputeSubpass (alias device, width, height, 1);
-        self.pass = (alias pass)?;
-        
-        let dmut shader = win:.loadResource!{&ComputeShader} (DefaultShaders::COMPOSE_3D);
-        self.shader = (alias shader)?;
-        if let Ok (dmut c : &ComputeShader) = (alias shader:.get ())? {
-            self.computeShader = (alias c)?;
-        }
-
-        {
-            let dmut set = shader:.get ():.allocateDescriptorSet ();
-            self.set = (alias set)?;
-            
-            set:.setTexture ("positions", defer.position.value.get ());
-            set:.setTexture ("normals", defer.normal.value.get ());
-            set:.setTexture ("binormals", defer.binormal.value.get ());
-            set:.setTexture ("albedo", defer.albedo.value.get ());
-            set:.setTexture ("materialID", defer.materialID.value.get ());
-            set:.setTexture ("depth", defer.depth.value.get ());  
-            
-            set:.setStorageTexture ("output", output);                        
-        } catch {
-            err => {
-                log::error #("Scene", "Malformed deferred textures", err);
-                throw copy BalderError ("Failed to configure compose pass");
-            }
-        }
-    
-        {            
-            let dmut pipeline = win:.getVulkanPipeline ();        
-            pipeline:.registerSubPass (passName, alias pass);            
-        } catch {
-            err => {
-                log::error #("Scene", "Failed to register deferred subpass", err);
-                throw copy BalderError ("Failed to configure compose pass");
-            }
-        }
-
-        alias pass
-    }
-
-    impl Disposable {
-        pub over dispose (mut self) {            
-            if let Ok (dmut pass) = alias self.pass {
-                pass:.dispose ();
-                self.pass = none;
-            }
-            
-            if let Ok (dmut output) = alias self.output {
-                output:.dispose ();
-                self.output = none;
-            }
-
-            if let Ok (dmut shader) = alias self.shader {
-                shader:.dispose ();
-                self.shader = none;
-            }
-
-            if let Ok (dmut set)= alias self.set {
-                set:.dispose ();
-                self.set = none;
-            }
-            
-        }
-    }
 }
 
 /*!
@@ -344,16 +141,18 @@ pub class Scene {
             let dmut pipeline = self._window:.getVulkanPipeline ();
             let dname = "deferred_" ~ self._name;
             let cname = "compose_" ~ self._name;
+
+            self._deferred:.configure (dname, alias self._window, self._width, self._height);
+            self._compose:.configure (cname, alias self._window, self._width, self._height, self._deferred);
             
-            let dmut dpass = self._deferred:.configure (dname, alias self._window, self._width, self._height);                        
-            let dmut cpass = self._compose:.configure (cname, alias self._window, self._width, self._height, self._deferred);        
+            let dmut dpass = alias self._deferred.subpass;                         
+            let dmut cpass = alias self._compose.subpass;        
 
             dpass:.onDraw ():.connect (&self:.onDeferredDraw);
             cpass:.onDraw ():.connect (&self:.onComposeDraw);
             
             pipeline:.setPassOutput (dname, cname);
-            // pipeline:.setPassOutputToSwap (cname);
-            
+                        
             self:.setAspect (width, height);
         }
     }
@@ -461,49 +260,49 @@ pub class Scene {
     /**
      * @returns: the generated position texture of the scene
      * */
-    pub fn getPositionTexture (mut self)-> dmut (&RefCount!{&Texture})? {
-        alias self._deferred.position
+    pub fn getPositionTexture (mut self)-> dmut &RefCount!{&Texture} {
+        alias self._deferred.positions
     }
 
     /**
      * @returns: the generated albedo texture of the scene
      * */
-    pub fn getAlbedoTexture (mut self)-> dmut (&RefCount!{&Texture})? {
+    pub fn getAlbedoTexture (mut self)-> dmut &RefCount!{&Texture} {
         alias self._deferred.albedo
     }
 
     /**
      * @returns: the generated material ID texture of the scene
      * */
-    pub fn getMaterialIDTexture (mut self)-> dmut (&RefCount!{&Texture})? {
+    pub fn getMaterialIDTexture (mut self)-> dmut &RefCount!{&Texture} {
         alias self._deferred.materialID
     }
 
     /**
      * @returns: the generated normal texture of the scene
      * */
-    pub fn getNormalTexture (mut self)-> dmut (&RefCount!{&Texture})? {
-        alias self._deferred.normal
+    pub fn getNormalTexture (mut self)-> dmut &RefCount!{&Texture} {
+        alias self._deferred.normals
     }
 
     /**
      * @returns: the generated binormal texture of the scene
      * */
-    pub fn getBinormalTexture (mut self)-> dmut (&RefCount!{&Texture})? {
-        alias self._deferred.binormal
+    pub fn getBinormalTexture (mut self)-> dmut &RefCount!{&Texture} {
+        alias self._deferred.binormals
     }
 
     /**
      * @returns: the generated depth texture of the scene
      * */
-    pub fn getDepthTexture (mut self)-> dmut (&RefCount!{&Texture})? {
+    pub fn getDepthTexture (mut self)-> dmut &RefCount!{&Texture} {
         alias self._deferred.depth
     }
 
     /**
      * @returns: the generated output texture (composition) of the scene
      * */
-    pub fn getOutputTexture (mut self)-> dmut (&RefCount!{&Texture})? {
+    pub fn getOutputTexture (mut self)-> dmut &RefCount!{&Texture} {
         alias self._compose.output
     }
 
@@ -521,40 +320,37 @@ pub class Scene {
             return;
         }
         
-        if let Ok (dmut subpass : &DrawSubpass) = alias self._deferred.pass {        
-            let dmut cmd = copy IndexedDrawCommandAllocator (alias subpass);
-            atomic self {
-                for _, dmut c in alias self._shaderToNode.nodeAssoc {
-                    for _, dmut v in alias c { v:.register (alias cmd); }
-                }
+        let dmut subpass = alias self._deferred.subpass;        
+        let dmut cmd = copy IndexedDrawCommandAllocator (alias subpass);
+        atomic self {
+            for _, dmut c in alias self._shaderToNode.nodeAssoc {
+                for _, dmut v in alias c { v:.register (alias cmd); }
+            }
 
-                {
-                    cmd:.finalizeRegister ();
-                } catch {
-                    err => {
-                        log::error #("Scene", "Failed to register nodes to draw", err);
-                        return;
-                    }
-                }
-
-                {
-                    for shName, dmut c in alias self._shaderToNode.nodeAssoc {
-                        if let Ok (dmut shO) = alias self._shaderToNode.shaders [shName] {
-                            let dmut sh = shO:.get ();
-                            sh.select (cmd.getCommandBuffer ());
-                            
-                            for _, v in c { v.draw (alias sh, alias cmd); }
-                        }
-                    }
-                } catch {
-                    err => {
-                        log::error #("Scene", "Failed to get shaders", err);                        
-                    }
+            {
+                cmd:.finalizeRegister ();
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to register nodes to draw", err);
+                    return;
                 }
             }
-        } else {
-            log::error #("Scene", "Malformed deferred subpass");
-        }        
+
+            {
+                for shName, dmut c in alias self._shaderToNode.nodeAssoc {
+                    if let Ok (dmut shO) = alias self._shaderToNode.shaders [shName] {
+                        let dmut sh = shO:.get ();
+                        sh.select (cmd.getCommandBuffer ());
+                        
+                        for _, v in c { v.draw (alias sh, alias cmd); }
+                    }
+                }
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to get shaders", err);                        
+                }
+            }
+        }            
     }        
     
     /*!
@@ -565,34 +361,33 @@ pub class Scene {
      * ====================================================================================================
      */
 
-    fn onComposeDraw (mut self) {
+    /**
+     * Slot called when the composition pass is redrawn
+     * */
+    fn onComposeDraw (mut self) {        
+        let dmut pass = alias self._compose.subpass;            
+        
+        let frame = pass.getCurrentFrame ();                                    
+        let cmdV = pass.getDrawingCommandBuffer ();
+        
+        log::debug #("Scene", "Calling compose compute shader");
+        
+        let dmut cmd = copy ComputeDispatchCommandAllocator (alias pass);
+
+        let sizes = self._compose.groupSizes;
+
         {
-            let dmut pass = alias self._compose.pass.value;
-            let dmut sh = alias self._compose.computeShader.value;                            
-            let dmut set = alias self._compose.set.value;
-            let dmut output = alias self._compose.outputTex.value;
-            
-            let frame = pass.getCurrentFrame ();            
-            let sizes = sh.getGroupSizes ();            
-            let cmdV = pass.getDrawingCommandBuffer ();
-            
-            log::debug #("Scene", "Calling compose compute shader");
-            
-            let dmut cmd = copy ComputeDispatchCommandAllocator (alias pass);
-            
-            output:.getImages ()[frame]:.transitionToWrite (cmdV, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
-            
             cmd:.registerDispatch (groupX-> sizes [0], groupY-> sizes [1], groupZ-> sizes [2]);
             cmd:.finalizeRegister ();
             
-            sh.select (cmd.getCommandBuffer ());                                        
-            set.select (cmd.getCommandBuffer ());
+            self._compose:.prepareTexture (cmdV, frame);
+            self._compose:.select (cmdV);
             
             cmd:.dispatchNext ();
-            output:.getImages ()[frame]:.transitionToRead (cmdV, VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT);
+            self._compose:.finalizeTexture (cmdV, frame);
         } catch {
             err => {
-                log::error #("Scene", "Failed to compose scene", err);                
+                log::error #("Scene", "Failed to call compose shader", err);                
             }
         }
     }
@@ -706,40 +501,39 @@ pub class Scene {
 
             self._shaderToNode.uniqInstanceIds += 1;
 
-            if let Ok (dmut sub) = alias self._deferred.pass {
-                {
-                    let dmut shader = if let Ok (dmut sh) = alias self._shaderToNode.shaders [shCfg.name] {
-                        alias sh
-                    } else {
-                        let dmut shader = self._window:.loadResource!{&RasterShader} (shCfg.name,
-                                                                                      shCfg,
-                                                                                      sub.getRenderPass (),
-                                                                                      sub.getDimension ()._0,
-                                                                                      sub.getDimension ()._1,
-                                                                                      self._deferred.subpassTextures);
+            let dmut sub = alias self._deferred.subpass;
+            {
+                let dmut shader = if let Ok (dmut sh) = alias self._shaderToNode.shaders [shCfg.name] {
+                    alias sh
+                } else {
+                    let dmut shader = self._window:.loadResource!{&RasterShader} (shCfg.name,
+                                                                                  shCfg,
+                                                                                  sub.getRenderPass (),
+                                                                                  sub.getDimension ()._0,
+                                                                                  sub.getDimension ()._1,
+                                                                                  self._deferred.outputTextures);
 
-                        self._shaderToNode.shaders [shCfg.name] = alias shader;
-                        alias shader
-                    };
+                    self._shaderToNode.shaders [shCfg.name] = alias shader;
+                    alias shader
+                };
 
+                if let Ok (dmut inner) = alias self._shaderToNode.nodeAssoc [shCfg.name] {
+                    inner [uid] = alias node;
+                } else {
+                    self._shaderToNode.nodeAssoc [shCfg.name] = copy [uid => alias node];
+                }
+
+                return alias shader;
+            } catch {
+                err => {
+                    log::error#("Scene", "failed to attach visual instance ", err);
                     if let Ok (dmut inner) = alias self._shaderToNode.nodeAssoc [shCfg.name] {
-                        inner [uid] = alias node;
-                    } else {
-                        self._shaderToNode.nodeAssoc [shCfg.name] = copy [uid => alias node];
-                    }
-
-                    return alias shader;
-                } catch {
-                    err => {
-                        log::error#("Scene", "failed to attach visual instance ", err);
-                        if let Ok (dmut inner) = alias self._shaderToNode.nodeAssoc [shCfg.name] {
-                            inner:.remove (uid);
-                        }
+                        inner:.remove (uid);
                     }
                 }
-            }
+            }         
         }
-
+        
         throw copy BalderError ("Failed to register shader reference");
     }
 
