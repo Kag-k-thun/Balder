@@ -12,22 +12,18 @@ layout (location = 2) out vec3 binormals;
 layout (location = 3) out vec4 albedo;
 layout (location = 4) out uint materialID;
 
+
+layout(binding = 2) uniform Material {    
+    uint materialID;
+} material;
+
+
 void main() {
-    int id = gl_PrimitiveID * 7907 % 256;
-    int id2 = gl_PrimitiveID * 3931 % 256;
-    int id3 = gl_PrimitiveID * 17 % 256;
-
-    float r, g, b;
-    // notice the 256's instead of 255
-    r = (id) / 255.0f;
-    g = (id2 / 255.0f);
-    b = (id3 / 255.0f);
-
-    position = vec3 (r, g, b); //inPosition.xyz);
+    position = inPosition.xyz;
     normals = vec3 (inNormals);
     binormals = vec3 (inNormals);
     albedo = vec4 (texture (diffuse, inUV).xyz, 1);
     
-    materialID = 2;
+    materialID = material.materialID;
             
 }

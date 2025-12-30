@@ -13,23 +13,18 @@ layout(binding = 1) uniform Camera {
     mat4 viewProj;
 } camera;
 
-layout(binding = 2) uniform Color {
-    vec4 color;
-} color;
-
 layout (location = 0) out vec4 outPosition;
 layout (location = 1) out vec3 outNormals;
 layout (location = 2) out vec3 outColor;
-
 
 out gl_PerVertex {
     vec4 gl_Position;
 };
 
 void main () {
-    gl_Position = camera.viewProj * world.model* vec4 (inPosition, 1.0);    
-
-    outPosition = gl_Position;
-    outNormals = inNormals;
-    outColor = color.color.xyz;
+    vec4 viewPos = camera.view * world.model * vec4 (inPosition, 1.0);    
+    gl_Position = camera.proj * viewPos;  
+    
+    outPosition = viewPos;    
+    outNormals = inNormals;        
 }

@@ -1,54 +1,21 @@
 in scene;
 
 pub mod ::node;
-mod ::deferred;
-mod ::compose;
+mod ::utils;
+
 
 use balder::core::_;
 use balder::core::{application::_, shader::_, driver::_, config::_};
 use balder::utils::_;
 
-use balder::scene::node::node3D::{camera, visual};
-use balder::scene::{deferred, compose};
+use balder::scene::node::node3D::{camera, visual, visual::material};
+use balder::scene::utils::_;
 
 use ::std::{io, time, time::_, fs::path};
 
 use ::vulkan::core;
 
-/**
- * Record holding the information of the camera on the scene
- * */
-record CameraScene {
-    pub let dmut camera : (&Camera)? = none;            
-    pub let dmut aspectChanged : &Signal!{u32, u32} = copy Signal!{u32, u32} ();
-    pub let mut aspectWidth : u32 = 0;
-    pub let mut aspectHeight : u32 = 0;
-    pub self () {}
-}
 
-/**
- * Record holding the shaders loaded by the scene and associating them to nodes to draw
- * */
-record ShaderNodeScene {    
-    pub let dmut shaders : [[c8] => &RefCount!{&Shader}] = copy [];
-    pub let dmut shadowShader : (&RefCount!{&Shader})? = none;
-    
-    pub let dmut nodeAssoc : [[c8] => [usize => &VisualInstance3D]] = copy [];
-    pub let dmut shadowMeshes : [usize => &VisualInstance3D] = copy [];    
-
-    pub let dmut uniqInstanceIds : usize = 1us;
-    
-    pub self () {}
-}
-
-/**
- * The node tree of the scene
- * */
-record NodeTreeScene {
-    pub let dmut rootNode : (&Node)? = none;
-    pub let dmut nodes : [usize => &Node] = copy [];
-    pub self () {}
-}
 
 /*!
  * ====================================================================================================
@@ -81,9 +48,6 @@ pub class Scene {
     // The slot emitter, used to trigger signals from scene events
     let dmut _box : &SlotEmitter = copy SlotEmitter ();
 
-    // The camera filming the scene
-    let dmut _camera : CameraScene = CameraScene ();
-
     // The association of shaders to loaded nodes
     let dmut _shaderToNode : ShaderNodeScene = ShaderNodeScene ();    
 
@@ -95,6 +59,16 @@ pub class Scene {
 
     // The compose rendering textures and subpasses
     let dmut _compose : ComposeRenderScene = ComposeRenderScene ();
+
+
+    prot { // Aspect 
+
+        let dmut _aspectChanged : &Signal!{u32, u32} = copy Signal!{u32, u32} ();
+        
+        let mut _aspectWidth : u32 = 0;
+        
+        let mut _aspectHeight : u32 = 0;
+    }
     
     /*!
      * ====================================================================================================
@@ -110,9 +84,7 @@ pub class Scene {
     pub self (dmut window : &Window, name : [c8])
         with _window = alias window
         , _name = name        
-    {        
-        self._tree.rootNode = (copy root::RootNode (alias self))?;
-    }
+    {}                
 
     __dtor (mut self) {
         self:.dispose ();
@@ -132,6 +104,7 @@ pub class Scene {
     pub fn configure (mut self, width : u32, height : u32)
         throws BalderError
     {
+        log::debug #("Scene", "Configure scene :", width, height);        
         self:.dispose ();
         
         if height != 0 && width != 0 {
@@ -142,18 +115,27 @@ pub class Scene {
             let dname = "deferred_" ~ self._name;
             let cname = "compose_" ~ self._name;
 
+            self._tree:.configure (alias self._window, alias self);            
             self._deferred:.configure (dname, alias self._window, self._width, self._height);
             self._compose:.configure (cname, alias self._window, self._width, self._height, self._deferred);
-            
+
+                    
             let dmut dpass = alias self._deferred.subpass;                         
             let dmut cpass = alias self._compose.subpass;        
 
+            self._shaderToNode:.configure (alias self._window, self._deferred.outputTextures, alias dpass);
+            
             dpass:.onDraw ():.connect (&self:.onDeferredDraw);
             cpass:.onDraw ():.connect (&self:.onComposeDraw);
             
             pipeline:.setPassOutput (dname, cname);
                         
-            self:.setAspect (width, height);
+            self:.setAspect (width, height);            
+        } catch {
+            err => {
+                log::error #("Scene", "Configuration failed", err);
+                throw err;
+            }
         }
     }
 
@@ -161,10 +143,10 @@ pub class Scene {
      * Change the rendering aspect of the scene, without recomputing the rendering textures
      * */
     pub fn setAspect (mut self, width : u32, height : u32) {
-        self._camera.aspectHeight = height;
-        self._camera.aspectWidth = width;
+        self._aspectHeight = height;
+        self._aspectWidth = width;
 
-        self._camera.aspectChanged:.emit (width, height);
+        self._aspectChanged:.emit (width, height);
     }
 
     /*!
@@ -179,14 +161,7 @@ pub class Scene {
      * @returns: the root node of the scene
      * */
     pub fn getRootNode (mut self)-> dmut &Node {
-        if let Ok (dmut r) = alias self._tree.rootNode {
-            return alias r;
-        }
-
-        let dmut res = copy root::RootNode (alias self);
-        self._tree.rootNode = (alias res)?;
-
-        alias res
+        alias self._tree.rootNode      
     }
 
     /**
@@ -210,7 +185,7 @@ pub class Scene {
      * */
     @field
     pub fn aspectWidth (self)-> u32 {
-        self._camera.aspectWidth
+        self._aspectWidth
     }
 
     /**
@@ -218,21 +193,21 @@ pub class Scene {
      * */
     @field
     pub fn aspectHeight (self)-> u32 {
-        self._camera.aspectHeight
+        self._aspectHeight
     }
 
     /**
      * @returns: the signal emitted when the size of the scene changes on screen (does not change rendering texture sizes)
      * */
     pub fn aspectChanged (mut self)-> dmut &Signal!{u32, u32} {
-        alias self._camera.aspectChanged
+        alias self._aspectChanged
     }
 
     /**
      * @returns: the camera of the scene if there is one camera set in the tree of nodes
      * */
     pub fn getCamera (mut self)-> dmut (&Camera)? {
-        alias self._camera.camera
+        alias self._tree.camera
     }
 
     /**
@@ -316,40 +291,14 @@ pub class Scene {
 
     fn onDeferredDraw (mut self) {
         log::debug #("Scene", "Drawing deferred pass scene");
-        if !self._camera.camera.hasValue { // nothing to draw if there is no camera
+        if !self._tree.camera.hasValue { // nothing to draw if there is no camera
             return;
         }
         
         let dmut subpass = alias self._deferred.subpass;        
         let dmut cmd = copy IndexedDrawCommandAllocator (alias subpass);
         atomic self {
-            for _, dmut c in alias self._shaderToNode.nodeAssoc {
-                for _, dmut v in alias c { v:.register (alias cmd); }
-            }
-
-            {
-                cmd:.finalizeRegister ();
-            } catch {
-                err => {
-                    log::error #("Scene", "Failed to register nodes to draw", err);
-                    return;
-                }
-            }
-
-            {
-                for shName, dmut c in alias self._shaderToNode.nodeAssoc {
-                    if let Ok (dmut shO) = alias self._shaderToNode.shaders [shName] {
-                        let dmut sh = shO:.get ();
-                        sh.select (cmd.getCommandBuffer ());
-                        
-                        for _, v in c { v.draw (alias sh, alias cmd); }
-                    }
-                }
-            } catch {
-                err => {
-                    log::error #("Scene", "Failed to get shaders", err);                        
-                }
-            }
+            self._shaderToNode:.draw (alias cmd);
         }            
     }        
     
@@ -381,7 +330,7 @@ pub class Scene {
             cmd:.finalizeRegister ();
             
             self._compose:.prepareTexture (cmdV, frame);
-            self._compose:.select (cmdV);
+            self._compose:.select (frame, alias self._shaderToNode.materials, cmdV);
             
             cmd:.dispatchNext ();
             self._compose:.finalizeTexture (cmdV, frame);
@@ -404,137 +353,34 @@ pub class Scene {
      * Attach a node in the rendering scene
      * */
     pub fn registerNode (mut self, dmut node : &Node) atomic self {
-        if let Ok (dmut n) = alias self._tree.nodes [node.uid] {
-            n:.onExit (alias self);
-        }
-
-        self._tree.nodes [node.uid] = alias node;
-        node:.onEnter (alias self);
-
-        if let dmut ca : &Camera = alias node {
-            if let Ok (ica) = self._camera.camera && ica !is ca {
-                log::error #("Scene", "scene has multiple cameras");
-            } else {
-                self:.onSetCamera (alias ca);
-            }
-        } else {
-            if let dmut vis : &VisualInstance3D = alias node {
-                if let Ok (dmut cam) = alias self._camera.camera {
-                    vis:.setCamera (alias cam);
-                }
-            }
-        }
-
-        self._window:.redrawPipeline ();
+        self._tree:.register (alias node);            
     }
 
     /**
      * Detach a node from the rendering scene
      * */
-    pub fn removeNode (mut self, dmut node : &Node) atomic self {
-        if let Ok (dmut n) = alias self._tree.nodes [node.uid] {
-            self._tree.nodes:.remove (node.uid);
-
-            if let dmut ca : &Camera = alias node {
-                if let Ok (ica) = self._camera.camera && ica is ca {
-                    self:.onRemoveCamera ();
-                }
-            } else {
-                n:.onExit (alias self);
-            }
-
-            self._window:.redrawPipeline ();
-        }
+    pub fn removeNode (mut self, dmut node : &Node) atomic self {        
+        self._tree:.remove (alias node);        
     }
-
-    /**
-     * Set the camera of the scene, and apply it to every drawable nodes in the scene
-     * */
-    fn onSetCamera (mut self, dmut cam : &Camera) {
-        self._camera.camera = (alias cam)?;
-
-        for _, dmut n in alias self._tree.nodes {
-            if let dmut vis : &VisualInstance3D = alias n {
-                vis:.setCamera (alias cam);
-            }
-        }
-    }
-
-    /**
-     * Remove the camera of the scene
-     * */
-    fn onRemoveCamera (mut self) {
-        if let Ok (dmut cam) = alias self._camera.camera {
-            self._tree.nodes:.remove (cam.uid);
-
-            self._camera.camera = none;
-            cam:.onExit (alias self);
-
-            for _, dmut n in alias self._tree.nodes {
-                if let dmut vis : &VisualInstance3D = alias n {
-                    vis:.removeCamera ();
-                }
-            }
-        }
-    }
-
+    
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * ==============================          BUFFER RECOMPUTATION          ==============================
+     * ====================================          SHADERS          =====================================
      * ====================================================================================================
      * ====================================================================================================
      */
-
+    
     /**
      * Register a shader reference that will be used to draw a mesh in the scene
      *
      * */
     pub fn registerShaderRef (mut self, shCfg : &ShaderConfig, dmut node : &VisualInstance3D)-> dmut (&RefCount!{&Shader})
         throws BalderError
-    {
-        shCfg;
-        
+    {        
         atomic self {
-            let dmut uid = self._shaderToNode.uniqInstanceIds;
-            node:.setUID (uid);
-
-            self._shaderToNode.uniqInstanceIds += 1;
-
-            let dmut sub = alias self._deferred.subpass;
-            {
-                let dmut shader = if let Ok (dmut sh) = alias self._shaderToNode.shaders [shCfg.name] {
-                    alias sh
-                } else {
-                    let dmut shader = self._window:.loadResource!{&RasterShader} (shCfg.name,
-                                                                                  shCfg,
-                                                                                  sub.getRenderPass (),
-                                                                                  sub.getDimension ()._0,
-                                                                                  sub.getDimension ()._1,
-                                                                                  self._deferred.outputTextures);
-
-                    self._shaderToNode.shaders [shCfg.name] = alias shader;
-                    alias shader
-                };
-
-                if let Ok (dmut inner) = alias self._shaderToNode.nodeAssoc [shCfg.name] {
-                    inner [uid] = alias node;
-                } else {
-                    self._shaderToNode.nodeAssoc [shCfg.name] = copy [uid => alias node];
-                }
-
-                return alias shader;
-            } catch {
-                err => {
-                    log::error#("Scene", "failed to attach visual instance ", err);
-                    if let Ok (dmut inner) = alias self._shaderToNode.nodeAssoc [shCfg.name] {
-                        inner:.remove (uid);
-                    }
-                }
-            }         
-        }
-        
-        throw copy BalderError ("Failed to register shader reference");
+            return self._shaderToNode:.register (shCfg, alias node);
+        }                
     }
 
     /**
@@ -542,20 +388,33 @@ pub class Scene {
      * */
     pub fn freeShaderRef (mut self, shCfg : &ShaderConfig, dmut node : &VisualInstance3D) {
         atomic self {
-            if let Ok (dmut inner) = alias self._shaderToNode.nodeAssoc [shCfg.name] {
-                inner:.remove (node.uid);
-
-                if inner.len == 0us {
-                    if let Ok (dmut sh) = alias self._shaderToNode.shaders [shCfg.name] {
-                        sh:.dispose ();
-                        self._shaderToNode.shaders:.remove (shCfg.name);
-                    }
-
-                    self._shaderToNode.nodeAssoc:.remove (shCfg.name);
-                }
-            }
+            self._shaderToNode:.release (shCfg, alias node);
         }
     }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          MATERIALS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Register a material to be used in the composition shader
+     * */
+    pub fn registerMaterialRef (mut self, mat : MaterialConfig)-> u32
+        throws BalderError
+    {
+        self._shaderToNode.materials:.register (mat)
+    }
+
+    /**
+     * Free a reference to a material
+     * */
+    pub fn freeMaterialRef (mut self, mat : u32) {
+        self._shaderToNode.materials:.release (mat)        
+    }    
     
     /*!
      * ====================================================================================================
@@ -569,9 +428,7 @@ pub class Scene {
      * Emit the update signal on inner nodes
      * */
     pub fn onTick (mut self, delta : Duration) {
-        for _, dmut t in alias self._tree.nodes {
-            t:.onTick (delta);
-        }
+        self._tree:.onTick (delta);        
     }
 
     /*!
@@ -586,18 +443,9 @@ pub class Scene {
 
         pub over dispose (mut self) {
             log::debug #("Scene", "dispose scene");
-            
-            self:.onRemoveCamera ();
-
-            for _, dmut n in alias self._tree.nodes {
-                n:.onExit (alias self);
-            }
-            self._tree.nodes = copy [];            
-            
-            if let Ok (dmut r) = alias self._tree.rootNode {
-                r:.dispose ();
-                self._tree.rootNode = none;
-            }
+                    
+            self._tree:.dispose ();                                            
+            self._shaderToNode:.dispose ();
             
             self._deferred:.dispose ();
             self._compose:.dispose ();
