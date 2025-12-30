@@ -4,7 +4,7 @@ layout (location = 0) in vec4 inPosition;
 layout (location = 1) in vec3 inNormals;
 layout (location = 2) in vec2 inUV;
 
-layout (binding = 1) uniform sampler2D diffuse;
+layout (binding = 3) uniform sampler2D diffuse;
 
 layout (location = 0) out vec3 position;
 layout (location = 1) out vec3 normals;
@@ -22,11 +22,12 @@ void main() {
     r = (id) / 255.0f;
     g = (id2 / 255.0f);
     b = (id3 / 255.0f);
-    
+
     position = vec3 (r, g, b); //inPosition.xyz);
     normals = vec3 (inNormals);
     binormals = vec3 (inNormals);
     albedo = vec4 (texture (diffuse, inUV).xyz, 1);
     
     materialID = 2;
+            
 }
