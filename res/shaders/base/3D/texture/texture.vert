@@ -12,6 +12,7 @@ layout(binding = 1) uniform Camera {
     mat4 proj;
     mat4 view;
     mat4 viewProj;
+    vec3 eyePos;
 } camera;
 
 layout (location = 0) out vec4 outPosition;
@@ -26,7 +27,7 @@ void main () {
     vec4 viewPos = camera.view * world.model * vec4 (inPosition, 1.0);    
     gl_Position = camera.proj * viewPos;  
     
-    outPosition = viewPos;    
+    outPosition = gl_Position;    
     outNormals = inNormals;
     outUV = inUV;
 }

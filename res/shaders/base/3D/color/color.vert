@@ -11,6 +11,7 @@ layout(binding = 1) uniform Camera {
     mat4 proj;
     mat4 view;
     mat4 viewProj;
+    vec3 eyePos;
 } camera;
 
 layout (location = 0) out vec4 outPosition;
