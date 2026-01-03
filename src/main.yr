@@ -25,22 +25,56 @@ use sdl2::_;
 
 class MyActivity over Activity {
 
-    let dmut _scene : (&Scene)? = none;
-    let dmut _lbl : (&Label)? = none;
-    let dmut _cam : (&Camera)? = none;
+    let dmut _scene : (&Scene)?  = none;
+    let dmut _lbl   : (&Label)?  = none;
+    let dmut _cam   : (&Camera)? = none;
 
     let mut _angle : f32 = 0.f;
-    let mut _dist : f32 = 2.f;
+    let mut _dist : f32 = 5.f;
     
+    let mut _movingCam : bool       = false;
+    let mut _camStart  : (i32, i32) = (0, 0);
+    let mut _yaw       : f32        = 0.f;
+    let mut _pitch     : f32        = 45.0f;
+    let mut _camSens   : f32        = 1.f / 5.f;
+    
+    let mut _target    : vec3            = makeVec3 (0.f, 0.f, 0.f);
+    let dmut _subject  : (&Node3D)?      = none;
+    let dmut _camSpeed : (f32, f32, f32) = (0.f, 0.f, 100.f);
+    let dmut _forward  : vec3            = makeVec3 (0.f, 0.f, 0.f);
+    let dmut _right    : vec3            = makeVec3 (0.f, 0.f, 0.f);
+                
     
     pub self (uid : usize, dmut app : &Application, dmut window : &Window)
         with super (uid, alias app, alias window)
     {}
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==============================          ACTIVITY MANAGEMENT          ===============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
     over onStart (mut self) {
         self.input:.quit ():.connect (self.box, &self:.onQuit);
+
+        // Connect the camera to the mouse events
         self.input:.mouseWheel ():.connect (self.box, &self:.onWheel);
+        self.input:.mouse (MouseInfo (SDL_BUTTON_MIDDLE, KeyEvent::DOWN)):.connect (self.box, &self:.onCameraEnter);
+        self.input:.mouse (MouseInfo (SDL_BUTTON_MIDDLE, KeyEvent::RELEASE)):.connect (self.box, &self:.onCameraExit);
+
+        self.input:.keyboard (KeyInfo (SDLK_z, KeyEvent::ALL)):.connect (self.box, &self:.onMoveForward);
+        self.input:.keyboard (KeyInfo (SDLK_s, KeyEvent::ALL)):.connect (self.box, &self:.onMoveBackward);
+        self.input:.keyboard (KeyInfo (SDLK_q, KeyEvent::ALL)):.connect (self.box, &self:.onMoveLeft);
+        self.input:.keyboard (KeyInfo (SDLK_d, KeyEvent::ALL)):.connect (self.box, &self:.onMoveRight);
+        self.input:.keyboard (KeyInfo (SDLK_LSHIFT, KeyEvent::ALL)):.connect (self.box, &self:.onShift);
         
+        self.input:.mouseMotion ():.connect (self.box, &self:.onMouseMove);
+
+        // Loading the screen content
+        // 
         println ("StyleSheet : ", self.gui:.loadStyleFile ("res:/config/app.style")?);
         println ("GUI : ", self.gui:.loadGUIFile ("res:/config/app.gui")?);
 
@@ -55,7 +89,7 @@ class MyActivity over Activity {
         {
             if let Ok (dmut s : &Scene) = alias self._scene {
                 self:.createBoxMesh (alias s);
-                self._cam = (alias self:.createCam (alias s))?;
+                self:.createCamera (alias s);
                 self:.createLight (alias s);
             }
         } catch {
@@ -65,30 +99,22 @@ class MyActivity over Activity {
         }
     }
 
-    pub fn redraw (mut self, _ : KeyInfo) {
-        self.window:.redrawPipeline ();
-    }
-
     over onUpdate (mut self, _delta_ : Duration) {
         if let Ok (dmut lbl) = alias self._lbl {
             lbl:.setText (std::conv::to!{[c8]} (self.window.getNbFramesLastSecond ()));            
         }
 
-        self._angle += (cast!f32 (_delta_.millis) / 30.f);
-        let teta = 45.f;
-        let radius = self._dist;
-        
-        if let Ok (dmut cam) = alias self._cam {
-		    // self._angle = (self._angle + cam.position.x) % 360.f;
-            let mut pos = cam.position;
-            let mut target = makeVec3 (0.f, 0.f, 0.f);
-
-            pos.x = target.x + radius * sin (math::utils::radian (teta)) * sin (math::utils::radian (self._angle));
-            pos.y = target.y + radius * cos (math::utils::radian (teta));
-            pos.z = target.x + radius * sin (math::utils::radian (teta)) * cos (math::utils::radian (self._angle));
-            
-            cam.position = pos;
+        if let Ok (dmut subject) = alias self._subject {
+            subject.rotation += makeVec3 (0.f, cast!f32 (_delta_.millis) / 1000.0f, 0.f);
         }
+        
+        if self._camSpeed._0 != 0.f || self._camSpeed._1 != 0.f {
+            let speed = cast!f32 (_delta_.millis) / self._camSpeed._2;             
+            self._target += (self._camSpeed._0 * speed * self._forward)                 
+                + (self._camSpeed._1 * speed * self._right);
+            
+            self:.computeCamPosition ();
+        } 
     }
 
     pub fn onQuit (mut self) {
@@ -96,10 +122,101 @@ class MyActivity over Activity {
         self.app:.close (alias self);
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          CAMERA INPUTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     pub fn onWheel (mut self, _ : i32, _ : i32, _ : i32, w : i32) {
         self._dist -= cast!f32 (w) / 10.f;
+        self:.computeCamPosition ();
     }
 
+    pub fn onCameraEnter (mut self, x : i32, y : i32, _ : MouseInfo) {
+        self._movingCam = true;
+        self._camStart = (x, y);
+    }
+
+    pub fn onCameraExit (mut self, _ : i32, _ : i32, _ : MouseInfo) {
+        self._movingCam = false;
+        self._camStart = (0, 0);        
+    }
+
+    pub fn onMouseMove (mut self, x : i32, y : i32) {
+        if self._movingCam {                            
+            self._yaw += (cast!f32 (self._camStart._0 - x) * self._camSens);
+            self._yaw %= 360.f;
+            
+            self._pitch += cast!f32 (self._camStart._1 - y) * self._camSens;            
+            self._pitch = std::algorithm::comparison::clamp (self._pitch, -45.f, 89.f);
+            
+            self._camStart = (x, y);
+
+            self:.computeCamPosition ();
+        }
+    }
+
+    pub fn onMoveForward (mut self, info : KeyInfo) {        
+        if info.type == KeyEvent::DOWN {
+            self._camSpeed._0 -= 0.5f;
+        }
+
+        else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._0 += 0.5f;            
+        }
+    }
+
+    pub fn onMoveBackward (mut self, info : KeyInfo) {
+        if info.type == KeyEvent::DOWN {
+            self._camSpeed._0 += 0.5f;
+        }
+
+        else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._0 -= 0.5f;            
+        }
+    }
+
+    pub fn onMoveLeft (mut self, info : KeyInfo) {
+        if info.type == KeyEvent::DOWN {
+            self._camSpeed._1 += 0.5f;
+        }
+
+        else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._1 -= 0.5f;            
+        }
+    }
+
+    pub fn onMoveRight (mut self, info : KeyInfo) {
+        if info.type == KeyEvent::DOWN {
+            self._camSpeed._1 -= 0.5f;
+        }
+
+        else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._1 += 0.5f;            
+        }
+    }
+
+    pub fn onShift (mut self, info : KeyInfo) {
+        if info.type == KeyEvent::DOWN {
+            self._camSpeed._2 = 200.f;
+        }
+
+        else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._2 = 100.f;            
+        }        
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          CONFIGURATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
     fn createBoxMesh (mut self, dmut scene : &Scene)
         throws BalderError
     {
@@ -116,6 +233,10 @@ class MyActivity over Activity {
                                                              "res:/models/cube/cube.obj");    
         
         __subject__.scale *= 3.f;
+        __subject__.rotation += makeVec3 (0.f, 45.f, 0.f);
+        
+        self._subject = (alias __subject__)?;
+        
         ground.position = makeVec3 (0.f, -1.f, 0.f);
         ground.scale = makeVec3 (10.f, 0.2f, 10.f);
 
@@ -126,27 +247,46 @@ class MyActivity over Activity {
         _wall_2_.scale = makeVec3 (10.f, 5.f, 0.2f);
     }
 
-    fn createCam (mut self, dmut scene : &Scene)-> dmut &Camera {
-        let dmut cam = copy PerspectiveCamera ("cam", scene:.getRootNode ());
+    fn createCamera (mut self, dmut scene : &Scene) {
+        let dmut cam = copy PerspectiveCamera ("cam", scene:.getRootNode ());        
         cam.fov = 90.f;
-        cam.position = makeVec3 (-self._dist, self._dist, -self._dist);
+        
+        self._yaw = 0.f;
+        self._pitch = 45.f;
+        
+        self._cam = (alias cam)?;
+        self:.computeCamPosition ();
+    }
 
-        alias cam
+    fn computeCamPosition (mut self) {
+        let radius = self._dist;            
+        if let Ok (dmut cam) = alias self._cam {
+		    // self._angle = (self._angle + cam.position.x) % 360.f;
+            let mut pos = cam.position;
+            let mut target = self._target;
+
+            let pitchRad = math::utils::radian (self._pitch);
+            let yawRad = math::utils::radian (self._yaw);
+            
+            pos.x = target.x + radius * cos (pitchRad) * sin (yawRad);
+            pos.y = target.y + radius * sin (pitchRad);
+            pos.z = target.z + radius * cos (pitchRad) * cos (yawRad);
+
+            self._forward.x = cos(pitchRad) * sin(yawRad);
+            self._forward.y = sin(pitchRad);
+            self._forward.z = cos(pitchRad) * cos(yawRad);
+                                    
+            self._right = makeVec3 (cos (yawRad), 0.f, -sin (yawRad));
+
+            cam.target = self._target;
+            cam.position = pos;
+        }           
     }
 
     fn createLight (mut self, dmut scene : &Scene) {
         let dmut light = copy Light ("light", scene:.getRootNode ());
         light.position = makeVec3 (-0.3f, -1.0f, -0.2f);        
     }
-
-    // impl Disposable {
-    //     pub over dispose (mut self) {
-    //         if let Ok (dmut sc) = alias self._scene {
-    //             sc:.dispose ();
-    //             self._scene = none;
-    //         }
-    //     }
-    // }
 
 }
 
