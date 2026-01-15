@@ -4,8 +4,6 @@ layout (location = 0) in vec4 inPosition;
 layout (location = 1) in vec3 inNormals;
 layout (location = 2) in vec2 inUV;
 
-layout (binding = 3) uniform sampler2D diffuse;
-
 layout (location = 0) out vec3 position;
 layout (location = 1) out vec3 normals;
 layout (location = 2) out vec3 binormals;
@@ -13,9 +11,11 @@ layout (location = 3) out vec4 albedo;
 layout (location = 4) out uint materialID;
 
 
-layout(binding = 2) uniform Material {    
+layout(set = 0, binding = 2) uniform Material {    
     uint materialID;
 } material;
+
+layout (set = 0, binding = 3) uniform sampler2D diffuse;
 
 
 void main() {

@@ -1,9 +1,13 @@
 in layout;
 
 use balder::core::driver::device;
-use balder::core::{config, error, dispose};
-use balder::core::{config::_, shader::_};
+use balder::core::{error, dispose};
+use balder::core::config::{_, shader::_};
+
+use balder::core::shader::_;
 use balder::math::vector;
+
+use balder::utils::_;
 
 use ::vulkan::core;
 
@@ -17,8 +21,8 @@ pub class PipelineLayout {
     let dmut _layout : VkPipelineLayout = null;
 
     // The descriptor set layout describing the uniform values that can be bound to the shader
-    let dmut _descriptorSetLayout : VkDescriptorSetLayout = null;
-
+    let dmut _descriptorSetLayout : [DescriptorContext => (u32, VkDescriptorSetLayout)] = copy [];
+    
     // The device containing the pipeline layout
     let dmut _device : &VulkanDevice ;
 
@@ -49,8 +53,7 @@ pub class PipelineLayout {
     pub fn configure (mut self, config : &ShaderConfig)
         throws BalderError
     {
-        self._descriptorSetLayout = self:.createDescriptorSetLayout (config);
-
+        self:.createDescriptorSetLayouts (config);
         self._layout = self:.createPipelineLayout (config);
     }
 
@@ -72,8 +75,13 @@ pub class PipelineLayout {
     /**
      * @returns: the descriptor set layout usable for descriptor set allocation
      */
-    pub fn getDescriptorSetLayout (self)-> VkDescriptorSetLayout {
-        self._descriptorSetLayout
+    pub fn getDescriptorSetLayout (self, context : DescriptorContext)-> VkDescriptorSetLayout {
+        if let Ok (d) = self._descriptorSetLayout [context] {
+            return d._1;
+        }
+
+        log::error #("PipelineLayout", "Layout doesn't have the right context");
+        panic;
     }
     
     /**
@@ -96,17 +104,24 @@ pub class PipelineLayout {
      * Create the descriptor set layout for the given T template struct
      * @returns: the descriptor set layout
      */
-    prv fn createDescriptorSetLayout (mut self, config : &ShaderConfig)-> dmut VkDescriptorSetLayout
+    fn createDescriptorSetLayouts (mut self, config : &ShaderConfig)
         throws BalderError
     {
-        let dmut descs = copy [VkDescriptorSetLayoutBinding ()
-                               ; config.getUniforms ().len +
-                               config.getBuffers ().len +
-                               config.getTextures ().len +
-                               config.getStorageTextures ().len];
-        
+        for ctx, s in config.descSet {
+            self._descriptorSetLayout [ctx] = (s.id, self.createDescriptorLayout (s));
+        }
+    }
+
+    /**
+     * Create a descriptor set for a sub desc set
+     * */
+    fn createDescriptorLayout (self, config : DescriptorSetConfig)-> dmut VkDescriptorSetLayout
+        throws BalderError
+    {
+        let dmut descs = copy [VkDescriptorSetLayoutBinding () ; config.size.len];
+                                   
         let mut i = 0us;
-        for _, u in config.getUniforms () {
+        for _, u in config.uniforms {
             let mut desc = VkDescriptorSetLayoutBinding ();
             desc.descriptorCount    = 1;
             desc.descriptorType     = VkDescriptorType::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -116,7 +131,7 @@ pub class PipelineLayout {
             i += 1;
         }
         
-        for _, u in config.getBuffers () {
+        for _, u in config.buffers {
             let mut desc = VkDescriptorSetLayoutBinding ();
             desc.descriptorCount    = 1;
             desc.descriptorType     = VkDescriptorType::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -126,7 +141,7 @@ pub class PipelineLayout {
             i += 1;
         }
 
-        for _, u in config.getTextures () {
+        for _, u in config.textures {
             let mut desc = VkDescriptorSetLayoutBinding ();
             desc.descriptorCount    = 1;
             desc.descriptorType     = VkDescriptorType::VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -136,7 +151,7 @@ pub class PipelineLayout {
             i += 1;
         }
 
-        for _, u in config.getStorageTextures () {
+        for _, u in config.storageTextures {
             let mut desc         = VkDescriptorSetLayoutBinding ();
             desc.descriptorCount = 1;
             desc.descriptorType  = VkDescriptorType::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            
@@ -145,7 +160,7 @@ pub class PipelineLayout {
             descs [i]             = desc;
             i += 1;
         }
-
+        
         let mut layoutInfo = VkDescriptorSetLayoutCreateInfo ();
         layoutInfo.sType        = VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.bindingCount = cast!u32 (descs.len);
@@ -165,23 +180,39 @@ pub class PipelineLayout {
     prv fn createPipelineLayout (mut self, cfg : &ShaderConfig)-> dmut VkPipelineLayout
         throws BalderError
     {
-        let mut activateStages = 0u32;        
-        for _, p in cfg.getPasses () {
-            activateStages = activateStages | p.stage;
-        }
-                
+        let mut activateStages = 0u32;
+        match cfg {
+            raster : &RasterShaderConfig => {            
+                for _, p in raster.passes {
+                    activateStages = activateStages | p.stage;
+                }
+            }
+            _ : &ComputeShaderConfig => {
+                activateStages = VkShaderStageFlagBits::VK_SHADER_STAGE_COMPUTE_BIT;                
+            }
+            _ => {
+                log::error #("PipelineLayout", "??");
+                panic;
+            }
+        }  
+        
         let mut range = VkPushConstantRange ();
         range.offset = 0;
-        range.size = cfg.getPushConstantSize ();
+        range.size = cfg.pushConstant.size;
         range.stageFlags = activateStages; 
 
+        let mut sets : [mut VkDescriptorSetLayout] = copy [null ; self._descriptorSetLayout.len];
+        for _, s in self._descriptorSetLayout {
+            sets [s._0] = s._1;
+        }        
+        
         let dmut layout : VkPipelineLayout = null;
         let mut pipelineLayoutInfo = VkPipelineLayoutCreateInfo ();
         pipelineLayoutInfo.sType                  = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount         = 1u32;
-        pipelineLayoutInfo.pSetLayouts            = &self._descriptorSetLayout;
+        pipelineLayoutInfo.setLayoutCount         = cast!u32 (sets.len);
+        pipelineLayoutInfo.pSetLayouts            = sets.ptr;
 
-        if cfg.getPushConstantSize () != 0 {
+        if cfg.pushConstant.size != 0 {
             pipelineLayoutInfo.pushConstantRangeCount = 1u32;
             pipelineLayoutInfo.pPushConstantRanges = &range; 
         }
@@ -189,7 +220,7 @@ pub class PipelineLayout {
         if (vkCreatePipelineLayout (self._device.getDeviceHandle (), &pipelineLayoutInfo, null, alias &layout) != VkResult::VK_SUCCESS) {
             throw copy BalderError ("Failed to create pipeline layout.");
         }
-
+        
         return alias layout;
     }
 
@@ -204,11 +235,11 @@ pub class PipelineLayout {
     impl Disposable {
 
         pub over dispose (mut self) {
-            if self._descriptorSetLayout != null {
-                vkDestroyDescriptorSetLayout (self._device.getDeviceHandle (), self._descriptorSetLayout, null);
-                self._descriptorSetLayout = null;
+            for _, set in self._descriptorSetLayout {                
+                vkDestroyDescriptorSetLayout (self._device.getDeviceHandle (), set._1, null);                
             }
-
+            self._descriptorSetLayout = copy [];
+        
             if (self._layout != null) {
                 vkDestroyPipelineLayout (self._device.getDeviceHandle (), self._layout, null);
                 self._layout = null;

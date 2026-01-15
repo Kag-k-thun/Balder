@@ -4,11 +4,11 @@ layout (location = 0) in vec3 inPosition;
 layout (location = 1) in vec3 inNormals;
 layout (location = 2) in vec2 inUV;
 
-layout(binding = 0) uniform World {
+layout(set = 0, binding = 0) uniform World {
     mat4 model;
 } world;
 
-layout(binding = 1) uniform Camera {
+layout(set = 1, binding = 1) uniform Camera {
     mat4 proj;
     mat4 view;
     mat4 viewProj;

@@ -9,7 +9,7 @@ layout (location = 2) out vec3 binormals;
 layout (location = 3) out vec4 albedo;
 layout (location = 4) out uint materialID;
 
-layout(binding = 2) uniform Material {    
+layout(set = 0, binding = 2) uniform Material {    
     uint materialID;
 } material;
 

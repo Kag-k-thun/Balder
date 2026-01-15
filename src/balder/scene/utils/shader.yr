@@ -1,7 +1,9 @@
 in shader;
 
 use balder::core::_;
-use balder::core::{application::_, shader::_, driver::_, config::_};
+use balder::core::{application::_, shader::_, driver::_, config::{_, shader::_}};
+use balder::core::shader::buffers::_;
+
 use balder::utils::_;
 
 use balder::scene::node::node3D::{camera, visual, visual::material};
@@ -19,7 +21,7 @@ pub record ShaderNodeScene {
     let dmut _window : (&Window)? = none;
 
     // The list of shaders used in the scene
-    let dmut _shaders : [[c8] => &RefCount!{&Shader}] = copy [];
+    let dmut _shaders : [[c8] => (&RefCount!{&Shader}, &DescriptorSet)] = copy [];
 
     // The list of drawable nodes and the name of the associated shader
     let dmut _nodeAssoc : [[c8] => [usize => &VisualInstance3D]] = copy [];
@@ -30,6 +32,12 @@ pub record ShaderNodeScene {
     // The array containing the list of materials used by the drawable nodes
     let dmut _materials : &MaterialArray = copy MaterialArray ();
 
+    prv { // Camera
+
+        let mut _cam : (&UniformBufferObject)? = none;
+        
+    }
+    
     prv { // lights
     
         // The array containing the list of lights in the scene
@@ -64,7 +72,7 @@ pub record ShaderNodeScene {
         // The list of shadow shaders used to render shadow in the scene        
         // @warning >= self._shadowPass.len (indeed cascade shadow have multiple shaders)
         //   - ._1: the index of the shadowMap/shadowPass
-        let dmut _shadowShader : [(&RefCount!{&Shader}, u32)] = [];
+        let dmut _shadowShader : [(&RefCount!{&Shader}, u32, &DescriptorSet)] = [];
     
     }
     
@@ -101,6 +109,27 @@ pub record ShaderNodeScene {
         self._subpass = (alias subPass)?;
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the camera used in the shaders
+     * */
+    pub fn setCamera (mut self, dmut cam : &Camera) {
+        if let Ok (dmut ubo) = alias cam:.getUBO () {
+            for _, dmut sh in alias self._shaders {
+                sh._1:.setUniform (UniformNames::CAMERA, ubo);                
+            }
+
+            self._cam = (ubo)?;
+        }
+    }    
+    
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -185,13 +214,13 @@ pub record ShaderNodeScene {
      * Register a shader reference that will be used to draw a mesh in the scene
      *
      * */
-    pub fn register (mut self, shCfg : &ShaderConfig, dmut node : &VisualInstance3D)-> dmut (&RefCount!{&Shader})
+    pub fn register (mut self, shCfg : &RasterShaderConfig, dmut node : &VisualInstance3D)-> dmut (&RefCount!{&Shader})
         throws BalderError
     {        
         {
             let dmut sub = alias self._subpass.value;
             let dmut shader = if let Ok (dmut sh) = alias self._shaders [shCfg.name] {
-                alias sh
+                alias sh._0
             } else {
                 let dmut shader = self._window.value:.loadResource!{&RasterShader} (shCfg.name,
                                                                                     shCfg,
@@ -200,16 +229,21 @@ pub record ShaderNodeScene {
                                                                                     sub.getDimension ()._1,
                                                                                     self._outputTextures);
 
-                self._shaders [shCfg.name] = alias shader;
+                let dmut desc = shader:.get ():.allocateDescriptorSet (DescriptorContext::CAMERA);
+                if let Ok (cam) = self._cam {                    
+                    desc:.setUniform (UniformNames::CAMERA, cam);                    
+                }
+                        
+                self._shaders [shCfg.name] = (alias shader, alias desc);
                 alias shader
-            };
+            };            
 
             if let Ok (dmut inner) = alias self._nodeAssoc [shCfg.name] {
                 inner [node.uid] = alias node;
             } else {
                 self._nodeAssoc [shCfg.name] = copy [node.uid => alias node];
             }
-
+            
             return alias shader;
         } catch {
             err => {
@@ -226,16 +260,17 @@ pub record ShaderNodeScene {
     /**
      * Release a shader reference and free resources if possible
      * */
-    pub fn release (mut self, shCfg : &ShaderConfig, dmut node : &VisualInstance3D) { 
+    pub fn release (mut self, shCfg : &RasterShaderConfig, dmut node : &VisualInstance3D) { 
         if let Ok (dmut inner) = alias self._nodeAssoc [shCfg.name] {
             inner:.remove (node.uid);
 
             if inner.len == 0us {
                 if let Ok (dmut sh) = alias self._shaders [shCfg.name] {
-                    sh:.dispose ();
+                    sh._1:.dispose ();
+                    sh._0:.dispose ();
                     self._shaders:.remove (shCfg.name);
                 }
-
+                
                 self._nodeAssoc:.remove (shCfg.name);
             }
         }
@@ -282,11 +317,12 @@ pub record ShaderNodeScene {
 
         {
             for shName, dmut c in alias self._nodeAssoc {
-                if let Ok (dmut shO) = alias self._shaders [shName] {
+                if let Ok ((dmut shO, camSet)) = alias self._shaders [shName] {                    
                     let dmut sh = shO:.get ();
                     sh.select (cmd.getCommandBuffer ());
+                    camSet.select (frame, cmd.getCommandBuffer ());
                     
-                    for _, v in c { v.draw (frame, alias sh, alias cmd); }
+                    for _, v in c { v.draw (frame, alias sh, alias cmd); }                                                    
                 }
             }
         } catch {
@@ -307,12 +343,15 @@ pub record ShaderNodeScene {
 
     impl Disposable {
         pub over dispose (mut self) {
-            self._nodeAssoc = copy [];
+            self._nodeAssoc = copy [];            
+            
             for _, dmut sh in alias self._shaders {
-                sh:.dispose ();
+                sh._1:.dispose ();
+                sh._0:.dispose ();
             }
 
             for i in 0 .. self._shadowShader.len {
+                self._shadowShader [i]._2:.dispose ();
                 self._shadowShader [i]._0:.dispose ();
             }
             self._shadowShader = [];
