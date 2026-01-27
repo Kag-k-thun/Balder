@@ -17,8 +17,7 @@ record PassContent {
     pub let dmut pass : &VulkanSubpass;
     pub let mut sems : [mut [VkSemaphore]] = [];
     pub let dmut stages : [u32] = [];
-    pub let mut isEntry : bool = false;
-    
+
     pub self (dmut pass : &VulkanSubpass)
         with pass = alias pass
     {}            
@@ -34,8 +33,7 @@ pub class VulkanPipeline {
     
     // The device to which the pipeline is attached
     let dmut _device : &VulkanDevice;
-
-
+    
     prot { // pass redrawing
         
         // The frames that have been swapped already
@@ -56,9 +54,9 @@ pub class VulkanPipeline {
         // The DAG of passes sorted by dependences
         let dmut _passGraph : [PassContent] = [];
 
-        // The list of entry passes
-        let dmut _entryPasses : [PassContent] = [];
-
+        // The transfer subpass
+        let dmut _transfer : &VulkanTransferPass;
+        
         // The compose pass (out node of the pipeline DAG)
         let dmut _compose : &VulkanSubpass;        
     }
@@ -79,7 +77,8 @@ pub class VulkanPipeline {
     
     pub self (dmut device : &VulkanDevice)
         with _device = alias device
-        , _compose = alias self._device:.getSwapchain ():.getRenderPass ()
+        , _transfer = alias device:.getTransferPass ()
+        , _compose = alias device:.getSwapchain ():.getRenderPass ()        
     {
         self:.resetToDefault ();
     }        
@@ -125,18 +124,19 @@ pub class VulkanPipeline {
             }
         }
 
-        let frame = self._device.getCurrentFrameIndex ();                
-        for dmut pass in alias self._entryPasses {
+        let frame = self._device.getCurrentFrameIndex ();
+        self._transfer:.await (frame);
+        for dmut pass in alias self._passGraph {
             pass.pass:.await (frame);
-        }                    
+        }
     }
 
     /**
      * Submit the current frame to the graphics and compute queues
      * */
-    pub fn submitFrame (mut self) {
-        let frame = self._device.getCurrentFrameIndex ();
-
+    pub fn submitFrame (mut self) {        
+        let frame = self._device.getCurrentFrameIndex ();        
+        
         if self._updated [frame] != FrameDrawing::SWAPPED {
             log::debug #("VulkanPipeline", "Outdated frame : ", frame);
             if (self:.submitRedraw (frame)) {
@@ -144,7 +144,6 @@ pub class VulkanPipeline {
             }            
         } else {
             self:.submitNoDraw (frame);
-
         }
     }
 
@@ -175,12 +174,9 @@ pub class VulkanPipeline {
     /**
      * Submit the frame to be drawn on screen without needing to redraw it
      * */
-    prot fn submitNoDraw (mut self, frame : u32) {
-        for dmut pass in alias self._passGraph {
-            if !pass.isEntry {
-                pass.pass:.await (frame);
-            }
-            
+    prot fn submitNoDraw (mut self, frame : u32) {         
+        self._transfer:.submit (frame);
+        for dmut pass in alias self._passGraph {                                        
             pass.pass:.submit (frame, pass.stages, pass.sems [frame]);
         }        
     }
@@ -296,16 +292,13 @@ pub class VulkanPipeline {
      * Reset the drawing pipeline to its default state (only the final compose pass)
      * */
     fn resetToDefault (mut self) atomic self {                                
-        let dmut content = PassContent (alias self._compose);        
-        let sems = self._device.getImageAvailableSemaphores ();
+        let dmut content = PassContent (alias self._compose);                
         
         content.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-        content.sems = copy [copy [sems [i]] for i in 0 .. sems.len];
-        content.isEntry = true;
-        
-        self._entryPasses = copy [alias content];
+        content.sems = copy [copy [self._transfer.getSemaphore (i)] for i in 0 .. self._device.getNbFrames ()];        
+                
         self._passGraph = copy [content];    
-        self._updated = copy [FrameDrawing::REDRAW ; sems.len];
+        self._updated = copy [FrameDrawing::REDRAW ; self._device.getNbFrames ()];
         self._passes [""] = alias self._compose;
     }
     
@@ -317,8 +310,7 @@ pub class VulkanPipeline {
     {        
         let (sortedPass, deps) = self.constructSortedList ();
         let nbFrames = self._device:.getSwapchain ().nbFrames;
-        let dmut result : [PassContent] = [];
-        let dmut entryPasses : [PassContent] = [];        
+        let dmut result : [PassContent] = [];                
         
         for pname in sortedPass {
             let mut sems : [mut [VkSemaphore]] = copy [[] ; nbFrames];
@@ -341,25 +333,20 @@ pub class VulkanPipeline {
                     throw copy BalderError ("Failed to contrusct pass graph");
                 }
             }            
-
-            let mut entry = false;
-            // Then it's an entry node, and it depends on image available
-            if stages.len == 0 {
-                let deviceSems = self._device.getImageAvailableSemaphores ();                                
+            
+            // Then it's an entry node, and it depends on transfer pass
+            if stages.len == 0 {                                
                 stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-                sems = copy [copy [deviceSems [f]] for f in 0 .. deviceSems.len];
-                entry = true;
+                sems = copy [copy [self._transfer.getSemaphore (f)] for f in 0 .. self._device.getNbFrames ()];                
             }
 
             // Adding it on the result graph
             if let Ok (dmut p) = alias self._passes [pname] {
                 let dmut content = PassContent (alias p);
                 content.sems = alias sems;
-                content.stages = alias stages;
-                content.isEntry = entry;
+                content.stages = alias stages;                
                 
-                result ~= [alias content];
-                if entry { entryPasses ~= [alias content]; }
+                result ~= [alias content];                
             } else {
                 log::error #("VulkanPipeline", "malformed graph", self._passes, '(', pname, ')');
                 panic;
@@ -367,8 +354,7 @@ pub class VulkanPipeline {
         }
 
         self:.forceRedraw ();
-        self._passGraph = alias result;
-        self._entryPasses = alias entryPasses;
+        self._passGraph = alias result;        
     }
 
     /**
@@ -440,17 +426,17 @@ pub class VulkanPipeline {
     impl Disposable {
         pub over dispose (mut self) {        
             atomic self {
-                self._device:.waitIdle ();
+                self._device:.waitIdle ();                                                
                 for dmut pass in alias self._passGraph {
                     if pass.pass !is self._compose {
                         pass.pass:.dispose ();
                     }
                 }                
-                
-                self:.resetToDefault ();
+                                
                 self._compose:.resetCommands ();
                 self._compose:.resetDrawSignal ();
-                                                
+
+                self:.resetToDefault ();
                 self:.forceRedraw ();
             }
             

@@ -14,5 +14,5 @@ layout (location = 0) out vec4 out_color;
 
 void main () {     
     vec4 texColor = texture (diffuse, a_uv);
-    out_color = texColor * vec4 (1); //world.color;
+    out_color = texColor * world.color;
 }

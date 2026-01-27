@@ -8,7 +8,7 @@ layout(set = 0, binding = 0) uniform World {
     mat4 model;
 } world;
 
-layout(set = 1, binding = 1) uniform Camera {
+layout(set = 1, binding = 0) uniform Camera {
     mat4 proj;
     mat4 view;
     mat4 viewProj;
@@ -25,9 +25,9 @@ out gl_PerVertex {
 
 void main () {    
     vec4 viewPos = camera.view * world.model * vec4 (inPosition, 1.0);    
-    gl_Position = camera.proj * viewPos;  
+    gl_Position = camera.proj * viewPos;
     
-    outPosition = gl_Position;    
+    outPosition = viewPos;    
     outNormals = inNormals;
     outUV = inUV;
 }
