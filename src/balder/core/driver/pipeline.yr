@@ -11,6 +11,7 @@ enum
 | REDRAW    = 1
 | DRAWING   = 2
 | SWAPPED   = 3
+| AWAITED   = 4
  -> FrameDrawing;
 
 record PassContent {    
@@ -41,6 +42,9 @@ pub class VulkanPipeline {
 
         // The number of frames to redraw
         let mut _redrawFrames : u32 = 0;
+
+        // The number of frames to await (second pass)
+        let mut _awaitingFrames : u32 = 0;
     }
 
     prot { // pass graph
@@ -95,13 +99,23 @@ pub class VulkanPipeline {
      * ====================================================================================================
      */
 
+    // /**
+    //  * @return: the garbage bin used to recycle resources when all their references have disappeared
+    //  * */
+    // pub fn getBin (mut self)-> dmut &GarbageBin {
+    //     alias self._bin
+    // }    
+
     /**
-     * @return: the garbage bin used to recycle resources when all their references have disappeared
+     * Insert an element in the garbage bin
      * */
-    pub fn getBin (mut self)-> dmut &GarbageBin {
-        alias self._bin
-    }    
-    
+    pub fn insertBin {T impl Disposable} (mut self, dmut obj : T) {        
+        atomic self {                        
+            let dmut bin = alias self._bin:.get!{&ResourceBin!{T}} ();
+            bin:.insert (alias obj);            
+        }        
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -114,7 +128,7 @@ pub class VulkanPipeline {
      * Wait for the previous frame of the pipeline to be presented to the screen
      * */
     pub fn waitPreviousFrame (mut self) {                        
-        if self._device.needResize () {
+        if self._device.needResize () {            
             self._device:.recreateSwapchain ();
             self:.forceRedraw ();
         } catch {
@@ -124,52 +138,43 @@ pub class VulkanPipeline {
             }
         }
 
-        let frame = self._device.getCurrentFrameIndex ();
+        let frame = self._device.getCurrentFrameIndex ();        
         self._compose:.await (frame);        
     }
 
     /**
      * Submit the current frame to the graphics and compute queues
      * */
-    pub fn submitFrame (mut self) {        
+    pub fn submitFrame (mut self) {
         let frame = self._device.getCurrentFrameIndex ();        
+        atomic self {                        
+            if self._updated [frame] == FrameDrawing::REDRAW {                
+                self._updated [frame] = FrameDrawing::DRAWING;
+                                                        
+                // Redraw all subpasses for the current frame
+                for dmut pass in alias self._passGraph {
+                    pass.pass:.redraw (frame);
+                }                
+                            
+                self._updated [frame] = FrameDrawing::SWAPPED;        
+                self._redrawFrames -= 1;                
+            } else if self._updated [frame] == FrameDrawing::SWAPPED {
+                self._updated [frame] = FrameDrawing::AWAITED;
+                self._awaitingFrames -= 1;
                 
-        if self._updated [frame] != FrameDrawing::SWAPPED {
-            log::debug #("VulkanPipeline", "Outdated frame : ", frame);
-            if (self:.submitRedraw (frame)) {
-                self._bin:.emptyTrash ();
-            }            
-        } else {
-            self:.submitNoDraw (frame);
-        }
-    }
-
-    /**
-     * Redraw the current frame in the pipeline and submit the rendering 
-     * */
-    prot fn submitRedraw (mut self, frame : u32)-> bool {
-        atomic self {
-            self._updated [frame] = FrameDrawing::DRAWING;
-        }
-                        
-        { // Redraw all subpasses for the current frame
-            for dmut pass in alias self._passGraph {
-                pass.pass:.redraw (frame);
-            }            
+                if self._awaitingFrames == 0 {                    
+                    self._bin:.emptyTrash ();            
+                }
+            }
+            
+            self:.submitNoDraw (frame);                        
         }
 
-        {
-            self._updated [frame] = FrameDrawing::SWAPPED;        
-            self._redrawFrames -= 1;            
-        }
-        
-        self:.submitNoDraw (frame);
-                
-        return self._redrawFrames == 0;                    
     }
 
     /**
      * Submit the frame to be drawn on screen without needing to redraw it
+     * @atomic
      * */
     prot fn submitNoDraw (mut self, frame : u32) {
         log::debug #("VulkanPipeline", "Stage (", frame, ") transfer took", self._transfer:.getClock (frame):.time ());        
@@ -183,12 +188,14 @@ pub class VulkanPipeline {
     /**
      * Force the subpass to be redrawn
      * */
-    pub fn forceRedraw (mut self) {
-        atomic self {
+    pub fn forceRedraw (mut self) {        
+        atomic self {            
             for i in 0 .. self._updated.len {
                 self._updated [i] = FrameDrawing::REDRAW;
-                self._redrawFrames = cast!u32 (self._updated.len);
             }
+            
+            self._redrawFrames = cast!u32 (self._updated.len);
+            self._awaitingFrames = cast!u32 (self._updated.len);            
         }
     }
 
@@ -196,7 +203,7 @@ pub class VulkanPipeline {
      * ====================================================================================================
      * ====================================================================================================
      * =================================          DAG MANAGEMENT          =================================
-     * ====================================================================================================
+     * ==================================================================== ================================
      * ====================================================================================================
      */
 
@@ -205,8 +212,8 @@ pub class VulkanPipeline {
      * */
     pub fn registerSubPass (mut self, name : [c8], dmut pass : &VulkanSubpass)
         throws BalderError
-    {
-        atomic self {        
+    {        
+        atomic self {            
             if name == "" {
                 throw copy BalderError ("Empty pass name");
             }
@@ -222,8 +229,8 @@ pub class VulkanPipeline {
      * */
     pub fn removeSubPass (mut self, name : [c8])
         throws BalderError
-    {
-        atomic self {                
+    {        
+        atomic self {            
             self._passes:.remove (name);        
 
             // Connect the predecessor of 'name' to the output of 'name'        
@@ -249,8 +256,8 @@ pub class VulkanPipeline {
      * */
     pub fn setPassOutput (mut self, name : [c8], output : [c8]) 
         throws BalderError
-    {
-        atomic self {
+    {        
+        atomic self {            
             if name == "" throw copy BalderError ("Empty pass name");
             if output == "" throw copy BalderError ("Empty pass name");
             
@@ -269,8 +276,8 @@ pub class VulkanPipeline {
      * */
     pub fn setPassOutputToSwap (mut self, name : [c8])
         throws BalderError
-    {
-        atomic self {
+    {        
+        atomic self {            
             if name == "" throw copy BalderError ("Empty pass name");
             if name !in self._passes throw copy BalderError ("No pass named " ~ name);
             
@@ -290,15 +297,17 @@ pub class VulkanPipeline {
     /**
      * Reset the drawing pipeline to its default state (only the final compose pass)
      * */
-    fn resetToDefault (mut self) atomic self {                                
-        let dmut content = PassContent (alias self._compose);                
-        
-        content.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-        content.sems = copy [copy [self._transfer.getSemaphore (i)] for i in 0 .. self._device.getNbFrames ()];        
-                
-        self._passGraph = copy [content];    
-        self._updated = copy [FrameDrawing::REDRAW ; self._device.getNbFrames ()];
-        self._passes [""] = alias self._compose;
+    fn resetToDefault (mut self) {        
+        atomic self {            
+            let dmut content = PassContent (alias self._compose);                
+            
+            content.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
+            content.sems = copy [copy [self._transfer.getSemaphore (i)] for i in 0 .. self._device.getNbFrames ()];        
+            
+            self._passGraph = copy [content];    
+            self._updated = copy [FrameDrawing::REDRAW ; self._device.getNbFrames ()];
+            self._passes [""] = alias self._compose;
+        }
     }
     
     /**
@@ -423,20 +432,23 @@ pub class VulkanPipeline {
      */
     
     impl Disposable {
-        pub over dispose (mut self) {        
-            atomic self {
+        pub over dispose (mut self) {            
+            atomic self {                
                 self._device:.waitIdle ();                                                
                 for dmut pass in alias self._passGraph {
                     if pass.pass !is self._compose {
                         pass.pass:.dispose ();
                     }
                 }                
-                                
+                
                 self._compose:.resetCommands ();
                 self._compose:.resetDrawSignal ();
 
                 self:.resetToDefault ();
-                self:.forceRedraw ();
+                for i in 0 .. self._updated.len {
+                    self._updated [i] = FrameDrawing::REDRAW;
+                    self._redrawFrames = cast!u32 (self._updated.len);
+                }                
             }
             
             self._bin:.emptyTrash ();
