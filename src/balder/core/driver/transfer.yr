@@ -31,13 +31,14 @@ pub class VulkanTransferPass {
     // Empty command buffer when nothing to transfer
     let dmut _emptyCmd : [VkCommandBuffer] = [];
 
+    // Clocks to compute transfer pass time
     let dmut _clocks : [&VulkanClock] = [];
 
     prot {
         // The signal emitted by the subpass when it is redrawn
-        let dmut _box : &MailBox!{dg (VkCommandBuffer)-> void} = copy MailBox!{dg (VkCommandBuffer)-> void} ();
+        let dmut _box : [dg (VkCommandBuffer)-> void] = [];
 
-        let dmut _clean : &MailBox!{dg ()-> void} = copy MailBox!{dg ()-> void} ();
+        let dmut _clean : [dg ()-> void] = [];
         
         // The cleaners to run when the previous transfer has been awaited
         let mut _cleaners : [mut [dg ()-> void]] = [];
@@ -73,16 +74,12 @@ pub class VulkanTransferPass {
      */
 
     /**
-     * Wait for the render pass to be finished (synchronize CPU and GPU rendering)
+     * @returns: the clock of the frame 'frame'
      * */
-    @final
-    pub fn await (mut self, currentFrame : u32) {
-        vkWaitForFences (self._device.getDeviceHandle (), 1u32, &self._fences [currentFrame], VK_TRUE, u64::max);            
-        vkResetFences (self._device.getDeviceHandle (), 1u32, &self._fences [currentFrame]);
-        
-        log::debug #("VulkanTransferPass", "Transfer pass took ", self._clocks [currentFrame]:.time ());
+    pub fn getClock (mut self, frame : u32)-> dmut &VulkanClock {
+        alias self._clocks [frame]
     }
-
+    
     /**
      * @returns: the semaphore emitted when the pass has finished (on GPU side)
      * */
@@ -112,8 +109,8 @@ pub class VulkanTransferPass {
      * */
     pub fn add (mut self, callback : dg (VkCommandBuffer)-> void, clean : dg ()-> void = &emptyClean) {
         atomic self {
-            self._box:.send (callback);
-            self._clean:.send (clean);
+            self._box ~= [callback];
+            self._clean ~= [clean];
         }
     }
     
@@ -130,16 +127,19 @@ pub class VulkanTransferPass {
      * */
     pub fn submit (mut self, frame : u32)-> VkResult {
         let tasks = atomic self {
-            let tasks = self._box:[];
+            let tasks = self._box;
+            self._box = [];
             
             // run cleaners of previous similar transfer
             for c in self._cleaners [frame] { 
                 c ();
-            }
+            }            
             
-            self._cleaners [frame] = self._clean:[];
+            self._cleaners [frame] = self._clean;
+            self._clean = [];
             tasks
         }
+        
         
         let mut submitInfo = VkSubmitInfo ();
         submitInfo.sType              = VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -157,6 +157,7 @@ pub class VulkanTransferPass {
         
         // Launch the transfer tasks
         if tasks.len != 0 {
+            log::debug #("VulkanTransferPass", "Transfer commands : ", tasks.len);
             cmd = self._commandBuffers [frame];
             vkResetCommandBuffer (cmd, 0u32);
             let mut cmdBegin = VkCommandBufferBeginInfo ();
@@ -176,10 +177,10 @@ pub class VulkanTransferPass {
 
         submitInfo.commandBufferCount = 1u32;
         submitInfo.pCommandBuffers    = &cmd;
-
         self._device:.getMemoryAllocator ():.commitDynamicBuffers ();
-        atomic self._device {                            
-            let r = vkQueueSubmit (self._device.getTransferQueue (), 1u32, &submitInfo, self._fences [frame]);
+        
+        atomic self._device {                    
+            let r = vkQueueSubmit (self._device.getTransferQueue (), 1u32, &submitInfo, null);
             self._clocks [frame]:.submit ();
 
             if (r != VkResult::VK_SUCCESS) {
@@ -274,9 +275,15 @@ pub class VulkanTransferPass {
      */
 
     impl Disposable {
-        pub over dispose (mut self) {
-            self._box:.clear ();
+        pub over dispose (mut self) {                        
+            for c in self._clean {
+                c ();
+            }
             
+            for lst in self._cleaners for c in lst {
+                c ();
+            }
+                                                
             for i in 0 .. self._finishSemaphore.len {
                 vkDestroySemaphore (self._device.getDeviceHandle (), self._finishSemaphore [i], null);
             }
@@ -294,6 +301,9 @@ pub class VulkanTransferPass {
             self._commandBuffers = [];
             self._emptyCmd = [];
             self._clocks = [];
+            self._cleaners = [];
+            self._clean = [];
+            self._box = [];
         }        
     }
 
