@@ -6,7 +6,8 @@ Reads the pull_request event payload, finds Plane work item identifiers
 
   * attaches the PR url as a link on the work item (idempotent),
   * comments when the PR opens, closes or merges,
-  * moves the item to a completed state when the PR merges.
+  * moves the item to In Progress when the PR opens and to Done when it
+    merges (the first state of the started and completed groups).
 
 Standard library only, so the workflow needs no pip install.
 """
@@ -104,19 +105,41 @@ def comment(item, html):
     return status in (200, 201)
 
 
-def complete(item):
-    """Move the item into the project's first completed-group state."""
-    for state in paginate(f"/projects/{item['project']}/states/"):
-        if state.get("group") == "completed":
-            status, _ = request(
-                "PATCH",
-                f"/projects/{item['project']}/work-items/{item['id']}/",
-                {"state": state["id"]},
-            )
-            if status == 200:
-                return f"state -> {state['name']}"
-            return f"state change failed (HTTP {status})"
-    return "no completed state in project"
+def move_state(item, group):
+    """Move the item into the earliest state of the given group.
+
+    Groups are Plane's fixed five: backlog, unstarted, started, completed,
+    cancelled. A project may hold several states per group, so order by the
+    sequence the board shows and take the first.
+    """
+    candidates = sorted(
+        (s for s in paginate(f"/projects/{item['project']}/states/") if s.get("group") == group),
+        key=lambda s: s.get("sequence", 0),
+    )
+    if not candidates:
+        return f"no {group} state in project"
+
+    state = candidates[0]
+    if item.get("state") == state["id"]:
+        return f"already {state['name']}"
+
+    status, _ = request(
+        "PATCH",
+        f"/projects/{item['project']}/work-items/{item['id']}/",
+        {"state": state["id"]},
+    )
+    if status == 200:
+        return f"state -> {state['name']}"
+    return f"state change failed (HTTP {status})"
+
+
+def target_group(action, merged):
+    """Which state group this event should put the work item in, if any."""
+    if action in ("opened", "reopened", "ready_for_review"):
+        return "started"
+    if action == "closed" and merged:
+        return "completed"
+    return None
 
 
 def describe(pr, action, merged):
@@ -161,8 +184,9 @@ def main():
         notes = [ensure_link(item, pr)]
         if body and comment(item, body):
             notes.append("commented")
-        if action == "closed" and merged:
-            notes.append(complete(item))
+        group = target_group(action, merged)
+        if group:
+            notes.append(move_state(item, group))
         print(f"  - {ref}: {', '.join(notes)}")
     return 0
 
