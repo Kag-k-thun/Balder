@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Mirror pull request state onto Plane work items.
 
-Reads the pull_request event payload, finds Plane work item identifiers
-(e.g. BALDE-12) in the head branch, title and body, and for each one:
+Reads the pull_request event payload and takes the work item from a
+leading [IDENT-N] tag on the PR title, e.g. "[BAL-47][ci] Log". That tag
+is the only source, so a body mentioning another item cannot attach the
+PR to it. For that one item it:
 
   * attaches the PR url as a link on the work item (idempotent),
   * comments when the PR opens, closes or merges,
@@ -62,17 +64,22 @@ def known_identifiers():
     return {p["identifier"].upper(): p["id"] for p in paginate("/projects/")}
 
 
-def find_references(pr, identifiers):
-    """Scan branch, title and body for <IDENT>-<n> referring to a real project."""
-    haystack = " ".join(
-        filter(None, [pr["head"]["ref"], pr.get("title"), pr.get("body")])
-    )
-    found = []
-    for prefix, number in re.findall(r"\b([A-Z][A-Z0-9]{1,19})-(\d+)\b", haystack):
-        ref = f"{prefix.upper()}-{number}"
-        if prefix.upper() in identifiers and ref not in found:
-            found.append(ref)
-    return found
+# The work item is named by a leading [IDENT-N] tag on the PR title, and
+# nowhere else. Branch names and body prose are deliberately not scanned:
+# a body that merely mentions another item ("same change as BAL-47") must
+# not attach this PR to it.
+TITLE_REF = re.compile(r"^\s*\[([A-Za-z][A-Za-z0-9]{1,19})-(\d+)\]")
+
+
+def find_reference(pr, identifiers):
+    """Return the work item this PR is for, or None."""
+    match = TITLE_REF.match(pr.get("title") or "")
+    if not match:
+        return None
+    prefix, number = match.group(1).upper(), match.group(2)
+    if prefix not in identifiers:
+        return None
+    return f"{prefix}-{number}"
 
 
 def resolve(ref):
@@ -170,24 +177,24 @@ def main():
         print("Could not list Plane projects - check the token and base url.", file=sys.stderr)
         return 1
 
-    refs = find_references(pr, identifiers)
-    if not refs:
-        print("No Plane work item referenced in branch, title or body - nothing to do.")
+    ref = find_reference(pr, identifiers)
+    if ref is None:
+        print("PR title does not start with a known [IDENT-N] tag - nothing to do.")
         return 0
 
+    item = resolve(ref)
+    if item is None:
+        print(f"  - {ref}: no such work item, skipped")
+        return 0
+
+    notes = [ensure_link(item, pr)]
     body = describe(pr, action, merged)
-    for ref in refs:
-        item = resolve(ref)
-        if item is None:
-            print(f"  - {ref}: no such work item, skipped")
-            continue
-        notes = [ensure_link(item, pr)]
-        if body and comment(item, body):
-            notes.append("commented")
-        group = target_group(action, merged)
-        if group:
-            notes.append(move_state(item, group))
-        print(f"  - {ref}: {', '.join(notes)}")
+    if body and comment(item, body):
+        notes.append("commented")
+    group = target_group(action, merged)
+    if group:
+        notes.append(move_state(item, group))
+    print(f"  - {ref}: {', '.join(notes)}")
     return 0
 
 
