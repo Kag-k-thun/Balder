@@ -1,0 +1,216 @@
+in face;
+
+use balder::core::_;
+
+use std::conv;
+use std::fs::path;
+
+use ::freetype::{freetype, ftimage, fttypes};
+
+/**
+ * Number of horizontal positions a glyph is rasterised at inside a pixel
+ * */
+pub def SUBPIXEL_LEVELS = 4u8;
+
+lazy dmut __FACE_UID__ = copy [0u32];
+fn uniqFaceId()-> u32 {
+  __FACE_UID__[0] += 1u32;
+  __FACE_UID__[0]
+}
+
+/**
+ * Coverage of a rasterised glyph, one byte per pixel, rows tightly packed
+ * */
+@data
+pub record GlyphBitmap {
+
+    pub let width: u32;
+    pub let height: u32;
+
+    // Offset from the pen position to the left of the bitmap
+    pub let left: i32;
+
+    // Offset from the baseline up to the top of the bitmap
+    pub let top: i32;
+
+    pub let pixels: [u8];
+}
+
+/**
+ * A font file opened with FreeType, rasterising glyphs at any pixel size
+ * */
+@final
+pub class FontFace {
+
+    // The freetype library owning the face
+    let dmut _library: FT_Library = null;
+
+    // The freetype face
+    let dmut _face: FT_Face = null;
+
+    // The uniq id of the face
+    let _uid: u32;
+
+    // The path of the font file
+    let _path: Path;
+
+    // The pixel size the face is currently set at
+    let mut _pixelSize: u32 = 0;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self open(path: Path, index: i64 = 0)
+        with _path = path
+        , _uid = { uniqFaceId() }
+        throws BalderError
+    {
+        if FT_Init_FreeType(alias &self._library) != 0 {
+            throw copy BalderError("Failed to initialize FreeType");
+        }
+
+        if FT_New_Face(alias self._library, path.toStr().toStringZ(), index, alias &self._face) != 0 {
+            self:.dispose();
+            throw copy BalderError("Failed to open font face : " ~ path.toStr());
+        }
+    }
+
+    __dtor(mut self) {
+        self:.dispose();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the uniq id of the face, never shared by two faces of the program
+     * */
+    pub fn getUniqId(self)-> u32 {
+        self._uid
+    }
+
+    @field
+    pub fn path(self)-> Path {
+        self._path
+    }
+
+    /**
+     * @returns: the glyph index of the code point 'c', 0 if the face has no glyph for it
+     * */
+    pub fn getGlyphIndex(mut self, c: c32)-> u32 {
+        if self._face == null { return 0u32; }
+        FT_Get_Char_Index(alias self._face, cast!u64(cast!u32(c)))
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          RASTERISING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Rasterise a glyph of the face
+     * @params:
+     *    - glyph: the index of the glyph in the face
+     *    - pixelSize: the height of the em square in pixels
+     *    - subpixel: the horizontal offset of the pen in 1/SUBPIXEL_LEVELS of a pixel
+     * */
+    pub fn rasterize(mut self, glyph: u32, pixelSize: u32, subpixel: u8)-> GlyphBitmap
+        throws BalderError
+    {
+        if self._face == null {
+            throw copy BalderError("Rasterising a glyph of a disposed face");
+        }
+
+        if self._pixelSize != pixelSize {
+            if FT_Set_Pixel_Sizes(alias self._face, 0u32, pixelSize) != 0 {
+                throw copy BalderError(std::format::format("Failed to set pixel size {} of face {}", pixelSize, self._path));
+            }
+
+            self._pixelSize = pixelSize;
+        }
+
+        let dmut delta = FT_Vector();
+        delta.x = (cast!i64(subpixel % SUBPIXEL_LEVELS) * 64i64) / cast!i64(SUBPIXEL_LEVELS);
+        FT_Set_Transform(alias self._face, null, alias &delta);
+
+        if FT_Load_Glyph(alias self._face, glyph, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) != 0 {
+            throw copy BalderError(std::format::format("Failed to rasterise glyph {} of face {}", glyph, self._path));
+        }
+
+        let slot = unsafe { (*self._face).glyph };
+        let bitmap = unsafe { (*slot).bitmap };
+        let left = unsafe { (*slot).bitmap_left };
+        let top = unsafe { (*slot).bitmap_top };
+
+        GlyphBitmap(bitmap.width, bitmap.rows, left, top, self.readBitmap(bitmap))
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the coverage of a gray or mono bitmap, one byte per pixel
+     * */
+    fn readBitmap(self, bitmap: FT_Bitmap)-> [u8] {
+        let dmut pixels = copy [0u8; bitmap.width * bitmap.rows];
+        let mono = bitmap.pixel_mode == cast!u8(FT_Pixel_Mode::FT_PIXEL_MODE_MONO);
+
+        // a negative pitch stores the rows bottom up
+        let absPitch = if bitmap.pitch < 0 { -bitmap.pitch } else { bitmap.pitch };
+        let pitch = cast!usize(absPitch);
+        for row in 0u32 .. bitmap.rows {
+            let memRow = if bitmap.pitch < 0 { bitmap.rows - 1u32 - row } else { row };
+            let line = bitmap.buffer + (cast!usize(memRow) * pitch);
+            for col in 0u32 .. bitmap.width {
+                pixels[row * bitmap.width + col] = if mono {
+                    let byte = unsafe { *(line + cast!usize(col / 8u32)) };
+                    if (byte >> cast!u8(7u32 - (col % 8u32))) & 1u8 != 0u8 { 255u8 } else { 0u8 }
+                } else {
+                    unsafe { *(line + cast!usize(col)) }
+                };
+            }
+        }
+
+        pixels
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            if self._face != null {
+                FT_Done_Face(alias self._face);
+                self._face = null;
+            }
+
+            if self._library != null {
+                FT_Done_FreeType(alias self._library);
+                self._library = null;
+            }
+        }
+    }
+}
