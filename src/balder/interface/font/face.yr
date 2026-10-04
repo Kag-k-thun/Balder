@@ -7,6 +7,8 @@ use std::fs::path;
 
 use ::freetype::{freetype, ftimage, fttypes};
 
+use ::harfbuzz::{common, font, ft};
+
 /**
  * Number of horizontal positions a glyph is rasterised at inside a pixel
  * */
@@ -37,6 +39,22 @@ pub record GlyphBitmap {
 }
 
 /**
+ * Vertical metrics of a face at a pixel size, in pixels
+ * */
+@data
+pub record LineMetrics {
+
+    // Distance from the baseline up to the top of the line
+    pub let ascender: f32;
+
+    // Distance from the baseline down to the bottom of the line, negative below the baseline
+    pub let descender: f32;
+
+    // Distance between the baselines of two consecutive lines
+    pub let height: f32;
+}
+
+/**
  * A font file opened with FreeType, rasterising glyphs at any pixel size
  * */
 @final
@@ -56,6 +74,9 @@ pub class FontFace {
 
     // The pixel size the face is currently set at
     let mut _pixelSize: u32 = 0;
+
+    // The harfbuzz font shaping with the face, created on first use
+    let dmut _hbFont: *hb_font_t = null;
 
     /*!
      * ====================================================================================================
@@ -112,6 +133,65 @@ pub class FontFace {
         FT_Get_Char_Index(alias self._face, cast!u64(cast!u32(c)))
     }
 
+    /**
+     * @returns: the vertical metrics of the face at 'pixelSize'
+     * */
+    pub fn getLineMetrics(mut self, pixelSize: u32)-> LineMetrics
+        throws BalderError
+    {
+        self:.setPixelSize(pixelSize);
+
+        let metrics = unsafe { (*(*self._face).size).metrics };
+        LineMetrics(cast!f32(metrics.ascender) / 64.0f,
+                    cast!f32(metrics.descender) / 64.0f,
+                    cast!f32(metrics.height) / 64.0f)
+    }
+
+    /**
+     * @returns: the harfbuzz font of the face set at 'pixelSize', positions being in 26.6 fixed point
+     * @warning: valid until the next change of pixel size, or the disposal of the face
+     * */
+    pub fn getHarfbuzzFont(mut self, pixelSize: u32)-> dmut *hb_font_t
+        throws BalderError
+    {
+        self:.setPixelSize(pixelSize);
+        if self._hbFont == null {
+            self._hbFont = hb_ft_font_create(self._face);
+        }
+
+        alias self._hbFont
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the height of the em square in pixels, used by the next rasterisations and shapings
+     * */
+    pub fn setPixelSize(mut self, pixelSize: u32)
+        throws BalderError
+    {
+        if self._face == null {
+            throw copy BalderError("Setting the pixel size of a disposed face");
+        }
+
+        if self._pixelSize != pixelSize {
+            if FT_Set_Pixel_Sizes(alias self._face, 0u32, pixelSize) != 0 {
+                throw copy BalderError(std::format::format("Failed to set pixel size {} of face {}", pixelSize, self._path));
+            }
+
+            self._pixelSize = pixelSize;
+            if self._hbFont != null {
+                hb_ft_font_changed(alias self._hbFont);
+            }
+        }
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -134,13 +214,7 @@ pub class FontFace {
             throw copy BalderError("Rasterising a glyph of a disposed face");
         }
 
-        if self._pixelSize != pixelSize {
-            if FT_Set_Pixel_Sizes(alias self._face, 0u32, pixelSize) != 0 {
-                throw copy BalderError(std::format::format("Failed to set pixel size {} of face {}", pixelSize, self._path));
-            }
-
-            self._pixelSize = pixelSize;
-        }
+        self:.setPixelSize(pixelSize);
 
         let dmut delta = FT_Vector();
         delta.x = (cast!i64(subpixel % SUBPIXEL_LEVELS) * 64i64) / cast!i64(SUBPIXEL_LEVELS);
@@ -202,6 +276,11 @@ pub class FontFace {
 
     impl Disposable {
         pub over dispose(mut self) {
+            if self._hbFont != null {
+                hb_font_destroy(alias self._hbFont);
+                self._hbFont = null;
+            }
+
             if self._face != null {
                 FT_Done_Face(alias self._face);
                 self._face = null;
