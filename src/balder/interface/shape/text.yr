@@ -1,0 +1,300 @@
+in text;
+
+use balder::core::_;
+use balder::core::config::shader::_;
+use balder::core::driver::cmd_alloc;
+use balder::core::shader::{_, buffers::_};
+use balder::interface::drawer;
+use balder::interface::font::{atlas, cache, face, shaper};
+use balder::math::vector;
+
+use std::math;
+
+
+/**
+ * The quads of a text drawn from one page of the atlas
+ * */
+@data
+record PageBatch {
+
+    // The page sampled by the quads
+    pub let page: u32;
+
+    // The first index of the quads in the index buffer
+    pub let firstIndex: u32;
+
+    // The number of indices of the quads
+    pub let nbIndices: u32;
+}
+
+/**
+ * A 2D text, drawn as one quad per glyph sampling the glyph atlas
+ * The quads sampling the same page are drawn at once, so a text costs one draw per page it uses
+ * */
+@final
+pub class TextShape over Shape {
+
+    // The atlas the glyphs are taken from
+    let dmut _atlas: &GlyphAtlas;
+
+    // The shader the descriptor sets of the pages are allocated from
+    let dmut _shader: &Shader;
+
+    // The corners and texture coordinates of the quads, sorted by page
+    let dmut _quadVBO: &VertexBufferObject;
+
+    // The indices of the quads
+    let dmut _quadIBO: &IndexBufferObject!{u32};
+
+    // The quads of each page
+    let mut _batches: [PageBatch] = [];
+
+    // The descriptor set of the pages other than 0, page 0 using the one of the shape
+    let dmut _pageSets: [u32 => &DescriptorSet] = copy [];
+
+    // True once the texture of page 0 is bound to the descriptor set of the shape
+    let mut _firstPageBound: bool = false;
+
+    // The glyphs the quads are made of, marked used at each recording of the draws
+    let mut _keys: [GlyphKey] = [];
+
+    // The number of device pixels in a window unit
+    let mut _pixelRatio: f32 = 1.0f;
+
+    // The size of the text in window units
+    let mut _textSize: vec2 = vec2();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (uid: usize,
+              dmut drawer: &ShapeDrawer,
+              dmut shader: &Shader,
+              dmut atlas: &GlyphAtlas,
+              dmut vbo: &VertexBufferObject,
+              dmut ibo: &IndexBufferObject!{u32})
+        with super(uid, alias drawer, vbo, ibo,
+                   ubo-> copy UniformBufferObject(alias shader:.getDevice(), shape::World::size),
+                   descSet-> shader:.allocateDescriptorSet(DescriptorContext::OBJECT))
+        , _atlas = alias atlas
+        , _shader = alias shader
+        , _quadVBO = alias vbo
+        , _quadIBO = alias ibo
+        throws BalderError
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Replace the glyphs of the text, rasterising the ones not in the atlas yet
+     * @params:
+     *    - face: the face the run was shaped with
+     *    - run: the shaped glyphs, in device pixels
+     *    - pixelRatio: the number of device pixels in a window unit
+     * */
+    pub fn setText(mut self, dmut face: &FontFace, run: ShapedRun, pixelRatio: f32)
+        throws BalderError
+    {
+        let ratio = pixelRatio;
+        let baseline = round(run.metrics.ascender);
+
+        let dmut vertices: [u32 => [f32]] = copy [];
+        let mut keys: [GlyphKey] = [];
+        for g in run.glyphs {
+            let (whole, sub) = quantizePen(g.x);
+            let entry = self._atlas:.getGlyph(alias face, run.pixelSize, g.glyph, sub);
+            keys ~= [GlyphKey(face.getUniqId(), run.pixelSize, g.glyph, sub)];
+            if !entry.isPacked() { continue; }
+
+            let x0 = (whole + cast!f32(entry.left)) / ratio;
+            let y0 = (baseline - round(g.y) - cast!f32(entry.top)) / ratio;
+            let x1 = x0 + cast!f32(entry.width) / ratio;
+            let y1 = y0 + cast!f32(entry.height) / ratio;
+
+            let dmut quad = copy [x0, y0, entry.u0, entry.v0,
+                        x0, y1, entry.u0, entry.v1,
+                        x1, y1, entry.u1, entry.v1,
+                        x1, y0, entry.u1, entry.v0];
+
+            if let Ok(v) = vertices[entry.page] {
+                vertices[entry.page] = v ~ quad;
+            } else {
+                vertices[entry.page] = alias quad;
+            }
+        }
+
+        let mut points: [f32] = [];
+        let mut indices: [u32] = [];
+        let mut batches: [PageBatch] = [];
+        for page in 0u32 .. self._atlas.getNbPages() {
+            if let Ok(v) = vertices[page] {
+                let first = cast!u32(indices.len);
+                for q in 0u32 .. cast!u32(v.len / 16us) {
+                    let base = cast!u32(points.len / 4us) + q * 4u32;
+                    indices ~= [base + 1u32, base, base + 2u32,
+                                base + 2u32, base, base + 3u32];
+                }
+
+                points ~= v;
+                batches ~= [PageBatch(page, first, cast!u32(indices.len) - first)];
+                self:.selectPage(page);
+            }
+        }
+
+        self:.replaceBuffers(cast!u32(points.len / 4us), points, indices);
+
+        self._batches = batches;
+        self._keys = keys;
+        self._pixelRatio = ratio;
+        self._textSize = makeVec2(run.width / ratio, run.getHeight() / ratio);
+        self._needRedraw = true;
+    }
+
+    /**
+     * Change the position of the text, snapped to a whole device pixel so the glyphs keep their rasterisation
+     * */
+    pub over setPosition(mut self, pos: vec2) {
+        let r = self._pixelRatio;
+        self.__super__:.setPosition(makeVec2(round(pos.x * r) / r, round(pos.y * r) / r));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the size of the text in window units, the advance of the run and the height of its line
+     * */
+    pub fn getTextSize(self)-> vec2 {
+        self._textSize
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Mark the glyphs of the text used by the recording of the draws, so they stay in the atlas while the recording is in use
+     * */
+    pub fn touchGlyphs(mut self) {
+        for k in self._keys {
+            self._atlas:.touch(k);
+        }
+    }
+
+    pub over registerDraws(self, dmut cmd: &IndexedDrawCommandAllocator) {
+        for b in self._batches {
+            cmd:.registerIndexedObject(b.nbIndices, firstIndex-> b.firstIndex);
+        }
+    }
+
+    pub over draw(self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator) {
+        if self._batches.len == 0us { return; }
+
+        self.selectScissors(cmd.getCommandBuffer());
+        self._quadVBO.select(cmd.getCommandBuffer());
+        self._quadIBO.select(cmd.getCommandBuffer());
+
+        for b in self._batches {
+            if b.page == 0u32 {
+                if let Ok(ds) = self._descSet {
+                    ds.select(frame, cmd.getCommandBuffer());
+                }
+            } else if let Ok(ds) = self._pageSets[b.page] {
+                ds.select(frame, cmd.getCommandBuffer());
+            }
+
+            cmd:.drawNextIndexed();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Bind the texture of a page to its descriptor set, allocating the set the first time the page is used
+     * */
+    fn selectPage(mut self, page: u32)
+        throws BalderError
+    {
+        if page == 0u32 {
+            if !self._firstPageBound {
+                if let Ok(dmut ds) = alias self._descSet {
+                    ds:.setTexture(TextureKind::ALBEDO, self._atlas:.getPage(0u32));
+                    self._firstPageBound = true;
+                }
+            }
+        } else if page !in self._pageSets {
+            let dmut ds = self._shader:.allocateDescriptorSet(DescriptorContext::OBJECT);
+            ds:.setUniform(UniformNames::WORLD, self._ubo);
+            ds:.setTexture(TextureKind::ALBEDO, self._atlas:.getPage(page));
+            self._pageSets[page] = alias ds;
+        }
+    }
+
+    /**
+     * Upload the quads in new buffers, the previous ones being disposed once the frames using them are done
+     * */
+    fn replaceBuffers(mut self, nbPoints: u32, points: [f32], indices: [u32])
+        throws BalderError
+    {
+        let dmut window = self._context:.getWindow();
+        window:.insertBin(alias self._quadVBO);
+        window:.insertBin(alias self._quadIBO);
+
+        self._quadVBO = copy VertexBufferObject();
+        self._quadIBO = copy IndexBufferObject!{u32}();
+        if indices.len != 0us {
+            let dmut device = self._shader:.getDevice();
+            self._quadVBO:.update(alias device, nbPoints, points);
+            self._quadIBO:.update(alias device, indices);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self.__super__:.dispose();
+
+            for _, dmut ds in alias self._pageSets {
+                ds:.dispose();
+            }
+
+            self._pageSets = copy [];
+            self._quadVBO:.dispose();
+            self._quadIBO:.dispose();
+            self._batches = [];
+        }
+    }
+}
