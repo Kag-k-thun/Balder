@@ -5,7 +5,7 @@ mod ::run;
 mod ::utils;
 
 use balder::core::error;
-use balder::interface::font::{chain, face, grapheme};
+use balder::interface::font::{chain, face, grapheme, itemizer};
 
 use std::{algorithm::_, math};
 
@@ -42,30 +42,35 @@ pub fn mergeSpans(spans: [(f32, f32)])-> [(f32, f32)] {
  * Shape a single line of text with HarfBuzz and a single face
  * @params:
  *    - face: the face the glyphs are taken from
- *    - text: the text to shape, in UTF-16 code units
+ *    - text: the text to shape, in UTF-8
  *    - pixelSize: the height of the em square in pixels
+ *    - features: the OpenType features to turn on or off, in the syntax of CSS or of HarfBuzz ("kern=0", "-liga", "smcp")
  * @returns: the glyphs of the line, with their positions, every glyph being of the face 0
+ * @throws: if a feature cannot be read
  * */
-pub fn shapeLine(dmut face: &FontFace, text: [c16], pixelSize: u32)-> ShapedRun
+pub fn shapeLine(dmut face: &FontFace, text: [c8], pixelSize: u32, features: [[c8]] = [])-> ShapedRun
     throws BalderError
 {
     let dmut faces = copy [alias face];
     let dmut chain = copy FontChain::fromFaces(alias faces);
-    shapeLine(alias chain, text, pixelSize)
+    shapeLine(alias chain, text, pixelSize, features-> features)
 }
 
 /**
  * Shape a single line of text with HarfBuzz, each grapheme being drawn with the first face of the chain that has glyphs
  * for it
- * The line is split into one run per face, each run being shaped with the rest of the line as context, the runs being
- * laid out in the direction of the line
+ * The line is split into items of one face and one script, each item being shaped in its script with the rest of the
+ * line as context, the items being laid out in the direction of the line (guessed from its first strong character, a
+ * line mixing directions being laid out in that single direction)
  * @params:
  *    - chain: the faces the glyphs are taken from
- *    - text: the text to shape, in UTF-16 code units
+ *    - text: the text to shape, in UTF-8
  *    - pixelSize: the height of the em square in pixels
+ *    - features: the OpenType features to turn on or off, in the syntax of CSS or of HarfBuzz ("kern=0", "-liga", "smcp")
  * @returns: the glyphs of the line, with their positions, the line taking the metrics of the primary face
+ * @throws: if a feature cannot be read
  * */
-pub fn shapeLine(dmut chain: &FontChain, text: [c16], pixelSize: u32)-> ShapedRun
+pub fn shapeLine(dmut chain: &FontChain, text: [c8], pixelSize: u32, features: [[c8]] = [])-> ShapedRun
     throws BalderError
 {
     let metrics = chain:.getPrimary():.getLineMetrics(pixelSize);
@@ -73,24 +78,28 @@ pub fn shapeLine(dmut chain: &FontChain, text: [c16], pixelSize: u32)-> ShapedRu
         return ShapedRun([], 0.0f, metrics, pixelSize, copy [0.0f], copy [0us]);
     }
 
+    let feats = readFeatures(features);
+
     let stops = boundaries(text);
-    let runs = utils::splitByFace(alias chain, text, stops);
+    let items = itemize(alias chain, text, stops);
     let direction = utils::guessDirection(text);
     let backward = HB_DIRECTION_IS_BACKWARD(direction);
 
     let dmut result: [ShapedGlyph] = [];
     let dmut pens: [f32] = [];
     let mut pen = 0.0f;
-    for k in 0us .. runs.len {
-        let (start, end, faceIndex) = runs[if backward { runs.len - 1us - k } else { k }];
+    for k in 0us .. items.len {
+        let item = items[if backward { items.len - 1us - k } else { k }];
+        let faceIndex = item.face;
         let dmut font = chain:.getFace(faceIndex):.getHarfbuzzFont(pixelSize);
         let dmut buf = hb_buffer_create();
 
         let (infos, positions) = {
-            hb_buffer_add_utf16(alias buf, text.ptr, cast!i32(text.len), cast!u32(start), cast!i32(end - start));
+            hb_buffer_add_utf8(alias buf, text.ptr, cast!i32(text.len), cast!u32(item.start), cast!i32(item.end - item.start));
             hb_buffer_set_direction(alias buf, direction);
+            hb_buffer_set_script(alias buf, item.script);
             hb_buffer_guess_segment_properties(alias buf);
-            hb_shape(alias font, alias buf, null, 0u32);
+            hb_shape(alias font, alias buf, feats.ptr, cast!u32(feats.len));
 
             (getGlyphInfos(alias buf), getGlyphPositions(alias buf))
         } exit {
@@ -112,6 +121,29 @@ pub fn shapeLine(dmut chain: &FontChain, text: [c16], pixelSize: u32)-> ShapedRu
     }
 
     ShapedRun(result, pen, metrics, pixelSize, utils::placeCarets(result, pens, text.len, stops, backward), stops)
+}
+
+/**
+ * Read the OpenType features a text is shaped with
+ * @params:
+ *    - features: the features, in the syntax of CSS or of HarfBuzz ("kern=0", "-liga", "smcp")
+ * @returns: the features, applied to the whole text
+ * @throws: if a feature cannot be read
+ * */
+pub fn readFeatures(features: [[c8]])-> [hb_feature_t]
+    throws BalderError
+{
+    let dmut res: [hb_feature_t] = [];
+    for f in features {
+        let dmut feature = hb_feature_t();
+        if hb_feature_from_string(f.ptr, cast!i32(f.len), alias &feature) == 0 {
+            throw copy BalderError("Invalid font feature : " ~ f);
+        }
+
+        res ~= [feature];
+    }
+
+    res
 }
 
 /**

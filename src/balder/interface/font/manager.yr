@@ -1,12 +1,13 @@
 in manager;
 
 use balder::core::_;
-use balder::interface::font::{chain, family, registry, shaper};
+use balder::interface::font::{chain, family, layout, registry, runs, shaper};
 
 use std::algorithm::comparison;
 
 /**
- * Font manager resolving the families requested by the styles into chains of faces, and shaping text with them
+ * Font manager resolving the families requested by the styles into chains of faces, and shaping text with them, the
+ * runs shaped last being kept so an unchanged text is not shaped again
  * */
 @final
 pub class FontManager {
@@ -25,6 +26,9 @@ pub class FontManager {
 
     // The version of the registry the chains were created at
     let mut _chainsVersion: u64 = 0;
+
+    // The runs shaped last, by chain, text, pixel size and features
+    let dmut _runs: &RunCache = copy RunCache();
 
     /**
      * Create a manager reading its fonts on first use
@@ -97,18 +101,58 @@ pub class FontManager {
     }
 
     /**
-     * Shape a single line of text
+     * Shape a single line of text, or take it from the runs shaped last
      * @params:
-     *    - text: the text to shape
+     *    - text: the text to shape, in UTF-8
      *    - chain: the faces the glyphs are taken from
      *    - fontSize: the size of the font
      *    - pixelRatio: the number of device pixels in a window unit, the glyphs being positioned in device pixels
+     *    - features: the OpenType features to turn on or off ("kern=0", "-liga", "smcp")
      * @returns: the shaped run, in device pixels
      * */
-    pub fn shape(mut self, text: [c16], dmut chain: &FontChain, fontSize: u32, pixelRatio: f32 = 1.0f)-> ShapedRun
+    pub fn shape(mut self, text: [c8], dmut chain: &FontChain, fontSize: u32, pixelRatio: f32 = 1.0f, features: [[c8]] = [])-> ShapedRun
         throws BalderError
     {
-        shapeLine(alias chain, text, self.getPixelSize(fontSize, pixelRatio-> pixelRatio))
+        self:.shapeCached(text, alias chain, self.getPixelSize(fontSize, pixelRatio-> pixelRatio), features)
+    }
+
+    /**
+     * Lay a text out in lines, broken at its line breaks and wrapped to a width, each line being shaped on its own, or
+     * taken from the runs shaped last
+     * @params:
+     *    - text: the text to lay out, in UTF-8
+     *    - chain: the faces the glyphs are taken from
+     *    - fontSize: the size of the font
+     *    - pixelRatio: the number of device pixels in a window unit, the glyphs being positioned in device pixels
+     *    - maxWidth: the width the lines are wrapped to, in device pixels, f32::max to break them at the line breaks only
+     *    - align: the part of its free space put on the left of a line, 0 aligning the lines to the left, 0.5 centering
+     *             them, 1 aligning them to the right
+     *    - features: the OpenType features to turn on or off ("kern=0", "-liga", "smcp")
+     * @returns: the laid out text, in device pixels
+     * */
+    pub fn layout(mut self, text: [c8], dmut chain: &FontChain, fontSize: u32, pixelRatio: f32 = 1.0f, maxWidth: f32 = f32::max, align: f32 = 0.0f, features: [[c8]] = [])-> TextLayout
+        throws BalderError
+    {
+        let pixelSize = self.getPixelSize(fontSize, pixelRatio-> pixelRatio);
+
+        let dmut lines: [(ShapedRun, usize, usize)] = [];
+        for p in splitParagraphs(text) {
+            let (start, end, breaks) = p;
+            let paragraph = text[start .. end];
+            let run = self:.shapeCached(paragraph, alias chain, pixelSize, features);
+
+            let ranges = wrapLine(paragraph, run, breaks, maxWidth);
+            if ranges.len == 1us && ranges[0]._1 == paragraph.len {
+                lines ~= [(run, start, end)];
+            } else {
+                for r in ranges {
+                    let line = self:.shapeCached(text[start + r._0 .. start + r._1], alias chain, pixelSize, features);
+                    lines ~= [(line, start + r._0, start + r._1)];
+                }
+            }
+        }
+
+        stackLines(lines, align)
     }
 
     /**
@@ -126,6 +170,31 @@ pub class FontManager {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Shape a single line of text at a pixel size, or take it from the runs shaped last
+     * */
+    fn shapeCached(mut self, text: [c8], dmut chain: &FontChain, pixelSize: u32, features: [[c8]])-> ShapedRun
+        throws BalderError
+    {
+        let key = RunKey(chain.getUniqId(), text, pixelSize, features);
+        if let Ok(run) = self._runs:.find(key) {
+            return run;
+        }
+
+        let run = shapeLine(alias chain, text, pixelSize, features-> features);
+        self._runs:.insert(key, run);
+
+        run
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ===================================          DISPOSING          ====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -134,6 +203,7 @@ pub class FontManager {
     impl Disposable {
         pub over dispose(mut self) {
             self._chains = copy [];
+            self._runs:.clear();
             self._registry:.dispose();
         }
     }
