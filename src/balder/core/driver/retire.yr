@@ -1,0 +1,199 @@
+in retire;
+
+/**
+ * A disposal waiting in a retire queue
+ * */
+pub record RetireEntry {
+
+    // The stamp of the queue when the entry was pushed
+    pub let stamp: u64;
+
+    // The disposal to run
+    pub let clean: dg ()-> void;
+
+    pub self (stamp: u64, clean: dg ()-> void)
+        with stamp = stamp
+        , clean = clean
+    {}
+}
+
+/**
+ * A FIFO of deferred disposals
+ * Each entry is stamped with the stamp of the queue when it is pushed. The stamp only grows, so
+ * the entries are sorted by stamp, and collecting up to a bound runs a prefix of the queue. What a
+ * stamp counts (redraw generations, awaited frames), and when a bound is safe, is up to the owner
+ * of the queue.
+ * */
+@final
+pub class RetireQueue {
+
+    // The entries waiting to be collected, sorted by stamp
+    let dmut _entries: [RetireEntry] = [];
+
+    // The stamp given to the entries pushed now
+    let mut _stamp: u64 = 0;
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the stamp given to the entries pushed now
+     * */
+    pub fn getStamp(self)-> u64 {
+        self._stamp
+    }
+
+    /**
+     * @returns: the number of entries waiting to be collected
+     * */
+    pub fn len(self)-> usize {
+        self._entries.len
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSERTION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Move to the next stamp, the entries pushed from now on wait for a bound above it
+     * @returns: the new stamp
+     * */
+    pub fn advance(mut self)-> u64 {
+        atomic self {
+            self._stamp += 1u64;
+            self._stamp
+        }
+    }
+
+    /**
+     * Push a disposal, stamped with the current stamp
+     * @returns: the stamp of the entry
+     * */
+    pub fn push(mut self, clean: dg ()-> void)-> u64 {
+        atomic self {
+            self._entries ~= [RetireEntry(self._stamp, clean)];
+            self._stamp
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          COLLECTING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Run the entries stamped strictly below 'bound', in the order they were pushed
+     * @info: the entries are taken out of the queue before they run, so an entry pushed by a running
+     * disposal gets the current stamp and waits for its own turn
+     * @returns: the number of entries that ran
+     * */
+    pub fn collect(mut self, bound: u64)-> usize {
+        let ready = atomic self {
+            let mut nb = 0us;
+            while nb < self._entries.len && self._entries[nb].stamp < bound {
+                nb += 1us;
+            }
+
+            let ready = self._entries[0us .. nb];
+            self._entries = alias self._entries[nb .. $];
+            ready
+        };
+
+        for e in ready {
+            e.clean();
+        }
+
+        ready.len
+    }
+
+    /**
+     * Run every entry, the ones pushed by running disposals included, until the queue is empty
+     * @warning: only safe once nothing can use the retired objects anymore (the device is idle and
+     * nothing is recorded)
+     * @returns: the number of entries that ran
+     * */
+    pub fn drain(mut self)-> usize {
+        let mut total = 0us;
+        let mut ready = self:.take();
+        while ready.len != 0us {
+            for e in ready {
+                e.clean();
+            }
+
+            total += ready.len;
+            ready = self:.take();
+        }
+
+        total
+    }
+
+    /**
+     * @returns: every entry of the queue, which is left empty
+     * */
+    fn take(mut self)-> [RetireEntry] {
+        atomic self {
+            let all = self._entries;
+            self._entries = [];
+            all
+        }
+    }
+}
+
+/**
+ * The redraw generations of the frame slots of a pipeline
+ * A slot uses the objects of the generation it was recorded with. Its previous recording stays in
+ * flight until its submission is awaited, so the generation it may still use only rises then.
+ * An object retired in generation g is no longer used once every slot may only use generations above g.
+ * */
+@final
+pub class SlotGenerations {
+
+    // The generation each slot was last recorded with
+    let dmut _recorded: [u64];
+
+    // The lowest generation each slot may still use
+    let dmut _safe: [u64];
+
+    pub self (nbSlots: u32)
+        with _recorded = copy [0u64; nbSlots]
+        , _safe = copy [0u64; nbSlots]
+    {}
+
+    /**
+     * The slot 'slot' was recorded again
+     * @params:
+     *    - generation: the generation read before the recording started
+     * */
+    pub fn recorded(mut self, slot: u32, generation: u64) {
+        self._recorded[slot] = generation;
+    }
+
+    /**
+     * The previous submission of the slot 'slot' was awaited, it only uses its current recording from now on
+     * @returns: the lowest generation a slot may still use, the bound to collect the retired objects with
+     * */
+    pub fn awaited(mut self, slot: u32)-> u64 {
+        self._safe[slot] = self._recorded[slot];
+
+        let mut bound = u64::max;
+        for g in self._safe {
+            if g < bound { bound = g; }
+        }
+
+        bound
+    }
+}
