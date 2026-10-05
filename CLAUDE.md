@@ -10,8 +10,10 @@ work item (`BAL-30-glyph-atlas`).
 Taken from balder-dev (`../../CLAUDE.md`), itself taken from bootstrap:
 
 - split work in logical commits
-- a commit is one piece: one module, or one behavior. A feature spread over several modules is
-  one commit per module, never a single commit adding them all
+- a commit is one change: a fix, a refactor, a feature, or the tests of one of them. A change
+  spanning several modules (a protocol and the classes ported to it, a declaration and the code
+  using it for the same purpose) is one commit touching them all; two unrelated changes to the
+  same module are two commits
 - order the commits like the dependencies they touch: chore, then declarations, then what uses
   them, then tests, then docs. Across repositories, a binding is committed before the Balder
   code that uses it

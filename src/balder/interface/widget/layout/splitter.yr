@@ -1,0 +1,707 @@
+in splitter;
+
+use balder::utils;
+use balder::core::dispose;
+use balder::core::application::refcount;
+use balder::core::shader::texture;
+use balder::interface::{_, loader};
+use balder::interface::widget::alignement;
+use balder::interface::widget::layout::flex;
+use balder::math::vector;
+
+use std::algorithm::comparison;
+use std::fs::path;
+
+use ::sdl3::mouse;
+
+// The thickness of a grip (and of the box catching the cursor around it) when the style sets none, in pixels
+def DEFAULT_GRIP_SIZE = 4.0f;
+
+/**
+ * A pane of a splitter
+ * */
+record Pane {
+
+    // The content of the pane
+    pub let dmut widget: &Widget;
+
+    // The position of the pane relative to the inner box of the splitter
+    pub let mut relPos: vec2 = vec2();
+
+    // The size of the pane relative to the inner box of the splitter
+    pub let mut relSize: vec2 = vec2();
+
+    // The part of the space shared by the panes this one takes, negative until the splitter is first laid out
+    pub let mut ratio: f32 = -1.0f;
+
+    pub self (dmut widget: &Widget)
+        with widget = alias widget
+    {}
+}
+
+/**
+ * The grip between two panes of a splitter, dragged to resize them
+ * */
+record Grip {
+
+    // The shape displaying the grip
+    pub let dmut shape: (&Shape)? = none;
+
+    // The shape displaying the background image of the grip
+    pub let dmut image: (&Shape)? = none;
+
+    // The position of the displayed grip relative to the inner box of the splitter
+    pub let mut relPos: vec2 = vec2();
+
+    // The position of the box catching the cursor (larger than the displayed grip) relative to the inner box
+    pub let mut relBoxPos: vec2 = vec2();
+
+    pub self () {}
+}
+
+/**
+ * A layout of panes side by side, separated by grips the user drags to share the space between two panes
+ * The size of a pane along the axis of the splitter is taken from its style when the splitter is first laid out, the
+ * panes without one sharing the rest, and its min and max bounds always hold
+ * */
+pub class Splitter over Layout {
+
+    // The panes, from left to right (or from top to bottom)
+    let dmut _panes: [Pane] = [];
+
+    // The grips, the grip 'i' being between the panes 'i' and 'i + 1'
+    let dmut _grips: [Grip] = [];
+
+    // True if the panes are side by side, on top of each other otherwise
+    let _horizontal: bool;
+
+    prot { // grip sizes
+
+        // The size of a displayed grip relative to the inner box
+        let mut _relGripSize: vec2 = vec2();
+
+        // The size of the box catching the cursor around a grip relative to the inner box
+        let mut _relGripBoxSize: vec2 = vec2();
+    }
+
+    prot { // grip background image
+
+        // The background image of the grips
+        let mut _currentGripImage: [c8] = "";
+
+        // The texture of the grips
+        let dmut _gripTexture: &RefCount!{&Texture};
+    }
+
+    prot { // dragging
+
+        // The grip being dragged
+        let mut _dragged: usize = 0us;
+
+        // The position of the mouse when the dragging started, in pixels
+        let mut _slideStart: vec2 = vec2();
+
+        // The sizes of the panes along the axis when the dragging started, in pixels
+        let mut _dragStart: [f32] = [];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - horizontal: true if the panes are side by side, on top of each other otherwise
+     * */
+    pub self (dmut manager: &WidgetManager, name: [c8], horizontal: bool = true)
+        with super(alias manager, name, WidgetKeys::SPLITTER)
+        , _horizontal = horizontal
+        , _gripTexture = manager:.getWindow():.emptyResource!{&Texture2D} ()
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHILDREN          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Insert a pane after the last one, a grip separating it from the one before
+     * @warning: the widget is disposed when the splitter is disposed
+     * */
+    pub fn insertPane(mut self, dmut widget: &Widget) {
+        if self._panes.len != 0us {
+            self._grips ~= [Grip()];
+            if self._attached {
+                self:.registerGrip(self._grips.len - 1us);
+            }
+        }
+
+        self._panes ~= [Pane(alias widget)];
+        for dmut p in alias self._panes {
+            p.ratio = -1.0f;
+        }
+
+        if self._attached {
+            widget:.onAttach(self._path);
+        }
+
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * @returns: the panes of the splitter, in order
+     * */
+    pub over getChildren(mut self)-> dmut [&Widget] {
+        return copy [alias p.widget for dmut p in alias self._panes];
+    }
+
+    /**
+     * @returns: true iif the panes are side by side, on top of each other otherwise
+     * */
+    pub fn isHorizontal(self)-> bool {
+        self._horizontal
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        let mut max = self._depth;
+        for p in self._panes {
+            let chD = p.widget.getMaxDepth();
+            if chD > max { max = chD; }
+        }
+
+        max + 2 // grip color + grip image
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          ATTACH/DETACH          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onAttach(mut self, parentPath: Path) {
+        self.__super__:.onAttach(parentPath);
+
+        for i in 0us .. self._grips.len {
+            self:.registerGrip(i);
+        }
+    }
+
+    over onHide(mut self) {
+        self.__super__:.onHide();
+        for dmut g in alias self._grips {
+            if let Ok(dmut s) = alias g.shape { s:.hide(); }
+            if let Ok(dmut s) = alias g.image { s:.hide(); }
+        }
+    }
+
+    over onShow(mut self) {
+        self.__super__:.onShow();
+        for dmut g in alias self._grips {
+            if let Ok(dmut s) = alias g.shape { s:.show(); }
+            if let Ok(dmut s) = alias g.image { s:.show(); }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Share the space left by the grips between the panes, from their ratios kept in the bounds of their sizes
+     * */
+    over onUpdateSize(mut self) {
+        if self._panes.len == 0us { return; }
+
+        let mainSize = self.getMain(self._absoluteSize);
+        let gripSize = self.getGripSize("grip", mainSize);
+        let boxSize = max(gripSize, self.getGripSize("bbox", mainSize));
+        let space = max(0.0f, mainSize - gripSize * cast!f32(cast!u32(self._grips.len)));
+
+        self._relGripSize = self.toVec(gripSize, self.getCross(self._absoluteSize)) / self._absoluteSize;
+        self._relGripBoxSize = self.toVec(boxSize, self.getCross(self._absoluteSize)) / self._absoluteSize;
+
+        if self._panes[0].ratio < 0.0f {
+            self:.initRatios(space);
+        }
+
+        let n = self._panes.len;
+        let dmut items: [FlexItem] = copy [FlexItem() ; n];
+        for i in 0us .. n {
+            let size = self.getMainSize(self._panes[i].widget.getStyle());
+            items[i] = FlexItem(basis-> self._panes[i].ratio * space,
+                                grow-> 1.0f,
+                                shrink-> 1.0f,
+                                min-> cast!f32(size.minPix),
+                                max-> cast!f32(size.maxPix));
+        }
+
+        let sizes = resolveFlexibleLengths(items, space);
+
+        let mut current = 0.0f;
+        for i in 0us .. n {
+            let pos = self.toVec(current, 0.0f) + self._absolutePosition;
+            let size = self.toVec(sizes[i], self.getCross(self._absoluteSize));
+            let (relPos, relSize) = self:.placeChild(alias self._panes[i].widget, pos, size, self._depth + 1);
+
+            self._panes[i].relPos = relPos;
+            self._panes[i].relSize = relSize;
+            current += sizes[i];
+
+            if i < self._grips.len {
+                self._grips[i].relPos = self.toVec(current, 0.0f) / self._absoluteSize;
+                self._grips[i].relBoxPos = self.toVec(current - (boxSize - gripSize) / 2.0f, 0.0f) / self._absoluteSize;
+                current += gripSize;
+            }
+        }
+    }
+
+    over onUpdateScissors(mut self) {
+        for dmut p in alias self._panes {
+            self:.clipChild(alias p.widget, p.relPos, p.relSize);
+        }
+
+        for dmut g in alias self._grips {
+            let (sciPos, sciSize) = self.getScissors(g.relPos * self._absoluteSize + self._absolutePosition,
+                                                     self._relGripSize * self._absoluteSize);
+            if let Ok(dmut s) = alias g.shape { s:.setScissors(sciPos, sciSize); }
+            if let Ok(dmut s) = alias g.image { s:.setScissors(sciPos, sciSize); }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          MEASURE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The content of a splitter is its panes and its grips, side by side along its axis
+     * */
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        let mut minWidth = 0.0f, mut maxWidth = 0.0f;
+        for dmut p in alias self._panes {
+            let (minW, maxW) = p.widget:.measureIntrinsicWidths();
+            if self._horizontal {
+                minWidth += minW;
+                maxWidth += maxW;
+            } else {
+                minWidth = max(minWidth, minW);
+                maxWidth = max(maxWidth, maxW);
+            }
+        }
+
+        if self._horizontal {
+            let grips = self.getGripSize("grip", 0.0f) * cast!f32(cast!u32(self._grips.len));
+            (minWidth + grips, maxWidth + grips)
+        } else {
+            (minWidth, maxWidth)
+        }
+    }
+
+    prot over measureContentHeight(mut self, width: f32)-> f32 {
+        let n = cast!f32(cast!u32(self._panes.len));
+        let mut height = 0.0f;
+        for dmut p in alias self._panes {
+            if self._horizontal {
+                height = max(height, p.widget:.measureIntrinsicHeight(width / n));
+            } else {
+                height += p.widget:.measureIntrinsicHeight(width);
+            }
+        }
+
+        if self._horizontal {
+            height
+        } else {
+            height + self.getGripSize("grip", 0.0f) * cast!f32(cast!u32(self._grips.len))
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        if let Ok(_) = self.mouseOnGrip(pos) {
+            if let Ok(dmut w) = alias self._lastHover {
+                w:.onLoseHoverFocus();
+                self._lastHover = none;
+            }
+
+            self:.setHover(true);
+            self:.setResizeCursor();
+
+            return (alias self)?;
+        }
+
+        self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT);
+        self:.setHover(false);
+
+        self.__super__:.onHover(pos)
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        self.__super__:.onLoseHoverFocus();
+        self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT);
+    }
+
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if let Ok(grip) = self.mouseOnGrip(pos) {
+            self._dragged = grip;
+            self._slideStart = self._manager.getMousePosition();
+            self._dragStart = copy [self.getMain(p.relSize * self._absoluteSize) for p in self._panes];
+
+            return (alias self)?;
+        }
+
+        self.__super__:.onClick(pos, button)
+    }
+
+    pub over onDoubleClick(mut self, pos: vec2)-> dmut (&Widget)? {
+        if let Ok(_) = self.mouseOnGrip(pos) {
+            return self:.onClick(pos, SDL_BUTTON_LEFT);
+        }
+
+        self.__super__:.onDoubleClick(pos)
+    }
+
+    /**
+     * Move the dragged grip with the mouse, the two panes it separates sharing their space, each in its bounds
+     * */
+    pub over onSliding(mut self, _pos_: vec2, _speed_: vec2, _: u8) {
+        let k = self._dragged;
+        if k + 1us >= self._panes.len || self._dragStart.len != self._panes.len { return; }
+
+        let delta = self.getMain(self._manager.getMousePosition() - self._slideStart);
+        let before = self.getMainSize(self._panes[k].widget.getStyle());
+        let after = self.getMainSize(self._panes[k + 1us].widget.getStyle());
+
+        let total = self._dragStart[k] + self._dragStart[k + 1us];
+        let low = max(cast!f32(before.minPix), total - cast!f32(after.maxPix));
+        let high = min(cast!f32(before.maxPix), total - cast!f32(after.minPix));
+        let first = max(low, min(high, self._dragStart[k] + delta));
+
+        let dmut sizes: [f32] = copy self._dragStart;
+        sizes[k] = first;
+        sizes[k + 1us] = total - first;
+
+        let mut space = 0.0f;
+        for s in sizes { space += s; }
+
+        if space > 0.0f {
+            for i in 0us .. self._panes.len {
+                self._panes[i].ratio = sizes[i] / space;
+            }
+        }
+
+        self._manager:.updateWidgets();
+    }
+
+    pub over onGainFocus(mut self) {
+        self:.setResizeCursor();
+    }
+
+    pub over onLoseFocus(mut self) {
+        self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT);
+        self:.onLoseHoverFocus();
+    }
+
+    pub over isFocusableLeftClick(self)-> bool {
+        true
+    }
+
+    pub over loseFocusOnReleaseLeft(self)-> bool {
+        true
+    }
+
+    /**
+     * The cursor is over none of the splitter but its panes and its grips
+     * */
+    prot over mouseToWidget(mut self, pos: vec2, ref mut canBeSelf: bool)-> dmut (&Widget, vec2)? {
+        canBeSelf = false;
+        if let Ok(inPaddingPos) = self.isInPadding(pos) {
+            for i in 0us .. self._panes.len {
+                let a = self._panes[i].relPos;
+                if let Ok(relPos) = self.isInSquare(inPaddingPos, a, a + self._panes[i].relSize) {
+                    if let Ok(_) = self._panes[i].widget.isInBorder(relPos) {
+                        return (alias self._panes[i].widget, relPos)?;
+                    }
+                }
+            }
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          STYLE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    over onApplyStyle(mut self) {
+        let gripStyle = self.getStyle().getSubStyle("grip");
+        self:.loadGripTexture(gripStyle);
+
+        let depth = self.getMaxDepth();
+        for dmut g in alias self._grips {
+            let pos = g.relPos * self._absoluteSize + self._absolutePosition;
+            let size = self._relGripSize * self._absoluteSize;
+
+            if let Ok(dmut s) = alias g.shape {
+                s:.setPosition(pos);
+                s:.setSize(size);
+                s:.setColor(gripStyle.getColor(WidgetShapeKind::BACKGROUND));
+                s:.setLevel(depth - 1u32);
+                s:.show();
+            }
+
+            if let Ok(dmut s) = alias g.image {
+                let (imagePos, imageSize) = self.computeGripTextureSize(gripStyle, pos, size);
+                s:.setPosition(imagePos);
+                s:.setSize(imageSize);
+                s:.setColor(gripStyle.getColor(WidgetShapeKind::IMAGE));
+                s:.setLevel(depth);
+                s:.show();
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self._attached = false;
+
+            let dmut shDr = self._manager:.getShapeDrawer();
+            for dmut g in alias self._grips {
+                if let Ok(dmut s) = alias g.shape {
+                    shDr:.removeShape(s.uid);
+                    g.shape = none;
+                }
+
+                if let Ok(dmut s) = alias g.image {
+                    shDr:.removeShape(s.uid);
+                    g.image = none;
+                }
+            }
+
+            self._gripTexture:.dispose();
+            self._currentGripImage = "";
+
+            self.__super__:.dispose();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Share the space between the panes when the splitter is first laid out, a pane whose style sets its size along the
+     * axis taking it, the others sharing the rest
+     * @params:
+     *    - space: the space left by the grips, in pixels
+     * */
+    fn initRatios(mut self, space: f32) {
+        let n = self._panes.len;
+        let dmut sizes: [f32] = copy [-1.0f ; n];
+
+        let mut fixed = 0.0f;
+        let mut free = 0us;
+        for i in 0us .. n {
+            let dmut w = alias self._panes[i].widget;
+            let style = w.getStyle();
+            let set = if self._horizontal { style.hasWidth() } else { style.hasHeight() };
+            if set {
+                sizes[i] = if self._horizontal {
+                    w:.measureWidth(space)
+                } else {
+                    w:.measureHeight(self._absoluteSize.x, space)
+                };
+
+                fixed += sizes[i];
+            } else {
+                free += 1us;
+            }
+        }
+
+        let share = if free != 0us { max(0.0f, space - fixed) / cast!f32(cast!u32(free)) } else { 0.0f };
+        let mut total = 0.0f;
+        for i in 0us .. n {
+            if sizes[i] < 0.0f { sizes[i] = share; }
+            total += sizes[i];
+        }
+
+        for i in 0us .. n {
+            self._panes[i].ratio = if total > 0.0f { sizes[i] / total } else { 1.0f / cast!f32(cast!u32(n)) };
+        }
+    }
+
+    /**
+     * Register the shapes of a grip
+     * */
+    fn registerGrip(mut self, i: usize) {
+        let dmut shDr = self._manager:.getShapeDrawer();
+        {
+            let dmut shape = shDr:.registerColorQuad();
+            self._grips[i].shape = (alias shape)?;
+
+            if !self._gripTexture.isEmpty() {
+                let dmut image = shDr:.registerTextureQuad(texture-> self._gripTexture:.clone());
+                self._grips[i].image = (alias image)?;
+            }
+        } catch {
+            err => {
+                log::error #("Splitter", "Failed to construct shapes : ", err);
+            }
+        }
+    }
+
+    /**
+     * Load the background image of the grips, when the style changes it
+     * */
+    fn loadGripTexture(mut self, gripStyle: &Style) {
+        if self._currentGripImage == gripStyle.backgroundImage._1 { return; }
+        self._currentGripImage = gripStyle.backgroundImage._1;
+
+        let dmut shDr = self._manager:.getShapeDrawer();
+        for dmut g in alias self._grips {
+            if let Ok(dmut s) = alias g.image {
+                shDr:.removeShape(s.uid);
+                g.image = none;
+            }
+        }
+
+        self._gripTexture:.dispose();
+        if self._currentGripImage == "" { return; }
+
+        {
+            self._gripTexture = self._manager:.getWindow():.loadResource!{&Texture2D} (self._currentGripImage);
+            if !self._gripTexture.isEmpty() {
+                for dmut g in alias self._grips {
+                    let dmut image = shDr:.registerTextureQuad(texture-> self._gripTexture:.clone());
+                    g.image = (alias image)?;
+                }
+            }
+        } catch {
+            err => {
+                log::error #("Splitter", "Failed to load the grip image : ", err);
+            }
+        }
+    }
+
+    /**
+     * @returns: the position and size of the background image of a grip, its ratio kept when the style asks for it
+     * */
+    fn computeGripTextureSize(self, gripStyle: &Style, absPos: vec2, absSize: vec2)-> (vec2, vec2) {
+        if !gripStyle.backgroundImageKeepRatio._1 {
+            return (absPos, absSize);
+        }
+
+        let test = if gripStyle.backgroundImageFill._1 { absSize.x < absSize.y } else { absSize.x > absSize.y };
+        if test {
+            (makeVec2(absPos.x + (absSize.x - absSize.y) / 2.0f, absPos.y), makeVec2(absSize.y, absSize.y))
+        } else {
+            (makeVec2(absPos.x, absPos.y + (absSize.y - absSize.x) / 2.0f), makeVec2(absSize.x, absSize.x))
+        }
+    }
+
+    /**
+     * @returns: the index of the grip under the cursor, if any
+     * @params:
+     *    - pos: the position of the cursor relative to the splitter
+     * */
+    fn mouseOnGrip(self, pos: vec2)-> (usize)? {
+        if let Ok(relPos) = self.isInPadding(pos) {
+            for i in 0us .. self._grips.len {
+                let a = self._grips[i].relBoxPos;
+                if let Ok(_) = self.isInSquare(relPos, a, a + self._relGripBoxSize) {
+                    return (i)?;
+                }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the thickness of a grip (or of the box catching the cursor around it) from a sub style, in pixels
+     * */
+    fn getGripSize(self, sub: [c8], mainSize: f32)-> f32 {
+        let style = self.getStyle().getSubStyle(sub);
+        let set = if self._horizontal { style.hasWidth() } else { style.hasHeight() };
+        if !set { return DEFAULT_GRIP_SIZE; }
+
+        self.getMainSize(style).resolve(mainSize)
+    }
+
+    /**
+     * @returns: the size of a style along the axis of the splitter
+     * */
+    fn getMainSize(self, style: &Style)-> WidgetSize {
+        if self._horizontal { style.getWidth() } else { style.getHeight() }
+    }
+
+    /**
+     * @returns: the component of a vector along the axis of the splitter
+     * */
+    fn getMain(self, v: vec2)-> f32 {
+        if self._horizontal { v.x } else { v.y }
+    }
+
+    /**
+     * @returns: the component of a vector across the axis of the splitter
+     * */
+    fn getCross(self, v: vec2)-> f32 {
+        if self._horizontal { v.y } else { v.x }
+    }
+
+    /**
+     * @returns: a vector from its components along and across the axis of the splitter
+     * */
+    fn toVec(self, main: f32, cross: f32)-> vec2 {
+        if self._horizontal { makeVec2(main, cross) } else { makeVec2(cross, main) }
+    }
+
+    /**
+     * Set the cursor resizing along the axis of the splitter
+     * */
+    fn setResizeCursor(mut self) {
+        if self._horizontal {
+            self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_EW_RESIZE);
+        } else {
+            self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_NS_RESIZE);
+        }
+    }
+}
