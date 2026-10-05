@@ -1,7 +1,7 @@
 in linear;
 
 use balder::interface::loader;
-use balder::interface::widget::alignement;
+use balder::interface::widget::layout::flex;
 use balder::math::vector;
 
 use std::io;
@@ -13,14 +13,12 @@ record Child {
     pub let dmut relPos : vec2;
     pub let dmut relSize : vec2;
     pub let dmut level : u32;
-    pub let dmut size : WidgetSize;
 
-    pub self (dmut widget : &Widget, relPos : vec2, relSize : vec2, level : u32, size : WidgetSize)
+    pub self (dmut widget : &Widget, relPos : vec2, relSize : vec2, level : u32)
         with widget = alias widget
         , relPos = relPos
         , relSize = relSize
         , level = level
-        , size = size
     {}
 }
 
@@ -38,6 +36,9 @@ pub class LinearLayout over Layout {
 
     // The relative size of the widget (may be greater than 1 if containes too much widgets to fit on screen°)
     let mut _relFullSize : f32 = 0.0f;
+
+    // True if the children keep their bases instead of shrinking, the layout being scrolled over them
+    let mut _scrolled : bool = false;
 
     /*!
      * ====================================================================================================
@@ -61,34 +62,33 @@ pub class LinearLayout over Layout {
      */
 
     /**
-     * Compute the drawing size of the inner widgets
+     * Compute the drawing size of the inner widgets, sized along the axis of the layout from their flex bases, growth and
+     * shrink factors, and across it from their style (stretched to the layout when unset)
      */
     over onUpdateSize (mut self) {
         if self._childs.len == 0 {
             return;
         }
 
+        let (mainSize, crossSize) = if self._vertical {
+            (self._absoluteSize.x, self._absoluteSize.y)
+        } else {
+            (self._absoluteSize.y, self._absoluteSize.x)
+        };
+
+        let (mains, crosses) = self:.measureChildren (mainSize, crossSize);
+
         let mut current = 0.0f;
         for col in 0 .. self._childs.len {
+            let relMain = mains [col] / mainSize;
             let (wpos, wsize) = if self._vertical {
-                let relColumnSize = self.clampSize (self._childs [col].size, self._absoluteSize.x);
-                let wpos = makeVec2 (current + self._shift, 0.0f) * self._absoluteSize + self._absolutePosition;
-                let wsize = makeVec2 (relColumnSize, 1.0f) * self._absoluteSize;
-                self._relFullSize = current + relColumnSize;
-
-                current  += relColumnSize;
-
-                (wpos, wsize)
+                (makeVec2 (current + self._shift, 0.0f) * self._absoluteSize + self._absolutePosition, makeVec2 (mains [col], crosses [col]))
             } else {
-                let relColumnSize = self.clampSize (self._childs [col].size, self._absoluteSize.y);
-                let wpos =  makeVec2 (0.0f, current + self._shift) * self._absoluteSize + self._absolutePosition;
-                let wsize = makeVec2 (1.0f, relColumnSize) * self._absoluteSize;
-                self._relFullSize = current + relColumnSize;
-
-                current  += relColumnSize;
-
-                (wpos, wsize)
+                (makeVec2 (0.0f, current + self._shift) * self._absoluteSize + self._absolutePosition, makeVec2 (crosses [col], mains [col]))
             };
+
+            current += relMain;
+            self._relFullSize = current;
 
             let (relPos, relSize) = self:.placeChild (alias self._childs [col].widget, wpos, wsize, self._depth + 1);
             self._childs [col].relPos = relPos;
@@ -115,13 +115,7 @@ pub class LinearLayout over Layout {
      * @warning: child is disposed when layout is disposed
      * */
     pub fn insertChild (mut self, dmut ch : &Widget, level : u32 = 0) {
-        let size = if self._vertical {
-            ch.getStyle ().getWidth ()
-        } else {
-            ch.getStyle ().getHeight ()
-        };
-
-        self._childs ~= [Child (alias ch, makeVec2 (0.0f, 0.0f), makeVec2 (0.0f, 0.0f), level, size)];
+        self._childs ~= [Child (alias ch, makeVec2 (0.0f, 0.0f), makeVec2 (0.0f, 0.0f), level)];
         std::algorithm::sorting::sort (alias self._childs, |x, y| => { x.level < y.level });
 
         self._manager:.updateWidgets ();
@@ -139,27 +133,8 @@ pub class LinearLayout over Layout {
      * @params:
      *   - index: the index of the child
      * */
-    pub fn getChildSize (self, index : u32)-> WidgetSize {
-        self._childs [index].size
-    }
-
-    /**
-     * @returns: the size of a given child in the layout
-     * @params:
-     *   - index: the index of the child
-     * */
     pub fn getChild (self, index : u32)-> &Widget {
         self._childs [index].widget
-    }
-
-    /**
-     * Set the size of a given child in the layout
-     * @params:
-     *   - index: the index of the child
-     *   - size: the size to set
-     * */
-    pub fn setChildSize (mut self, index : u32, size : WidgetSize) {
-        self._childs [index].size = size;
     }
 
     /*!
@@ -192,6 +167,13 @@ pub class LinearLayout over Layout {
 
         self._shift = scroll;
         self:.onUpdateScissors ();
+    }
+
+    /**
+     * Keep the bases of the children instead of shrinking them when they overflow, the layout being scrolled over them
+     * */
+    pub fn setScrolled (mut self, scrolled : bool) {
+        self._scrolled = scrolled;
     }
 
     /**
@@ -240,6 +222,112 @@ pub class LinearLayout over Layout {
      * */
     pub over getChildren (mut self)-> dmut [&Widget] {
         return copy [alias c.widget for dmut c in alias self._childs];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          MEASURE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The content of a layout is its children, side by side along its axis, the widest (or highest) across it
+     * */
+    prot over measureContentWidths (mut self)-> (f32, f32) {
+        let mut minWidth = 0.0f, mut maxWidth = 0.0f;
+        for dmut c in alias self._childs {
+            let (minW, maxW) = c.widget:.measureIntrinsicWidths ();
+            if self._vertical {
+                minWidth += minW;
+                maxWidth += maxW;
+            } else {
+                minWidth = max (minWidth, minW);
+                maxWidth = max (maxWidth, maxW);
+            }
+        }
+
+        (minWidth, maxWidth)
+    }
+
+    prot over measureContentHeight (mut self, width : f32)-> f32 {
+        if self._childs.len == 0 { return 0.0f; }
+
+        let mut height = 0.0f;
+        if self._vertical {
+            let (mains, _) = self:.measureChildren (width, 0.0f);
+            for i, dmut c in alias self._childs {
+                height = max (height, c.widget:.measureIntrinsicHeight (mains [i]));
+            }
+        } else {
+            for dmut c in alias self._childs {
+                let w = if c.widget.getStyle ().hasWidth () { c.widget:.measureWidth (width) } else { width };
+                height += c.widget:.measureIntrinsicHeight (w);
+            }
+        }
+
+        height
+    }
+
+    /**
+     * Measure the sizes of the children along the axis of the layout and across it
+     * @params:
+     *    - mainSize: the size of the layout along its axis, in pixels
+     *    - crossSize: the size of the layout across its axis, in pixels
+     * @returns: the size of each child along the axis, its basis grown or shrunk to the layout, and across it
+     * */
+    fn measureChildren (mut self, mainSize : f32, crossSize : f32)-> ([f32], [f32]) {
+        let n = self._childs.len;
+        let dmut items : [FlexItem] = copy [FlexItem () ; n];
+        let dmut crosses : [f32] = copy [crossSize ; n];
+
+        for i in 0us .. n {
+            let dmut w = alias self._childs [i].widget;
+            let style = w.getStyle ();
+
+            // the width of a child of a column is known before its height, which may depend on it
+            if !self._vertical && style.hasWidth () {
+                crosses [i] = w:.measureWidth (crossSize);
+            }
+
+            let (size, basis, minContent) = if self._vertical {
+                let size = style.getWidth ();
+                let basis = if style.flexBasis.0 { w:.resolveWidth (style.flexBasis.1, mainSize) } else { w:.measureWidth (mainSize) };
+                let minContent = if size.isContent () { w:.measureIntrinsicWidths ()._0 } else { 0.0f };
+                (size, basis, minContent)
+            } else {
+                let size = style.getHeight ();
+                let basis = if style.flexBasis.0 {
+                    w:.resolveHeight (style.flexBasis.1, crosses [i], mainSize)
+                } else {
+                    w:.measureHeight (crosses [i], mainSize)
+                };
+
+                let minContent = if size.isContent () { w:.measureIntrinsicHeight (crosses [i]) } else { 0.0f };
+                (size, basis, minContent)
+            };
+
+            items [i] = FlexItem (basis-> basis,
+                                  grow-> style.flexGrow.1,
+                                  shrink-> if self._scrolled { 0.0f } else { style.flexShrink.1 },
+                                  min-> max (cast!f32 (size.minPix), minContent),
+                                  max-> cast!f32 (size.maxPix));
+        }
+
+        let mains = resolveFlexibleLengths (items, mainSize);
+
+        // the height of a child of a row is known once its width is
+        if self._vertical {
+            for i in 0us .. n {
+                let dmut w = alias self._childs [i].widget;
+                if w.getStyle ().hasHeight () {
+                    crosses [i] = w:.measureHeight (mains [i], crossSize);
+                }
+            }
+        }
+
+        (mains, crosses)
     }
 
     /*!
