@@ -1,0 +1,135 @@
+in shaper;
+
+use balder::core::_;
+use balder::interface::font::face;
+
+use std::math;
+
+use ::harfbuzz::{buffer, fixed, glyphs, shape};
+
+/**
+ * A glyph of a shaped run, positioned on the baseline
+ * */
+@data
+pub record ShapedGlyph {
+
+    // The index of the glyph in the face
+    pub let glyph: u32;
+
+    // The index of the first code unit of the text the glyph comes from
+    pub let cluster: u32;
+
+    // The pen position the glyph is drawn at, from the start of the run, in pixels
+    pub let x: f32;
+
+    // The offset of the glyph up from the baseline, in pixels
+    pub let y: f32;
+
+    // The advance of the pen after the glyph, in pixels
+    pub let advance: f32;
+}
+
+/**
+ * A single line of text shaped with a face at a pixel size
+ * */
+@data
+pub record ShapedRun {
+
+    // The glyphs of the run, in visual order
+    pub let glyphs: [ShapedGlyph];
+
+    // The advance of the whole run, in pixels
+    pub let width: f32;
+
+    // The vertical metrics of the face at the pixel size of the run
+    pub let metrics: LineMetrics;
+
+    // The height of the em square the run is shaped at
+    pub let pixelSize: u32;
+
+    /**
+     * @returns: the height of the line, from the top of the ascender to the bottom of the descender
+     * */
+    pub fn getHeight(self)-> f32 {
+        self.metrics.ascender - self.metrics.descender
+    }
+
+    /**
+     * @returns: the advance of the glyphs coming from the code units before 'index', the position of a caret put there
+     * */
+    pub fn advanceTo(self, index: usize)-> f32 {
+        let mut x = 0.0f;
+        for g in self.glyphs {
+            if cast!usize(g.cluster) < index {
+                x += g.advance;
+            }
+        }
+
+        x
+    }
+}
+
+/**
+ * Shape a single line of text with HarfBuzz
+ * @params:
+ *    - face: the face the glyphs are taken from
+ *    - text: the text to shape, in UTF-16 code units
+ *    - pixelSize: the height of the em square in pixels
+ * @returns: the glyphs of the line, with their positions
+ * */
+pub fn shapeLine(dmut face: &FontFace, text: [c16], pixelSize: u32)-> ShapedRun
+    throws BalderError
+{
+    let metrics = face:.getLineMetrics(pixelSize);
+    if text.len == 0us {
+        return ShapedRun([], 0.0f, metrics, pixelSize);
+    }
+
+    let dmut font = face:.getHarfbuzzFont(pixelSize);
+    let dmut buf = hb_buffer_create();
+
+    let (infos, positions) = {
+        hb_buffer_add_utf16(alias buf, text.ptr, cast!i32(text.len), 0u32, cast!i32(text.len));
+        hb_buffer_guess_segment_properties(alias buf);
+        hb_shape(alias font, alias buf, null, 0u32);
+
+        (getGlyphInfos(alias buf), getGlyphPositions(alias buf))
+    } exit {
+        hb_buffer_destroy(alias buf);
+    };
+
+    let dmut result: [ShapedGlyph] = [];
+    let mut pen = 0.0f;
+    for i, info in infos {
+        let p = positions[i];
+        let advance = fromF26Dot6(p.x_advance);
+        result ~= [ShapedGlyph(info.codepoint,
+                               info.cluster,
+                               pen + fromF26Dot6(p.x_offset),
+                               fromF26Dot6(p.y_offset),
+                               advance)];
+        pen += advance;
+    }
+
+    ShapedRun(result, pen, metrics, pixelSize)
+}
+
+/**
+ * Split a pen position into the whole pixel and the subpixel offset a glyph is rasterised at
+ * @params:
+ *    - pen: the pen position in device pixels
+ * @returns:
+ *    - .0: the whole pixel the glyph is placed on
+ *    - .1: the offset of the pen inside that pixel, in 1/SUBPIXEL_LEVELS of a pixel
+ * */
+pub fn quantizePen(pen: f32)-> (f32, u8) {
+    let levels = cast!f32(cast!u32(SUBPIXEL_LEVELS));
+    let mut whole = floor(pen);
+    let mut sub = cast!u32(floor((pen - whole) * levels + 0.5f));
+    if sub >= cast!u32(SUBPIXEL_LEVELS) {
+        whole += 1.0f;
+        sub = 0u32;
+    }
+
+    (whole, cast!u8(sub))
+}

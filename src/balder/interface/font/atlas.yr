@@ -1,0 +1,340 @@
+in atlas;
+
+use balder::core::_;
+use balder::core::driver::device;
+use balder::core::memory::buffer;
+use balder::core::shader::texture;
+use balder::interface::font::{cache, face};
+use balder::utils::log;
+
+use std::algorithm::comparison;
+
+use ::vulkan::core;
+
+/**
+ * The padding around each glyph of the atlas, so bilinear sampling never reads a neighbour
+ * */
+pub def GLYPH_PADDING = 1u32;
+
+/**
+ * Regions of atlas pages to write during the next transfer pass, copied from a single staging buffer
+ * */
+@final
+class UploadBatch {
+
+    // The device used to allocate the staging buffer
+    let dmut _device: &VulkanDevice;
+
+    // The texture of each page written by the batch
+    let dmut _targets: [u32 => &AtlasTexture] = copy [];
+
+    // The page, and the region (x, y, width, height) of each write
+    let mut _regions: [(u32, u32, u32, u32, u32)] = [];
+
+    // The pixels of each write
+    let mut _pixels: [[u8]] = [];
+
+    // True once the batch is recorded in a command buffer, it then accepts no more writes
+    let mut _recorded: bool = false;
+
+    // The staging buffer, alive until the transfer is awaited
+    let dmut _staging: (&Buffer)? = none;
+
+    pub self (dmut device: &VulkanDevice)
+        with _device = alias device
+    {}
+
+    __dtor(mut self) {
+        self:.dispose();
+    }
+
+    /**
+     * Add the write of a region of a page, replacing the earlier writes of the batch it overlaps
+     * @returns: false if the batch is already recorded and the write was not added
+     * */
+    pub fn add(mut self, page: u32, dmut target: &AtlasTexture, x: u32, y: u32, width: u32, height: u32, pixels: [u8])-> bool {
+        atomic self {
+            if self._recorded { return false; }
+
+            let mut regions: [(u32, u32, u32, u32, u32)] = [];
+            let mut datas: [[u8]] = [];
+            for i, r in self._regions {
+                let overlaps = r._0 == page && r._1 < x + width && x < r._1 + r._3 && r._2 < y + height && y < r._2 + r._4;
+                if !overlaps {
+                    regions ~= [r];
+                    datas ~= [self._pixels[i]];
+                }
+            }
+
+            self._regions = regions ~ [(page, x, y, width, height)];
+            self._pixels = datas ~ [pixels];
+            self._targets[page] = alias target;
+            return true;
+        }
+    }
+
+    /**
+     * Record the copies of the batch, the batch accepts no more writes
+     * */
+    pub fn flush(mut self, cmd: VkCommandBuffer) {
+        atomic self {
+            self._recorded = true;
+        }
+
+        if self._regions.len == 0 { return; }
+        {
+            let mut offsets: [usize] = [];
+            let mut total = 0us;
+            for p in self._pixels {
+                offsets ~= [total];
+                total += ((p.len + 3us) / 4us) * 4us;
+            }
+
+            let dmut bytes = copy [0u8; total];
+            for i, p in self._pixels {
+                for j, b in p {
+                    bytes[offsets[i] + j] = b;
+                }
+            }
+
+            let dmut staging = self._device
+                :.getMemoryAllocator()
+                :.allocBuffer(total,
+                              cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+                              cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                       | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
+            staging:.copyMappedData(bytes);
+            self._staging = (alias staging)?;
+
+            for page, dmut target in alias self._targets {
+                let mut copies: [VkBufferImageCopy] = [];
+                for i, r in self._regions {
+                    if r._0 != page { continue; }
+
+                    let mut c = VkBufferImageCopy();
+                    c.bufferOffset = cast!u64(offsets[i]);
+                    c.imageSubresource.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+                    c.imageSubresource.layerCount = 1;
+                    c.imageOffset.x = cast!i32(r._1);
+                    c.imageOffset.y = cast!i32(r._2);
+                    c.imageExtent.width = r._3;
+                    c.imageExtent.height = r._4;
+                    c.imageExtent.depth = 1;
+                    copies ~= [c];
+                }
+
+                target:.upload(cmd, alias staging, copies);
+            }
+        } catch {
+            err => {
+                log::error #("GlyphAtlas", "Failed to upload glyphs : ", err);
+            }
+        }
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            if let Ok(dmut staging) = alias self._staging {
+                staging:.dispose();
+                self._staging = none;
+            }
+        }
+    }
+}
+
+/**
+ * Glyphs rasterised once and packed in shared textures, so a text run is drawn from a few textures
+ * Uploads of the glyphs inserted during a frame are batched in the next transfer pass
+ * Glyphs used by the frames in flight are never evicted, provided advance is called once per recording of the draws
+ * */
+@final
+pub class GlyphAtlas {
+
+    // The device owning the textures of the pages
+    let dmut _device: &VulkanDevice;
+
+    // The placement of the glyphs
+    let dmut _cache: &GlyphCache;
+
+    // The texture of each page
+    let dmut _pages: [&AtlasTexture] = [];
+
+    // The writes waiting for the next transfer pass
+    let dmut _batch: (&UploadBatch)? = none;
+
+    /**
+     * @params:
+     *    - pageSize: the width and height of a page
+     *    - maxPages: the number of pages from which glyphs are evicted instead of opening a new page
+     * */
+    pub self (dmut device: &VulkanDevice, pageSize: u32 = 1024u32, maxPages: u32 = 4u32)
+        with _device = alias device
+        , _cache = copy GlyphCache(pageSize, maxPages, cast!u64(max(1u32, device.getNbFrames())), GLYPH_PADDING)
+    {}
+
+    __dtor(mut self) {
+        self:.dispose();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the width and height of a page
+     * */
+    pub fn getPageSize(self)-> u32 {
+        self._cache.getPageSize()
+    }
+
+    /**
+     * @returns: the number of pages
+     * */
+    pub fn getNbPages(self)-> u32 {
+        cast!u32(self._pages.len)
+    }
+
+    /**
+     * @returns: the texture of the page 'index'
+     * */
+    pub fn getPage(mut self, index: u32)-> dmut &AtlasTexture {
+        alias self._pages[index]
+    }
+
+    /**
+     * @returns: the number of glyphs evicted so far, placements read before a change of this value may be stale
+     * */
+    pub fn getEvictionCount(self)-> u64 {
+        self._cache.getEvictionCount()
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Mark the start of a new recording of the draws using the atlas
+     * */
+    pub fn advance(mut self) {
+        atomic self {
+            self._cache:.advance();
+        }
+    }
+
+    /**
+     * Mark a glyph used by the current recording, so it is not evicted while the frames recorded with it are in flight
+     * @returns: false if the glyph is not in the atlas anymore
+     * */
+    pub fn touch(mut self, key: GlyphKey)-> bool {
+        atomic self {
+            if let Ok(_) = self._cache:.find(key) {
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    /**
+     * Find a glyph in the atlas, rasterising and uploading it if it is not there yet
+     * @params:
+     *    - face: the face of the glyph
+     *    - pixelSize: the height of the em square in pixels
+     *    - glyph: the index of the glyph in the face
+     *    - subpixel: the horizontal offset of the pen in 1/SUBPIXEL_LEVELS of a pixel
+     * @returns: the placement of the glyph, valid until the glyph is evicted
+     * */
+    pub fn getGlyph(mut self, dmut face: &FontFace, pixelSize: u32, glyph: u32, subpixel: u8)-> GlyphEntry
+        throws BalderError
+    {
+        atomic self {
+            let key = GlyphKey(face.getUniqId(), pixelSize, glyph, subpixel % SUBPIXEL_LEVELS);
+            if let Ok(entry) = self._cache:.find(key) {
+                return entry;
+            }
+
+            let bitmap = face:.rasterize(glyph, pixelSize, key.subpixel);
+            let entry  = self._cache:.insert(key, bitmap.width, bitmap.height, bitmap.left, bitmap.top);
+            if entry.isPacked() {
+                while cast!u32(self._pages.len) <= entry.page {
+                    let size = self._cache.getPageSize();
+                    self._pages ~= [copy AtlasTexture(alias self._device, size, size, VkFormat::VK_FORMAT_R8_UNORM)];
+                }
+
+                self:.queueUpload(entry, bitmap);
+            }
+
+            return entry;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add the write of a glyph and of its padding to the pending batch, opening a batch if there is none
+     * */
+    fn queueUpload(mut self, entry: GlyphEntry, bitmap: GlyphBitmap) {
+        let p = GLYPH_PADDING;
+        let width = entry.width + 2u32 * p, height = entry.height + 2u32 * p;
+
+        let dmut pixels = copy [0u8; width * height];
+        for row in 0u32 .. entry.height {
+            for col in 0u32 .. entry.width {
+                pixels[(row + p) * width + col + p] = bitmap.pixels[row * entry.width + col];
+            }
+        }
+
+        if let Ok(dmut batch) = alias self._batch {
+            if batch:.add(entry.page, alias self._pages[entry.page], entry.x - p, entry.y - p, width, height, pixels) {
+                return;
+            }
+        }
+
+        let dmut batch = copy UploadBatch(alias self._device);
+        batch:.add(entry.page, alias self._pages[entry.page], entry.x - p, entry.y - p, width, height, pixels);
+
+        self._device
+            :.getTransferPass()
+            :.add(callback-> copy |cmd| {
+                      batch:.flush(cmd);
+                  },
+                  clean-> copy || {
+                      batch:.dispose();
+                  });
+
+        self._batch = (alias batch)?;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            for dmut page in alias self._pages {
+                page:.dispose();
+            }
+
+            self._pages = [];
+            self._batch = none;
+        }
+    }
+}

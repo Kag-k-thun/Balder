@@ -1,0 +1,311 @@
+in cache;
+
+use balder::core::error;
+use balder::interface::font::packer;
+
+use std::algorithm::sorting;
+
+/**
+ * Identity of a rasterised glyph
+ * */
+@data
+pub record GlyphKey {
+
+    // The uniq id of the face
+    pub let face: u32;
+
+    // The height of the em square in pixels
+    pub let size: u32;
+
+    // The index of the glyph in the face
+    pub let glyph: u32;
+
+    // The horizontal offset of the pen in 1/SUBPIXEL_LEVELS of a pixel
+    pub let subpixel: u8;
+
+    pub fn opEquals(self, o: GlyphKey)-> bool {
+        self.face == o.face && self.size == o.size && self.glyph == o.glyph && self.subpixel == o.subpixel
+    }
+
+    impl Hashable;
+}
+
+/**
+ * Placement of a glyph in the atlas
+ * */
+pub record GlyphEntry {
+
+    // The index of the page holding the glyph
+    pub let page: u32 = 0;
+
+    // The top left corner of the glyph bitmap in the page, in pixels
+    pub let x: u32 = 0;
+    pub let y: u32 = 0;
+
+    // The size of the glyph bitmap, empty for glyphs drawing nothing
+    pub let width: u32 = 0;
+    pub let height: u32 = 0;
+
+    // Offset from the pen position to the left of the bitmap
+    pub let left: i32 = 0;
+
+    // Offset from the baseline up to the top of the bitmap
+    pub let top: i32 = 0;
+
+    // The bounds of the glyph bitmap in normalized texture coordinates
+    pub let u0: f32 = 0.0f;
+    pub let v0: f32 = 0.0f;
+    pub let u1: f32 = 0.0f;
+    pub let v1: f32 = 0.0f;
+
+    pub self () {}
+
+    pub self (page: u32, x: u32, y: u32, width: u32, height: u32, left: i32, top: i32, pageSize: u32)
+        with page = page
+        , x = x
+        , y = y
+        , width = width
+        , height = height
+        , left = left
+        , top = top
+        , u0 = cast!f32(x) / cast!f32(pageSize)
+        , v0 = cast!f32(y) / cast!f32(pageSize)
+        , u1 = cast!f32(x + width) / cast!f32(pageSize)
+        , v1 = cast!f32(y + height) / cast!f32(pageSize)
+    {}
+
+    /**
+     * @returns: true if the glyph occupies a region of a page
+     * */
+    pub fn isPacked(self)-> bool {
+        self.width != 0u32 && self.height != 0u32
+    }
+}
+
+/**
+ * A glyph of the cache, and the generation it was last used in
+ * */
+@data
+record GlyphSlot {
+    pub let mut entry: GlyphEntry;
+    pub let mut lastUse: u64;
+}
+
+/**
+ * Placement and LRU eviction of glyphs in square pages, without the pixels
+ * Each glyph owns a ring of padding around its bitmap, so sampling never reads a neighbour
+ * A glyph used during one of the last 'guard' generations is never evicted
+ * */
+@final
+pub class GlyphCache {
+
+    // The width and height of a page
+    let _pageSize: u32;
+
+    // The maximum number of pages
+    let _maxPages: u32;
+
+    // The number of generations whose glyphs are protected from eviction (current one included)
+    let _guard: u64;
+
+    // The padding around each glyph
+    let _padding: u32;
+
+    // The packing of each page
+    let dmut _pages: [&ShelfPacker] = [];
+
+    // The glyphs in the cache
+    let dmut _slots: [GlyphKey => GlyphSlot] = copy [];
+
+    // The current generation
+    let mut _generation: u64 = 0;
+
+    // The number of glyphs evicted since the creation of the cache
+    let mut _evictions: u64 = 0;
+
+    pub self (pageSize: u32, maxPages: u32, guard: u64, padding: u32)
+        with _pageSize = pageSize
+        , _maxPages = maxPages
+        , _guard = guard
+        , _padding = padding
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the width and height of a page
+     * */
+    pub fn getPageSize(self)-> u32 {
+        self._pageSize
+    }
+
+    /**
+     * @returns: the number of pages opened so far
+     * */
+    pub fn getNbPages(self)-> u32 {
+        cast!u32(self._pages.len)
+    }
+
+    /**
+     * @returns: the number of glyphs in the cache
+     * */
+    pub fn getNbGlyphs(self)-> usize {
+        self._slots.len
+    }
+
+    /**
+     * @returns: the current generation
+     * */
+    pub fn getGeneration(self)-> u64 {
+        self._generation
+    }
+
+    /**
+     * @returns: the number of glyphs evicted so far, placements read before a change of this value may be stale
+     * */
+    pub fn getEvictionCount(self)-> u64 {
+        self._evictions
+    }
+
+    /**
+     * @returns: true if the glyph 'key' is in the cache
+     * */
+    pub fn contains(self, key: GlyphKey)-> bool {
+        key in self._slots
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start a new generation, the glyphs of the oldest protected generation become evictable
+     * */
+    pub fn advance(mut self) {
+        self._generation += 1u64;
+    }
+
+    /**
+     * Find a glyph and mark it used by the current generation
+     * @returns: the placement of the glyph, none if it is not in the cache
+     * */
+    pub fn find(mut self, key: GlyphKey)-> GlyphEntry? {
+        if let Ok(slot) = self._slots[key] {
+            self._slots[key] = GlyphSlot(slot.entry, self._generation);
+            return slot.entry?;
+        }
+
+        none
+    }
+
+    /**
+     * Place a glyph in a page, opening a page or evicting the least recently used glyphs if needed
+     * @params:
+     *    - key: the glyph to insert, assumed not in the cache
+     *    - width, height: the size of the glyph bitmap
+     *    - left, top: the bearings of the glyph bitmap
+     * @returns: the placement of the glyph, used by the current generation
+     * @throws: if the glyph cannot fit in a page, or every page is full of protected glyphs
+     * */
+    pub fn insert(mut self, key: GlyphKey, width: u32, height: u32, left: i32, top: i32)-> GlyphEntry
+        throws BalderError
+    {
+        if width == 0u32 || height == 0u32 {
+            let entry = GlyphEntry(0u32, 0u32, 0u32, 0u32, 0u32, left, top, self._pageSize);
+            self._slots[key] = GlyphSlot(entry, self._generation);
+            return entry;
+        }
+
+        let w = width + 2u32 * self._padding, h = height + 2u32 * self._padding;
+        if w > self._pageSize || h > self._pageSize {
+            throw copy BalderError(std::format::format("Glyph of {}x{} does not fit in an atlas page of {}", width, height, self._pageSize));
+        }
+
+        let (page, x, y) = self:.place(w, h);
+        let entry = GlyphEntry(page, x + self._padding, y + self._padding, width, height, left, top, self._pageSize);
+        self._slots[key] = GlyphSlot(entry, self._generation);
+
+        entry
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve a padded region of size 'w' x 'h' in a page
+     * @returns: the page, and the top left corner of the region
+     * */
+    fn place(mut self, w: u32, h: u32)-> (u32, u32, u32)
+        throws BalderError
+    {
+        for i, dmut packer in alias self._pages {
+            if let Ok((x, y)) = packer:.alloc(w, h) {
+                return (cast!u32(i), x, y);
+            }
+        }
+
+        if cast!u32(self._pages.len) < self._maxPages {
+            let dmut packer = copy ShelfPacker(self._pageSize, self._pageSize);
+            if let Ok((x, y)) = packer:.alloc(w, h) {
+                self._pages ~= [alias packer];
+                return (cast!u32(self._pages.len - 1us), x, y);
+            }
+        }
+
+        for key in self.evictionOrder() {
+            let page = self:.evict(key);
+            if let Ok((x, y)) = self._pages[page]:.alloc(w, h) {
+                return (page, x, y);
+            }
+        }
+
+        throw copy BalderError("Glyph atlas is full of glyphs in use");
+    }
+
+    /**
+     * @returns: the evictable glyphs occupying a page, least recently used first
+     * */
+    fn evictionOrder(self)-> [GlyphKey] {
+        let dmut candidates: [(u64, GlyphKey)] = [];
+        for key, slot in self._slots {
+            if slot.entry.isPacked() && slot.lastUse + self._guard <= self._generation {
+                candidates ~= [(slot.lastUse, key)];
+            }
+        }
+
+        sort(alias candidates, |a, b| { a._0 < b._0 });
+        copy [c._1 for c in candidates]
+    }
+
+    /**
+     * Remove a glyph from the cache and give its region back to its page
+     * @returns: the page the glyph was in
+     * */
+    fn evict(mut self, key: GlyphKey)-> u32 {
+        let mut page = 0u32;
+        if let Ok(slot) = self._slots[key] {
+            let e = slot.entry;
+            page = e.page;
+            self._pages[e.page]:.free(e.x - self._padding, e.y - self._padding, e.width + 2u32 * self._padding);
+            self._slots:.remove(key);
+            self._evictions += 1u64;
+        }
+
+        page
+    }
+}

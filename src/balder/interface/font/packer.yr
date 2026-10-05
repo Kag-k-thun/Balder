@@ -1,0 +1,175 @@
+in packer;
+
+use balder::core::memory::segments;
+
+use std::algorithm::comparison;
+
+/**
+ * Heights of opened shelves are rounded up to a multiple of this value, so close heights share shelves
+ * */
+pub def SHELF_ROUND = 4u32;
+
+/**
+ * Horizontal strip of a packed page, holding rectangles side by side
+ * */
+record Shelf {
+
+    // The top of the shelf in the page
+    pub let y: u32;
+
+    // The height of the shelf
+    pub let height: u32;
+
+    // The free spans of the shelf, all free once its last rectangle is freed
+    pub let dmut spans: &SegmentList;
+
+    pub self (y: u32, height: u32, dmut spans: &SegmentList)
+        with y = y
+        , height = height
+        , spans = alias spans
+    {}
+}
+
+/**
+ * Shelf packing of rectangles into a page, rectangles can be freed and their place reused
+ * A shelf is closed and its rows given back to the page when its last rectangle is freed
+ * */
+@final
+pub class ShelfPacker {
+
+    // The width of the page
+    let _width: u32;
+
+    // The height of the page
+    let _height: u32;
+
+    // The free rows of the page
+    let dmut _rows: &SegmentList;
+
+    // The opened shelves, by their top
+    let dmut _shelves: [u32 => Shelf] = copy [];
+
+    pub self (width: u32, height: u32)
+        with _width = width
+        , _height = height
+        , _rows = copy SegmentList(cast!usize(height))
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    @field
+    pub fn width(self)-> u32 {
+        self._width
+    }
+
+    @field
+    pub fn height(self)-> u32 {
+        self._height
+    }
+
+    /**
+     * @returns: true if nothing is packed in the page
+     * */
+    pub fn isEmpty(self)-> bool {
+        self._shelves.len == 0
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PACKING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve a rectangle of size 'width' x 'height'
+     * @returns: the top left corner of the rectangle, none if the page has no room for it
+     * */
+    pub fn alloc(mut self, width: u32, height: u32)-> (u32, u32)? {
+        if width == 0 || height == 0 || width > self._width || height > self._height { return none; }
+
+        let rounded = ((height + SHELF_ROUND - 1u32) / SHELF_ROUND) * SHELF_ROUND;
+        if let Ok(pos) = self:.allocInShelves(width, height, rounded) {
+            return pos?;
+        }
+
+        if let Ok(pos) = self:.allocInNewShelf(width, min(rounded, self._height)) {
+            return pos?;
+        }
+
+        if let Ok(pos) = self:.allocInShelves(width, height, self._height) {
+            return pos?;
+        }
+
+        none
+    }
+
+    /**
+     * Free a rectangle previously reserved by alloc
+     * @params:
+     *    - x, y: the top left corner returned by alloc
+     *    - width: the width of the rectangle
+     * */
+    pub fn free(mut self, x: u32, y: u32, width: u32) {
+        if let Ok(dmut shelf) = alias self._shelves[y] {
+            shelf.spans:.free(cast!usize(x), cast!usize(width));
+            if shelf.spans.isEmpty() {
+                self._rows:.free(cast!usize(shelf.y), cast!usize(shelf.height));
+                self._shelves:.remove(y);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve a rectangle in the lowest opened shelf whose height is between 'height' and 'maxHeight'
+     * */
+    fn allocInShelves(mut self, width: u32, height: u32, maxHeight: u32)-> (u32, u32)? {
+        let mut best = (false, 0u32, u32::max);
+        for y, shelf in self._shelves {
+            if shelf.height >= height && shelf.height <= maxHeight && shelf.height < best._2 {
+                if shelf.spans.findFreeSegment(cast!usize(width), 1us)._0 {
+                    best = (true, y, shelf.height);
+                }
+            }
+        }
+
+        if !best._0 { return none; }
+        if let Ok(dmut shelf) = alias self._shelves[best._1] {
+            if let Ok(x) = shelf.spans:.alloc(cast!usize(width), 1us) {
+                return (cast!u32(x), shelf.y)?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Open a shelf of height 'height' and reserve a rectangle at its start
+     * */
+    fn allocInNewShelf(mut self, width: u32, height: u32)-> (u32, u32)? {
+        if let Ok(y) = self._rows:.alloc(cast!usize(height), 1us) {
+            let dmut spans = copy SegmentList(cast!usize(self._width));
+            spans:.reserve(0us, 0us, cast!usize(width));
+
+            self._shelves[cast!u32(y)] = Shelf(cast!u32(y), height, alias spans);
+            return (0u32, cast!u32(y))?;
+        }
+
+        none
+    }
+}

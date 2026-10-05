@@ -1,0 +1,233 @@
+in segments;
+
+use balder::utils;
+
+use std::stream;
+
+pub record FreeSegment {
+    pub let mut start: usize;
+    pub let mut end: usize;
+
+    pub self (start: usize, end: usize)
+        with start = start
+        , end = end
+    {}
+}
+
+/**
+ * Best-fit allocator of the intervals of a one dimensional range [0, size)
+ * */
+@final
+pub class SegmentList {
+
+    // The size of the range
+    let _size: usize;
+
+    // The free segments, sorted and never adjacent
+    let dmut _segments: [FreeSegment];
+
+    pub self (size: usize)
+        with _size = size
+        , _segments = copy [FreeSegment(0, size)]
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the size of the range
+     * */
+    pub fn getSize(self)-> usize {
+        self._size
+    }
+
+    /**
+     * @returns: true if the range is completely free
+     */
+    pub fn isEmpty(self)-> bool {
+        if (self._segments.len != 1) return false;
+        return (self._segments[0].start == 0 && self._segments[0].end == self._size);
+    }
+
+    /**
+     * @returns: the free segments of the range
+     * */
+    pub fn getFreeSegments(self)-> [FreeSegment] {
+        self._segments
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SEARCHING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the free segment that fits a reservation of size 'size' aligned on 'align' with the least waste
+     * @returns:
+     *    - .0: true if a segment was found
+     *    - .1: the aligned offset of the reservation
+     *    - .2: the index of the free segment to pass to reserve
+     * */
+    pub fn findFreeSegment(self, size: usize, align: usize)-> (bool, usize, usize) {
+        let mut best = (false, 0us, i64::max, 0us);
+        for i, seg in self._segments {
+            let segAlign = if seg.start % align != 0 {
+                align - (seg.start % align)
+            } else { 0 };
+
+            let alignedStart = seg.start + segAlign;
+            let dist         = (cast!i64(seg.end) - cast!i64(alignedStart)) - cast!i64(size);
+
+            if (dist >= 0 && dist < best.2) {
+                best = (true, alignedStart, dist, i);
+            }
+        }
+
+        (best.0, best.1, best.3)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          RESERVATION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve a segment of the range
+     * @params:
+     *    - index: the index of the free segment to reserve
+     *    - offset: the offset of the reservation
+     *    - size: the size of the reservation
+     * @assume: the segment is free
+     */
+    pub fn reserve(mut self, index: usize, offset: usize, size: usize) {
+        let seg = self._segments[index];
+
+        // full reservation
+        if seg.start == offset && seg.end == offset + size {
+            self._segments = self._segments[0 .. index] ~ self._segments[index + 1 .. $];
+            return;
+        }
+
+        // left reservation
+        if seg.start == offset {
+            self._segments[index].start += size;
+            return;
+        }
+
+        // Right reservation
+        if seg.end == offset + size {
+            self._segments[index].end -= size;
+            return;
+        }
+
+        // Middle reservation
+        self._segments[index].end = offset;
+        let onRight = FreeSegment(offset + size, seg.end);
+        self._segments = self._segments[0 .. index + 1] ~ [onRight] ~ self._segments[index + 1 .. $];
+    }
+
+    /**
+     * Find and reserve a segment of size 'size' aligned on 'align'
+     * @returns: the offset of the reservation, none if no free segment fits
+     * */
+    pub fn alloc(mut self, size: usize, align: usize)-> usize? {
+        let (succ, offset, index) = self.findFreeSegment(size, align);
+        if !succ { return none; }
+
+        self:.reserve(index, offset, size);
+        offset?
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          FREEING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Free a segment
+     * @params:
+     *    - offset: the start of the segment
+     *    - size: the size of the segment to free
+     * @assume the segment was reserved
+     */
+    pub fn free(mut self, offset: usize, size: usize) {
+        if self._segments.len == 0 {
+            self._segments = copy [FreeSegment(offset, offset + size)];
+            return;
+        }
+
+        let mut index = 0us;
+        // searching where to insert the free segment
+        for seg in self._segments {
+            if seg.start <= offset && seg.end >= offset + size {
+                log::warn #("SegmentList", "segment already free : ", offset, size);
+                return;
+            }
+
+            if offset + size <= seg.start { break; }
+            index += 1;
+        }
+
+        // Free at the beginning
+        if index == 0 {
+            if self._segments[0].start == offset + size { // collide first free
+                self._segments[0].start = offset;
+            } else {
+                self._segments = [FreeSegment(offset, offset + size)] ~ self._segments;
+            }
+
+            return;
+        }
+
+        // Free at the end
+        if index == self._segments.len {
+            if self._segments[$ - 1].end == offset { // collide last free
+                self._segments[$ - 1].end += size;
+            } else {
+                self._segments ~= [FreeSegment(offset, offset + size)];
+            }
+
+            return;
+        }
+
+        // Middle insertion
+        // 1. collide with left and right
+        if self._segments[index - 1].end == offset && self._segments[index].start == offset + size {
+            self._segments[index - 1].end = self._segments[index].end;
+            self._segments = self._segments[0 .. index] ~ self._segments[index + 1 .. $];
+
+            return;
+        }
+
+        // 2. Collide with left
+        if self._segments[index - 1].end == offset {
+            self._segments[index - 1].end += size;
+            return;
+        }
+
+        // 3. Collide with right
+        if self._segments[index].start == offset + size {
+            self._segments[index].start = offset;
+            return;
+        }
+
+        // 4. new fragment
+        self._segments = self._segments[0 .. index] ~ [FreeSegment(offset, offset + size)] ~ self._segments[index .. $];
+    }
+
+    impl Streamable;
+}
