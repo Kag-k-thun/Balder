@@ -38,6 +38,15 @@ pub class ShapeDrawer {
 
     // The shape sorted by their drawing order
     let dmut _shapeList : &ShapeList = copy ShapeList ();
+
+    // The shapes the draws are recorded with, those of the shape list at the last commit
+    let dmut _drawn : [&Shape] = [];
+
+    // The shapes removed since the last commit, retired once they are not drawn anymore
+    let dmut _removed : [&Shape] = [];
+
+    // True when the shape list changed since the last commit
+    let mut _listChanged : bool = false;
     
     let dmut _uid       : usize = 1us;
     let mut _needRedraw : bool = false;    
@@ -212,6 +221,7 @@ pub class ShapeDrawer {
 
             atomic self {
                 self._shapeList:.insert (alias result);
+                self._listChanged = true;
             }
             
             self:.redraw ();
@@ -246,6 +256,7 @@ pub class ShapeDrawer {
 
             atomic self {            
                 self._shapeList:.insert (alias result);
+                self._listChanged = true;
             }
                 
             self:.redraw ();
@@ -282,6 +293,7 @@ pub class ShapeDrawer {
 
             atomic self {
                 self._shapeList:.insert (alias result);
+                self._listChanged = true;
             }
 
             self:.redraw ();
@@ -301,25 +313,30 @@ pub class ShapeDrawer {
         atomic self {
             if let Ok (dmut sh) = alias self._shapeList:.remove (shape.uid) {
                 self._shapeList:.insert (alias sh);
+                self._listChanged = true;
                 self._needRedraw = true;
             }
         }
     }
 
     /**
-     * Remove a shape from the drawer either color or texture
+     * Remove a shape from the drawer, still drawn until the next commit
      * @params:
      *    - uid: the uid of the shape to remove
      * */
     pub fn removeShape (mut self, uid : usize) {
-        let dmut shape = atomic self {
-            alias self._shapeList:.remove (uid)
+        let removed = atomic self {
+            if let Ok (dmut sh) = alias self._shapeList:.remove (uid) {
+                self._removed ~= [alias sh];
+                self._listChanged = true;
+                self._needRedraw = true;
+                true
+            } else {
+                false
+            }
         };
         
-        if let Ok (dmut sh) = alias shape {
-            self._window:.retire (alias sh);
-            self:.redraw ();            
-        } else {                    
+        if !removed {                    
             log::error #("ShapeDrawer", "Removing a shape that was not created by the drawer ? -> ", uid);            
         }
     }
@@ -345,8 +362,8 @@ pub class ShapeDrawer {
             let mut drawn : [&Shape] = [];
             { // Register shapes
                 self._atlas:.advance ();
-                for dmut s in alias self._shapeList {
-                    if s.isHidden () { continue; }
+                for dmut s in alias self._drawn {
+                    if !s.isDrawn () { continue; }
                     if let dmut t : &TextShape = alias s {
                         t:.touchGlyphs ();
                     }
@@ -433,21 +450,45 @@ pub class ShapeDrawer {
     }
 
     /**
-     * Commit the change of shapes in the last iteration
+     * Commit the change of shapes in the last iteration, all drawn from the same frame
      * */
     pub fn commit (mut self) {
-        let need = atomic self {            
-            for dmut c in alias self._shapeList {
-                c:.commit ();
-            }
+        {
+            // A frame submitted in the middle of the commit would upload a part of it only
+            self._window:.lockFrame ();
 
-            let need = self._needRedraw;
-            self._needRedraw = false;
-            need
-        };
+            let need = atomic self {            
+                for dmut c in alias self._shapeList {
+                    c:.commit ();
+                }
+
+                if self._listChanged {
+                    let dmut drawn : [&Shape] = [];
+                    for dmut c in alias self._shapeList {
+                        drawn ~= [alias c];
+                    }
+
+                    self._drawn = alias drawn;
+                    self._listChanged = false;
+                }
+
+                // Not drawn by the recordings to come, the ones in flight still using them
+                for dmut r in alias self._removed {
+                    self._window:.retire (alias r);
+                }
+
+                self._removed = [];
+
+                let need = self._needRedraw;
+                self._needRedraw = false;
+                need
+            };
         
-        if need {
-            self._window:.redrawPipeline ();                        
+            if need {
+                self._window:.redrawPipeline ();                        
+            }
+        } exit {
+            self._window:.unlockFrame ();
         }
     }
 
@@ -466,6 +507,14 @@ pub class ShapeDrawer {
         let dmut cp = atomic self {
             let dmut cp = alias self._shapeList;
             self._shapeList = copy ShapeList ();
+
+            for dmut r in alias self._removed {
+                self._window:.retire (alias r);
+            }
+
+            self._drawn = [];
+            self._removed = [];
+            self._listChanged = false;
             alias cp
         };
         
