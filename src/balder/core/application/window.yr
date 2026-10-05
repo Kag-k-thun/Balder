@@ -71,9 +71,6 @@ pub class Window {
 
         // The thread running the rendering loop
         let dmut _renderingTh: (future-> void)? = none;
-
-        // True iif must wait frame on redrawing
-        let mut _mustWaitFrameRedraw: bool = true;
     }
 
     prot { // thread
@@ -86,14 +83,14 @@ pub class Window {
         // The timer of a second, for nb frame per second computation
         let dmut _secondTimer: Timer = Timer();
 
-        // Semaphore used to wait for the next frame
+        // Semaphore posted when a frame is requested
         let dmut _frameSemaphore: &Semaphore = copy Semaphore();
 
-        // The duration of a frame in ms, by fnault 60 frame per seconds
+        // The minimal duration of a frame, by default 60 frames per second
         let mut _frameDuration: Duration = dur::millis(16u64) + dur::micros(666u64);
 
-        // If true, wait frames by triggers instead of timed
-        let mut _interactive: bool = false;
+        // The number of continuous requests, frames are drawn at the frame rate while there is one, on request otherwise
+        let mut _continuous: u32 = 0;
 
         // The number of frame in the current second
         let mut _nbFrame: u32 = 0;
@@ -166,18 +163,14 @@ pub class Window {
         self._vkDevice:.configure(alias self, cfg);
         self:.hide();
 
-        if cfg.timer.interactive {
-            self._interactive = true;
-            self._frameDuration = dur::minutes(1);
-        } else {
-            self._interactive = false;
-            if cfg.timer.fps == 0 {
-                log::error #("Window", "Fps must be a positive number");
-                throw copy BalderError("Invalid fps configuration");
-            }
-
-            self._frameDuration = dur::seconds(1) / cast!{u64} (cfg.timer.fps);
+        if cfg.timer.fps <= 0 {
+            log::error #("Window", "Fps must be a positive number");
+            throw copy BalderError("Invalid fps configuration");
         }
+
+        // The frame rate caps the frames drawn on request, a window that is not interactive draws them continuously
+        self._frameDuration = dur::seconds(1) / cast!{u64} (cfg.timer.fps);
+        self._continuous = if cfg.timer.interactive { 0u32 } else { 1u32 };
 
         // Draw empty screen, to configure default command buffers
         self:.configureRenderPipeline();
@@ -281,14 +274,14 @@ pub class Window {
 
         self._w = w;
         self._h = h;
-        self:.forceFrame();
+        self:.requestFrame();
     }
 
     /**
      * Slot called when the window is exposed
      * */
     pub fn onExpose(mut self) {
-        self:.forceFrame();
+        self:.requestFrame();
     }
 
     /**
@@ -627,7 +620,7 @@ pub class Window {
         {
             self._startStopMutex:.lock();
             self._isRunning = false;
-            self:.forceFrame();
+            self:.requestFrame();
 
             if let Ok(th) = self._renderingTh {
                 th.value; // join thread
@@ -694,13 +687,14 @@ pub class Window {
                 if (image >= 0) {
                     self:.submitFrame();
                     self:.presentFrame(image);
+                    self._nbFrame += 1u32;
                 } else {
                     if let Ok(dmut pipe) = alias self._pipeline {
                         pipe:.forceRedraw();
                     }
                 }
 
-                self:.waitFrame(false);
+                self:.waitFrame();
             }
         }
 
@@ -717,57 +711,87 @@ pub class Window {
      */
 
     /**
-     * Wait until the next frame should be drawn.
-     * @info: update the frame count.
+     * Request a frame, drawn as soon as the frame rate allows it
+     * @info: what changes the content of the GPU (transfers, dynamic buffers, recordings) requests it itself
+     * */
+    pub fn requestFrame(mut self) {
+        self._frameSemaphore:.post();
+    }
+
+    /**
+     * Draw the frames continuously at the frame rate, until the matching call to endContinuous
+     * @info: for what changes the frames without changing the content of the GPU, or measures the frame rate
+     * */
+    pub fn beginContinuous(mut self) {
+        atomic self {
+            self._continuous += 1u32;
+        }
+
+        self:.requestFrame();
+    }
+
+    /**
+     * End a continuous request started by beginContinuous, the frames are drawn on request once none is left
+     * */
+    pub fn endContinuous(mut self) {
+        atomic self {
+            if self._continuous == 0u32 {
+                log::error #("Window", "No continuous request to end");
+            } else {
+                self._continuous -= 1u32;
+            }
+        }
+    }
+
+    /**
+     * @returns: true iif the frames are drawn continuously at the frame rate (false if they are drawn on request)
+     * */
+    pub fn isContinuous(self)-> bool {
+        self._continuous > 0u32
+    }
+
+    /**
+     * Wait until the next frame should be drawn: at the frame rate while a continuous request holds or a frame slot
+     * still has to be recorded again, when a frame is requested otherwise
      */
-    fn waitFrame(mut self, redraw: bool) {
+    fn waitFrame(mut self) {
         if !self._isRunning { return; }
 
-        if self._interactive {
-            self:.waitInteractive(redraw);
+        if self._continuous > 0u32 || self.hasPendingRedraw() {
+            self:.waitFrameDuration();
         } else {
-            self:.waitTimed();
+            self:.waitRequest();
+        }
+
+        // The requests made until now are drawn by the next frame
+        while self._frameSemaphore.get() > 0 {
+            self._frameSemaphore:.wait();
         }
     }
 
     /**
-     * Interactive wait of the next frame
-     * */
-    fn waitInteractive(mut self, redraw: bool) {
-        // In redraw interactive will redraw every swapchain frames in one go
-        if redraw {
-            return;
+     * Wait for a frame request, then for the end of the frame duration
+     */
+    fn waitRequest(mut self) {
+        loop {
+            self:.countSecond();
+
+            // Woken at the end of the second to roll the frame count over, a timeout of zero would wait forever
+            let elapsed = self._secondTimer.timeSinceStart();
+            let remaining = if elapsed < dur::seconds(1u64) { dur::seconds(1u64) - elapsed } else { dur::millis(1u64) };
+            if self._frameSemaphore:.wait(timeout-> remaining) || !self._isRunning {
+                break;
+            }
         }
 
-        // Semaphore posted in previous frame
-        if !self._mustWaitFrameRedraw {
-            self._mustWaitFrameRedraw = true;
-            return;
-        }
-
-        if !self._frameSemaphore:.wait(timeout-> self._frameDuration) {
-            // semaphore not posted, timeout
-            self._mustWaitFrameRedraw = true;
-        } else {
-            // semaphore posted
-            self._mustWaitFrameRedraw = false;
-        }
+        self:.waitFrameDuration();
     }
 
     /**
-     * Timed wait of the next frame
-     * */
-    fn waitTimed(mut self) {
-        self._nbFrame += 1u32;
-
-        if (self._secondTimer.timeSinceStart() >= dur::seconds(1u64)) {
-            self._secondTimer:.reset();
-            self._lastNbFrame = self._nbFrame;
-            self._nbFrame = 0u32;
-
-            let oldName = self._name;
-            self._name = oldName;
-        }
+     * Wait for the end of the duration of the current frame
+     */
+    fn waitFrameDuration(mut self) {
+        self:.countSecond();
 
         let tick = self._frameTimer.timeSinceStart();
         if (self._frameDuration > tick) {
@@ -777,48 +801,35 @@ pub class Window {
 
             let z = (Instant::now() - x) - r;
             self._frameTimer:.reset(z);
+        } else if tick < self._frameDuration + self._frameDuration {
+            // Late by less than a frame, the next one catches up
+            self._frameTimer:.reset(tick - self._frameDuration);
         } else {
-            let z = tick - self._frameDuration;
-            self._frameTimer:.reset(z);
+            // Idle since the last frame, the next one starts a frame duration from now
+            self._frameTimer:.reset();
         }
     }
 
     /**
-     * Change the mode of frame waiting from timer to interactive
-     * @warning: it will happen in the next frame
-     * */
-    pub fn setInteractiveWait(mut self) {
-        if !self._interactive {
-            self._interactive = true;
-            self._mustWaitFrameRedraw = false;
+     * Roll the frame count over when a second elapsed
+     */
+    fn countSecond(mut self) {
+        if (self._secondTimer.timeSinceStart() >= dur::seconds(1u64)) {
+            self._secondTimer:.reset();
+            self._lastNbFrame = self._nbFrame;
+            self._nbFrame = 0u32;
         }
     }
 
     /**
-     * Change the mode of frame waiting from interactive to timer
-     * */
-    pub fn setTimedWait(mut self) {
-        if self._interactive {
-            self._interactive = false;
-            self._frameSemaphore:.post();
+     * @returns: true iif a frame slot of the pipeline has to be recorded again
+     */
+    fn hasPendingRedraw(self)-> bool {
+        if let Ok(pipe) = self._pipeline {
+            return pipe.hasPendingRedraw();
         }
-    }
 
-    /**
-     * Force the next frame to be drawn as soon as possible
-     * @info: only works in interactive mode
-     * */
-    pub fn forceFrame(mut self) {
-        if self._interactive {
-            self._frameSemaphore:.post();
-        }
-    }
-
-    /**
-     * @returns: true iif the window is in interactive mode rendering (false if in timer mode)
-     * */
-    pub fn isInteractive(self)-> bool {
-        self._interactive
+        false
     }
 
     /*!
