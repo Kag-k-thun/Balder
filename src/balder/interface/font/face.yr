@@ -1,11 +1,12 @@
 in face;
 
 use balder::core::_;
+use balder::interface::font::family;
 
 use std::conv;
 use std::fs::path;
 
-use ::freetype::{freetype, ftimage, fttypes};
+use ::freetype::{fixed, freetype, ftimage, ftsynth, fttypes, tttables};
 
 use ::harfbuzz::{common, font, ft};
 
@@ -13,6 +14,16 @@ use ::harfbuzz::{common, font, ft};
  * Number of horizontal positions a glyph is rasterised at inside a pixel
  * */
 pub def SUBPIXEL_LEVELS = 4u8;
+
+/**
+ * The thickening of a synthetic bold glyph, in em
+ * */
+pub def SYNTHETIC_BOLD = 1.0f / 24.0f;
+
+/**
+ * The horizontal shift of a synthetic oblique glyph per unit of height, the 12 degrees slant of FreeType
+ * */
+pub def SYNTHETIC_SLANT = 0.2126f;
 
 lazy dmut __FACE_UID__ = copy [0u32];
 fn uniqFaceId()-> u32 {
@@ -78,6 +89,12 @@ pub class FontFace {
     // The harfbuzz font shaping with the face, created on first use
     let dmut _hbFont: *hb_font_t = null;
 
+    // True if the glyphs are emboldened, the face lacking the requested weight
+    let _syntheticBold: bool;
+
+    // True if the glyphs are slanted, the face lacking the requested style
+    let _syntheticOblique: bool;
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -86,9 +103,19 @@ pub class FontFace {
      * ====================================================================================================
      */
 
-    pub self open(path: Path, index: i64 = 0)
+    /**
+     * Open a face of a font file
+     * @params:
+     *    - path: the path to the font file
+     *    - index: the index of the face in the file
+     *    - syntheticBold: true to embolden the glyphs
+     *    - syntheticOblique: true to slant the glyphs
+     * */
+    pub self open(path: Path, index: i64 = 0, syntheticBold: bool = false, syntheticOblique: bool = false)
         with _path = path
         , _uid = { uniqFaceId() }
+        , _syntheticBold = syntheticBold
+        , _syntheticOblique = syntheticOblique
         throws BalderError
     {
         if FT_Init_FreeType(alias &self._library) != 0 {
@@ -126,11 +153,93 @@ pub class FontFace {
     }
 
     /**
+     * @returns: true if the glyphs of the face are emboldened
+     * */
+    pub fn isSyntheticBold(self)-> bool {
+        self._syntheticBold
+    }
+
+    /**
+     * @returns: true if the glyphs of the face are slanted
+     * */
+    pub fn isSyntheticOblique(self)-> bool {
+        self._syntheticOblique
+    }
+
+    /**
      * @returns: the glyph index of the code point 'c', 0 if the face has no glyph for it
      * */
     pub fn getGlyphIndex(mut self, c: c32)-> u32 {
         if self._face == null { return 0u32; }
         FT_Get_Char_Index(alias self._face, cast!u64(cast!u32(c)))
+    }
+
+    /**
+     * @returns: true if the face has a glyph for the code point 'c'
+     * */
+    pub fn hasGlyph(mut self, c: c32)-> bool {
+        self:.getGlyphIndex(c) != 0u32
+    }
+
+    /**
+     * @returns: the number of faces in the font file of the face
+     * */
+    pub fn getNbFaces(self)-> i64 {
+        if self._face == null { return 0i64; }
+        unsafe { (*self._face).num_faces }
+    }
+
+    /**
+     * Read the family, weight, style and width of the face from the font file
+     * @params:
+     *    - path: the path the face is registered with
+     *    - index: the index of the face in its font file
+     * @returns: the description of the face
+     * */
+    pub fn describe(mut self, path: [c8], index: i64)-> FaceInfo
+        throws BalderError
+    {
+        if self._face == null {
+            throw copy BalderError("Describing a disposed face");
+        }
+
+        let rec = unsafe { *self._face };
+        let family = if rec.family_name != null { unsafe { fromStringZ(rec.family_name) } } else { self._path.file() };
+        let styleName = if rec.style_name != null { unsafe { fromStringZ(rec.style_name) } } else { "" };
+
+        let mut weight = weightOfStyleName(styleName);
+        if (rec.style_flags & FT_STYLE_FLAG_BOLD) != 0i64 && weight < FONT_WEIGHT_BOLD {
+            weight = FONT_WEIGHT_BOLD;
+        }
+
+        let mut oblique = isObliqueStyleName(styleName);
+        let mut width = FONT_WIDTH_NORMAL;
+
+        let os2 = FT_Get_Sfnt_Table(alias self._face, FT_Sfnt_Tag::FT_SFNT_OS2);
+        if os2 != null {
+            let table = unsafe { *cast!(*TT_OS2) (os2) };
+            let w = cast!u32(table.usWeightClass);
+            if w >= 1u32 && w < 10u32 { // some fonts use the old scale from 1 to 9
+                weight = w * 100u32;
+            } else if w >= 1u32 && w <= 1000u32 {
+                weight = w;
+            }
+
+            let wd = cast!u32(table.usWidthClass);
+            if wd >= 1u32 && wd <= 9u32 { width = wd; }
+
+            if (table.fsSelection & TT_FS_SELECTION_OBLIQUE) != 0u16 { oblique = true; }
+        }
+
+        let style = if oblique {
+            FontStyle::OBLIQUE
+        } else if (rec.style_flags & FT_STYLE_FLAG_ITALIC) != 0i64 {
+            FontStyle::ITALIC
+        } else {
+            FontStyle::NORMAL
+        };
+
+        FaceInfo(family, path, index, weight, style, width)
     }
 
     /**
@@ -157,6 +266,15 @@ pub class FontFace {
         self:.setPixelSize(pixelSize);
         if self._hbFont == null {
             self._hbFont = hb_ft_font_create(self._face);
+
+            // the advances grow by the thickening, the outlines being emboldened to the right and the top
+            if self._syntheticBold {
+                hb_font_set_synthetic_bold(alias self._hbFont, SYNTHETIC_BOLD, SYNTHETIC_BOLD, 0);
+            }
+
+            if self._syntheticOblique {
+                hb_font_set_synthetic_slant(alias self._hbFont, SYNTHETIC_SLANT);
+            }
         }
 
         alias self._hbFont
@@ -201,7 +319,7 @@ pub class FontFace {
      */
 
     /**
-     * Rasterise a glyph of the face
+     * Rasterise a glyph of the face, emboldened and slanted if the face synthesizes these styles
      * @params:
      *    - glyph: the index of the glyph in the face
      *    - pixelSize: the height of the em square in pixels
@@ -220,11 +338,32 @@ pub class FontFace {
         delta.x = (cast!i64(subpixel % SUBPIXEL_LEVELS) * 64i64) / cast!i64(SUBPIXEL_LEVELS);
         FT_Set_Transform(alias self._face, null, alias &delta);
 
-        if FT_Load_Glyph(alias self._face, glyph, FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL) != 0 {
+        // an embedded bitmap can neither be emboldened nor slanted, the outline is used instead
+        let synthetic = self._syntheticBold || self._syntheticOblique;
+        let flags = if synthetic { FT_LOAD_NO_BITMAP | FT_LOAD_TARGET_NORMAL } else { FT_LOAD_TARGET_NORMAL };
+        if FT_Load_Glyph(alias self._face, glyph, flags) != 0 {
             throw copy BalderError(std::format::format("Failed to rasterise glyph {} of face {}", glyph, self._path));
         }
 
-        let slot = unsafe { (*self._face).glyph };
+        let dmut slot = unsafe { alias (*self._face).glyph };
+
+        // the left and bottom borders stay in place, the glyph growing to the right and to the top
+        if self._syntheticBold {
+            FT_GlyphSlot_AdjustWeight(alias slot, toFixed(SYNTHETIC_BOLD), toFixed(SYNTHETIC_BOLD));
+        }
+
+        // the outline is sheared around the baseline
+        if self._syntheticOblique {
+            FT_GlyphSlot_Slant(alias slot, toFixed(SYNTHETIC_SLANT), 0i64);
+        }
+
+        let format = unsafe { (*slot).format };
+        if format == FT_Glyph_Format::FT_GLYPH_FORMAT_OUTLINE {
+            if FT_Render_Glyph(alias slot, FT_Render_Mode::FT_RENDER_MODE_NORMAL) != 0 {
+                throw copy BalderError(std::format::format("Failed to rasterise glyph {} of face {}", glyph, self._path));
+            }
+        }
+
         let bitmap = unsafe { (*slot).bitmap };
         let left = unsafe { (*slot).bitmap_left };
         let top = unsafe { (*slot).bitmap_top };
