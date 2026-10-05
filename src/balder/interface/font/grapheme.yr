@@ -1,0 +1,223 @@
+in grapheme;
+
+use ::harfbuzz::unicode;
+
+/**
+ * The property of a code point that decides the grapheme boundaries around it, the subset of the
+ * Grapheme_Cluster_Break property of UAX #29 a text input needs
+ * */
+enum Break: u8
+| OTHER        = 0
+| CR           = 1
+| LF           = 2
+| CONTROL      = 3
+| EXTEND       = 4
+| ZWJ          = 5
+| SPACING_MARK = 6
+| REGIONAL     = 7
+| L            = 8
+| V            = 9
+| T            = 10
+| LV           = 11
+| LVT          = 12;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ==================================          BOUNDARIES          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * Split a text into its user perceived characters (extended grapheme clusters), so a base and its combining marks, a
+ * surrogate pair, an emoji sequence or a Hangul syllable are kept whole
+ * @params:
+ *    - text: the text to split, in UTF-16 code units
+ * @returns: the code units a grapheme starts at, in increasing order, followed by the length of the text
+ * */
+pub fn boundaries(text: [c16])-> [usize] {
+    if text.len == 0us {
+        return copy [0us];
+    }
+
+    let dmut res: [usize] = copy [0us];
+    let (first, firstSize) = codePointAt(text, 0us);
+
+    let mut prev = breakOf(first);
+
+    // the code points since the last boundary are an emoji followed by extenders
+    let mut emoji = isPictographic(first);
+
+    // the code points since the last boundary are an emoji followed by extenders and a zero width joiner
+    let mut emojiJoiner = false;
+
+    // the number of regional indicators in a row before the current code point
+    let mut regionals = if prev == Break::REGIONAL { 1us } else { 0us };
+
+    let mut i = firstSize;
+    while i < text.len {
+        let (cp, size) = codePointAt(text, i);
+        let next = breakOf(cp);
+        let pict = isPictographic(cp);
+
+        if !joins(prev, next, regionals, emojiJoiner && pict) {
+            res ~= [i];
+        }
+
+        emojiJoiner = emoji && next == Break::ZWJ;
+        emoji = pict || (emoji && next == Break::EXTEND);
+        regionals = if next == Break::REGIONAL { regionals + 1us } else { 0us };
+        prev = next;
+        i += size;
+    }
+
+    res ~= [text.len];
+    res
+}
+
+/**
+ * @returns: the first grapheme boundary of 'text' after 'index', the length of the text if there is none
+ * */
+pub fn nextBoundary(text: [c16], index: usize)-> usize {
+    for b in boundaries(text) {
+        if b > index {
+            return b;
+        }
+    }
+
+    text.len
+}
+
+/**
+ * @returns: the last grapheme boundary of 'text' before 'index', 0 if there is none
+ * */
+pub fn previousBoundary(text: [c16], index: usize)-> usize {
+    let mut res = 0us;
+    for b in boundaries(text) {
+        if b >= index {
+            break;
+        }
+
+        res = b;
+    }
+
+    res
+}
+
+/**
+ * @returns: 'index' if it is a grapheme boundary of 'text', the next boundary otherwise
+ * */
+pub fn alignBoundary(text: [c16], index: usize)-> usize {
+    for b in boundaries(text) {
+        if b >= index {
+            return b;
+        }
+    }
+
+    text.len
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===================================          PROPERTIES          ===================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * Tell if two consecutive code points belong to the same grapheme (rules GB3 to GB13 of UAX #29)
+ * @params:
+ *    - prev: the break property of the first code point
+ *    - next: the break property of the second code point
+ *    - regionals: the number of regional indicators in a row ending with the first code point
+ *    - emojiJoin: the first code point is a zero width joiner following an emoji, and the second one is an emoji
+ * @returns: true if there is no boundary between them
+ * */
+fn joins(prev: Break, next: Break, regionals: usize, emojiJoin: bool)-> bool {
+    if prev == Break::CR && next == Break::LF { return true; }
+    if prev == Break::CR || prev == Break::LF || prev == Break::CONTROL { return false; }
+    if next == Break::CR || next == Break::LF || next == Break::CONTROL { return false; }
+
+    if prev == Break::L && (next == Break::L || next == Break::V || next == Break::LV || next == Break::LVT) { return true; }
+    if (prev == Break::LV || prev == Break::V) && (next == Break::V || next == Break::T) { return true; }
+    if (prev == Break::LVT || prev == Break::T) && next == Break::T { return true; }
+
+    if next == Break::EXTEND || next == Break::ZWJ || next == Break::SPACING_MARK { return true; }
+    if emojiJoin { return true; }
+
+    if prev == Break::REGIONAL && next == Break::REGIONAL { return regionals % 2us == 1us; }
+
+    false
+}
+
+/**
+ * @returns: the break property of the code point 'cp'
+ * */
+fn breakOf(cp: u32)-> Break {
+    if cp == 0x0Du32 { return Break::CR; }
+    if cp == 0x0Au32 { return Break::LF; }
+    if cp == 0x200Du32 { return Break::ZWJ; }
+
+    // zero width non joiner, emoji modifiers and tags extend the grapheme before them
+    if cp == 0x200Cu32 { return Break::EXTEND; }
+    if cp >= 0x1F3FBu32 && cp <= 0x1F3FFu32 { return Break::EXTEND; }
+    if cp >= 0xE0020u32 && cp <= 0xE007Fu32 { return Break::EXTEND; }
+
+    if cp >= 0x1F1E6u32 && cp <= 0x1F1FFu32 { return Break::REGIONAL; }
+
+    // Hangul jamos and precomposed syllables
+    if (cp >= 0x1100u32 && cp <= 0x115Fu32) || (cp >= 0xA960u32 && cp <= 0xA97Cu32) { return Break::L; }
+    if (cp >= 0x1160u32 && cp <= 0x11A7u32) || (cp >= 0xD7B0u32 && cp <= 0xD7C6u32) { return Break::V; }
+    if (cp >= 0x11A8u32 && cp <= 0x11FFu32) || (cp >= 0xD7CBu32 && cp <= 0xD7FBu32) { return Break::T; }
+    if cp >= 0xAC00u32 && cp <= 0xD7A3u32 {
+        return if (cp - 0xAC00u32) % 28u32 == 0u32 { Break::LV } else { Break::LVT };
+    }
+
+    let category = hb_unicode_general_category(hb_unicode_funcs_get_default(), cp);
+    match category {
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_CONTROL             => { Break::CONTROL }
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_FORMAT              => { Break::CONTROL }
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_SURROGATE           => { Break::CONTROL }
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_LINE_SEPARATOR      => { Break::CONTROL }
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_PARAGRAPH_SEPARATOR => { Break::CONTROL }
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK    => { Break::EXTEND }
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_ENCLOSING_MARK      => { Break::EXTEND }
+        hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_SPACING_MARK        => { Break::SPACING_MARK }
+        _                                                                              => { Break::OTHER }
+    }
+}
+
+/**
+ * @returns: true if the code point 'cp' is an emoji, that a zero width joiner can glue to the emoji before it
+ * */
+fn isPictographic(cp: u32)-> bool {
+    if cp >= 0x1F000u32 && cp <= 0x1FAFFu32 && !(cp >= 0x1F1E6u32 && cp <= 0x1F1FFu32) && !(cp >= 0x1F3FBu32 && cp <= 0x1F3FFu32) {
+        return true;
+    }
+
+    if cp < 0x80u32 {
+        return false;
+    }
+
+    hb_unicode_general_category(hb_unicode_funcs_get_default(), cp) == hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_OTHER_SYMBOL
+}
+
+/**
+ * Decode the code point starting at the code unit 'index' of a UTF-16 text, a lone surrogate being its own code point
+ * @returns:
+ *    - .0: the code point
+ *    - .1: the number of code units it takes
+ * */
+fn codePointAt(text: [c16], index: usize)-> (u32, usize) {
+    let high = cast!u32(cast!u16(text[index]));
+    if high >= 0xD800u32 && high <= 0xDBFFu32 && index + 1us < text.len {
+        let low = cast!u32(cast!u16(text[index + 1us]));
+        if low >= 0xDC00u32 && low <= 0xDFFFu32 {
+            return (0x10000u32 + ((high - 0xD800u32) << 10u32) + (low - 0xDC00u32), 2us);
+        }
+    }
+
+    (high, 1us)
+}
