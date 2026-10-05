@@ -1,0 +1,397 @@
+in registry;
+
+mod ::utils;
+
+use balder::core::_;
+use balder::interface::font::{face, family};
+use balder::utils::log;
+
+use std::env;
+
+/**
+ * The fonts a text can be drawn with, by family:
+ *    - the faces registered by the project (by file, or from a directory such as res:/fonts), that take precedence
+ *    - the faces of the system, read from the system font directories the first time a family is not registered
+ *    - the generic families (sans-serif, serif, monospace), each standing for the first available family of a list
+ *    - the fallbacks of a family, and the global fallbacks, tried when a face has no glyph for a code point
+ * The faces are opened once, and shared by every chain resolving to them
+ * */
+@final
+pub class FontRegistry {
+
+    // The faces registered by the project, by family key
+    let dmut _families: [[c8] => [FaceInfo]] = copy [];
+
+    // The faces of the system, by family key, read on first miss
+    let dmut _system: [[c8] => [FaceInfo]] = copy [];
+
+    // The directories the system faces are read from
+    let _systemDirs: [[c8]];
+
+    // True once the system directories were read
+    let mut _systemRead: bool = false;
+
+    // The families each generic family stands for, by generic family key
+    let dmut _generics: [[c8] => [[c8]]] = copy [];
+
+    // The fallbacks of the families, by family key
+    let dmut _fallbacks: [[c8] => [[c8]]] = copy [];
+
+    // The families tried after the ones of a chain and their fallbacks
+    let mut _globalFallbacks: [[c8]] = [];
+
+    // The faces opened so far, by path, index and synthesized styles
+    let dmut _faces: [([c8], i64, bool, bool) => &FontFace] = copy [];
+
+    // Incremented by each change of the registered faces, generic families or fallbacks
+    let mut _version: u64 = 0;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create a registry with the usual generic families and global fallbacks, and no registered face
+     * @params:
+     *    - systemDirs: the directories the system fonts are read from, none to only use the registered faces
+     * */
+    pub self (systemDirs: [[c8]] = FontRegistry::systemFontDirs())
+        with _systemDirs = systemDirs
+    {
+        self:.setGeneric("sans-serif", copy ["Noto Sans", "DejaVu Sans", "Liberation Sans", "Arimo", "FreeSans"]);
+        self:.setGeneric("serif", copy ["Noto Serif", "DejaVu Serif", "Liberation Serif", "Tinos", "FreeSerif"]);
+        self:.setGeneric("monospace", copy ["DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", "Cousine", "FreeMono"]);
+
+        self._globalFallbacks = copy ["sans-serif", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans CJK SC",
+                                 "Droid Sans Fallback", "Noto Color Emoji", "DejaVu Sans", "FreeSerif"];
+    }
+
+    __dtor(mut self) {
+        self:.dispose();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          REGISTRATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Register a face in a family, as a @font-face rule does
+     * @params:
+     *    - face: the face, its family being the one it is registered in
+     * */
+    pub fn register(mut self, face: FaceInfo) {
+        self._version += 1u64;
+        let key = familyKey(face.family);
+        if let Ok(faces) = self._families[key] {
+            self._families[key] = faces ~ [face];
+        } else {
+            self._families[key] = copy [face];
+        }
+    }
+
+    /**
+     * Register the faces of a font file, in the family the file names, or in 'family'
+     * @params:
+     *    - path: the path to the font file, that may use the custom path qualifiers (res:/)
+     *    - family: the family to register the faces in, empty to use the one of the file
+     *    - weight: the weight of the faces, none to use the one of the file
+     *    - style: the style of the faces, none to use the one of the file
+     * @returns: the registered faces
+     * */
+    pub fn registerFile(mut self, path: [c8], family: [c8] = "", weight: (u32)? = none, style: (FontStyle)? = none)-> [FaceInfo]
+        throws BalderError
+    {
+        let mut res: [FaceInfo] = [];
+        for f in utils::describeFile(path) {
+            let face = FaceInfo(if family != "" { family } else { f.family },
+                                f.path,
+                                f.index,
+                                if let Ok(w) = weight { w } else { f.weight },
+                                if let Ok(s) = style { s } else { f.style },
+                                f.width);
+            self:.register(face);
+            res ~= [face];
+        }
+
+        res
+    }
+
+    /**
+     * Register the faces of every font file of a directory and of its sub directories, in the family each file names
+     * The files that cannot be read are skipped
+     * @params:
+     *    - dir: the directory, that may use the custom path qualifiers (res:/)
+     * @returns: the number of registered faces
+     * */
+    pub fn registerDirectory(mut self, dir: [c8])-> usize {
+        let mut nb = 0us;
+        for f in utils::readDirectory(dir) {
+            self:.register(f);
+            nb += 1us;
+        }
+
+        nb
+    }
+
+    /**
+     * Change the families a generic family stands for, the first available one being used
+     * @params:
+     *    - name: the name of the generic family (sans-serif...)
+     *    - families: the families it stands for, by order of preference
+     * */
+    pub fn setGeneric(mut self, name: [c8], families: [[c8]]) {
+        self._version += 1u64;
+        self._generics[familyKey(name)] = dcopy families;
+    }
+
+    /**
+     * Change the families tried when a face of 'family' has no glyph for a code point, before the global fallbacks
+     * */
+    pub fn setFallbacks(mut self, family: [c8], fallbacks: [[c8]]) {
+        self._version += 1u64;
+        self._fallbacks[familyKey(family)] = dcopy fallbacks;
+    }
+
+    /**
+     * Change the families tried when no family of a chain, nor their fallbacks, has a glyph for a code point
+     * */
+    pub fn setGlobalFallbacks(mut self, fallbacks: [[c8]]) {
+        self._version += 1u64;
+        self._globalFallbacks = fallbacks;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: a number changing with each change of the registered faces, generic families or fallbacks, the chains
+     * created before a change resolving the families as they were
+     * */
+    pub fn getVersion(self)-> u64 {
+        self._version
+    }
+
+    /**
+     * @returns: the fallbacks of a family
+     * */
+    pub fn getFallbacks(self, family: [c8])-> [[c8]] {
+        if let Ok(f) = self._fallbacks[familyKey(family)] {
+            return f;
+        }
+
+        []
+    }
+
+    /**
+     * @returns: the families tried after the ones of a chain and their fallbacks
+     * */
+    pub fn getGlobalFallbacks(self)-> [[c8]] {
+        self._globalFallbacks
+    }
+
+    /**
+     * @returns: true if a family is registered by the project
+     * */
+    pub fn isRegistered(self, family: [c8])-> bool {
+        familyKey(family) in self._families
+    }
+
+    /**
+     * @returns: true if 'name' is a generic family
+     * */
+    pub fn isGeneric(self, name: [c8])-> bool {
+        familyKey(name) in self._generics
+    }
+
+    /**
+     * Expand a list of families into the list a chain tries in order: the families, then their fallbacks, then the
+     * global fallbacks, each family appearing once
+     * */
+    pub fn expandFamilies(self, families: [[c8]])-> [[c8]] {
+        let mut all = families;
+        for f in families {
+            all ~= self.getFallbacks(f);
+        }
+
+        all ~= self._globalFallbacks;
+
+        let dmut seen: [[c8] => bool] = copy [];
+        let mut res: [[c8]] = [];
+        for f in all {
+            let key = familyKey(f);
+            if key !in seen {
+                seen[key] = true;
+                res ~= [f];
+            }
+        }
+
+        res
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          RESOLUTION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the face of a family the closest to a weight and a style
+     * The faces registered by the project hide the faces of the system of the same family
+     * A generic family resolves to the first family it stands for that has a face
+     * @returns: the face, and the styles to synthesize, none if the family has no face
+     * */
+    pub fn resolve(mut self, family: [c8], weight: u32 = FONT_WEIGHT_NORMAL, style: FontStyle = FontStyle::NORMAL)-> FaceMatch? {
+        let all = self:.resolveFaces(family, weight-> weight, style-> style);
+        if all.len == 0us { return none; }
+        all[0]?
+    }
+
+    /**
+     * Find the faces of a family a grapheme is looked for in, the closest to a weight and a style first, then the
+     * regular face of the family synthesizing the weight and the style
+     * @returns: the faces, none if the family has no face
+     * */
+    pub fn resolveFaces(mut self, family: [c8], weight: u32 = FONT_WEIGHT_NORMAL, style: FontStyle = FontStyle::NORMAL)-> [FaceMatch] {
+        let key = familyKey(family);
+        if let Ok(names) = self._generics[key] {
+            for n in names {
+                if familyKey(n) !in self._generics {
+                    let all = self:.resolveFaces(n, weight-> weight, style-> style);
+                    if all.len != 0us { return all; }
+                }
+            }
+
+            return [];
+        }
+
+        if let Ok(faces) = self._families[key] {
+            return matchFaces(faces, weight, style);
+        }
+
+        self:.readSystem();
+        if let Ok(faces) = self._system[key] {
+            return matchFaces(faces, weight, style);
+        }
+
+        []
+    }
+
+    /**
+     * Open (or reuse) the face a family resolved to
+     * @returns: the face, synthesizing the styles the match lacks
+     * */
+    pub fn open(mut self, m: FaceMatch)-> dmut &FontFace
+        throws BalderError
+    {
+        let key = (m.face.path, m.face.index, m.syntheticBold, m.syntheticOblique);
+        if let Ok(dmut f) = alias self._faces[key] {
+            return alias f;
+        }
+
+        let dmut face = copy FontFace::open(balder::utils::path::projectPath(m.face.path),
+                                            index-> m.face.index,
+                                            syntheticBold-> m.syntheticBold,
+                                            syntheticOblique-> m.syntheticOblique);
+        self._faces[key] = alias face;
+
+        alias face
+    }
+
+    /**
+     * Open (or reuse) the regular face of a font file, outside of any family
+     * */
+    pub fn openFile(mut self, path: [c8], index: i64 = 0)-> dmut &FontFace
+        throws BalderError
+    {
+        self:.open(FaceMatch(FaceInfo("", path, index, FONT_WEIGHT_NORMAL, FontStyle::NORMAL, FONT_WIDTH_NORMAL), false, false))
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the faces of the system directories, the first time only
+     * */
+    fn readSystem(mut self) {
+        if self._systemRead { return; }
+        self._systemRead = true;
+
+        for dir in self._systemDirs {
+            for f in utils::readDirectory(dir) {
+                let key = familyKey(f.family);
+                if let Ok(faces) = self._system[key] {
+                    self._system[key] = faces ~ [f];
+                } else {
+                    self._system[key] = copy [f];
+                }
+            }
+        }
+
+        log::debug #("FontRegistry", "Read ", self._system.len, " families of system fonts");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            for _, dmut f in alias self._faces {
+                f:.dispose();
+            }
+
+            self._faces = copy [];
+        }
+    }
+}
+
+/**
+ * The font directories of a project and of the system
+ * */
+pub mod FontRegistry {
+
+    /**
+     * The directory of the fonts shipped with a project, registered before any system font
+     * */
+    pub def RES_FONT_DIR = "res:/fonts";
+
+    /**
+     * @returns: the directories the fonts of the system are installed in, the ones of the user first (XDG base directory)
+     * */
+    pub fn systemFontDirs()-> [[c8]] {
+        let home = unsafe { env::getVar("HOME") };
+        let data = unsafe { env::getVar("XDG_DATA_HOME") };
+
+        let mut dirs: [[c8]] = [];
+        if data != "" { dirs ~= [data ~ "/fonts"]; }
+        else if home != "" { dirs ~= [home ~ "/.local/share/fonts"]; }
+
+        if home != "" { dirs ~= [home ~ "/.fonts"]; }
+
+        dirs ~ ["/usr/local/share/fonts", "/usr/share/fonts"]
+    }
+}
