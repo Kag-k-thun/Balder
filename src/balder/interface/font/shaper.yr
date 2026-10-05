@@ -1,11 +1,14 @@
 in shaper;
 
 use balder::core::_;
-use balder::interface::font::face;
+use balder::interface::font::{face, grapheme};
 
-use std::math;
+use std::{algorithm::_, math};
 
-use ::harfbuzz::{buffer, fixed, glyphs, shape};
+use ::harfbuzz::{buffer, common, fixed, glyphs, shape};
+
+// The gap under which two spans of a selection are merged, in pixels
+def SPAN_JOIN = 0.01f;
 
 /**
  * A glyph of a shaped run, positioned on the baseline
@@ -47,6 +50,12 @@ pub record ShapedRun {
     // The height of the em square the run is shaped at
     pub let pixelSize: u32;
 
+    // The position of a caret put before each code unit of the text, and after the last one, in pixels
+    pub let carets: [f32];
+
+    // The code units a caret can stand before, the grapheme boundaries, followed by the length of the text
+    pub let stops: [usize];
+
     /**
      * @returns: the height of the line, from the top of the ascender to the bottom of the descender
      * */
@@ -55,18 +64,84 @@ pub record ShapedRun {
     }
 
     /**
-     * @returns: the advance of the glyphs coming from the code units before 'index', the position of a caret put there
+     * @returns: the position of a caret put before the code unit 'index', after the text if 'index' is past its end
      * */
-    pub fn advanceTo(self, index: usize)-> f32 {
-        let mut x = 0.0f;
-        for g in self.glyphs {
-            if cast!usize(g.cluster) < index {
-                x += g.advance;
+    pub fn caretAt(self, index: usize)-> f32 {
+        self.carets[min(index, self.carets.len - 1us)]
+    }
+
+    /**
+     * Find where a click put a caret
+     * @params:
+     *    - x: the position of the click, from the start of the run, in pixels
+     * @returns: the grapheme boundary of the caret, the closest edge of the grapheme under 'x', or the closest boundary
+     * when 'x' is outside the text
+     * */
+    pub fn hitTest(self, x: f32)-> usize {
+        for j in 1us .. self.stops.len {
+            let lead  = self.carets[self.stops[j - 1us]];
+            let trail = self.carets[self.stops[j]];
+            if x >= min(lead, trail) && x <= max(lead, trail) {
+                return if abs(x - lead) <= abs(x - trail) { self.stops[j - 1us] } else { self.stops[j] };
             }
         }
 
-        x
+        let mut best = 0us;
+        let mut dist = f32::max;
+        for s in self.stops {
+            let d = abs(x - self.carets[s]);
+            if d < dist {
+                dist = d;
+                best = s;
+            }
+        }
+
+        best
     }
+
+    /**
+     * Compute the horizontal spans covered by the graphemes of a part of the text
+     * @params:
+     *    - start: the code unit the part starts at
+     *    - end: the code unit the part ends before
+     * @returns: the spans, from the start of the run in pixels, merged and sorted from left to right
+     * */
+    pub fn selectionSpans(self, start: usize, end: usize)-> [(f32, f32)] {
+        let lo = min(start, end);
+        let hi = max(start, end);
+
+        let dmut spans: [(f32, f32)] = [];
+        for j in 1us .. self.stops.len {
+            if self.stops[j - 1us] >= lo && self.stops[j] <= hi {
+                let lead  = self.carets[self.stops[j - 1us]];
+                let trail = self.carets[self.stops[j]];
+                spans ~= [(min(lead, trail), max(lead, trail))];
+            }
+        }
+
+        mergeSpans(spans)
+    }
+}
+
+/**
+ * Merge the spans that overlap or touch, the spans of the runs of a line becoming the rectangles of its selection
+ * @params:
+ *    - spans: the spans to merge, in any order
+ * @returns: the merged spans, sorted from left to right
+ * */
+pub fn mergeSpans(spans: [(f32, f32)])-> [(f32, f32)] {
+    let sorted = sort(copy spans, |a, b| => a._0 < b._0);
+
+    let dmut res: [(f32, f32)] = [];
+    for s in sorted {
+        if res.len != 0us && s._0 <= res[$ - 1us]._1 + SPAN_JOIN {
+            res[$ - 1us] = (res[$ - 1us]._0, max(res[$ - 1us]._1, s._1));
+        } else {
+            res ~= [s];
+        }
+    }
+
+    res
 }
 
 /**
@@ -82,23 +157,24 @@ pub fn shapeLine(dmut face: &FontFace, text: [c16], pixelSize: u32)-> ShapedRun
 {
     let metrics = face:.getLineMetrics(pixelSize);
     if text.len == 0us {
-        return ShapedRun([], 0.0f, metrics, pixelSize);
+        return ShapedRun([], 0.0f, metrics, pixelSize, copy [0.0f], copy [0us]);
     }
 
     let dmut font = face:.getHarfbuzzFont(pixelSize);
     let dmut buf = hb_buffer_create();
 
-    let (infos, positions) = {
+    let (infos, positions, backward) = {
         hb_buffer_add_utf16(alias buf, text.ptr, cast!i32(text.len), 0u32, cast!i32(text.len));
         hb_buffer_guess_segment_properties(alias buf);
         hb_shape(alias font, alias buf, null, 0u32);
 
-        (getGlyphInfos(alias buf), getGlyphPositions(alias buf))
+        (getGlyphInfos(alias buf), getGlyphPositions(alias buf), HB_DIRECTION_IS_BACKWARD(hb_buffer_get_direction(buf)))
     } exit {
         hb_buffer_destroy(alias buf);
     };
 
     let dmut result: [ShapedGlyph] = [];
+    let dmut pens: [f32] = [];
     let mut pen = 0.0f;
     for i, info in infos {
         let p = positions[i];
@@ -108,10 +184,87 @@ pub fn shapeLine(dmut face: &FontFace, text: [c16], pixelSize: u32)-> ShapedRun
                                pen + fromF26Dot6(p.x_offset),
                                fromF26Dot6(p.y_offset),
                                advance)];
+        pens ~= [pen];
         pen += advance;
     }
 
-    ShapedRun(result, pen, metrics, pixelSize)
+    let stops = boundaries(text);
+    ShapedRun(result, pen, metrics, pixelSize, placeCarets(result, pens, text.len, stops, backward), stops)
+}
+
+/**
+ * Place a caret before every code unit of a shaped text, on the edges of the clusters, a cluster holding several
+ * graphemes (a ligature) being split evenly between them
+ * @params:
+ *    - glyphs: the shaped glyphs, in visual order
+ *    - pens: the pen position of each glyph, without its offset
+ *    - len: the number of code units of the text
+ *    - stops: the grapheme boundaries of the text
+ *    - backward: true if the text is shaped right to left, its first code unit being on the right
+ * @returns: the position of the caret before each code unit, and after the last one
+ * */
+fn placeCarets(glyphs: [ShapedGlyph], pens: [f32], len: usize, stops: [usize], backward: bool)-> [f32] {
+    // the edges of the clusters, by the code unit they start at
+    let dmut lefts: [f32] = [];
+    let dmut rights: [f32] = [];
+    let dmut isStart: [bool] = [];
+    let dmut isStop: [bool] = [];
+    for _ in 0us .. len {
+        lefts ~= [f32::max];
+        rights ~= [-f32::max];
+        isStart ~= [false];
+        isStop ~= [false];
+    }
+
+    for s in stops {
+        if s < len { isStop[s] = true; }
+    }
+
+    for i, g in glyphs {
+        let c = cast!usize(g.cluster);
+        if c < len {
+            isStart[c] = true;
+            lefts[c] = min(lefts[c], pens[i]);
+            rights[c] = max(rights[c], pens[i] + g.advance);
+        }
+    }
+
+    let dmut carets: [f32] = [];
+    let mut last = 0.0f;
+    let mut i = 0us;
+    while i < len {
+        // the code units before the first cluster are given to it
+        let mut cs = i;
+        while cs < len && !isStart[cs] { cs += 1us; }
+        if cs == len {
+            carets ~= [last];
+            i += 1us;
+            continue;
+        }
+
+        let mut ce = cs + 1us;
+        while ce < len && !isStart[ce] { ce += 1us; }
+
+        let lead  = if backward { rights[cs] } else { lefts[cs] };
+        let trail = if backward { lefts[cs] } else { rights[cs] };
+
+        let mut parts = 1us;
+        for j in cs + 1us .. ce {
+            if isStop[j] { parts += 1us; }
+        }
+
+        let mut k = 0us;
+        for j in i .. ce {
+            if j > cs && isStop[j] { k += 1us; }
+            carets ~= [lead + (trail - lead) * cast!f32(cast!u32(k)) / cast!f32(cast!u32(parts))];
+        }
+
+        last = trail;
+        i = ce;
+    }
+
+    carets ~= [last];
+    carets
 }
 
 /**
