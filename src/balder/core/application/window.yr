@@ -11,12 +11,12 @@ use std::algorithm::comparison;
 
 use ::core::concurrency::sync::{mutex, semaphore};
 
-use ::sdl2::_;
+use ::sdl3::_;
 
 use ::vulkan::core;
 
 /**
- * The DPI at which a CSS pixel (1/96 of an inch) is a window unit, the one of a desktop whose DPI cannot be read
+ * The DPI at which a CSS pixel (1/96 of an inch) is a pixel, the one of a display at the scale 1
  */
 pub def REFERENCE_DPI = 96.0f;
 
@@ -30,10 +30,10 @@ pub class Window {
 
     prot { // context
 
-        // the width of the window
+        // the width of the window in pixels
         let mut _w: u32 = 0;
 
-        // The height of the window
+        // The height of the window in pixels
         let mut _h: u32 = 0;
 
         // The name (displayed on the window bar) of the window
@@ -60,11 +60,8 @@ pub class Window {
         // The drawing pipeline of the window
         let dmut _pipeline: (&VulkanPipeline)? = none;
 
-        // The configured DPI of the interface, 0 when it is the one of the desktop
+        // The configured DPI of the interface, 0 when it is the one of the display of the window
         let mut _dpi: f32 = 0.0f;
-
-        // The DPI the desktop renders its applications at, 0 when it cannot be read
-        let mut _desktopDpi: f32 = 0.0f;
     }
 
     prot { // drawing
@@ -136,48 +133,34 @@ pub class Window {
     {
         atomic {
             if __FIRST_WINDOW__[0] {
-                if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
-                    throw copy BalderError("Failed to init SDL2");
+                if !SDL_Init(SDL_INIT_VIDEO) {
+                    throw copy BalderError("Failed to init SDL3 : " ~ sdlError());
                 }
 
                 __FIRST_WINDOW__[0] = false;
             }
         }
 
-        // Sizes relative to the screen are resolved against the usable bounds of display 0 (task bar and panels left out)
-        let mut bounds = SDL_Rect();
-        if SDL_GetDisplayUsableBounds(0, alias &bounds) < 0 {
-            throw copy BalderError("Failed to query the usable bounds of the display");
-        }
-
         self._dpi = cfg.window.dpi;
-        self._desktopDpi = readDesktopDpi();
 
-        // The sizes in pixels of the configuration are CSS pixels, scaled like the rest of the interface
-        self._w = cfg.window.width.resolve(cast!u32(bounds.w), scale-> self.getScale());
-        self._h = cfg.window.height.resolve(cast!u32(bounds.h), scale-> self.getScale());
-
+        // Created hidden at a provisional size, the configured one depending on the scale of the display the window
+        // opens on. The back buffer has the pixels of the display, not its coordinates
+        let flags = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
         self._sdlWindow = SDL_CreateWindow(std::conv::toStringZ(self._name),
-                                           cast!i32(SDL_WINDOWPOS_UNDEFINED),
-                                           cast!i32(SDL_WINDOWPOS_UNDEFINED),
-                                           cast!i32(self._w),
-                                           cast!i32(self._h),
-                                           if (cfg.window.resizable) {
-                                               SDL_WindowFlags::SDL_WINDOW_VULKAN
-                                               | SDL_WindowFlags::SDL_WINDOW_RESIZABLE
-                                           } else {
-                                               SDL_WindowFlags::SDL_WINDOW_VULKAN
-                                           });
+                                           640,
+                                           480,
+                                           if cfg.window.resizable { flags | SDL_WINDOW_RESIZABLE } else { flags });
 
         if (self._sdlWindow == null) {
-            throw copy BalderError("Failed to create window");
+            throw copy BalderError("Failed to create window : " ~ sdlError());
         }
+
+        self:.resizeToConfiguration(cfg);
 
         self._vkInstance:.configure(alias self, cfg);
 
-        SDL_Vulkan_CreateSurface(self._sdlWindow, self._vkInstance:.getHandle(), alias &self._vkSurface);
-        if (self._vkSurface == null) {
-            throw copy BalderError("Failed to create vulkan surface");
+        if !SDL_Vulkan_CreateSurface(self._sdlWindow, self._vkInstance:.getHandle(), null, alias &self._vkSurface) {
+            throw copy BalderError("Failed to create vulkan surface : " ~ sdlError());
         }
 
         self._vkDevice:.configure(alias self, cfg);
@@ -198,6 +181,41 @@ pub class Window {
 
         // Draw empty screen, to configure default command buffers
         self:.configureRenderPipeline();
+    }
+
+    /**
+     * Size the window as configured, at the scale of its display
+     * @params:
+     *    - cfg: the configuration of the window
+     * @throws:
+     *    - &BalderError: if the display of the window cannot be queried
+     */
+    fn resizeToConfiguration(mut self, cfg: &BalderConfig)
+        throws BalderError
+    {
+        // Sizes relative to the screen are resolved against the usable bounds of the display of the window (task bar
+        // and panels left out), which are in window coordinates
+        let mut bounds = SDL_Rect();
+        if !SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(self._sdlWindow), alias &bounds) {
+            throw copy BalderError("Failed to query the usable bounds of the display : " ~ sdlError());
+        }
+
+        // The sizes in pixels of the configuration are CSS pixels, scaled like the rest of the interface, then
+        // brought back to window coordinates
+        let coordinates = self.getScale() / self.getPixelDensity();
+        let w = cfg.window.width.resolve(cast!u32(bounds.w), scale-> coordinates);
+        let h = cfg.window.height.resolve(cast!u32(bounds.h), scale-> coordinates);
+
+        // Centered on its display, where the compositor puts it under Wayland, which leaves no client the placement
+        SDL_SetWindowSize(alias self._sdlWindow, cast!i32(w), cast!i32(h));
+        SDL_SetWindowPosition(alias self._sdlWindow, cast!i32(SDL_WINDOWPOS_CENTERED), cast!i32(SDL_WINDOWPOS_CENTERED));
+        SDL_SyncWindow(alias self._sdlWindow);
+
+        let (pw, ph) = self.getDimension();
+        self._w = pw;
+        self._h = ph;
+
+        log::debug #("Window", "Sized", pw, "x", ph, "pixels, density", self.getPixelDensity(), "scale", self.getScale());
     }
 
     /**
@@ -229,14 +247,17 @@ pub class Window {
     /**
      * Change the dimension of the window
      * @params:
-     *    - w: the width of the window
-     *    - h: the height of the window
+     *    - w: the width of the window in pixels
+     *    - h: the height of the window in pixels
      */
     pub fn setDimension(mut self, w: u32, h: u32) {
         self._w = w;
         self._h = h;
         if (self._sdlWindow != null) {
-            SDL_SetWindowSize(alias self._sdlWindow, cast!i32(self._w), cast!i32(self._h));
+            let density = self.getPixelDensity();
+            SDL_SetWindowSize(alias self._sdlWindow,
+                              cast!i32(round(cast!f32(w) / density)),
+                              cast!i32(round(cast!f32(h) / density)));
         }
     }
 
@@ -280,13 +301,13 @@ pub class Window {
 
     /**
      * @returns:
-     *   - .0: the width of the window
-     *   - .1: the height of the window
+     *   - .0: the width of the window in pixels
+     *   - .1: the height of the window in pixels
      */
     pub fn getDimension(self)-> (u32, u32) {
         if self._sdlWindow != null {
             let mut w = 0, mut h = 0;
-            SDL_GetWindowSize(self._sdlWindow, alias &w, alias &h);
+            SDL_GetWindowSizeInPixels(self._sdlWindow, alias &w, alias &h);
             return (cast!u32(w), cast!u32(h));
         }
 
@@ -294,21 +315,38 @@ pub class Window {
     }
 
     /**
-     * @returns: the DPI of the interface, the configured one, or else the one of the desktop
+     * @returns: the number of pixels in a window coordinate, those of the mouse events and of the window size the
+     * desktop sees
      */
-    pub fn getDpi(self)-> f32 {
-        if self._dpi > 0.0f {
-            self._dpi
-        } else if self._desktopDpi > 0.0f {
-            self._desktopDpi
-        } else {
-            REFERENCE_DPI
+    pub fn getPixelDensity(self)-> f32 {
+        if self._sdlWindow != null {
+            let density = SDL_GetWindowPixelDensity(self._sdlWindow);
+            if density > 0.0f { return density; }
         }
+
+        1.0f
     }
 
     /**
-     * @returns: the number of window units in a CSS pixel, the DPI of the interface over the reference one, rounded to
-     * a quarter
+     * @returns: the DPI of the interface, the configured one, or else the one the desktop displays the window at (the
+     * reference DPI times the display scale of the window)
+     */
+    pub fn getDpi(self)-> f32 {
+        if self._dpi > 0.0f {
+            return self._dpi;
+        }
+
+        if self._sdlWindow != null {
+            let scale = SDL_GetWindowDisplayScale(self._sdlWindow);
+            if scale > 0.0f { return REFERENCE_DPI * scale; }
+        }
+
+        REFERENCE_DPI
+    }
+
+    /**
+     * @returns: the number of pixels in a CSS pixel, the DPI of the interface over the reference one, rounded to a
+     * quarter
      */
     pub fn getScale(self)-> f32 {
         max(0.25f, round(self.getDpi() * 4.0f / REFERENCE_DPI) / 4.0f)
@@ -866,7 +904,7 @@ pub class Window {
             self._vkInstance:.dispose();
 
             if (self._sdlWindow != null) {
-                SDL_DestroyWindow(self._sdlWindow);
+                SDL_DestroyWindow(alias self._sdlWindow);
                 self._sdlWindow = null;
             }
         }
@@ -889,4 +927,11 @@ pub class Window {
     __dtor(mut self) {
         self:.dispose();
     }
+}
+
+/**
+ * @returns: the message of the last error of SDL
+ */
+fn sdlError()-> [c8] {
+    unsafe { std::conv::fromStringZ(SDL_GetError()) }
 }
