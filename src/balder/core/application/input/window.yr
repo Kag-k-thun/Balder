@@ -1,10 +1,10 @@
 in window;
 
-use ::sdl2::_;
-
 use balder::core::application::{input::_, signal};
 
-use std::{conv, io, time};
+use std::{conv, io, math, time};
+
+use ::sdl3::_;
 
 /**
  * All events associated to a given window
@@ -19,7 +19,7 @@ pub class WindowInputSignals {
     // The list of key combinations that trigger signals
     let dmut _combinations: [[SDL_Keycode] => &Signal!{()}] = copy [];
 
-    // The list of mouse events that trigger signals
+    // The list of mouse events that trigger signals, at a position in pixels in the window
     let dmut _mouse: [MouseInfo => &Signal!{i32, i32, MouseInfo}] = copy [];
 
     // The signal emitted when a double click is sent
@@ -45,8 +45,11 @@ pub class WindowInputSignals {
 
     prot { // window events
 
-        // Signal emitted when the window is resized
+        // Signal emitted when the size of the window in pixels changes
         let dmut _resize: (&Signal!{u32, u32})? = none;
+
+        // Signal emitted when the display scale of the window changes
+        let dmut _scaleChanged: (&Signal!{()})? = none;
 
         // Signal emitted when the position of the window is updated
         let dmut _moved: (&Signal!{u32, u32})? = none;
@@ -85,8 +88,8 @@ pub class WindowInputSignals {
     // True if the window has the keyboard focus and is currently in text edit mode
     let mut _isTextInput: bool = false;
 
-    // The timestamp of the last left click
-    let mut _lastClick: u32 = 0u32;
+    // The timestamp of the last left click in nanoseconds
+    let mut _lastClick: u64 = 0u64;
 
     // The amount of time between two clicks to be considered a double click in milliseconds
     let mut _doubleClickSensivity: u32 = 300u32;
@@ -283,7 +286,8 @@ pub class WindowInputSignals {
     }
 
     /**
-     * @returns: the signal emitted when the window is resized
+     * @returns: the signal emitted when the size of the window in pixels changes, with that size, when the window is
+     * resized or its display scale changes
      */
     pub fn windowResized(mut self)-> dmut &Signal!{u32, u32} {
         if let Ok(dmut t) = alias self._resize {
@@ -292,6 +296,21 @@ pub class WindowInputSignals {
 
         let dmut ret = copy Signal!{u32, u32} ();
         self._resize = (alias ret)?;
+
+        alias ret
+    }
+
+    /**
+     * @returns: the signal emitted when the display scale of the window changes, the window moved to another display
+     * or the scale of its display changed
+     */
+    pub fn windowScaleChanged(mut self)-> dmut &Signal!{()} {
+        if let Ok(dmut t) = alias self._scaleChanged {
+            return alias t;
+        }
+
+        let dmut ret = copy Signal!{()} ();
+        self._scaleChanged = (alias ret)?;
 
         alias ret
     }
@@ -435,7 +454,7 @@ pub class WindowInputSignals {
      */
     pub fn startInputText(mut self) {
         if self._hasKeyboardFocus {
-            SDL_StartTextInput();
+            SDL_StartTextInput(SDL_GetWindowFromID(self.uid));
             self._isTextInput = true;
         }
     }
@@ -445,7 +464,7 @@ pub class WindowInputSignals {
      */
     pub fn stopInputText(mut self) {
         if self._hasKeyboardFocus {
-            SDL_StopTextInput();
+            SDL_StopTextInput(SDL_GetWindowFromID(self.uid));
             self._isTextInput = false;
         }
     }
@@ -459,10 +478,10 @@ pub class WindowInputSignals {
      */
 
     /**
-     * Manage an event of type SDL_KEYDOWN
+     * Manage an event of type SDL_EVENT_KEY_DOWN
      */
     pub fn manageKeyDown(mut self, e: SDL_Event) {
-        let key  = e.key.keysym.sym;
+        let key  = e.key.key;
         let kind = if key !in self._isDown {
             self._isDown[key] = ();
             KeyEvent::DOWN
@@ -481,10 +500,10 @@ pub class WindowInputSignals {
     }
 
     /**
-     * Manage an event of type SDL_KEYUP
+     * Manage an event of type SDL_EVENT_KEY_UP
      */
     pub fn manageKeyUp(mut self, e: SDL_Event) {
-        let key = e.key.keysym.sym;
+        let key = e.key.key;
         self._isDown:.remove(key);
 
         if let Ok(dmut x) = alias self._keys[KeyInfo(key, KeyEvent::RELEASE)] {
@@ -495,136 +514,139 @@ pub class WindowInputSignals {
     }
 
     /**
-     * Manage an event of type SDL_MOUSEBUTTONDOWN
+     * Manage an event of type SDL_EVENT_MOUSE_BUTTON_DOWN
      */
     pub fn manageMouseButtonDown(mut self, e: SDL_Event) {
         let button = e.button.button;
+        let (x, y) = self.toPixels(e.button.x, e.button.y);
 
         if button == SDL_BUTTON_LEFT {
-            let diff = e.common.timestamp - self._lastClick;
+            let diff = (e.common.timestamp - self._lastClick) / SDL_NS_PER_MS;
             self._lastClick = e.common.timestamp;
 
-            if e.button.clicks != 1 && diff <= self._doubleClickSensivity {
+            if e.button.clicks != 1u8 && diff <= cast!u64(self._doubleClickSensivity) {
                 if let Ok(dmut m) = alias self._doubleClick {
-                    m:.emit(e.button.x, e.button.y);
+                    m:.emit(x, y);
                 }
 
                 return;
             }
         }
 
-        if let Ok(dmut x) = alias self._mouse[MouseInfo(button, KeyEvent::DOWN)] {
-            x:.emit(e.button.x, e.button.y, MouseInfo(button, KeyEvent::DOWN));
-        } else if let Ok(dmut x) = alias self._mouse[MouseInfo(button, KeyEvent::ALL)] {
-            x:.emit(e.button.x, e.button.y, MouseInfo(button, KeyEvent::DOWN));
+        if let Ok(dmut m) = alias self._mouse[MouseInfo(button, KeyEvent::DOWN)] {
+            m:.emit(x, y, MouseInfo(button, KeyEvent::DOWN));
+        } else if let Ok(dmut m) = alias self._mouse[MouseInfo(button, KeyEvent::ALL)] {
+            m:.emit(x, y, MouseInfo(button, KeyEvent::DOWN));
         }
     }
 
     /**
-     * Manage an event of type SDL_MOUSEBUTTONUP
+     * Manage an event of type SDL_EVENT_MOUSE_BUTTON_UP
      */
     pub fn manageMouseButtonUp(mut self, e: SDL_Event) {
         let button = e.button.button;
-        if let Ok(dmut x) = alias self._mouse[MouseInfo(button, KeyEvent::RELEASE)] {
-            x:.emit(e.button.x, e.button.y, MouseInfo(button, KeyEvent::RELEASE));
-        } else if let Ok(dmut x) = alias self._mouse[MouseInfo(button, KeyEvent::ALL)] {
-            x:.emit(e.button.x, e.button.y, MouseInfo(button, KeyEvent::RELEASE));
+        let (x, y) = self.toPixels(e.button.x, e.button.y);
+
+        if let Ok(dmut m) = alias self._mouse[MouseInfo(button, KeyEvent::RELEASE)] {
+            m:.emit(x, y, MouseInfo(button, KeyEvent::RELEASE));
+        } else if let Ok(dmut m) = alias self._mouse[MouseInfo(button, KeyEvent::ALL)] {
+            m:.emit(x, y, MouseInfo(button, KeyEvent::RELEASE));
         }
     }
 
     /**
-     * Emit the signal for a SDL_MOUSEMOTION event
+     * Emit the signal for a SDL_EVENT_MOUSE_MOTION event
      */
     pub fn manageMouseMotion(mut self, e: SDL_Event) {
         if let Ok(dmut m) = alias self._motion {
-            m:.emit(e.button.x, e.button.y);
+            let (x, y) = self.toPixels(e.motion.x, e.motion.y);
+            m:.emit(x, y);
         }
     }
 
     /**
-     * Emit the signal for a SDL_MOUSEWHEEL event
+     * Emit the signal for a SDL_EVENT_MOUSE_WHEEL event
      */
     pub fn manageMouseWheel(mut self, e: SDL_Event) {
         if let Ok(dmut m) = alias self._wheel {
-            let mut x = 0, mut y = 0;
-            SDL_GetMouseState(alias &x, alias &y);
-            m:.emit(x, y, e.wheel.x, e.wheel.y);
+            let (x, y) = self.toPixels(e.wheel.mouse_x, e.wheel.mouse_y);
+            m:.emit(x, y, e.wheel.integer_x, e.wheel.integer_y);
         }
     }
 
     /**
-     * Manage the event of type SDL_WINDOWEVENT
+     * Manage the events of a window, of type SDL_EVENT_WINDOW_*
      */
     pub fn manageWindowEvent(mut self, e: SDL_Event) {
-        match e.window.event {
-            SDL_WindowEventID::SDL_WINDOWEVENT_RESIZED => {
+        match e.type {
+            SDL_EventType::SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
                 if let Ok(dmut m) = alias self._resize {
                     m:.emit(cast!u32(e.window.data1), cast!u32(e.window.data2));
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_SIZE_CHANGED => {
-                if let Ok(dmut m) = alias self._resize {
-                    m:.emit(cast!u32(e.window.data1), cast!u32(e.window.data2));
+            SDL_EventType::SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED => {
+                if let Ok(dmut m) = alias self._scaleChanged {
+                    m:.emit();
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_MOVED => {
+            SDL_EventType::SDL_EVENT_WINDOW_MOVED => {
                 if let Ok(dmut m) = alias self._moved {
                     m:.emit(cast!u32(e.window.data1), cast!u32(e.window.data2));
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_EXPOSED => {
+            SDL_EventType::SDL_EVENT_WINDOW_EXPOSED => {
                 if let Ok(dmut m) = alias self._exposed {
                     m:.emit();
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_HIDDEN => {
+            SDL_EventType::SDL_EVENT_WINDOW_HIDDEN => {
                 if let Ok(dmut m) = alias self._hidden {
                     m:.emit();
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_SHOWN => {
+            SDL_EventType::SDL_EVENT_WINDOW_SHOWN => {
                 if let Ok(dmut m) = alias self._shown {
                     m:.emit();
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_MINIMIZED => {
+            SDL_EventType::SDL_EVENT_WINDOW_MINIMIZED => {
                 if let Ok(dmut m) = alias self._minimized {
                     m:.emit();
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_MAXIMIZED => {
+            SDL_EventType::SDL_EVENT_WINDOW_MAXIMIZED => {
                 if let Ok(dmut m) = alias self._maximized {
                     m:.emit();
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_RESTORED => {
+            SDL_EventType::SDL_EVENT_WINDOW_RESTORED => {
                 if let Ok(dmut m) = alias self._restored {
                     m:.emit();
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_FOCUS_GAINED => {
+            SDL_EventType::SDL_EVENT_WINDOW_FOCUS_GAINED => {
                 self._hasKeyboardFocus = true;
                 if let Ok(dmut m) = alias self._keyboardFocus {
                     m:.emit(true);
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_FOCUS_LOST => {
+            SDL_EventType::SDL_EVENT_WINDOW_FOCUS_LOST => {
                 self._hasKeyboardFocus = false;
                 if let Ok(dmut m) = alias self._keyboardFocus {
                     m:.emit(false);
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_ENTER => {
+            SDL_EventType::SDL_EVENT_WINDOW_MOUSE_ENTER => {
                 if let Ok(dmut m) = alias self._mouseFocus {
                     m:.emit(true);
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_LEAVE => {
+            SDL_EventType::SDL_EVENT_WINDOW_MOUSE_LEAVE => {
                 if let Ok(dmut m) = alias self._mouseFocus {
                     m:.emit(false);
                 }
             }
-            SDL_WindowEventID::SDL_WINDOWEVENT_CLOSE => {
+            SDL_EventType::SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                 if let Ok(dmut m) = alias self._quit && !self._freeze {
                     m:.emit();
                 }
@@ -633,23 +655,23 @@ pub class WindowInputSignals {
     }
 
     /**
-     * Manage event of type SDL_TEXTINPUT
+     * Manage event of type SDL_EVENT_TEXT_EDITING
      */
     pub fn manageTextEdit(mut self, e: SDL_Event) {
-        if let Ok(dmut m) = alias self._textEdit {
+        if let Ok(dmut m) = alias self._textEdit && e.edit.text != null {
             unsafe {
-                m:.emit(std::conv::fromStringZ(e.edit.text.ptr), cast!u32(e.edit.start), cast!u32(e.edit.length));
+                m:.emit(std::conv::fromStringZ(e.edit.text), cast!u32(e.edit.start), cast!u32(e.edit.length));
             }
         }
     }
 
     /**
-     * Manage event of type SDL_TEXTEDIT
+     * Manage event of type SDL_EVENT_TEXT_INPUT
      */
     pub fn manageTextInput(mut self, e: SDL_Event) {
-        if let Ok(dmut m) = alias self._textInput {
+        if let Ok(dmut m) = alias self._textInput && e.text.text != null {
             unsafe {
-                m:.emit(std::conv::fromStringZ(e.text.text.ptr));
+                m:.emit(std::conv::fromStringZ(e.text.text));
             }
         }
     }
@@ -670,6 +692,17 @@ pub class WindowInputSignals {
         if let Ok(dmut m) = alias self._freezeSig {
             m:.emit();
         }
+    }
+
+    /**
+     * @returns: the position in pixels of the window coordinates ('x', 'y') of a mouse event
+     * */
+    fn toPixels(self, x: f32, y: f32)-> (i32, i32) {
+        let window  = SDL_GetWindowFromID(self.uid);
+        let density = if window != null { SDL_GetWindowPixelDensity(window) } else { 1.0f };
+        let ratio   = if density > 0.0f { density } else { 1.0f };
+
+        (cast!i32(floor(x * ratio)), cast!i32(floor(y * ratio)))
     }
 
     /**
