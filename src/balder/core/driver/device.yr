@@ -1,13 +1,14 @@
 in device;
 
-use balder::core::{_, driver::_, memory, application::window};
-
+use balder::core::{_, driver::_, memory};
+use balder::core::application::window;
 use balder::utils::log;
 
-use ::vulkan::core;
+use std::{conv, io, time};
+
 use ::sdl2;
 
-use std::{conv, io, time};
+use ::vulkan::core;
 
 /**
  * A vulkan device used to manage vulkan rendering tools
@@ -99,6 +100,18 @@ pub class VulkanDevice {
 
         // The transfer pass of the device
         let dmut _transferPass: (&VulkanTransferPass)? = none;
+    }
+
+    prot { // Deferred disposal
+
+        // The disposals waiting for every frame slot to be recorded again, stamped with the redraw generation
+        let dmut _retired: &RetireQueue = copy RetireQueue();
+
+        // The disposals waiting for the frames in flight, stamped with the number of awaited frames
+        let dmut _retiredAfterFrame: &RetireQueue = copy RetireQueue();
+
+        // True when a retire is waiting for the pipeline to record its frame slots again
+        let mut _redrawRequested: bool = false;
     }
 
     /*!
@@ -519,6 +532,101 @@ pub class VulkanDevice {
     /**
      * ======================================================================================================
      * ======================================================================================================
+     * ==========================================   DEFERRED DISPOSAL  ======================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * Dispose an object that recorded commands may reference, once they no longer can: every frame slot
+     * was recorded again after the retire, and the submission of its previous recording was awaited
+     * @info: requests the redraw itself (see takeRedrawRequest), the caller has nothing else to do
+     * @params:
+     *    - clean: the disposal of the object
+     */
+    pub fn retire(mut self, clean: dg ()-> void) {
+        atomic self._retired {
+            self._retired:.push(clean);
+            self._redrawRequested = true;
+        }
+    }
+
+    /**
+     * Dispose an object that only submitted commands use (staging buffers, the allocators of a replaced
+     * recording), once every frame in flight was awaited
+     * @warning: never for an object that recorded commands reference, they are submitted again, use retire
+     * @params:
+     *    - clean: the disposal of the object
+     */
+    pub fn retireAfterFrame(mut self, clean: dg ()-> void) {
+        self._retiredAfterFrame:.push(clean);
+    }
+
+    /**
+     * @returns: true if a retire is waiting for the frame slots to be recorded again, the request is cleared
+     * @warning: the caller has to advance the generation after this call, so a retire racing with it is
+     * either covered by that new generation or requests another redraw
+     */
+    pub fn takeRedrawRequest(mut self)-> bool {
+        atomic self._retired {
+            let requested = self._redrawRequested;
+            self._redrawRequested = false;
+            requested
+        }
+    }
+
+    /**
+     * Start a new redraw generation, the objects retired before it are not referenced by the recordings made in it
+     * @returns: the new generation
+     */
+    pub fn advanceGeneration(mut self)-> u64 {
+        self._retired:.advance()
+    }
+
+    /**
+     * @returns: the current redraw generation, to stamp a recording with before it starts
+     */
+    pub fn getGeneration(self)-> u64 {
+        self._retired.getStamp()
+    }
+
+    /**
+     * @returns: the number of disposals waiting in the retire queues
+     */
+    pub fn getPendingRetires(self)-> usize {
+        self._retired.len() + self._retiredAfterFrame.len()
+    }
+
+    /**
+     * Run the disposals that became safe after a frame slot was awaited
+     * @params:
+     *    - safeGeneration: the lowest generation a frame slot may still record or have in flight
+     */
+    pub fn collect(mut self, safeGeneration: u64) {
+        // Every slot has a frame in flight, an entry is safe once each of them was awaited after it
+        let awaited = self._retiredAfterFrame:.advance();
+        let nbFrames = cast!u64(self.getNbFrames());
+        if awaited >= nbFrames {
+            self._retiredAfterFrame:.collect(awaited - nbFrames + 1u64);
+        }
+
+        self._retired:.collect(safeGeneration);
+
+        log::debug #("Device", "Pending retires :", self.getPendingRetires());
+    }
+
+    /**
+     * Run every retired disposal
+     * @warning: only once nothing recorded or in flight can use the retired objects (device idle, commands reset)
+     */
+    pub fn drainRetired(mut self) {
+        // Draining one queue can retire in the other
+        while self._retired:.drain() + self._retiredAfterFrame:.drain() != 0us {}
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
      * ============================================   MEM ALLOCATOR  ========================================
      * ======================================================================================================
      * ======================================================================================================
@@ -895,6 +1003,10 @@ pub class VulkanDevice {
 
         pub over dispose(mut self) {
             atomic self {
+                // The retired objects free their memory through the allocators, they go first
+                self:.waitIdle();
+                self:.drainRetired();
+
                 self._requiredExtensions = copy [];
                 self._win = none;
 

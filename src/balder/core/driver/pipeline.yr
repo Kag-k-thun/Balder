@@ -1,9 +1,9 @@
 in pipeline;
 
-use ::vulkan::core;
-
-use balder::core::{_, driver::_, application::bin};
+use balder::core::{_, driver::_};
 use balder::utils::log;
+
+use ::vulkan::core;
 
 
 enum FrameDrawing
@@ -40,9 +40,12 @@ pub class VulkanPipeline {
 
         // The number of frames to redraw
         let mut _redrawFrames : u32 = 0;
+    }
 
-        // The number of frames to await (second pass)
-        let mut _awaitingFrames : u32 = 0;
+    prot { // deferred disposal
+
+        // The redraw generations of the frame slots
+        let dmut _generations : &SlotGenerations = copy SlotGenerations (0u32);
     }
 
     prot { // pass graph
@@ -61,11 +64,6 @@ pub class VulkanPipeline {
         
         // The compose pass (out node of the pipeline DAG)
         let dmut _compose : &VulkanSubpass;        
-    }
-
-    prot {
-        // The garbage bin used for cleaning
-        let dmut _bin : &GarbageBin = copy GarbageBin ();
     }
 
     
@@ -87,31 +85,6 @@ pub class VulkanPipeline {
 
     __dtor (mut self) {
         self:.dispose ();
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ===================================          TRASH BIN          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    // /**
-    //  * @return: the garbage bin used to recycle resources when all their references have disappeared
-    //  * */
-    // pub fn getBin (mut self)-> dmut &GarbageBin {
-    //     alias self._bin
-    // }    
-
-    /**
-     * Insert an element in the garbage bin
-     * */
-    pub fn insertBin {T impl Disposable} (mut self, dmut obj : T) {        
-        atomic self {                        
-            let dmut bin = alias self._bin:.get!{&ResourceBin!{T}} ();
-            bin:.insert (alias obj);            
-        }        
     }
 
     /*!
@@ -139,7 +112,14 @@ pub class VulkanPipeline {
         }
 
         let frame = self._device.getCurrentFrameIndex ();        
-        self._compose:.awaitRender (frame);        
+        self._compose:.awaitRender (frame);
+
+        // The slot only uses its current recording from now on
+        let safe = atomic self {
+            self._generations:.awaited (frame)
+        };
+
+        self._device:.collect (safe);
     }
 
     /**
@@ -147,9 +127,16 @@ pub class VulkanPipeline {
      * */
     pub fn submitFrame (mut self) {
         let frame = self._device.getCurrentFrameIndex ();        
+        if self._device:.takeRedrawRequest () {
+            self:.forceRedraw ();
+        }
+
         atomic self {                        
             if self._updated [frame] == FrameDrawing::REDRAW {                
                 self._updated [frame] = FrameDrawing::DRAWING;
+
+                // Read before recording, so an object retired while recording is never counted as unused by it
+                self._generations:.recorded (frame, self._device.getGeneration ());
                                                         
                 // Redraw all subpasses for the current frame
                 for dmut pass in alias self._passGraph {
@@ -160,11 +147,6 @@ pub class VulkanPipeline {
                 self._redrawFrames -= 1;                
             } else if self._updated [frame] == FrameDrawing::SWAPPED {
                 self._updated [frame] = FrameDrawing::AWAITED;
-                self._awaitingFrames -= 1;
-                
-                if self._awaitingFrames == 0 {                    
-                    self._bin:.emptyTrash ();            
-                }
             }
             
             self:.submitNoDraw (frame);                        
@@ -186,16 +168,16 @@ pub class VulkanPipeline {
     }
     
     /**
-     * Force the subpass to be redrawn
+     * Force the subpass to be redrawn, in a new generation
      * */
     pub fn forceRedraw (mut self) {        
         atomic self {            
+            self._device:.advanceGeneration ();
             for i in 0 .. self._updated.len {
                 self._updated [i] = FrameDrawing::REDRAW;
             }
             
             self._redrawFrames = cast!u32 (self._updated.len);
-            self._awaitingFrames = cast!u32 (self._updated.len);            
         }
     }
 
@@ -306,6 +288,7 @@ pub class VulkanPipeline {
             
             self._passGraph = copy [content];    
             self._updated = copy [FrameDrawing::REDRAW ; self._device.getNbFrames ()];
+            self._generations = copy SlotGenerations (self._device.getNbFrames ());
             self._passes [""] = alias self._compose;
         }
     }
@@ -450,8 +433,9 @@ pub class VulkanPipeline {
                     self._redrawFrames = cast!u32 (self._updated.len);
                 }                
             }
-            
-            self._bin:.emptyTrash ();
+
+            // Nothing is recorded nor in flight anymore
+            self._device:.drainRetired ();
         }
     }
 }
