@@ -5,12 +5,167 @@ use balder::core::error;
 use std::{fs, stream};
 use std::config::{_, conv::_};
 
+/**
+ * A dimension of a window, either a pixel count or a fraction of the usable bounds of the display clamped between
+ * two pixel counts. Written in the configuration as `width = 1024` or `width = {relative = 0.6, min = 800, max = 1920}`
+ */
+pub record WindowSize {
+
+    // The fraction of the usable bounds of the display, in ]0, 1]
+    let mut _relative: f64 = 1.0;
+
+    // The minimum size in pixels
+    let mut _min: u32 = 0u32;
+
+    // The maximum size in pixels
+    let mut _max: u32 = cast!u32(i32::max);
+
+    /**
+     * A size of `pix` pixels, whatever the display
+     */
+    pub self (pix: u32)
+        with _relative = 1.0
+        , _min = pix
+        , _max = pix
+    {}
+
+    /**
+     * Read a size from a configuration entry, a pixel count or a table with the entries relative, min and max
+     * @params:
+     *    - name: the name of the entry, quoted in the errors
+     *    - cfg: the value of the entry
+     * @throws:
+     *    - &BalderError: if the entry is neither a positive pixel count nor a well formed table
+     */
+    pub self (name: [c8], cfg: &Config)
+        throws BalderError
+    {
+        match cfg {
+            Int(value-> pix) => {
+                self._min = readPixels(name, pix);
+                self._max = self._min;
+            }
+            d: &Dict => {
+                for key, value in d[] match key {
+                    "relative" => {
+                        self._relative = readRelative(name, value);
+                    }
+                    "min" => {
+                        self._min = readPixels(name ~ ".min", value);
+                    }
+                    "max" => {
+                        self._max = readPixels(name ~ ".max", value);
+                    }
+                    _ => {
+                        throw copy BalderError("Unexpected entry " ~ name ~ "." ~ key ~ " in the window size");
+                    }
+                }
+
+                if self._min > self._max {
+                    throw copy BalderError("Window " ~ name ~ " has a min greater than its max");
+                }
+            }
+            _ => {
+                throw copy BalderError("Window " ~ name ~ " must be a pixel count or a table {relative, min, max}");
+            }
+        }
+    }
+
+    /**
+     * @params:
+     *    - display: the usable length of the display along this dimension, in screen coordinates
+     * @returns: the size of the window along this dimension, the relative part of `display` clamped between min and max
+     */
+    pub fn resolve(self, display: u32)-> u32 {
+        let size = cast!u32(self._relative * cast!f64(display) + 0.5);
+        if size < self._min {
+            self._min
+        } else if size > self._max {
+            self._max
+        } else {
+            size
+        }
+    }
+
+    @field
+    pub fn relative(self)-> f64 {
+        self._relative
+    }
+
+    @field
+    pub fn min(self)-> u32 {
+        self._min
+    }
+
+    @field
+    pub fn max(self)-> u32 {
+        self._max
+    }
+
+    impl Streamable;
+}
+
+/**
+ * @returns: the pixel count `cfg`, a positive integer that fits an i32
+ * @throws:
+ *    - &BalderError: if `cfg` is not such an integer, naming the entry `name`
+ */
+fn readPixels(name: [c8], cfg: &Config)-> u32
+    throws BalderError
+{
+    if let Int(value-> pix) = cfg {
+        return readPixels(name, pix);
+    }
+
+    throw copy BalderError("Window " ~ name ~ " must be a pixel count");
+}
+
+/**
+ * @returns: the pixel count `pix`
+ * @throws:
+ *    - &BalderError: if `pix` is not positive or does not fit an i32, naming the entry `name`
+ */
+fn readPixels(name: [c8], pix: i64)-> u32
+    throws BalderError
+{
+    // SDL takes the window dimensions as i32
+    if pix <= 0 || pix > cast!i64(i32::max) {
+        throw copy BalderError("Window " ~ name ~ " must be a pixel count between 1 and " ~ std::conv::to!{[c8]} (i32::max));
+    }
+
+    cast!u32(pix)
+}
+
+/**
+ * @returns: the fraction of the display `cfg`, in ]0, 1]
+ * @throws:
+ *    - &BalderError: if `cfg` is not a number in ]0, 1], naming the size `name`
+ */
+fn readRelative(name: [c8], cfg: &Config)-> f64
+    throws BalderError
+{
+    let relative = match cfg {
+        Float(value-> f) => { f }
+        Int(value-> i) => { cast!f64(i) }
+        _ => {
+            throw copy BalderError("Window " ~ name ~ ".relative must be a number");
+        }
+    };
+
+    // Written so that NaN is rejected as well
+    if !(relative > 0.0 && relative <= 1.0) {
+        throw copy BalderError("Window " ~ name ~ ".relative must be in ]0, 1]");
+    }
+
+    relative
+}
+
 pub record WindowConfig {
 
-    let mut _name: [c8]      = "Balder";
-    let mut _width: u32      = 1024;
-    let mut _height: u32     = 768;
-    let mut _resizable: bool = false;
+    let mut _name: [c8]          = "Balder";
+    let mut _width: WindowSize   = WindowSize(1024u32);
+    let mut _height: WindowSize  = WindowSize(768u32);
+    let mut _resizable: bool     = false;
 
     pub self (cfg: &Config)
         throws BalderError
@@ -20,17 +175,20 @@ pub record WindowConfig {
         }
 
         if let Ok(w) = cfg["width"]? {
-            self._width = cast!{u32} (w.to!{i64} ());
+            self._width = WindowSize("width", w);
         }
 
         if let Ok(h) = cfg["height"]? {
-            self._height = cast!{u32} (h.to!{i64} ());
+            self._height = WindowSize("height", h);
         }
 
         if let Ok(b) = cfg["resizable"]? {
             self._resizable = b.to!{bool} ();
         }
     } catch {
+        b: &BalderError => {
+            throw copy BalderError("Failed to read window configuration : " ~ b.msg);
+        }
         err => {
             throw copy BalderError("Failed to read window configuration : " ~ std::conv::to!{[c8]} (err));
         }
@@ -50,12 +208,12 @@ pub record WindowConfig {
     }
 
     @field
-    pub fn width(self)-> u32 {
+    pub fn width(self)-> WindowSize {
         self._width
     }
 
     @field
-    pub fn height(self)-> u32 {
+    pub fn height(self)-> WindowSize {
         self._height
     }
 
