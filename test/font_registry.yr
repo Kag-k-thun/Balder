@@ -1,0 +1,148 @@
+in font_registry;
+
+use balder::core::error;
+use balder::interface::font::{face, family, registry};
+
+use std::fs::{errors, path, sys};
+
+/**
+ * A registry of the fonts of res:/fonts only, so the tests do not depend on the fonts of the system
+ * */
+fn shipped()-> dmut &FontRegistry {
+    let dmut r = copy FontRegistry(systemDirs-> []);
+    r:.registerDirectory(FontRegistry::RES_FONT_DIR);
+    r:.setGlobalFallbacks([]);
+    alias r
+}
+
+fn resolved(dmut r: &FontRegistry, family: [c8], weight: u32, style: FontStyle)-> FaceMatch
+    throws BalderError
+{
+    if let Ok(m) = r:.resolve(family, weight-> weight, style-> style) {
+        return m;
+    }
+
+    throw copy BalderError("unresolved family " ~ family);
+}
+
+__test shipped_families_are_read_from_the_files {
+    let dmut r = copy FontRegistry(systemDirs-> []);
+    assert (r:.registerDirectory(FontRegistry::RES_FONT_DIR) == 5us);
+    assert (r.isRegistered("Noto Sans"));
+    assert (r.isRegistered("dejavu sans mono"));
+    assert (!r.isRegistered("Noto Serif"));
+}
+
+/**
+ * (weight, style, file, synthetic bold, synthetic oblique)
+ * */
+@parameters ((yield c for c in [(400u32, FontStyle::NORMAL, "res:/fonts/noto/NotoSans-Regular.ttf", false, false),
+                                (700u32, FontStyle::NORMAL, "res:/fonts/noto/NotoSans-Bold.ttf", false, false),
+                                (900u32, FontStyle::NORMAL, "res:/fonts/noto/NotoSans-Bold.ttf", false, false),
+                                (600u32, FontStyle::ITALIC, "res:/fonts/noto/NotoSans-BoldItalic.ttf", false, false),
+                                (300u32, FontStyle::OBLIQUE, "res:/fonts/noto/NotoSans-Italic.ttf", false, false)]))
+__test noto_faces (weight: u32, style: FontStyle, file: [c8], bold: bool, oblique: bool) {
+    let dmut r = shipped();
+    let m = resolved(alias r, "Noto Sans", weight, style);
+    assert (m.face.path == file);
+    assert (m.syntheticBold == bold);
+    assert (m.syntheticOblique == oblique);
+}
+
+__test missing_styles_are_synthesized {
+    let dmut r = shipped();
+    let m = resolved(alias r, "DejaVu Sans Mono", 700u32, FontStyle::ITALIC);
+    assert (m.face.path == "res:/fonts/DejaVuSansMono.ttf");
+    assert (m.syntheticBold && m.syntheticOblique);
+
+    let dmut synthetic = r:.open(m);
+    let dmut regular = r:.openFile("res:/fonts/DejaVuSansMono.ttf");
+    assert (synthetic.isSyntheticBold() && synthetic.isSyntheticOblique());
+    assert (!regular.isSyntheticBold() && !regular.isSyntheticOblique());
+    assert (synthetic.getUniqId() != regular.getUniqId());
+    assert (r:.open(m).getUniqId() == synthetic.getUniqId());
+}
+
+__test unknown_family_has_no_face {
+    let dmut r = shipped();
+    assert (!r:.resolve("No Such Family").hasValue);
+}
+
+__test generic_family_resolves_to_the_first_available {
+    let dmut r = shipped();
+    r:.setGeneric("monospace", copy ["No Such Family", "DejaVu Sans Mono"]);
+    let m = resolved(alias r, "monospace", 400u32, FontStyle::NORMAL);
+    assert (m.face.family == "DejaVu Sans Mono");
+    assert (r.isGeneric("Monospace"));
+}
+
+__test registered_file_takes_the_given_family {
+    let dmut r = copy FontRegistry(systemDirs-> []);
+    let faces = r:.registerFile("res:/fonts/noto/NotoSans-Bold.ttf", family-> "Title", weight-> (500u32)?);
+    assert (faces.len == 1us);
+    assert (faces[0].family == "Title" && faces[0].weight == 500u32 && faces[0].style == FontStyle::NORMAL);
+
+    let m = resolved(alias r, "title", 500u32, FontStyle::NORMAL);
+    assert (m.face.path == "res:/fonts/noto/NotoSans-Bold.ttf");
+}
+
+__test families_expand_with_their_fallbacks {
+    let dmut r = copy FontRegistry(systemDirs-> []);
+    r:.setFallbacks("A", copy ["B", "C"]);
+    r:.setFallbacks("D", copy ["c", "E"]);
+    r:.setGlobalFallbacks(copy ["F", "a"]);
+    assert (r.expandFamilies(copy ["A", "D"]) == ["A", "D", "B", "C", "E", "F"]);
+}
+
+__test changes_bump_the_version {
+    let dmut r = copy FontRegistry(systemDirs-> []);
+    let v = r.getVersion();
+    r:.setFallbacks("A", copy ["B"]);
+    assert (r.getVersion() != v);
+}
+
+/**
+ * A directory standing for the fonts of the system, holding a copy of DejaVu Sans Mono and of Noto Sans Bold
+ * */
+fn systemDir()-> Path
+    throws FsError
+{
+    let dir = tempDirectory(prefix-> "balder_fonts_");
+    createDir(dir.push("truetype"));
+    copyFile(Path("res/fonts/DejaVuSansMono.ttf"), dir.push("truetype/DejaVuSansMono.ttf"));
+    copyFile(Path("res/fonts/noto/NotoSans-Bold.ttf"), dir.push("NotoSans-Bold.TTF"));
+    writeFile(dir.push("readme.txt"), "not a font");
+    writeFile(dir.push("broken.ttf"), "not a font either");
+    dir
+}
+
+__test system_fonts_are_read_on_first_miss {
+    let dir = systemDir();
+    {
+        let dmut r = copy FontRegistry(systemDirs-> copy [dir.toStr()]);
+        let m = resolved(alias r, "DejaVu Sans Mono", 400u32, FontStyle::NORMAL);
+        assert (m.face.path == dir.push("truetype/DejaVuSansMono.ttf").toStr());
+        assert (!r.isRegistered("DejaVu Sans Mono"));
+
+        let b = resolved(alias r, "noto sans", 700u32, FontStyle::NORMAL);
+        assert (!b.syntheticBold);
+        assert (r:.open(b).path.file() == "NotoSans-Bold.TTF");
+    } exit {
+        removeDir(dir, recursive-> true)?;
+    }
+}
+
+__test registered_family_hides_the_system_one {
+    let dir = systemDir();
+    {
+        let dmut r = copy FontRegistry(systemDirs-> copy [dir.toStr()]);
+        r:.registerFile("res:/fonts/noto/NotoSans-Regular.ttf");
+
+        // the bold face of the system is not merged in the registered family, the regular one is emboldened
+        let m = resolved(alias r, "Noto Sans", 700u32, FontStyle::NORMAL);
+        assert (m.face.path == "res:/fonts/noto/NotoSans-Regular.ttf");
+        assert (m.syntheticBold);
+    } exit {
+        removeDir(dir, recursive-> true)?;
+    }
+}

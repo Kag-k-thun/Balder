@@ -1,127 +1,21 @@
 in shaper;
 
-use balder::core::_;
-use balder::interface::font::{face, grapheme};
+mod ::glyph;
+mod ::run;
+mod ::utils;
+
+use balder::core::error;
+use balder::interface::font::{chain, face, grapheme};
 
 use std::{algorithm::_, math};
 
 use ::harfbuzz::{buffer, common, fixed, glyphs, shape};
 
+pub def ShapedGlyph : glyph::ShapedGlyph;
+pub def ShapedRun : run::ShapedRun;
+
 // The gap under which two spans of a selection are merged, in pixels
 def SPAN_JOIN = 0.01f;
-
-/**
- * A glyph of a shaped run, positioned on the baseline
- * */
-@data
-pub record ShapedGlyph {
-
-    // The index of the glyph in the face
-    pub let glyph: u32;
-
-    // The index of the first code unit of the text the glyph comes from
-    pub let cluster: u32;
-
-    // The pen position the glyph is drawn at, from the start of the run, in pixels
-    pub let x: f32;
-
-    // The offset of the glyph up from the baseline, in pixels
-    pub let y: f32;
-
-    // The advance of the pen after the glyph, in pixels
-    pub let advance: f32;
-}
-
-/**
- * A single line of text shaped with a face at a pixel size
- * */
-@data
-pub record ShapedRun {
-
-    // The glyphs of the run, in visual order
-    pub let glyphs: [ShapedGlyph];
-
-    // The advance of the whole run, in pixels
-    pub let width: f32;
-
-    // The vertical metrics of the face at the pixel size of the run
-    pub let metrics: LineMetrics;
-
-    // The height of the em square the run is shaped at
-    pub let pixelSize: u32;
-
-    // The position of a caret put before each code unit of the text, and after the last one, in pixels
-    pub let carets: [f32];
-
-    // The code units a caret can stand before, the grapheme boundaries, followed by the length of the text
-    pub let stops: [usize];
-
-    /**
-     * @returns: the height of the line, from the top of the ascender to the bottom of the descender
-     * */
-    pub fn getHeight(self)-> f32 {
-        self.metrics.ascender - self.metrics.descender
-    }
-
-    /**
-     * @returns: the position of a caret put before the code unit 'index', after the text if 'index' is past its end
-     * */
-    pub fn caretAt(self, index: usize)-> f32 {
-        self.carets[min(index, self.carets.len - 1us)]
-    }
-
-    /**
-     * Find where a click put a caret
-     * @params:
-     *    - x: the position of the click, from the start of the run, in pixels
-     * @returns: the grapheme boundary of the caret, the closest edge of the grapheme under 'x', or the closest boundary
-     * when 'x' is outside the text
-     * */
-    pub fn hitTest(self, x: f32)-> usize {
-        for j in 1us .. self.stops.len {
-            let lead  = self.carets[self.stops[j - 1us]];
-            let trail = self.carets[self.stops[j]];
-            if x >= min(lead, trail) && x <= max(lead, trail) {
-                return if abs(x - lead) <= abs(x - trail) { self.stops[j - 1us] } else { self.stops[j] };
-            }
-        }
-
-        let mut best = 0us;
-        let mut dist = f32::max;
-        for s in self.stops {
-            let d = abs(x - self.carets[s]);
-            if d < dist {
-                dist = d;
-                best = s;
-            }
-        }
-
-        best
-    }
-
-    /**
-     * Compute the horizontal spans covered by the graphemes of a part of the text
-     * @params:
-     *    - start: the code unit the part starts at
-     *    - end: the code unit the part ends before
-     * @returns: the spans, from the start of the run in pixels, merged and sorted from left to right
-     * */
-    pub fn selectionSpans(self, start: usize, end: usize)-> [(f32, f32)] {
-        let lo = min(start, end);
-        let hi = max(start, end);
-
-        let dmut spans: [(f32, f32)] = [];
-        for j in 1us .. self.stops.len {
-            if self.stops[j - 1us] >= lo && self.stops[j] <= hi {
-                let lead  = self.carets[self.stops[j - 1us]];
-                let trail = self.carets[self.stops[j]];
-                spans ~= [(min(lead, trail), max(lead, trail))];
-            }
-        }
-
-        mergeSpans(spans)
-    }
-}
 
 /**
  * Merge the spans that overlap or touch, the spans of the runs of a line becoming the rectangles of its selection
@@ -145,126 +39,79 @@ pub fn mergeSpans(spans: [(f32, f32)])-> [(f32, f32)] {
 }
 
 /**
- * Shape a single line of text with HarfBuzz
+ * Shape a single line of text with HarfBuzz and a single face
  * @params:
  *    - face: the face the glyphs are taken from
  *    - text: the text to shape, in UTF-16 code units
  *    - pixelSize: the height of the em square in pixels
- * @returns: the glyphs of the line, with their positions
+ * @returns: the glyphs of the line, with their positions, every glyph being of the face 0
  * */
 pub fn shapeLine(dmut face: &FontFace, text: [c16], pixelSize: u32)-> ShapedRun
     throws BalderError
 {
-    let metrics = face:.getLineMetrics(pixelSize);
+    let dmut faces = copy [alias face];
+    let dmut chain = copy FontChain::fromFaces(alias faces);
+    shapeLine(alias chain, text, pixelSize)
+}
+
+/**
+ * Shape a single line of text with HarfBuzz, each grapheme being drawn with the first face of the chain that has glyphs
+ * for it
+ * The line is split into one run per face, each run being shaped with the rest of the line as context, the runs being
+ * laid out in the direction of the line
+ * @params:
+ *    - chain: the faces the glyphs are taken from
+ *    - text: the text to shape, in UTF-16 code units
+ *    - pixelSize: the height of the em square in pixels
+ * @returns: the glyphs of the line, with their positions, the line taking the metrics of the primary face
+ * */
+pub fn shapeLine(dmut chain: &FontChain, text: [c16], pixelSize: u32)-> ShapedRun
+    throws BalderError
+{
+    let metrics = chain:.getPrimary():.getLineMetrics(pixelSize);
     if text.len == 0us {
         return ShapedRun([], 0.0f, metrics, pixelSize, copy [0.0f], copy [0us]);
     }
 
-    let dmut font = face:.getHarfbuzzFont(pixelSize);
-    let dmut buf = hb_buffer_create();
-
-    let (infos, positions, backward) = {
-        hb_buffer_add_utf16(alias buf, text.ptr, cast!i32(text.len), 0u32, cast!i32(text.len));
-        hb_buffer_guess_segment_properties(alias buf);
-        hb_shape(alias font, alias buf, null, 0u32);
-
-        (getGlyphInfos(alias buf), getGlyphPositions(alias buf), HB_DIRECTION_IS_BACKWARD(hb_buffer_get_direction(buf)))
-    } exit {
-        hb_buffer_destroy(alias buf);
-    };
+    let stops = boundaries(text);
+    let runs = utils::splitByFace(alias chain, text, stops);
+    let direction = utils::guessDirection(text);
+    let backward = HB_DIRECTION_IS_BACKWARD(direction);
 
     let dmut result: [ShapedGlyph] = [];
     let dmut pens: [f32] = [];
     let mut pen = 0.0f;
-    for i, info in infos {
-        let p = positions[i];
-        let advance = fromF26Dot6(p.x_advance);
-        result ~= [ShapedGlyph(info.codepoint,
-                               info.cluster,
-                               pen + fromF26Dot6(p.x_offset),
-                               fromF26Dot6(p.y_offset),
-                               advance)];
-        pens ~= [pen];
-        pen += advance;
-    }
+    for k in 0us .. runs.len {
+        let (start, end, faceIndex) = runs[if backward { runs.len - 1us - k } else { k }];
+        let dmut font = chain:.getFace(faceIndex):.getHarfbuzzFont(pixelSize);
+        let dmut buf = hb_buffer_create();
 
-    let stops = boundaries(text);
-    ShapedRun(result, pen, metrics, pixelSize, placeCarets(result, pens, text.len, stops, backward), stops)
-}
+        let (infos, positions) = {
+            hb_buffer_add_utf16(alias buf, text.ptr, cast!i32(text.len), cast!u32(start), cast!i32(end - start));
+            hb_buffer_set_direction(alias buf, direction);
+            hb_buffer_guess_segment_properties(alias buf);
+            hb_shape(alias font, alias buf, null, 0u32);
 
-/**
- * Place a caret before every code unit of a shaped text, on the edges of the clusters, a cluster holding several
- * graphemes (a ligature) being split evenly between them
- * @params:
- *    - glyphs: the shaped glyphs, in visual order
- *    - pens: the pen position of each glyph, without its offset
- *    - len: the number of code units of the text
- *    - stops: the grapheme boundaries of the text
- *    - backward: true if the text is shaped right to left, its first code unit being on the right
- * @returns: the position of the caret before each code unit, and after the last one
- * */
-fn placeCarets(glyphs: [ShapedGlyph], pens: [f32], len: usize, stops: [usize], backward: bool)-> [f32] {
-    // the edges of the clusters, by the code unit they start at
-    let dmut lefts: [f32] = [];
-    let dmut rights: [f32] = [];
-    let dmut isStart: [bool] = [];
-    let dmut isStop: [bool] = [];
-    for _ in 0us .. len {
-        lefts ~= [f32::max];
-        rights ~= [-f32::max];
-        isStart ~= [false];
-        isStop ~= [false];
-    }
+            (getGlyphInfos(alias buf), getGlyphPositions(alias buf))
+        } exit {
+            hb_buffer_destroy(alias buf);
+        };
 
-    for s in stops {
-        if s < len { isStop[s] = true; }
-    }
-
-    for i, g in glyphs {
-        let c = cast!usize(g.cluster);
-        if c < len {
-            isStart[c] = true;
-            lefts[c] = min(lefts[c], pens[i]);
-            rights[c] = max(rights[c], pens[i] + g.advance);
+        for i, info in infos {
+            let p = positions[i];
+            let advance = fromF26Dot6(p.x_advance);
+            result ~= [ShapedGlyph(info.codepoint,
+                                   faceIndex,
+                                   info.cluster,
+                                   pen + fromF26Dot6(p.x_offset),
+                                   fromF26Dot6(p.y_offset),
+                                   advance)];
+            pens ~= [pen];
+            pen += advance;
         }
     }
 
-    let dmut carets: [f32] = [];
-    let mut last = 0.0f;
-    let mut i = 0us;
-    while i < len {
-        // the code units before the first cluster are given to it
-        let mut cs = i;
-        while cs < len && !isStart[cs] { cs += 1us; }
-        if cs == len {
-            carets ~= [last];
-            i += 1us;
-            continue;
-        }
-
-        let mut ce = cs + 1us;
-        while ce < len && !isStart[ce] { ce += 1us; }
-
-        let lead  = if backward { rights[cs] } else { lefts[cs] };
-        let trail = if backward { lefts[cs] } else { rights[cs] };
-
-        let mut parts = 1us;
-        for j in cs + 1us .. ce {
-            if isStop[j] { parts += 1us; }
-        }
-
-        let mut k = 0us;
-        for j in i .. ce {
-            if j > cs && isStop[j] { k += 1us; }
-            carets ~= [lead + (trail - lead) * cast!f32(cast!u32(k)) / cast!f32(cast!u32(parts))];
-        }
-
-        last = trail;
-        i = ce;
-    }
-
-    carets ~= [last];
-    carets
+    ShapedRun(result, pen, metrics, pixelSize, utils::placeCarets(result, pens, text.len, stops, backward), stops)
 }
 
 /**

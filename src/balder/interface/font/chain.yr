@@ -1,0 +1,235 @@
+in chain;
+
+use balder::core::error;
+use balder::interface::font::family;
+use balder::utils::log;
+
+/**
+ * The faces a text is drawn with, tried in order for each grapheme: the faces of the requested families, then the ones
+ * of their fallbacks, then the ones of the global fallbacks
+ * Each family gives the face the closest to the requested weight and style, then its regular face (synthesizing the
+ * weight and style), whose coverage is often wider
+ * The families are resolved on demand, so a fallback is only looked for (and the system fonts only read) when the faces
+ * before it lack a glyph
+ * */
+@final
+pub class FontChain {
+
+    // The registry resolving the families, none for a chain of explicit faces
+    let dmut _registry: (&FontRegistry)? = none;
+
+    // The families of the chain, their fallbacks and the global fallbacks, in the order they are tried
+    let _families: [[c8]] = [];
+
+    // The requested weight
+    let _weight: u32 = FONT_WEIGHT_NORMAL;
+
+    // The requested style
+    let _style: FontStyle = FontStyle::NORMAL;
+
+    // The faces resolved so far, in the order of their families
+    let dmut _faces: [&FontFace] = [];
+
+    // The index of the next family to resolve
+    let mut _next: usize = 0us;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create a chain resolving a list of families in a registry
+     * @params:
+     *    - registry: the registry resolving the families
+     *    - families: the requested families, by order of preference
+     *    - weight: the requested weight
+     *    - style: the requested style
+     * */
+    pub self (dmut registry: &FontRegistry, families: [[c8]], weight: u32 = FONT_WEIGHT_NORMAL, style: FontStyle = FontStyle::NORMAL)
+        with _families = registry.expandFamilies(families)
+        , _weight = weight
+        , _style = style
+    {
+        self._registry = (alias registry)?;
+    }
+
+    /**
+     * Create a chain of explicit faces
+     * */
+    pub self fromFaces(dmut faces: [&FontFace])
+        with _faces = alias faces
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the families of the chain, followed by their fallbacks and the global fallbacks
+     * */
+    pub fn getFamilies(self)-> [[c8]] {
+        self._families
+    }
+
+    /**
+     * @returns: the requested weight
+     * */
+    pub fn getWeight(self)-> u32 {
+        self._weight
+    }
+
+    /**
+     * @returns: the requested style
+     * */
+    pub fn getStyle(self)-> FontStyle {
+        self._style
+    }
+
+    /**
+     * @returns: the number of faces resolved so far
+     * */
+    pub fn getNbFaces(self)-> u32 {
+        cast!u32(self._faces.len)
+    }
+
+    /**
+     * @returns: the face 'index' of the chain, resolved by a previous call to getPrimary or findFace
+     * */
+    pub fn getFace(mut self, index: u32)-> dmut &FontFace {
+        alias self._faces[index]
+    }
+
+    /**
+     * @returns: the first face of the chain, that gives its metrics to the lines
+     * @throws: if no family of the chain has a face
+     * */
+    pub fn getPrimary(mut self)-> dmut &FontFace
+        throws BalderError
+    {
+        if self._faces.len == 0us && !self:.resolveNext() {
+            throw copy BalderError(std::format::format("No font found for the families {}", self._families));
+        }
+
+        alias self._faces[0]
+    }
+
+    /**
+     * Find the face a grapheme is drawn with: the first one having a glyph for each of its code points, or if there is
+     * none the first one having a glyph for its first code point, or if there is none the primary face
+     * The code points that only alter the rendering of the others (joiners, variation selectors) are not required
+     * @params:
+     *    - codePoints: the code points of the grapheme
+     * @returns: the index of the face in the chain
+     * @throws: if no family of the chain has a face
+     * */
+    pub fn findFace(mut self, codePoints: [c32])-> u32
+        throws BalderError
+    {
+        self:.getPrimary();
+        if codePoints.len == 0us { return 0u32; }
+
+        let mut base: (u32)? = none;
+        let mut i = 0us;
+        loop {
+            while i < self._faces.len {
+                let (all, first) = self:.covers(cast!u32(i), codePoints);
+                if all { return cast!u32(i); }
+                if first && !base.hasValue { base = (cast!u32(i))?; }
+                i += 1us;
+            }
+
+            if !self:.resolveNext() { break; }
+        }
+
+        if let Ok(b) = base { return b; }
+        0u32
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns:
+     *    - .0: true if the face 'index' has a glyph for every code point of a grapheme that requires one
+     *    - .1: true if it has a glyph for the first code point
+     * */
+    fn covers(mut self, index: u32, codePoints: [c32])-> (bool, bool) {
+        let dmut f = alias self._faces[index];
+        let first = f:.hasGlyph(codePoints[0]);
+        if !first { return (false, false); }
+
+        for c in codePoints[1us .. $] {
+            if !isIgnorable(c) && !f:.hasGlyph(c) { return (false, true); }
+        }
+
+        (true, true)
+    }
+
+    /**
+     * Resolve the next family of the chain that has faces not already in the chain, adding its closest face to the
+     * requested weight and style, then its regular face
+     * @returns: false if every family is resolved
+     * */
+    fn resolveNext(mut self)-> bool {
+        if let Ok(dmut registry) = alias self._registry {
+            while self._next < self._families.len {
+                let name = self._families[self._next];
+                self._next += 1us;
+
+                let mut added = false;
+                for m in registry:.resolveFaces(name, weight-> self._weight, style-> self._style) {
+                    {
+                        let dmut f = registry:.open(m);
+                        if !self.indexOf(f.getUniqId()).hasValue {
+                            self._faces ~= [alias f];
+                            added = true;
+                        }
+                    } catch {
+                        err => {
+                            log::error #("FontChain", "Failed to open the font ", m.face.path, " of ", name, " : ", err);
+                        }
+                    }
+                }
+
+                if added { return true; }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the index of the face of uniq id 'uid' in the chain, none if it is not in it
+     * */
+    fn indexOf(self, uid: u32)-> (usize)? {
+        for i, f in self._faces {
+            if f.getUniqId() == uid { return i?; }
+        }
+
+        none
+    }
+}
+
+/**
+ * @returns: true if a code point only alters the rendering of the others, so the face of a grapheme needs no glyph for it
+ * (zero width joiner and non joiner, variation selectors, emoji tags)
+ * */
+fn isIgnorable(c: c32)-> bool {
+    let u = cast!u32(c);
+    u == 0x200Cu32 || u == 0x200Du32
+        || (u >= 0xFE00u32 && u <= 0xFE0Fu32)
+        || (u >= 0xE0000u32 && u <= 0xE0FFFu32)
+}

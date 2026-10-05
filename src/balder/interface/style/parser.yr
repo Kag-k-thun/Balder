@@ -3,6 +3,7 @@ in parser;
 use balder::utils::_;
 use balder::core::error;
 use balder::interface::style::_;
+use balder::interface::font::family;
 use balder::interface::widget::alignement;
 use balder::math::vector;
 
@@ -53,11 +54,66 @@ pub record StyleParser {
 
         while !lex.isEof() {
             let (widgetName, line, col) = lex:.next();
-            if widgetName != "" && !lex.isEof() {
+            if widgetName == Keywords::FONT_FACE {
+                self:.readFontFace(alias lex);
+            } else if widgetName != "" && !lex.isEof() {
                 self.verifyIdentifier(widgetName, line, col);
                 self:.readWidgetStyle(widgetName, alias lex);
             }
         }
+    }
+
+    /**
+     * Read a @font-face rule, registering a font file in a family
+     * ```
+     * @font-face {
+     *     font-family: "Noto Sans";
+     *     src: "res:/fonts/noto/NotoSans-Bold.ttf";
+     *     font-weight: 700;     // optional, read from the file if omitted
+     *     font-style: normal;   // optional, read from the file if omitted
+     * }
+     * ```
+     * */
+    fn readFontFace(mut self, dmut lexer: &Lexer!{c8})
+        throws BalderError
+    {
+        let (_, line, col) = self.readTokens(alias lexer, Tokens::LACC);
+
+        let mut family = "", mut src = "";
+        let mut weight: (u32)? = none;
+        let mut style: (FontStyle)? = none;
+        loop {
+            let (n, l, c) = lexer:.next();
+            match n {
+                Tokens::RACC => { break; }
+                Keywords::FONT_FAMILY => {
+                    let families = self.readFontFamilies(alias lexer);
+                    if families.len != 1us {
+                        throw copy BalderError(std::format::format("A @font-face names a single family at ({}:{})", l, c));
+                    }
+
+                    family = families[0];
+                }
+                Keywords::SRC => {
+                    src = self.readString(alias lexer);
+                }
+                Keywords::FONT_WEIGHT => {
+                    weight = (self.readFontWeight(alias lexer))?;
+                }
+                Keywords::FONT_STYLE => {
+                    style = (self.readFontStyle(alias lexer))?;
+                }
+                _ => {
+                    throw self.unexpected(n, l, c);
+                }
+            }
+        }
+
+        if family == "" || src == "" {
+            throw copy BalderError(std::format::format("A @font-face needs a font-family and a src at ({}:{})", line, col));
+        }
+
+        self._styleManager:.insertFontFace(FontFaceRule(family, src, weight, style));
     }
 
     /**
@@ -215,9 +271,17 @@ pub record StyleParser {
                     result.backgroundImage.0 = true;
                     result.backgroundImage.1 = self.readString(alias lexer);
                 }
-                Keywords::FONT => {
-                    result.font.0 = true;
-                    result.font.1 = self.readString(alias lexer);
+                Keywords::FONT_FAMILY => {
+                    result.fontFamily.0 = true;
+                    result.fontFamily.1 = copy self.readFontFamilies(alias lexer);
+                }
+                Keywords::FONT_WEIGHT => {
+                    result.fontWeight.0 = true;
+                    result.fontWeight.1 = self.readFontWeight(alias lexer);
+                }
+                Keywords::FONT_STYLE => {
+                    result.fontStyle.0 = true;
+                    result.fontStyle.1 = self.readFontStyle(alias lexer);
                 }
                 Keywords::FONT_SIZE => {
                     result.fontSize.0 = true;
@@ -401,6 +465,108 @@ pub record StyleParser {
 
         self.readTokens(alias lexer, Tokens::SEMI_COLON);
         align
+    }
+
+    /**
+     * Read a list of font families, separated by commas, a family being quoted ("Noto Sans") or not (sans-serif)
+     * */
+    fn readFontFamilies(self, dmut lexer: &Lexer!{c8})-> [[c8]]
+        throws BalderError
+    {
+        self.readTokens(alias lexer, Tokens::COLON);
+
+        let mut families: [[c8]] = [];
+        loop {
+            let (n, l, c) = lexer:.next();
+            let mut name = "";
+            if n == Tokens::DQUOTE || n == Tokens::SQUOTE {
+                let dmut result = copy StringStream();
+                lexer:.setSkipTokens(false);
+                {
+                    loop {
+                        let (s, _, _) = lexer:.next();
+                        if s == n { break; }
+                        if s == "" { throw self.unexpected(n, l, c); }
+                        result:.write(s);
+                    }
+                } exit {
+                    lexer:.setSkipTokens(true);
+                }
+
+                name = result[];
+            } else if n != Tokens::COMMA && n != Tokens::SEMI_COLON && n != "" {
+                // an unquoted family is a sequence of identifiers, "Noto Sans" being the same as Noto Sans
+                name = n;
+                let mut cursor = lexer.getCursor();
+                loop {
+                    let (w, _, _) = lexer:.next();
+                    if w == Tokens::COMMA || w == Tokens::SEMI_COLON || w == "" { break; }
+                    name = name ~ " " ~ w;
+                    cursor = lexer.getCursor();
+                }
+
+                lexer:.rewind(expand cursor);
+            } else {
+                throw self.unexpected(n, l, c);
+            }
+
+            if name == "" { throw self.unexpected(n, l, c); }
+            families ~= [name];
+
+            let (sep, l2, c2) = lexer:.next();
+            if sep == Tokens::SEMI_COLON { break; }
+            if sep != Tokens::COMMA { throw self.unexpected(sep, l2, c2); }
+        }
+
+        families
+    }
+
+    /**
+     * Read a font weight, a number from 1 to 1000, normal (400) or bold (700)
+     * */
+    fn readFontWeight(self, dmut lexer: &Lexer!{c8})-> u32
+        throws BalderError
+    {
+        self.readTokens(alias lexer, Tokens::COLON);
+
+        let (n, l, c) = lexer:.next();
+        let weight = match n {
+            Keywords::NORMAL => { FONT_WEIGHT_NORMAL }
+            Keywords::BOLD   => { FONT_WEIGHT_BOLD }
+            _ => {
+                let w = {
+                    std::conv::to!{u32} (n)
+                } catch {
+                    _ => { throw self.unexpected(n, l, c); }
+                };
+
+                if w < 1u32 || w > 1000u32 { throw self.unexpected(n, l, c); }
+                w
+            }
+        };
+
+        self.readTokens(alias lexer, Tokens::SEMI_COLON);
+        weight
+    }
+
+    /**
+     * Read a font style, normal, italic or oblique
+     * */
+    fn readFontStyle(self, dmut lexer: &Lexer!{c8})-> FontStyle
+        throws BalderError
+    {
+        self.readTokens(alias lexer, Tokens::COLON);
+
+        let (n, l, c) = lexer:.next();
+        let style = match n {
+            Keywords::NORMAL  => { FontStyle::NORMAL }
+            Keywords::ITALIC  => { FontStyle::ITALIC }
+            Keywords::OBLIQUE => { FontStyle::OBLIQUE }
+            _ => { throw self.unexpected(n, l, c); }
+        };
+
+        self.readTokens(alias lexer, Tokens::SEMI_COLON);
+        style
     }
 
     /**

@@ -1,23 +1,41 @@
 in manager;
 
 use balder::core::_;
-use balder::interface::font::{face, shaper};
+use balder::interface::font::{chain, family, registry, shaper};
 
 use std::algorithm::comparison;
 
 /**
- * Font manager opening the faces of the font files, and shaping text with them
+ * Font manager resolving the families requested by the styles into chains of faces, and shaping text with them
  * */
 @final
 pub class FontManager {
 
-    // The faces opened so far, by font path
-    let dmut _faces: [[c8] => &FontFace] = copy [];
+    // The registry of the faces
+    let dmut _registry: &FontRegistry;
+
+    // The directories registered on first use
+    let _fontDirs: [[c8]];
+
+    // True once the font directories are registered
+    let mut _dirsRead: bool = false;
+
+    // The chains created so far, by families, weight and style
+    let dmut _chains: [([[c8]], u32, FontStyle) => &FontChain] = copy [];
+
+    // The version of the registry the chains were created at
+    let mut _chainsVersion: u64 = 0;
 
     /**
-     * Create a manager opening faces on first use
+     * Create a manager reading its fonts on first use
+     * @params:
+     *    - fontDirs: the directories whose fonts are registered, before any system font
+     *    - systemDirs: the directories the system fonts are read from, when a family is not registered
      * */
-    pub self () {}
+    pub self (fontDirs: [[c8]] = copy [FontRegistry::RES_FONT_DIR], systemDirs: [[c8]] = FontRegistry::systemFontDirs())
+        with _registry = copy FontRegistry(systemDirs-> systemDirs)
+        , _fontDirs = fontDirs
+    {}
 
     __dtor(mut self) {
         self:.dispose();
@@ -32,6 +50,20 @@ pub class FontManager {
      */
 
     /**
+     * @returns: the registry of the faces, to register fonts or change the fallbacks
+     * */
+    pub fn getRegistry(mut self)-> dmut &FontRegistry {
+        if !self._dirsRead {
+            self._dirsRead = true;
+            for d in self._fontDirs {
+                self._registry:.registerDirectory(d);
+            }
+        }
+
+        alias self._registry
+    }
+
+    /**
      * @returns: the height of the em square in device pixels of a font of size 'fontSize' drawn at 'pixelRatio'
      * */
     pub fn getPixelSize(self, fontSize: u32, pixelRatio: f32 = 1.0f)-> u32 {
@@ -39,23 +71,48 @@ pub class FontManager {
     }
 
     /**
+     * Get the chain of faces of a list of families, shared by the texts requesting the same families, weight and style
+     * @params:
+     *    - families: the requested families, by order of preference (generic families such as sans-serif included)
+     *    - weight: the requested weight, from 100 to 900
+     *    - style: the requested style
+     * @returns: the chain, resolving its faces on demand
+     * */
+    pub fn getChain(mut self, families: [[c8]], weight: u32 = FONT_WEIGHT_NORMAL, style: FontStyle = FontStyle::NORMAL)-> dmut &FontChain {
+        let dmut registry = self:.getRegistry();
+        if registry.getVersion() != self._chainsVersion {
+            self._chains = copy [];
+            self._chainsVersion = registry.getVersion();
+        }
+
+        let key = (families, weight, style);
+        if let Ok(dmut c) = alias self._chains[key] {
+            return alias c;
+        }
+
+        let dmut c = copy FontChain(alias registry, families, weight-> weight, style-> style);
+        self._chains[key] = alias c;
+
+        alias c
+    }
+
+    /**
      * Shape a single line of text
      * @params:
      *    - text: the text to shape
-     *    - fontPath: the path to the font file
+     *    - chain: the faces the glyphs are taken from
      *    - fontSize: the size of the font
      *    - pixelRatio: the number of device pixels in a window unit, the glyphs being positioned in device pixels
      * @returns: the shaped run, in device pixels
      * */
-    pub fn shape(mut self, text: [c16], fontPath: [c8], fontSize: u32, pixelRatio: f32 = 1.0f)-> ShapedRun
+    pub fn shape(mut self, text: [c16], dmut chain: &FontChain, fontSize: u32, pixelRatio: f32 = 1.0f)-> ShapedRun
         throws BalderError
     {
-        let dmut face = self:.loadFace(fontPath);
-        shapeLine(alias face, text, self.getPixelSize(fontSize, pixelRatio-> pixelRatio))
+        shapeLine(alias chain, text, self.getPixelSize(fontSize, pixelRatio-> pixelRatio))
     }
 
     /**
-     * Load (or reuse) the face of a font file
+     * Load (or reuse) the regular face of a font file, outside of any family
      * @params:
      *    - path: the path to the font file
      * @returns: the opened face
@@ -63,14 +120,7 @@ pub class FontManager {
     pub fn loadFace(mut self, path: [c8])-> dmut &FontFace
         throws BalderError
     {
-        if let Ok(dmut f) = alias self._faces[path] {
-            return alias f;
-        }
-
-        let dmut face = copy FontFace::open(balder::utils::path::projectPath(path));
-        self._faces[path] = alias face;
-
-        return alias face;
+        self._registry:.openFile(path)
     }
 
     /*!
@@ -83,11 +133,8 @@ pub class FontManager {
 
     impl Disposable {
         pub over dispose(mut self) {
-            for _, dmut f in alias self._faces {
-                f:.dispose();
-            }
-
-            self._faces = copy [];
+            self._chains = copy [];
+            self._registry:.dispose();
         }
     }
 }
