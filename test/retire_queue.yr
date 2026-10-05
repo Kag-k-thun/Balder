@@ -1,0 +1,172 @@
+in retire_queue;
+
+use balder::core::driver::retire;
+
+/**
+ * The order in which the disposals ran
+ * */
+class Trace {
+    pub let mut ids: [u32] = [];
+
+    pub self () {}
+
+    pub fn add(mut self, id: u32) {
+        self.ids = self.ids ~ [id];
+    }
+}
+
+fn traced(dmut trace: &Trace, id: u32)-> dg ()-> void {
+    copy || {
+        trace:.add(id);
+    }
+}
+
+/**
+ * The frame loop of VulkanPipeline, without Vulkan: each frame awaits the next slot, collects, then
+ * records the slot again if a redraw is pending, as waitPreviousFrame and submitFrame do
+ * */
+class FrameLoop {
+
+    pub let dmut queue: &RetireQueue = copy RetireQueue();
+
+    let dmut _generations: &SlotGenerations;
+
+    // The slots waiting to be recorded again
+    let dmut _dirty: [bool];
+
+    // A retire requested a redraw
+    let mut _requested: bool = false;
+
+    let mut _slot: u32 = 0;
+
+    pub self (nbSlots: u32)
+        with _generations = copy SlotGenerations(nbSlots)
+        , _dirty = copy [true; nbSlots]
+    {}
+
+    /**
+     * As VulkanDevice.retire
+     * */
+    pub fn retire(mut self, clean: dg ()-> void) {
+        self.queue:.push(clean);
+        self._requested = true;
+    }
+
+    /**
+     * As VulkanPipeline.forceRedraw
+     * */
+    pub fn redraw(mut self) {
+        self.queue:.advance();
+        for i in 0 .. self._dirty.len {
+            self._dirty[i] = true;
+        }
+    }
+
+    pub fn frame(mut self) {
+        let slot = self._slot;
+        self._slot = (slot + 1u32) % cast!u32(self._dirty.len);
+
+        self.queue:.collect(self._generations:.awaited(slot));
+
+        if self._requested {
+            self._requested = false;
+            self:.redraw();
+        }
+
+        if self._dirty[slot] {
+            self._dirty[slot] = false;
+            self._generations:.recorded(slot, self.queue.getStamp());
+        }
+    }
+}
+
+__test collect_runs_the_entries_below_the_bound_in_push_order {
+    let dmut trace = copy Trace();
+    let dmut queue = copy RetireQueue();
+
+    queue:.push(traced(alias trace, 0u32));
+    queue:.advance();
+    queue:.push(traced(alias trace, 1u32));
+    queue:.push(traced(alias trace, 2u32));
+    queue:.advance();
+    queue:.push(traced(alias trace, 3u32));
+
+    assert (queue:.collect(1u64) == 1us);
+    assert (trace.ids == [0u32]);
+
+    assert (queue:.collect(1u64) == 0us);
+    assert (queue:.collect(3u64) == 3us);
+    assert (trace.ids == [0u32, 1u32, 2u32, 3u32]);
+    assert (queue.len() == 0us);
+}
+
+/**
+ * Retired while slot 0 already holds a recording of the current generation, and the other slots older ones:
+ * the object waits for the recordings that may reference it to be replaced and awaited
+ * */
+__test mid_cycle_retire_waits_for_every_slot {
+    let dmut trace = copy Trace();
+    let dmut lp = copy FrameLoop(3u32);
+
+    for _ in 0 .. 3 { lp:.frame(); }
+
+    lp:.redraw();
+    lp:.frame();
+
+    lp:.retire(traced(alias trace, 0u32));
+
+    // The recording of slot 0 made before the retire is awaited at the 3rd frame
+    for _ in 0 .. 3 {
+        lp:.frame();
+        assert (trace.ids.len == 0us);
+    }
+
+    for _ in 0 .. 3 { lp:.frame(); }
+    assert (trace.ids == [0u32]);
+}
+
+/**
+ * A retire and a redraw every frame (typing, resizing): the objects keep being collected
+ * */
+__test continuous_redraws_do_not_starve_the_queue {
+    let dmut trace = copy Trace();
+    let dmut lp = copy FrameLoop(3u32);
+
+    for i in 0u32 .. 100u32 {
+        lp:.retire(traced(alias trace, i));
+        lp:.frame();
+        assert (lp.queue.len() <= 9us);
+    }
+
+    assert (trace.ids.len >= 90us);
+    for i, id in trace.ids {
+        assert (id == cast!u32(i));
+    }
+}
+
+/**
+ * A disposal retiring another object: the new entry waits for its own turn, and a drain runs it
+ * */
+__test cascade_during_collect_and_drain {
+    let dmut trace = copy Trace();
+    let dmut queue = copy RetireQueue();
+
+    let third = traced(alias trace, 2u32);
+    let second = copy || {
+        trace:.add(1u32);
+        queue:.push(third);
+    };
+
+    queue:.push(copy || {
+        trace:.add(0u32);
+        queue:.push(second);
+    });
+
+    assert (queue:.collect(1u64) == 1us);
+    assert (trace.ids == [0u32]);
+    assert (queue.len() == 1us);
+
+    assert (queue:.drain() == 2us);
+    assert (trace.ids == [0u32, 1u32, 2u32]);
+    assert (queue.len() == 0us);
+}
