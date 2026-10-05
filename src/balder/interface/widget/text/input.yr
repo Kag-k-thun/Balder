@@ -3,7 +3,7 @@ in input;
 use balder::utils;
 use balder::core::{_, application::_};
 use balder::interface::_;
-use balder::interface::font::shaper;
+use balder::interface::font::{grapheme, shaper};
 use balder::interface::widget::text::label;
 use balder::math::vector;
 
@@ -193,7 +193,9 @@ pub class InputText over Widget {
         }
 
         if let Ok(dmut s) = alias self._cursorShape {
-            s:.show();
+            if self._isFocused {
+                s:.show();
+            }
         }
     }
 
@@ -228,19 +230,19 @@ pub class InputText over Widget {
     }
 
     over onUpdateScissors(mut self) {
+        // the text, the caret and the selection are cut to the input, which does not move with the caret and the
+        // selection, so moving them does not record the draws again
+        let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
         if let Ok(dmut s) = alias self._cursorShape {
-            let (csciPos, csciSize) = self.getScissors(self._cursorPos, self._cursorSize);
-            s:.setScissors(csciPos, csciSize);
+            s:.setScissors(sciPos, sciSize);
         }
 
         {
-            self._label:.setScissors(self._scissorPos, self._scissorSize);
+            self._label:.setScissors(sciPos, sciSize);
         }
 
         if let Ok(dmut s) = alias self._selectionShape {
-            let (sciPos, sciEnd) = self.getScissors(self._selectionPos, self._selectionSize);
-
-            s:.setScissors(sciPos, sciEnd);
+            s:.setScissors(sciPos, sciSize);
         }
     }
 
@@ -257,7 +259,7 @@ pub class InputText over Widget {
 
                 self._cursorSize.x = bar.width / ratio / 3.0f;
 
-                let cpos = makeVec2(run.advanceTo(self._cursor) / ratio - (self._textShiftLeft * size.x), size.y * 0.15f);
+                let cpos = makeVec2(run.caretAt(self._cursor) / ratio - (self._textShiftLeft * size.x), size.y * 0.15f);
                 let s    = makeVec2(self._cursorSize.x, size.y * 0.7);
 
                 b:.setPosition(cpos + pos);
@@ -283,24 +285,23 @@ pub class InputText over Widget {
         throws BalderError
     {
         if let Ok(dmut b) = alias self._selectionShape {
-            if self._hasSelection {
+            let (spans, ratio) = if self._hasSelection {
                 let (run, ratio) = self:.shapeText(self._text);
-                let selStart     = min(self._cursor, self._selectionCursor);
-                let selEnd       = max(self._cursor, self._selectionCursor);
+                (run.selectionSpans(self._cursor, self._selectionCursor), ratio)
+            } else { ([], 1.0f) };
 
-                let startX = run.advanceTo(selStart) / ratio;
-                let cpos   = makeVec2(startX + 2.0f - (self._textShiftLeft * size.x), size.y * 0.15f);
+            if spans.len != 0us {
+                // the input is a single run on a single line, its spans merge into one rectangle
+                let startX = spans[0]._0 / ratio;
+                let cpos   = makeVec2(startX - (self._textShiftLeft * size.x), size.y * 0.15f);
 
-                let selectionSize = run.advanceTo(selEnd) / ratio - startX;
+                let selectionSize = spans[$ - 1us]._1 / ratio - startX;
 
-                let s       = makeVec2(selectionSize, size.y * 0.7);
-                let sciPos  = makeVec2(pos.x, pos.y);
-                let sciSize = makeVec2(size.x, size.y);
+                let s = makeVec2(selectionSize, size.y * 0.7);
 
                 b:.setPosition(cpos + pos);
                 b:.setSize(s);
                 b:.setLevel(self.getDepth(WidgetShapeKind::SELECTION));
-                b:.setScissors(sciPos, sciSize);
 
                 self._selectionPos = cpos + pos;
                 self._selectionSize = s;
@@ -368,12 +369,11 @@ pub class InputText over Widget {
 
     pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
         if button == SDL_BUTTON_LEFT {
+            // the focus is given after the click, which places the caret the focus keeps
             self._hasSelection = false;
-            if self._isFocused {
-                self._inSelection = true;
-                self._cursor = self:.mousePositionToCursor(pos);
-                self._selectionCursor = self._cursor;
-            }
+            self._inSelection = true;
+            self._cursor = self:.mousePositionToCursor(pos);
+            self._selectionCursor = self._cursor;
 
             self:.resetSelection();
             self:.computeShifting();
@@ -482,8 +482,9 @@ pub class InputText over Widget {
         if self._hasSelection {
             self:.eraseSelection();
         } else if self._cursor > 0 {
-            self._text = self._text[0 .. self._cursor - 1] ~ self._text[self._cursor .. $];
-            self._cursor -= 1;
+            let start = previousBoundary(self._text, self._cursor);
+            self._text = self._text[0 .. start] ~ self._text[self._cursor .. $];
+            self._cursor = start;
 
             self:.setText(self._text);
         }
@@ -495,7 +496,7 @@ pub class InputText over Widget {
         if self._hasSelection {
             self:.eraseSelection();
         } else if self._cursor < self._text.len {
-            self._text = self._text[0 .. self._cursor] ~ self._text[self._cursor + 1 .. $];
+            self._text = self._text[0 .. self._cursor] ~ self._text[nextBoundary(self._text, self._cursor) .. $];
             self:.setText(self._text);
         }
 
@@ -506,17 +507,8 @@ pub class InputText over Widget {
         if self._hasSelection {
             self:.eraseSelection();
         } else if self._cursor > 0 {
-            let mut start = self._cursor;
-            self._cursor -= 1;
-            while self._cursor > 0 {
-                if self._cursor != self._text.len && self._cursor >= 1 {
-                    if self._text[self._cursor].isPunctuation() != self._text[self._cursor - 1].isPunctuation() {
-                        break;
-                    }
-                }
-
-                self._cursor -= 1;
-            }
+            let start = self._cursor;
+            self._cursor = self.previousWord(self._cursor);
 
             self._text = self._text[0 .. self._cursor] ~ self._text[start .. $];
             self:.setText(self._text);
@@ -529,18 +521,7 @@ pub class InputText over Widget {
         if self._hasSelection {
             self:.eraseSelection();
         } else if self._cursor < self._text.len {
-            let mut end = self._cursor;
-            while end < self._text.len {
-                if end != self._text.len - 1 {
-                    if self._text[end].isPunctuation() != self._text[end + 1].isPunctuation() {
-                        end += 1;
-                        break;
-                    }
-                }
-
-                end += 1;
-            }
-
+            let end = self.nextWord(self._cursor);
             self._text = self._text[0 .. self._cursor] ~ self._text[end .. $];
             self:.setText(self._text);
         }
@@ -562,8 +543,6 @@ pub class InputText over Widget {
         self._isFocused = true;
         self:.setHover(false);
 
-        self._inSelection = false;
-        self._cursor = 0;
         self:.resetCursorTimer();
 
         self:.resetSelection();
@@ -599,18 +578,14 @@ pub class InputText over Widget {
      */
 
     pub fn onTextForwardMove(mut self, _: KeyInfo) {
-        if self._cursor != self._text.len {
-            self._cursor += 1;
-        }
+        self._cursor = nextBoundary(self._text, self._cursor);
 
         self:.resetSelection();
         self:.computeShifting();
     }
 
     pub fn onTextBackwardMove(mut self, _: KeyInfo) {
-        if self._cursor != 0 {
-            self._cursor -= 1;
-        }
+        self._cursor = previousBoundary(self._text, self._cursor);
 
         self:.resetSelection();
         self:.computeShifting();
@@ -619,16 +594,7 @@ pub class InputText over Widget {
     pub fn onTextForwardMoveWord(mut self) {
         if (self._cursor == self._text.len) return;
 
-        while self._cursor < self._text.len {
-            if self._cursor != self._text.len - 1 {
-                if self._text[self._cursor].isPunctuation() != self._text[self._cursor + 1].isPunctuation() {
-                    self._cursor += 1;
-                    break;
-                }
-            }
-
-            self._cursor += 1;
-        }
+        self._cursor = self.nextWord(self._cursor);
 
         self:.resetSelection();
         self:.computeShifting();
@@ -637,16 +603,7 @@ pub class InputText over Widget {
     pub fn onTextBackwardMoveWord(mut self) {
         if (self._cursor == 0) return;
 
-        self._cursor -= 1;
-        while self._cursor > 0 {
-            if self._cursor != self._text.len && self._cursor >= 1 {
-                if self._text[self._cursor].isPunctuation() != self._text[self._cursor - 1].isPunctuation() {
-                    break;
-                }
-            }
-
-            self._cursor -= 1;
-        }
+        self._cursor = self.previousWord(self._cursor);
 
         self:.resetSelection();
         self:.computeShifting();
@@ -669,9 +626,7 @@ pub class InputText over Widget {
             self._hasSelection = true;
         }
 
-        if self._cursor != self._text.len {
-            self._cursor += 1;
-        }
+        self._cursor = nextBoundary(self._text, self._cursor);
 
         self:.resetCursorTimer();
         self:.computeShifting();
@@ -686,9 +641,7 @@ pub class InputText over Widget {
             self._hasSelection = true;
         }
 
-        if self._cursor != 0us {
-            self._cursor -= 1;
-        }
+        self._cursor = previousBoundary(self._text, self._cursor);
 
         self:.resetCursorTimer();
         self:.computeShifting();
@@ -758,6 +711,7 @@ pub class InputText over Widget {
             SDL_SetClipboardText(select.toStringZ());
 
             self._text = self._text[0 .. selStart] ~ self._text[selEnd .. $];
+            self._cursor = selStart;
 
             self:.setText(self._text);
             self:.resetSelection();
@@ -846,30 +800,54 @@ pub class InputText over Widget {
      */
 
     /**
-     * Convert an absolute mouse position into a text cursor index
+     * Convert a mouse position relative to the input into a text cursor index
      * */
     fn mousePositionToCursor(mut self, pos: vec2)-> usize {
         if self._text.len == 0 {
             return 0us;
         }
 
-        let baseX = -self._textShiftLeft;
         {
             let (run, ratio) = self:.shapeText(self._text);
-            for i in 0 .. self._text.len {
-                let before = run.advanceTo(i) / ratio;
-                let after  = run.advanceTo(i + 1us) / ratio;
-
-                let toChar = (after - (after - before) / 2.0f) / self._absoluteSize.x;
-                if pos.x <= toChar + baseX {
-                    return i;
-                }
-            }
+            return run.hitTest((pos.x + self._textShiftLeft) * self._absoluteSize.x * ratio);
         } catch {
             _ => return 0us;
         }
+    }
+
+    /**
+     * @returns: the end of the word at the code unit 'index', where the graphemes stop being punctuations or start being
+     * ones, the length of the text if there is none
+     * */
+    fn nextWord(self, index: usize)-> usize {
+        let stops = boundaries(self._text);
+        for j in 1us .. stops.len - 1us {
+            if stops[j - 1us] >= index && self._text[stops[j - 1us]].isPunctuation() != self._text[stops[j]].isPunctuation() {
+                return stops[j];
+            }
+        }
 
         self._text.len
+    }
+
+    /**
+     * @returns: the start of the word before the code unit 'index', where the graphemes start or stop being
+     * punctuations, 0 if there is none
+     * */
+    fn previousWord(self, index: usize)-> usize {
+        let stops = boundaries(self._text);
+        let mut res = 0us;
+        for j in 1us .. stops.len - 1us {
+            if stops[j] >= index {
+                break;
+            }
+
+            if self._text[stops[j - 1us]].isPunctuation() != self._text[stops[j]].isPunctuation() {
+                res = stops[j];
+            }
+        }
+
+        res
     }
 
     /**
@@ -893,7 +871,7 @@ pub class InputText over Widget {
      * Reset the selection by putting cursor and selectionCursor at the same position
      * */
     fn resetSelection(mut self) {
-        if self._cursor > self._text.len { self._cursor = self._text.len; }
+        self._cursor = alignBoundary(self._text, self._cursor);
         self._selectionCursor = self._cursor;
         self._hasSelection = false;
 
@@ -942,24 +920,19 @@ pub class InputText over Widget {
         {
             let (run, ratio) = self:.shapeText(self._text);
 
-            let relSize     = run.advanceTo(self._cursor) / ratio / self._absoluteSize.x;
+            let relSize     = run.caretAt(self._cursor) / ratio / self._absoluteSize.x;
             let relFullSize = run.width / ratio / self._absoluteSize.x;
             let limitRight  = 1.0f - (self._cursorSize.x * 2.0f / self._absoluteSize.x);
 
-            if relSize < 1.0f && !self._hasSelection {
-                self._textShiftLeft = 0.0f;
-            } else if self._textShiftLeft > relSize {
+            // scroll only as much as the caret needs to stay in view, so the text under the mouse does not move
+            if self._textShiftLeft > relSize {
                 self._textShiftLeft = relSize;
             } else if self._textShiftLeft < relSize - limitRight {
                 self._textShiftLeft = relSize - limitRight;
             }
 
-            if !self._inSelection {
-                // Move the text to the right if there is not enough text after the cursor to fill the remaining part of the input text
-                if relFullSize > limitRight && relFullSize - relSize < 1.0f {
-                    self._textShiftLeft = relFullSize - limitRight;
-                }
-            }
+            // a text that fits is not scrolled, and a longer one leaves no space after its end
+            self._textShiftLeft = max(0.0f, min(self._textShiftLeft, relFullSize - limitRight));
 
             if update {
                 self:.computeSize();
