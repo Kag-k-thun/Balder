@@ -5,6 +5,14 @@
 Project **BAL**, workspace `ymir-bootstrap`. Use the plane MCP tools. A branch is named after its
 work item (`BAL-30-glyph-atlas`).
 
+## Look at the std first
+
+Before writing anything heavy (a lexer, a parser, a container, an encoding, a format), look for it
+in the std of the compiler you build with: `~/ymir/ymir-dev/repos/midgard/midgard/std` for
+`ymirc`. It already has, among others, `syntax` (a `Lexer` with tokens, comments and rewind, a
+`Tokenizer`, `Regex`, `SyntaxError`), `config` (toml, json), `conv`, `format`, `encoding`, `fs`,
+`algorithm` and `concurrency`. Build on it rather than rewriting it.
+
 ## Commit policy
 
 Taken from balder-dev (`../../CLAUDE.md`), itself taken from bootstrap:
