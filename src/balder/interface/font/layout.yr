@@ -1,0 +1,176 @@
+/**
+ * The laying out of a text in lines, split at its line breaks, wrapped to a width and aligned
+ * */
+in layout;
+
+use balder::interface::font::{linebreak, shaper};
+
+use std::algorithm::comparison;
+
+// The width a line can exceed the width it is wrapped to by, absorbing the rounding of the advances, in pixels
+def WRAP_TOLERANCE = 0.01f;
+
+/**
+ * A line of a laid out text
+ * */
+@data
+pub record TextLine {
+
+    // The glyphs of the line, shaped on their own, their clusters and carets counting from 'start'
+    pub let run: ShapedRun;
+
+    // The byte of the text the line starts at
+    pub let start: usize;
+
+    // The byte of the text the visible part of the line ends before, its hanging white spaces and line break left out
+    pub let end: usize;
+
+    // The left of the line from the left of the text, in pixels
+    pub let x: f32;
+
+    // The top of the line from the top of the text, in pixels
+    pub let y: f32;
+}
+
+/**
+ * A text laid out in lines, from top to bottom
+ * */
+@data
+pub record TextLayout {
+
+    // The lines of the text, at least one
+    pub let lines: [TextLine];
+
+    // The width of the widest line, in pixels
+    pub let width: f32;
+
+    // The distance from the top of the first line to the bottom of the last one, in pixels
+    pub let height: f32;
+}
+
+/**
+ * Split a text into paragraphs at its line breaks
+ * @params:
+ *    - text: the text, in UTF-8
+ * @returns: for each paragraph, the byte it starts at, the one its visible part ends before, and the bytes a line can
+ * start at inside it, counted from its start
+ * */
+pub fn splitParagraphs(text: [c8])-> [(usize, usize, [usize])] {
+    let mut res: [(usize, usize, [usize])] = [];
+    let mut breaks: [usize] = [];
+    let mut start = 0us;
+    for b in breakOpportunities(text) {
+        if b._1 {
+            res ~= [(start, hangingEnd(text, start, b._0), breaks)];
+            breaks = [];
+            start = b._0;
+        } else {
+            breaks ~= [b._0 - start];
+        }
+    }
+
+    res ~= [(start, hangingEnd(text, start, text.len), breaks)];
+    res
+}
+
+/**
+ * Break a paragraph into the lines that fit a width, greedily: each line takes as many words as fit, a word wider than
+ * the width being cut between its graphemes
+ * @params:
+ *    - text: the visible part of the paragraph, in UTF-8, without line break
+ *    - run: the paragraph shaped as a single line
+ *    - breaks: the bytes a line can start at, in increasing order
+ *    - maxWidth: the width the lines fit in, in pixels
+ * @returns: for each line, the byte it starts at and the one its visible part ends before, at least one line
+ * */
+pub fn wrapLine(text: [c8], run: ShapedRun, breaks: [usize], maxWidth: f32)-> [(usize, usize)] {
+    if run.width <= maxWidth + WRAP_TOLERANCE {
+        return copy [(0us, text.len)];
+    }
+
+    let dmut res: [(usize, usize)] = [];
+
+    // the line from 'start' fits up to the break 'fit', none fitting while 'fit' is 'start'
+    let mut start = 0us;
+    let mut fit = 0us;
+    let mut k = 0us;
+    while k <= breaks.len {
+        let b = if k < breaks.len { min(breaks[k], text.len) } else { text.len };
+        if b <= start {
+            k += 1us;
+        } else if run.measure(start, hangingEnd(text, start, b)) <= maxWidth + WRAP_TOLERANCE {
+            fit = b;
+            k += 1us;
+        } else if fit > start {
+            res ~= [(start, hangingEnd(text, start, fit))];
+            start = fit;
+        } else {
+            let cut = cutGraphemes(run, start, b, maxWidth);
+            res ~= [(start, cut)];
+            start = cut;
+            fit = cut;
+        }
+    }
+
+    if start < text.len || res.len == 0us {
+        res ~= [(start, hangingEnd(text, start, text.len))];
+    }
+
+    res
+}
+
+/**
+ * Stack lines from top to bottom, each one being aligned in the width of the widest
+ * @params:
+ *    - lines: the shaped lines, with the byte each one starts at and the one its visible part ends before
+ *    - align: the part of its free space put on the left of a line, 0 aligning the lines to the left, 0.5 centering
+ *             them, 1 aligning them to the right
+ * @returns: the laid out text, its lines being one line height (of the primary face) apart
+ * */
+pub fn stackLines(lines: [(ShapedRun, usize, usize)], align: f32)-> TextLayout {
+    let mut width = 0.0f;
+    for l in lines {
+        let (run, _, _) = l;
+        width = max(width, run.width);
+    }
+
+    let dmut res: [TextLine] = [];
+    let mut y = 0.0f;
+    let mut height = 0.0f;
+    for l in lines {
+        let (run, start, end) = l;
+        res ~= [TextLine(run, start, end, (width - run.width) * align, y)];
+        height = y + run.getHeight();
+        y += run.metrics.height;
+    }
+
+    TextLayout(res, width, height)
+}
+
+/**
+ * Cut a word too wide for a line between its graphemes
+ * @params:
+ *    - run: the paragraph of the word, shaped as a single line
+ *    - start: the byte the word starts at
+ *    - end: the byte the word ends before
+ *    - maxWidth: the width the line fits in, in pixels
+ * @returns: the byte the part of the word that fits ends before, after one grapheme at least
+ * */
+fn cutGraphemes(run: ShapedRun, start: usize, end: usize, maxWidth: f32)-> usize {
+    let mut cut = start;
+    for s in run.stops {
+        if s > end {
+            break;
+        }
+
+        if s > start {
+            if cut != start && run.measure(start, s) > maxWidth + WRAP_TOLERANCE {
+                break;
+            }
+
+            cut = s;
+        }
+    }
+
+    cut
+}
