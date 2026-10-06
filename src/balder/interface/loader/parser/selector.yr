@@ -1,0 +1,250 @@
+in selector;
+
+use balder::interface::loader::parser::scanner;
+
+use std::syntax::errors;
+
+/**
+ * How a compound selector relates to the one on its left
+ * */
+pub enum Combinator
+| NONE       = 0u8  // the first compound of a selector
+| DESCENDANT = 1u8  // a space: any descendant of the widget matched on the left
+| CHILD      = 2u8; // a '>': a direct child of the widget matched on the left
+
+/**
+ * The tests a single widget has to pass, glued in CSS order: `PushButton#YES.yes:hover::label`
+ * */
+@data
+pub record Compound {
+
+    // How the compound relates to the one on its left
+    pub let combinator: Combinator;
+
+    // The type of the widget, "" for any ('*' or nothing)
+    pub let typeName: [c8];
+
+    // The id after the '#', "" for any
+    pub let id: [c8];
+
+    // The classes after the '.', all of them required
+    pub let classes: [[c8]];
+
+    // The states after the ':', all of them required
+    pub let states: [[c8]];
+
+    // The part after the '::', "" for the widget itself
+    pub let part: [c8];
+
+    // The line of the compound, from 1
+    pub let line: usize;
+
+    // The column of the compound, from 1
+    pub let col: usize;
+}
+
+/**
+ * A chain of compound selectors, the last one naming the widget (or the part) the rule styles:
+ * `.sidebar > PushButton.entry:hover`
+ * */
+@data
+pub record Selector {
+
+    // The compounds, from the left
+    pub let compounds: [Compound];
+
+    // The text of the selector in its file
+    pub let source: [c8];
+
+    // The line of the selector, from 1
+    pub let line: usize;
+
+    // The column of the selector, from 1
+    pub let col: usize;
+}
+
+/**
+ * Reader of the selectors heading a style rule (doc/gui-v2.md, §4)
+ * @info:
+ * =====
+ * ```
+ * selectors = selector { "," selector } ;
+ * selector  = compound { [ ">" ] compound } ;        (* a space: a descendant *)
+ * compound  = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part ] ;
+ * ```
+ * The tokens of a compound are glued, a space starting the next compound. The selectors end at the '{' that follows
+ * them, which the reader leaves to its caller.
+ * ====
+ * */
+pub record SelectorReader {
+
+    // The scanner the selectors are read from, shared with the parser of the file
+    let dmut _scanner: &Scanner;
+
+    // The offset after the last token read
+    let mut _end: usize = 0us;
+
+    /**
+     * @params:
+     *    - scanner: the scanner of the file, positioned before the selectors
+     * */
+    pub self (dmut scanner: &Scanner)
+        with _scanner = alias scanner
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          READING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read selectors separated by commas, up to the '{' that follows them, left unread
+     * */
+    pub fn readList(mut self)-> [Selector]
+        throws SyntaxError
+    {
+        let mut selectors = copy [self:.read()];
+        while self._scanner:.isDelim(",") {
+            self:.take();
+            selectors = selectors ~ [self:.read()];
+        }
+
+        selectors
+    }
+
+    /**
+     * Read a selector, up to the ',' or the '{' that follows it, left unread
+     * */
+    pub fn read(mut self)-> Selector
+        throws SyntaxError
+    {
+        let first = self._scanner:.peek();
+        let mut compounds: [Compound] = [];
+        let mut combinator = Combinator::NONE;
+        loop {
+            compounds = compounds ~ [self:.readCompound(combinator)];
+            let next = self._scanner:.peek();
+            if next.kind == TokenKind::EOF || (next.kind == TokenKind::DELIM && (next.text == "," || next.text == "{")) {
+                break;
+            }
+
+            if next.kind == TokenKind::DELIM && next.text == ">" {
+                self:.take();
+                combinator = Combinator::CHILD;
+            } else if next.spaced {
+                combinator = Combinator::DESCENDANT;
+            } else {
+                throw self._scanner.expected(next, "a selector");
+            }
+        }
+
+        Selector(compounds-> compounds, source-> self._scanner.source(first.start, self._end), line-> first.line, col-> first.col)
+    }
+
+    /**
+     * Read a compound selector
+     * @params:
+     *    - combinator: how it relates to the compound on its left
+     * */
+    fn readCompound(mut self, combinator: Combinator)-> Compound
+        throws SyntaxError
+    {
+        let first = self._scanner:.peek();
+        let mut typeName = "";
+        let mut id = "";
+        let mut classes: [[c8]] = [];
+        let mut states: [[c8]] = [];
+        let mut part = "";
+        let mut empty = true;
+        if first.kind == TokenKind::IDENT {
+            typeName = self:.take().text;
+            empty = false;
+        } else if first.kind == TokenKind::DELIM && first.text == "*" {
+            self:.take();
+            empty = false;
+        }
+
+        loop {
+            let tok = self._scanner:.peek();
+            if !empty && tok.spaced {
+                break;
+            }
+
+            let isTest = tok.kind == TokenKind::HASH || (tok.kind == TokenKind::DELIM && (tok.text == "." || tok.text == ":" || tok.text == "::"));
+            if !isTest {
+                break;
+            }
+
+            if part != "" {
+                throw copy SyntaxError("a part ends its compound selector, found '" ~ self._scanner.source(tok.start, tok.end) ~ "'", tok.line, tok.col);
+            }
+
+            self:.take();
+            if tok.kind == TokenKind::HASH {
+                if !Scanner::isName(tok.text) {
+                    throw copy SyntaxError("invalid id '#" ~ tok.text ~ "'", tok.line, tok.col);
+                }
+
+                if id != "" {
+                    throw copy SyntaxError("a second id '#" ~ tok.text ~ "'", tok.line, tok.col);
+                }
+
+                id = tok.text;
+            } else if tok.text == "." {
+                classes = classes ~ [self:.takeName("a class name")];
+            } else if tok.text == ":" {
+                states = states ~ [self:.takeName("a state")];
+            } else {
+                part = self:.takeName("a part");
+            }
+
+            empty = false;
+        }
+
+        if empty {
+            let next = self._scanner:.peek();
+            throw self._scanner.expected(next, "a selector");
+        }
+
+        Compound(combinator-> combinator, typeName-> typeName, id-> id, classes-> classes, states-> states, part-> part,
+                 line-> first.line, col-> first.col)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TOKENS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Consume the next token, remembering where it ends
+     * */
+    fn take(mut self)-> Token
+        throws SyntaxError
+    {
+        let tok = self._scanner:.next();
+        self._end = tok.end;
+        tok
+    }
+
+    /**
+     * Consume the name glued after a '.', a ':' or a '::'
+     * @params:
+     *    - what: what the name is, with its article ("a state")
+     * */
+    fn takeName(mut self, what: [c8])-> [c8]
+        throws SyntaxError
+    {
+        let name = self:.take();
+        if name.kind != TokenKind::IDENT || name.spaced {
+            throw self._scanner.expected(name, what ~ " glued to its sigil");
+        }
+
+        name.text
+    }
+}
