@@ -646,6 +646,33 @@ Both spellings of a side cascade, so `padding: 6; padding-left: 20;` works as it
 | `width: { relative: r; min: a; max: b; }` | style | `width: r%; min-width: a; max-width: b;` | .style |
 | `flex-grow: 1; flex-basis: 0;` | style | `flex: 1;` | .style |
 
+### The settings the layouts read (BAL-63)
+
+The layouts take no structural setting in their constructors. Each type registers the properties it reads, and a
+change of one of them through the cascade lays the interface out again, except for `popup-align`, which only moves the
+next popup opened.
+
+| Property | Registered by | Values | Default |
+|---|---|---|---|
+| `direction` | `LinearLayout`, `Splitter` | `row`, `column` | `column` |
+| `overflow` | `LinearLayout` | `hidden` (the children shrink, what still overflows is cut), `scroll` | `hidden` |
+| `scroll-speed` | `LinearLayout` | a number of 0 or more | `2` |
+| `columns`, `rows` | `GridLayout` | one or more tracks: a length, `%`, `fr`, `auto`, `min-content`, `max-content` | none |
+| `popup-align` | `MenuButton` | `left`/`center`/`right` then `top`/`center`/`bottom` | `left bottom` |
+| `left`, `top` | every widget, read by a `FloatingLayout` | a length | `0` |
+
+- **A layout scrolls itself.** `overflow: scroll` keeps the bases of the children instead of shrinking them, and the
+  layout scrolls over them with the wheel or by dragging its scrollbar, styled as its part `LinearLayout::scrollbar`.
+  The `ScrollLayout` wrapper is gone, so restyling `overflow` changes no widget of the tree.
+- **Tracks are sized as in CSS**: lengths, percentages and content sizes first, then the `auto` tracks grow from their
+  min-content to their max-content sharing the free space, then the shares in `fr` take what is left, the `auto`
+  tracks stretching to it when there is none. A share may be smaller than its content (`minmax(0, 1fr)`), and a track
+  the grid grows to beyond those given takes `1fr`, so a grid given no track keeps cells of equal size.
+- **Code sets them inline.** `Widget.setInlineStyle` gives a widget a style applied over every rule, as the style
+  attribute of an HTML element, and a registered property fills it with `set`:
+  `Layout::direction ().set (alias style, Direction::ROW)`. The v1 loader sets its `orientation`, `scrollable`,
+  `columns`, `(x:, y:)` and menu alignment that way until BAL-19 retires it.
+
 ## 7. How a widget plugs in
 
 The loader builds a tree of nodes with unparsed values, then asks a registry to instantiate each node. A widget type
