@@ -1,0 +1,259 @@
+/**
+ * The style properties: what a `name: value;` of a style rule means, how its value is decoded and which field of a
+ * Style it sets (doc/gui-v2.md, §2 and §5)
+ * */
+in property;
+
+use balder::interface::loader::parser;
+use balder::interface::style::implem;
+
+use std::syntax::errors;
+
+/**
+ * A property of a style rule, decoding its value into a Style
+ * */
+@abstract
+pub class Property {
+
+    // The name of the property
+    pub let name: [c8];
+
+    // True iif the property passes from a widget to its children and parts
+    pub let inherited: bool;
+
+    // True iif a change of the property lays the widgets out again
+    pub let affectsLayout: bool;
+
+    prot self (name: [c8], inherited: bool, affectsLayout: bool)
+        with name = name
+        , inherited = inherited
+        , affectsLayout = affectsLayout
+    {}
+
+    /**
+     * Decode a value of the property into a style
+     * @throws: at the value, naming the kind expected, when it is not of the kind of the property
+     * */
+    pub fn apply(self, dmut style: &Style, v: &Value)
+        throws SyntaxError;
+}
+
+/**
+ * A property setting a single field of a Style, its value decoded to a T: `Longhand!{vec4}("text-color", &?color, …)`
+ * */
+@final
+pub class Longhand {T} over Property {
+
+    let _decode: dg (&Value)-> (T)?;
+
+    let _set: dg (dmut &Style, T)-> void;
+
+    /**
+     * @params:
+     *    - decode: the decoder of the values, a throwing function taken with &?
+     *    - set: the setter of the field, called with the decoded value
+     * */
+    pub self (name: [c8],
+              decode: dg (&Value)-> (T)?,
+              set: dg (dmut &Style, T)-> void,
+              inherited: bool = false,
+              affectsLayout: bool = false)
+        with super(name, inherited, affectsLayout)
+        , _decode = decode
+        , _set = set
+    {}
+
+    pub over apply(self, dmut style: &Style, v: &Value)
+        throws SyntaxError
+    {
+        let decoded = self._decode(v);
+        if let Ok(value) = decoded {
+            self._set(alias style, value);
+        } else if let Err(e: &SyntaxError) = decoded {
+            throw e;
+        }
+    }
+}
+
+/**
+ * A property registered by a widget type beyond the common ones, its value decoded to a T and kept in a Style under its
+ * name, read back by the widget with `style.getCustom!{T}(name)`
+ * */
+@final
+pub class WidgetProperty {T} over Property {
+
+    let _decode: dg (&Value)-> (T)?;
+
+    /**
+     * @params:
+     *    - decode: the decoder of the values, a throwing function taken with &?
+     * */
+    pub self (name: [c8], decode: dg (&Value)-> (T)?, inherited: bool = false, affectsLayout: bool = false)
+        with super(name, inherited, affectsLayout)
+        , _decode = decode
+    {}
+
+    pub over apply(self, dmut style: &Style, v: &Value)
+        throws SyntaxError
+    {
+        let decoded = self._decode(v);
+        if let Ok(value) = decoded {
+            style.custom[self.name] = copy Custom!{T} (value);
+        } else if let Err(e: &SyntaxError) = decoded {
+            throw e;
+        }
+    }
+}
+
+/**
+ * A property setting several longhands at once, its value split into a value for each of them: `margin: 6 14;`
+ * @info: a longhand the split gives no value keeps the value it has, so `border: 2;` sets the width alone
+ * */
+@final
+pub class Shorthand over Property {
+
+    // The longhands set by the shorthand
+    pub let longhands: [&Property];
+
+    let _split: dg (&Value)-> ([(&Value)?])?;
+
+    /**
+     * @params:
+     *    - longhands: the properties set by the shorthand
+     *    - split: the splitter of the values, a throwing function taken with &?, giving one value per longhand, or none
+     *             to leave it as it is
+     * */
+    pub self (name: [c8], longhands: [&Property], split: dg (&Value)-> ([(&Value)?])?)
+        with super(name, Shorthand::anyInherited(longhands), Shorthand::anyAffectsLayout(longhands))
+        , longhands = longhands
+        , _split = split
+    {}
+
+    pub over apply(self, dmut style: &Style, v: &Value)
+        throws SyntaxError
+    {
+        let split = self._split(v);
+        if let Ok(values) = split {
+            for i, p in self.longhands {
+                if let Ok(value) = values[i] {
+                    p.apply(alias style, value);
+                }
+            }
+        } else if let Err(e: &SyntaxError) = split {
+            throw e;
+        }
+    }
+}
+
+/**
+ * The splitting of the values of the shorthands
+ * */
+pub mod Shorthand {
+
+    /**
+     * @returns: the values of the top, right, bottom and left sides of a box, from 1 to 4 values (margin: 6 14;)
+     * */
+    pub fn sides(v: &Value)-> [(&Value)?]
+        throws SyntaxError
+    {
+        let s = Sides(v);
+        copy [(s.top)?, (s.right)?, (s.bottom)?, (s.left)?]
+    }
+
+    /**
+     * @returns: the values of the width and the colour of a border, a length and a colour in any order, one of them
+     * being optional (border: 2 $edge;)
+     * */
+    pub fn border(v: &Value)-> [(&Value)?]
+        throws SyntaxError
+    {
+        let mut width: (&Value)? = none;
+        let mut color: (&Value)? = none;
+        let items                = v.toTuple();
+        if items.len > 2us {
+            throw v.expected("a width and a colour");
+        }
+
+        for item in items {
+            if let _: &Number = item {
+                if width.hasValue { throw v.expected("a width and a colour"); }
+                width = (item)?;
+            } else {
+                if color.hasValue { throw v.expected("a width and a colour"); }
+                color = (item)?;
+            }
+        }
+
+        copy [width, color]
+    }
+
+    /**
+     * @returns: the grow, the shrink and the basis of a flex item: `1` (1 1 0), `none` (0 0 auto), `auto` (1 1 auto),
+     * or the three spelled out (flex: 2 1 120;)
+     * */
+    pub fn flex(v: &Value)-> [(&Value)?]
+        throws SyntaxError
+    {
+        let what  = "a number, none, auto, or a grow, a shrink and a basis";
+        let items = v.toTuple();
+        if items.len == 3us {
+            return copy [(items[0])?, (items[1])?, (items[2])?];
+        }
+
+        if items.len != 1us {
+            throw v.expected(what);
+        }
+
+        match v {
+            Name(name-> n) => {
+                match n {
+                    "none" => { return copy [(number(v, 0.0))?, (number(v, 0.0))?, (keyword(v, "auto"))?]; }
+                    "auto" => { return copy [(number(v, 1.0))?, (number(v, 1.0))?, (keyword(v, "auto"))?]; }
+                    _      => {}
+                }
+            }
+            _: &Number => {
+                return copy [(v)?, (number(v, 1.0))?, (number(v, 0.0))?];
+            }
+            _ => {}
+        }
+
+        throw v.expected(what);
+    }
+
+    /**
+     * @returns: true iif one of the longhands is inherited
+     * */
+    pub fn anyInherited(longhands: [&Property])-> bool {
+        for p in longhands {
+            if p.inherited { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif one of the longhands affects the layout
+     * */
+    pub fn anyAffectsLayout(longhands: [&Property])-> bool {
+        for p in longhands {
+            if p.affectsLayout { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: a number standing for a value left out of a shorthand, located at the shorthand
+     * */
+    fn number(at: &Value, amount: f64)-> &Value {
+        copy Number(amount, "", true, at.getSource(), at.getLine(), at.getColumn())
+    }
+
+    /**
+     * @returns: a keyword standing for a value left out of a shorthand, located at the shorthand
+     * */
+    fn keyword(at: &Value, name: [c8])-> &Value {
+        copy Name(name, at.getSource(), at.getLine(), at.getColumn())
+    }
+}
