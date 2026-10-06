@@ -1,0 +1,552 @@
+in golden;
+
+use balder::core::error;
+use balder::interface::font::family;
+use balder::interface::loader;
+use balder::interface::loader::parser;
+use balder::interface::loader::registry;
+use balder::interface::loader::registry::{error, schema};
+use balder::interface::style;
+use balder::interface::style::manager;
+use balder::interface::widget::alignement;
+use balder::math::vector;
+
+use std::fs::_;
+
+/**
+ * The golden files of the .gui and the .style files of res/ and of the examples: the tree of the widgets a .gui file
+ * describes and the styles its sheets compute for them, written as text and compared to test/golden/<name>.txt
+ * @info:
+ * =====
+ * A widget is a line `Type #id .class "default value" { attribute: value; }`, its children indented under it. The
+ * lines under a widget are the properties of its computed style that a sheet set, a property inherited unchanged from
+ * the parent being left out, then the properties of its parts (`::label prop: value`) and of the states of its parts
+ * (`::tab:selected prop: value`). Under `:hover`, `:focus` and `:check` are the lines that differ while the widget is
+ * in that state.
+ *
+ * When the text differs from the golden file, it is written next to it, in <name>.txt.actual, to be compared and
+ * copied over the golden file once the change is the one intended.
+ * ====
+ * */
+
+/**
+ * The properties passed from a widget to its children and its parts, left out when they are unchanged
+ * */
+enum Inherited
+| TEXT_COLOR  = "text-color"
+| FONT_FAMILY = "font-family"
+| FONT_WEIGHT = "font-weight"
+| FONT_STYLE  = "font-style"
+| FONT_SIZE   = "font-size"
+| TEXT_XALIGN = "text-xalign"
+| TEXT_YALIGN = "text-yalign"
+| TEXT_WRAP   = "text-wrap";
+
+/**
+ * @returns: the golden text of a .gui file styled by a .style file
+ * */
+fn render(gui: [c8], sheet: [c8])-> [c8]
+    throws BalderError
+{
+    let registry = WidgetRegistry();
+    let doc = readGuiFile(gui);
+    registry.check(doc, gui);
+
+    let dmut styles = copy StyleManager();
+    let dmut loader = SheetLoader(registry);
+    for s in loader:.load(sheet) {
+        styles:.addSheet(s);
+    }
+
+    if let Ok(root) = doc.root {
+        return renderNode(registry, styles, root, [], copy Style(), "");
+    }
+
+    ""
+}
+
+/**
+ * @returns: the golden text of a node and of its children
+ * @params:
+ *    - ancestors: the elements of the ancestors of the node, its parent first
+ *    - parent: the computed style of the parent
+ *    - indent: the indentation of the node
+ * */
+fn renderNode(registry: &WidgetRegistry, styles: &StyleManager, node: Node, ancestors: [Element], parent: &Style, indent: [c8])-> [c8] {
+    let mut result = indent ~ head(node) ~ "\n";
+    let inner = indent ~ "    ";
+
+    let schema = if let Ok(s) = registry.get(node.typeName) { s } else { return result; };
+    let own = Element(node.typeName, id-> node.id, classes-> node.classes);
+    let base = styles.compute(copy [own] ~ ancestors, parent, parts-> schema.parts);
+    let baseLines = styleLines(styles, schema, base, parent, copy [own] ~ ancestors);
+    for l in baseLines {
+        result = result ~ inner ~ l ~ "\n";
+    }
+
+    for state in schema.states {
+        let tested = Element(node.typeName, id-> node.id, classes-> node.classes, states-> copy [state]);
+        let style = styles.compute(copy [tested] ~ ancestors, parent, parts-> schema.parts);
+        let changed = without(styleLines(styles, schema, style, parent, copy [tested] ~ ancestors), baseLines);
+        if changed.len != 0us {
+            result = result ~ inner ~ ":" ~ state ~ "\n";
+            for l in changed {
+                result = result ~ inner ~ "    " ~ l ~ "\n";
+            }
+        }
+    }
+
+    for c in node.children {
+        match c {
+            child: Node => {
+                result = result ~ renderNode(registry, styles, child, copy [own] ~ ancestors, base, inner);
+            }
+            _ => {}
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the head of a node, as written in a .gui file, without its children
+ * */
+fn head(node: Node)-> [c8] {
+    let mut result = node.typeName;
+    if node.id != "" {
+        result = result ~ " #" ~ node.id;
+    }
+
+    for c in node.classes {
+        result = result ~ " ." ~ c;
+    }
+
+    if let Ok(v) = node.value {
+        result = result ~ " " ~ v.getSource();
+    }
+
+    if node.attributes.len != 0us {
+        result = result ~ " {";
+        for a in node.attributes {
+            result = result ~ " " ~ a.name ~ ": " ~ a.value.getSource() ~ ";";
+        }
+
+        result = result ~ " }";
+    }
+
+    result
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          STYLES          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the lines of a computed style, then those of its parts and of the states of its parts
+ * @params:
+ *    - parent: the computed style the style inherits from
+ *    - path: the widget, then its ancestors
+ * */
+fn styleLines(styles: &StyleManager, schema: &WidgetSchema, style: &Style, parent: &Style, path: [Element])-> [[c8]] {
+    let mut result = ownLines(style, parent);
+    for part in sorted(partsOf(style)) {
+        let partStyle = style.getSubStyle(part);
+        for l in ownLines(partStyle, style) {
+            result = result ~ ["::" ~ part ~ " " ~ l];
+        }
+
+        for state in schema.statesOf(part) {
+            let inState = styles.computePart(path, style, part, states-> copy [state]);
+            for l in without(ownLines(inState, style), ownLines(partStyle, style)) {
+                result = result ~ ["::" ~ part ~ ":" ~ state ~ " " ~ l];
+            }
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the lines of the properties a sheet set in a style, those inherited unchanged from parent left out
+ * */
+fn ownLines(style: &Style, parent: &Style)-> [[c8]] {
+    let inherited = lines(parent);
+    let mut result: [[c8]] = [];
+    for l in lines(style) {
+        if !isInherited(l) || !contains(inherited, l) {
+            result = result ~ [l];
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the lines of the properties set in a style, `name: value`, in the order of the properties of a Style
+ * */
+fn lines(s: &Style)-> [[c8]] {
+    let mut result: [[c8]] = [];
+    if s.backgroundColor._0 { result = result ~ ["background-color: " ~ color(s.backgroundColor._1)]; }
+    if s.borderColor._0 { result = result ~ ["border-color: " ~ color(s.borderColor._1)]; }
+    if s.textColor._0 { result = result ~ ["text-color: " ~ color(s.textColor._1)]; }
+    if s.selectionColor._0 { result = result ~ ["selection-color: " ~ color(s.selectionColor._1)]; }
+    if s.color._0 { result = result ~ ["color: " ~ color(s.color._1)]; }
+    if s.fontFamily._0 { result = result ~ ["font-family: " ~ families(s.fontFamily._1)]; }
+    if s.fontWeight._0 { result = result ~ ["font-weight: " ~ std::conv::to!{[c8]}(s.fontWeight._1)]; }
+    if s.fontStyle._0 { result = result ~ ["font-style: " ~ fontStyle(s.fontStyle._1)]; }
+    if s.fontSize._0 { result = result ~ ["font-size: " ~ std::conv::to!{[c8]}(s.fontSize._1)]; }
+    if s.borderWidth._0 { result = result ~ ["border-width: " ~ std::conv::to!{[c8]}(s.borderWidth._1)]; }
+    if s.radius._0 { result = result ~ ["radius: " ~ std::conv::to!{[c8]}(s.radius._1)]; }
+    if s.marginTop._0 { result = result ~ ["margin-top: " ~ size(s.marginTop._1)]; }
+    if s.marginRight._0 { result = result ~ ["margin-right: " ~ size(s.marginRight._1)]; }
+    if s.marginBottom._0 { result = result ~ ["margin-bottom: " ~ size(s.marginBottom._1)]; }
+    if s.marginLeft._0 { result = result ~ ["margin-left: " ~ size(s.marginLeft._1)]; }
+    if s.paddingTop._0 { result = result ~ ["padding-top: " ~ size(s.paddingTop._1)]; }
+    if s.paddingRight._0 { result = result ~ ["padding-right: " ~ size(s.paddingRight._1)]; }
+    if s.paddingBottom._0 { result = result ~ ["padding-bottom: " ~ size(s.paddingBottom._1)]; }
+    if s.paddingLeft._0 { result = result ~ ["padding-left: " ~ size(s.paddingLeft._1)]; }
+    if s.hasWidth() { result = result ~ ["width: " ~ size(s.getWidth())]; }
+    if s.hasHeight() { result = result ~ ["height: " ~ size(s.getHeight())]; }
+    if s.left._0 { result = result ~ ["left: " ~ size(s.left._1)]; }
+    if s.top._0 { result = result ~ ["top: " ~ size(s.top._1)]; }
+    if s.flexGrow._0 { result = result ~ ["flex-grow: " ~ number(s.flexGrow._1)]; }
+    if s.flexShrink._0 { result = result ~ ["flex-shrink: " ~ number(s.flexShrink._1)]; }
+    if s.flexBasis._0 { result = result ~ ["flex-basis: " ~ size(s.flexBasis._1)]; }
+    if s.xalign._0 { result = result ~ ["text-xalign: " ~ xalign(s.xalign._1)]; }
+    if s.yalign._0 { result = result ~ ["text-yalign: " ~ yalign(s.yalign._1)]; }
+    if s.textWrap._0 { result = result ~ ["text-wrap: " ~ (if s.textWrap._1 { "wrap" } else { "nowrap" })]; }
+    if s.imageColor._0 { result = result ~ ["image-color: " ~ color(s.imageColor._1)]; }
+    if s.backgroundImage._0 { result = result ~ ["image: \"" ~ s.backgroundImage._1 ~ "\""]; }
+    if s.backgroundImageKeepRatio._0 { result = result ~ ["image-keep-ratio: " ~ boolean(s.backgroundImageKeepRatio._1)]; }
+    if s.backgroundImageFill._0 { result = result ~ ["image-fill: " ~ boolean(s.backgroundImageFill._1)]; }
+
+    result ~ customLines(s)
+}
+
+/**
+ * @returns: the lines of the properties registered by the widget types, in the order of their names
+ * */
+fn customLines(s: &Style)-> [[c8]] {
+    let mut names: [[c8]] = [];
+    for name, _ in s.custom {
+        names = names ~ [name];
+    }
+
+    let mut result: [[c8]] = [];
+    for name in sorted(names) {
+        result = result ~ [name ~ ": " ~ custom(s, name)];
+    }
+
+    result
+}
+
+/**
+ * @returns: the value of a property registered by a widget type
+ * */
+fn custom(s: &Style, name: [c8])-> [c8] {
+    if let Ok(d) = s.getCustom!{Direction}(name) {
+        return if d == Direction::ROW { "row" } else { "column" };
+    }
+
+    if let Ok(o) = s.getCustom!{Overflow}(name) {
+        return if o == Overflow::SCROLL { "scroll" } else { "hidden" };
+    }
+
+    if let Ok(f) = s.getCustom!{f32}(name) {
+        return number(f);
+    }
+
+    if let Ok(tracks) = s.getCustom!{[Track]}(name) {
+        let mut result = "";
+        for i, t in tracks {
+            result = (if i == 0us { "" } else { result ~ " " }) ~ track(t);
+        }
+
+        return result;
+    }
+
+    if let Ok(a) = s.getCustom!{(XAlign, YAlign)}(name) {
+        return xalign(a._0) ~ " " ~ yalign(a._1);
+    }
+
+    "?"
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          VALUES          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: a colour, #rrggbbaa
+ * */
+fn color(c: vec4)-> [c8] {
+    "#" ~ hex(c.x) ~ hex(c.y) ~ hex(c.z) ~ hex(c.w)
+}
+
+/**
+ * @returns: a channel from 0 to 1, in two hexadecimal digits
+ * */
+fn hex(channel: f32)-> [c8] {
+    let digits = "0123456789abcdef";
+    let v = cast!u32(channel * 255.0f + 0.5f);
+    digits[v / 16u32 .. v / 16u32 + 1u32] ~ digits[v % 16u32 .. v % 16u32 + 1u32]
+}
+
+/**
+ * @returns: a size: a number of pixels, a percentage of the parent or a content size, then its bounds when it has some
+ * */
+fn size(s: WidgetSize)-> [c8] {
+    let mut result = match s.kind {
+        SizeKind::AUTO        => { "auto" }
+        SizeKind::MIN_CONTENT => { "min-content" }
+        SizeKind::MAX_CONTENT => { "max-content" }
+        _ => {
+            if s.minPix == s.maxPix { std::conv::to!{[c8]}(s.minPix) } else { number(s.relative * 100.0f) ~ "%" }
+        }
+    };
+
+    if s.minPix != s.maxPix || s.kind != SizeKind::RELATIVE {
+        if s.minPix != 0u32 {
+            result = result ~ " min " ~ std::conv::to!{[c8]}(s.minPix);
+        }
+
+        if s.maxPix < cast!u32(i32::max - 1) {
+            result = result ~ " max " ~ std::conv::to!{[c8]}(s.maxPix);
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: a track of a grid
+ * */
+fn track(t: Track)-> [c8] {
+    match t.kind {
+        TrackKind::PERCENT     => { number(t.amount) ~ "%" }
+        TrackKind::SHARE       => { number(t.amount) ~ "fr" }
+        TrackKind::AUTO        => { "auto" }
+        TrackKind::MIN_CONTENT => { "min-content" }
+        TrackKind::MAX_CONTENT => { "max-content" }
+        _                      => { number(t.amount) }
+    }
+}
+
+/**
+ * @returns: a number of 0 or more, with two decimals at most
+ * */
+fn number(f: f32)-> [c8] {
+    let hundredths = cast!u64(f * 100.0f + 0.5f);
+    let whole = std::conv::to!{[c8]}(hundredths / 100u64);
+    let frac = hundredths % 100u64;
+    if frac == 0u64 { return whole; }
+    if frac % 10u64 == 0u64 { return whole ~ "." ~ std::conv::to!{[c8]}(frac / 10u64); }
+    if frac < 10u64 { return whole ~ ".0" ~ std::conv::to!{[c8]}(frac); }
+
+    whole ~ "." ~ std::conv::to!{[c8]}(frac)
+}
+
+/**
+ * @returns: the families of a font, separated by commas
+ * */
+fn families(names: [[c8]])-> [c8] {
+    let mut result = "";
+    for i, n in names {
+        result = (if i == 0us { "" } else { result ~ ", " }) ~ "\"" ~ n ~ "\"";
+    }
+
+    result
+}
+
+/**
+ * @returns: the keyword of a font style
+ * */
+fn fontStyle(f: FontStyle)-> [c8] {
+    match f {
+        FontStyle::ITALIC  => { "italic" }
+        FontStyle::OBLIQUE => { "oblique" }
+        _                  => { "normal" }
+    }
+}
+
+/**
+ * @returns: the keyword of a horizontal alignment
+ * */
+fn xalign(a: XAlign)-> [c8] {
+    match a {
+        XAlign::LEFT  => { "left" }
+        XAlign::RIGHT => { "right" }
+        XAlign::NONE  => { "none" }
+        _             => { "center" }
+    }
+}
+
+/**
+ * @returns: the keyword of a vertical alignment
+ * */
+fn yalign(a: YAlign)-> [c8] {
+    match a {
+        YAlign::TOP    => { "top" }
+        YAlign::BOTTOM => { "bottom" }
+        _              => { "center" }
+    }
+}
+
+/**
+ * @returns: the keyword of a boolean
+ * */
+fn boolean(b: bool)-> [c8] {
+    if b { "true" } else { "false" }
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          LINES          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: true iif the line is the one of an inherited property
+ * */
+fn isInherited(line: [c8])-> bool {
+    for name in Inherited::__members__ {
+        if line.len > name.len && line[0us .. name.len] == name && line[name.len] == ':' {
+            return true;
+        }
+    }
+
+    false
+}
+
+/**
+ * @returns: the names of the parts of a style
+ * */
+fn partsOf(s: &Style)-> [[c8]] {
+    let mut result: [[c8]] = [];
+    for name, _ in s.subItems {
+        result = result ~ [name];
+    }
+
+    result
+}
+
+/**
+ * @returns: the lines that are not in others
+ * */
+fn without(lines: [[c8]], others: [[c8]])-> [[c8]] {
+    let mut result: [[c8]] = [];
+    for l in lines {
+        if !contains(others, l) {
+            result = result ~ [l];
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: true iif line is one of the lines
+ * */
+fn contains(lines: [[c8]], line: [c8])-> bool {
+    for l in lines {
+        if l == line { return true; }
+    }
+
+    false
+}
+
+/**
+ * @returns: the names, in the order of their bytes
+ * */
+fn sorted(names: [[c8]])-> [[c8]] {
+    let mut result: [[c8]] = [];
+    for n in names {
+        let mut i = 0us;
+        while i < result.len && !before(n, result[i]) {
+            i += 1us;
+        }
+
+        result = result[0us .. i] ~ [n] ~ result[i .. $];
+    }
+
+    result
+}
+
+/**
+ * @returns: true iif a comes before b in the order of their bytes
+ * */
+fn before(a: [c8], b: [c8])-> bool {
+    for i in 0us .. a.len {
+        if i >= b.len { return false; }
+        if a[i] != b[i] { return a[i] < b[i]; }
+    }
+
+    a.len < b.len
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          FILES          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: true iif the golden text of a .gui file styled by a .style file is the content of its golden file, writing
+ * it in <golden>.actual when it is not
+ * */
+fn matches(gui: [c8], sheet: [c8], golden: [c8])-> bool
+    throws BalderError
+{
+    let text = render(gui, sheet);
+    let expected = {
+        readFile(golden)
+    } catch {
+        _: &BalderError => { "" }
+    };
+
+    if text == expected {
+        return true;
+    }
+
+    {
+        let dmut file = File::create(Path(golden ~ ".actual"), write-> true);
+        file:.write(text);
+        file:.close();
+    } catch {
+        _ => {}
+    }
+
+    false
+}
+
+__test the_message_dialog {
+    assert (matches("res:/dialog/message.gui", "res:/dialog/default.style", "test/golden/message.txt"));
+}
+
+__test the_demo {
+    assert (matches("res:/config/app.gui", "res:/config/app.style", "test/golden/app.txt"));
+}
+
+__test the_menu_of_the_demo {
+    assert (matches("res:/config/menu.gui", "res:/config/app.style", "test/golden/menu.txt"));
+}
+
+__test the_form {
+    assert (matches("example/form/form.gui", "example/form/form.style", "test/golden/form.txt"));
+}
+
+__test the_gallery {
+    assert (matches("example/gallery/gallery.gui", "example/gallery/gallery.style", "test/golden/gallery.txt"));
+}
