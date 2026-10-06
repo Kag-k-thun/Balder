@@ -1,0 +1,282 @@
+in style;
+
+use balder::interface::loader::parser::{condition, document, reader, scanner, selector, sheet};
+
+use std::syntax::errors;
+
+/**
+ * Reader of a .style file into its rules, knowing no property (doc/gui-v2.md, §4)
+ * @info:
+ * =====
+ * ```
+ * sheet       = { import } { directive | constant | rule | when } ;
+ * import      = "@import" string ";" ;
+ * directive   = "@font-face" "{" { declaration } "}" ;
+ * constant    = "$" ident ":" values ";" ;
+ * rule        = selectors "{" { declaration | rule-when } "}" ;
+ * rule-when   = "@when" "(" condition ")" "{" { declaration } "}" ;
+ * when        = "@when" "(" condition ")" "{" { rule } "}" ;
+ * declaration = ident ":" values ";" ;
+ * ```
+ * The constants are substituted as the sheet is read, each value seeing the constants defined before it. They are
+ * defined in a scope given by the caller, so that the sheets a sheet imports, read first in the same scope, share theirs
+ * with it: the imports come first, and readImports gives them before the rest is read. Whether a property exists and
+ * takes the value it is given is decided when the rules are applied.
+ * ====
+ * */
+pub record StyleReader {
+
+    // The scanner of the file
+    let dmut _scanner: &Scanner;
+
+    // The @import directives heading the sheet, once read
+    let mut _imports: ([Include])? = none;
+
+    /**
+     * @params:
+     *    - content: the content of the .style file
+     * */
+    pub self (content: [c8])
+        with _scanner = copy Scanner(content)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          READING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the @import directives heading the sheet, if they are not read yet
+     * @returns: the sheets imported, to read before the rest of this one
+     * */
+    pub fn readImports(mut self)-> [Include]
+        throws SyntaxError
+    {
+        if let Ok(imports) = self._imports {
+            return imports;
+        }
+
+        let mut imports: [Include] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind != TokenKind::DIRECTIVE || tok.text != "import" {
+                break;
+            }
+
+            self._scanner:.next();
+            let path = self._scanner:.next();
+            if path.kind != TokenKind::STRING {
+                throw self._scanner.expected(path, "the path of a file");
+            }
+
+            self._scanner:.expect(";");
+            imports = imports ~ [Include(path-> path.text, line-> tok.line, col-> tok.col)];
+        }
+
+        self._imports = (imports)?;
+        imports
+    }
+
+    /**
+     * Read the whole content, the imports included if they are not read yet
+     * @params:
+     *    - constants: the scope the constants of the sheet are defined in, holding those of the sheets read before
+     * @returns: the sheet
+     * */
+    pub fn read(mut self, dmut constants: &Constants)-> Sheet
+        throws SyntaxError
+    {
+        let imports = self:.readImports();
+        let mut fontFaces: [FontFace] = [];
+        let mut rules: [Rule] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::EOF {
+                break;
+            }
+
+            if tok.kind == TokenKind::CONSTANT {
+                self:.readConstant(alias constants);
+            } else if tok.kind != TokenKind::DIRECTIVE {
+                self:.refuseDeclaration();
+                rules = rules ~ [self:.readRule(constants, none)];
+            } else {
+                match tok.text {
+                    "font-face" => { fontFaces = fontFaces ~ [self:.readFontFace(constants)]; }
+                    "when"      => { rules = rules ~ self:.readWhenRules(constants); }
+                    "import"    => { throw copy SyntaxError("'@import' after the rules of the sheet", tok.line, tok.col); }
+                    _           => { throw copy SyntaxError("unknown directive '@" ~ tok.text ~ "'", tok.line, tok.col); }
+                }
+            }
+        }
+
+        Sheet(imports-> imports, fontFaces-> fontFaces, rules-> rules)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          RULES          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a constant, `$name: values;`, and define it
+     * */
+    fn readConstant(mut self, dmut constants: &Constants)
+        throws SyntaxError
+    {
+        let name = self._scanner:.next();
+        self._scanner:.expect(":");
+        let dmut values = ValueReader(alias self._scanner);
+        let value = values:.read();
+        self._scanner:.expect(";");
+        constants:.define(name.text, value);
+    }
+
+    /**
+     * Read a rule, from its selectors to the '}' closing its block
+     * @params:
+     *    - condition: the condition of the top level @when holding the rule, if any
+     * */
+    fn readRule(mut self, constants: &Constants, condition: (&Condition)?)-> Rule
+        throws SyntaxError
+    {
+        let first = self._scanner:.peek();
+        let dmut selectors = SelectorReader(alias self._scanner);
+        let list = selectors:.readList();
+        self._scanner:.expect("{");
+
+        let mut declarations: [Declaration] = [];
+        let mut whens: [When] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::DELIM && tok.text == "}" {
+                self._scanner:.next();
+                break;
+            }
+
+            if tok.kind == TokenKind::DIRECTIVE && tok.text == "when" {
+                whens = whens ~ [self:.readWhen(constants)];
+            } else {
+                declarations = declarations ~ [self:.readDeclaration(constants)];
+            }
+        }
+
+        Rule(selectors-> list, declarations-> declarations, whens-> whens, condition-> condition, line-> first.line, col-> first.col)
+    }
+
+    /**
+     * Read a @when inside a rule, holding declarations
+     * */
+    fn readWhen(mut self, constants: &Constants)-> When
+        throws SyntaxError
+    {
+        let at = self._scanner:.peek();
+        let condition = self:.readWhenHead(constants);
+        let mut declarations: [Declaration] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::DELIM && tok.text == "}" {
+                self._scanner:.next();
+                break;
+            }
+
+            declarations = declarations ~ [self:.readDeclaration(constants)];
+        }
+
+        When(condition-> condition, declarations-> declarations, line-> at.line, col-> at.col)
+    }
+
+    /**
+     * Read a @when at the top level, holding rules
+     * @returns: the rules, each carrying the condition
+     * */
+    fn readWhenRules(mut self, constants: &Constants)-> [Rule]
+        throws SyntaxError
+    {
+        let condition = self:.readWhenHead(constants);
+        let mut rules: [Rule] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::DELIM && tok.text == "}" {
+                self._scanner:.next();
+                break;
+            }
+
+            if tok.kind == TokenKind::DIRECTIVE || tok.kind == TokenKind::CONSTANT {
+                throw self._scanner.expected(tok, "a rule");
+            }
+
+            self:.refuseDeclaration();
+            rules = rules ~ [self:.readRule(constants, (condition)?)];
+        }
+
+        rules
+    }
+
+    /**
+     * Read the head of a @when, `@when (condition) {`
+     * @returns: the condition
+     * */
+    fn readWhenHead(mut self, constants: &Constants)-> &Condition
+        throws SyntaxError
+    {
+        self._scanner:.next();
+        self._scanner:.expect("(");
+        let dmut reader = ConditionReader(alias self._scanner, constants);
+        let condition = reader:.read();
+        self._scanner:.expect(")");
+        self._scanner:.expect("{");
+        condition
+    }
+
+    /**
+     * Read a @font-face block
+     * */
+    fn readFontFace(mut self, constants: &Constants)-> FontFace
+        throws SyntaxError
+    {
+        let at = self._scanner:.next();
+        self._scanner:.expect("{");
+        let mut declarations: [Declaration] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::DELIM && tok.text == "}" {
+                self._scanner:.next();
+                break;
+            }
+
+            declarations = declarations ~ [self:.readDeclaration(constants)];
+        }
+
+        FontFace(declarations-> declarations, line-> at.line, col-> at.col)
+    }
+
+    /**
+     * Refuse a declaration where a rule is expected, `name: value`, the ':' of a state being glued to its name
+     * */
+    fn refuseDeclaration(mut self)
+        throws SyntaxError
+    {
+        let tok = self._scanner:.peek();
+        if tok.kind == TokenKind::IDENT && self._scanner:.isDelim(1us, ":") && self._scanner:.peek(2us).spaced {
+            throw copy SyntaxError("declaration '" ~ tok.text ~ "' outside a rule", tok.line, tok.col);
+        }
+    }
+
+    /**
+     * Read a declaration, `name: values;`, substituting its constants
+     * */
+    fn readDeclaration(mut self, constants: &Constants)-> Declaration
+        throws SyntaxError
+    {
+        let dmut values = ValueReader(alias self._scanner);
+        let decl = values:.readDeclaration();
+        Declaration(name-> decl.name, value-> constants.resolve(decl.value), line-> decl.line, col-> decl.col)
+    }
+}

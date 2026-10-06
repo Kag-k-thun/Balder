@@ -1,0 +1,154 @@
+in parser_condition;
+
+use balder::interface::loader::parser;
+
+use std::syntax::errors;
+
+/**
+ * @returns: the condition of a content, with the constant $narrow defined, checking it ends at a ')' or the end
+ * */
+fn read(content: [c8])-> &Condition
+    throws SyntaxError
+{
+    let dmut constants = copy Constants();
+    let dmut values = copy Scanner("500");
+    let dmut valueReader = ValueReader(alias values);
+    constants:.define("narrow", valueReader:.read());
+
+    let dmut scanner = copy Scanner(content);
+    let dmut reader = ConditionReader(alias scanner, constants);
+    let condition = reader:.read();
+    let rest = scanner:.next();
+    if rest.kind != TokenKind::EOF && rest.text != ")" {
+        throw copy SyntaxError("condition followed by '" ~ rest.text ~ "'", rest.line, rest.col);
+    }
+
+    condition
+}
+
+/**
+ * @returns: the error of a condition that cannot be read, or none
+ * */
+fn failure(content: [c8])-> (&SyntaxError)? {
+    {
+        read(content);
+        none
+    } catch {
+        e: &SyntaxError => { (e)? }
+    }
+}
+
+/**
+ * @returns: a description of a condition, its tests written `variable op value` and its groups in prefix form
+ * */
+fn describe(c: &Condition)-> [c8] {
+    match c {
+        t: &Test => {
+            let op = match t.comparison {
+                Comparison::LT => { " < " }
+                Comparison::LE => { " <= " }
+                Comparison::GT => { " > " }
+                Comparison::GE => { " >= " }
+                Comparison::EQ => { " == " }
+                Comparison::NE => { " != " }
+                _              => { "" }
+            };
+
+            if let Ok(v) = t.value {
+                return t.variable ~ op ~ v.getSource();
+            }
+
+            return t.variable;
+        }
+        n: &Not => {
+            return "not(" ~ describe(n.operand) ~ ")";
+        }
+        a: &And => {
+            return "and(" ~ describeAll(a.operands) ~ ")";
+        }
+        o: &Or => {
+            return "or(" ~ describeAll(o.operands) ~ ")";
+        }
+        _ => {}
+    }
+
+    "?"
+}
+
+/**
+ * @returns: the descriptions of conditions separated by commas
+ * */
+fn describeAll(operands: [&Condition])-> [c8] {
+    let mut result = "";
+    for i, c in operands {
+        if i != 0us { result = result ~ ", "; }
+        result = result ~ describe(c);
+    }
+
+    result
+}
+
+__test comparisons {
+    assert (describe(read("window.width < 800")) == "window.width < 800");
+    assert (describe(read("width <= 1")) == "width <= 1");
+    assert (describe(read("window.density >= 2")) == "window.density >= 2");
+    assert (describe(read("height > 10%")) == "height > 10%");
+    assert (describe(read("app.mode == edit")) == "app.mode == edit");
+    assert (describe(read("theme != dark")) == "theme != dark");
+}
+
+__test a_variable_alone_tests_a_boolean {
+    match read("app.read-only") {
+        t: &Test => { assert (t.variable == "app.read-only" && t.comparison == Comparison::NONE && !t.value.hasValue); }
+        _ => { assert (false); }
+    }
+}
+
+__test constants_are_substituted {
+    match read("width < $narrow") {
+        t: &Test => {
+            if let Ok(v) = t.value {
+                assert (v.toInteger() == 500);
+            } else {
+                assert (false);
+            }
+        }
+        _ => { assert (false); }
+    }
+}
+
+__test and_binds_tighter_than_or {
+    assert (describe(read("app.mode == edit and not app.read-only")) == "and(app.mode == edit, not(app.read-only))");
+    assert (describe(read("a or b and c")) == "or(a, and(b, c))");
+    assert (describe(read("a and b or c and d or e")) == "or(and(a, b), and(c, d), e)");
+    assert (describe(read("(a or b) and c")) == "and(or(a, b), c)");
+    assert (describe(read("not not a")) == "not(not(a))");
+}
+
+__test conditions_are_located {
+    let c = read("\n  a and b");
+    assert (c.line == 2us && c.col == 3us);
+    match c {
+        a: &And => { assert (a.operands[1].col == 9us); }
+        _ => { assert (false); }
+    }
+}
+
+/**
+ * (content, line, column)
+ * */
+@parameters ((yield c for c in [("", 1us, 1us),
+                                ("a <", 1us, 4us),                 // a comparison without its value
+                                ("$narrow < 1", 1us, 1us),         // no variable
+                                ("a < $wide", 1us, 5us),           // an unknown constant
+                                ("window. width", 1us, 9us),       // a '.' apart from its name
+                                ("(a", 1us, 3us),
+                                ("a and", 1us, 6us),
+                                ("not", 1us, 4us)]))
+__test invalid_conditions (content: [c8], line: usize, col: usize) {
+    if let Ok(e) = failure(content) {
+        assert (e.line == line && e.col == col);
+    } else {
+        assert (false);
+    }
+}

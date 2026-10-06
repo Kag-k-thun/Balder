@@ -1,0 +1,304 @@
+in condition;
+
+use balder::interface::loader::parser::reader;
+
+use std::syntax::errors;
+
+/**
+ * The comparison of a test with its value
+ * */
+pub enum Comparison
+| NONE = 0u8  // no comparison: the variable alone tests a boolean
+| LT   = 1u8  // <
+| LE   = 2u8  // <=
+| GT   = 3u8  // >
+| GE   = 4u8  // >=
+| EQ   = 5u8  // ==
+| NE   = 6u8; // !=
+
+/**
+ * The condition of a `@when` block: `width < $narrow`, `app.mode == edit and not app.read-only`
+ * @info: a sealed hierarchy rather than a union, whose members cannot hold the union they belong to
+ * */
+@abstract
+pub class Condition {
+
+    prot self;
+
+    /**
+     * @returns: the line of the condition, from 1
+     * */
+    @field
+    pub fn line(self)-> usize;
+
+    /**
+     * @returns: the column of the condition, from 1
+     * */
+    @field
+    pub fn col(self)-> usize;
+}
+
+/**
+ * A variable compared to a value, or alone: `window.width < 800`, `app.compact`
+ * */
+@final
+pub class Test over Condition {
+
+    // The variable, its names joined by '.' (window.width)
+    pub let variable: [c8];
+
+    // How it is compared to the value
+    pub let comparison: Comparison;
+
+    // The value it is compared to, its constants substituted, none when the variable is alone
+    pub let value: (&Value)?;
+
+    // The line and the column of the variable, from 1
+    pub let loc: (usize, usize);
+
+    pub self;
+
+    @field
+    pub over line(self)-> usize {
+        self.loc._0
+    }
+
+    @field
+    pub over col(self)-> usize {
+        self.loc._1
+    }
+}
+
+/**
+ * The negation of a condition: `not app.read-only`
+ * */
+@final
+pub class Not over Condition {
+
+    // The condition that has to be false
+    pub let operand: &Condition;
+
+    // The line and the column of the 'not', from 1
+    pub let loc: (usize, usize);
+
+    pub self;
+
+    @field
+    pub over line(self)-> usize {
+        self.loc._0
+    }
+
+    @field
+    pub over col(self)-> usize {
+        self.loc._1
+    }
+}
+
+/**
+ * Conditions that all have to hold: `a and b and c`
+ * */
+@final
+pub class And over Condition {
+
+    // The conditions, two or more
+    pub let operands: [&Condition];
+
+    // The line and the column of the first operand, from 1
+    pub let loc: (usize, usize);
+
+    pub self;
+
+    @field
+    pub over line(self)-> usize {
+        self.loc._0
+    }
+
+    @field
+    pub over col(self)-> usize {
+        self.loc._1
+    }
+}
+
+/**
+ * Conditions of which one has to hold: `a or b or c`
+ * */
+@final
+pub class Or over Condition {
+
+    // The conditions, two or more
+    pub let operands: [&Condition];
+
+    // The line and the column of the first operand, from 1
+    pub let loc: (usize, usize);
+
+    pub self;
+
+    @field
+    pub over line(self)-> usize {
+        self.loc._0
+    }
+
+    @field
+    pub over col(self)-> usize {
+        self.loc._1
+    }
+}
+
+/**
+ * Reader of the condition between the parentheses of a `@when` (doc/gui-v2.md, §4)
+ * @info:
+ * =====
+ * ```
+ * condition = conjunction { "or" conjunction } ;
+ * conjunction = test { "and" test } ;
+ * test      = "not" test | "(" condition ")" | variable [ compare term ] ;
+ * variable  = ident { "." ident } ;                  (* glued *)
+ * compare   = "<" | "<=" | ">" | ">=" | "==" | "!=" ;
+ * ```
+ * 'and' binds tighter than 'or'. The compared value is a single value of the shared grammar, its constants
+ * substituted. The condition ends at the ')' that follows it, which the reader leaves to its caller.
+ * ====
+ * */
+pub record ConditionReader {
+
+    // The scanner the condition is read from, shared with the parser of the file
+    let dmut _scanner: &Scanner;
+
+    // The constants substituted in the compared values
+    let _constants: &Constants;
+
+    /**
+     * @params:
+     *    - scanner: the scanner of the file, positioned before the condition
+     *    - constants: the constants defined so far
+     * */
+    pub self (dmut scanner: &Scanner, constants: &Constants)
+        with _scanner = alias scanner
+        , _constants = constants
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          READING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a condition, up to the ')' that follows it, left unread
+     * */
+    pub fn read(mut self)-> &Condition
+        throws SyntaxError
+    {
+        let first = self:.readConjunction();
+        if !self:.isWord("or") {
+            return first;
+        }
+
+        let mut operands = copy [first];
+        while self:.isWord("or") {
+            self._scanner:.next();
+            operands = operands ~ [self:.readConjunction()];
+        }
+
+        copy Or(operands, (first.line, first.col))
+    }
+
+    /**
+     * Read tests joined by 'and'
+     * */
+    fn readConjunction(mut self)-> &Condition
+        throws SyntaxError
+    {
+        let first = self:.readTest();
+        if !self:.isWord("and") {
+            return first;
+        }
+
+        let mut operands = copy [first];
+        while self:.isWord("and") {
+            self._scanner:.next();
+            operands = operands ~ [self:.readTest()];
+        }
+
+        copy And(operands, (first.line, first.col))
+    }
+
+    /**
+     * Read a negated test, a condition between parentheses, or a variable and its comparison
+     * */
+    fn readTest(mut self)-> &Condition
+        throws SyntaxError
+    {
+        let tok = self._scanner:.next();
+        if tok.kind == TokenKind::DELIM && tok.text == "(" {
+            let inner = self:.read();
+            self._scanner:.expect(")");
+            return inner;
+        }
+
+        if tok.kind != TokenKind::IDENT {
+            throw self._scanner.expected(tok, "a variable");
+        }
+
+        if tok.text == "not" {
+            return copy Not(self:.readTest(), (tok.line, tok.col));
+        }
+
+        let mut variable = tok.text;
+        while self._scanner:.isDelim(".") && !self._scanner:.peek().spaced {
+            self._scanner:.next();
+            let name = self._scanner:.next();
+            if name.kind != TokenKind::IDENT || name.spaced {
+                throw self._scanner.expected(name, "the name of a variable glued to the '.'");
+            }
+
+            variable = variable ~ "." ~ name.text;
+        }
+
+        let comparison = self:.readComparison();
+        if comparison == Comparison::NONE {
+            return copy Test(variable, comparison, none, (tok.line, tok.col));
+        }
+
+        let dmut values = ValueReader(alias self._scanner);
+        let value = self._constants.resolve(values:.readTerm());
+        copy Test(variable, comparison, (value)?, (tok.line, tok.col))
+    }
+
+    /**
+     * Consume the comparison at the cursor, if there is one
+     * */
+    fn readComparison(mut self)-> Comparison
+        throws SyntaxError
+    {
+        let tok = self._scanner:.peek();
+        if tok.kind != TokenKind::DELIM {
+            return Comparison::NONE;
+        }
+
+        let comparison = match tok.text {
+            "<"  => { Comparison::LT }
+            "<=" => { Comparison::LE }
+            ">"  => { Comparison::GT }
+            ">=" => { Comparison::GE }
+            "==" => { Comparison::EQ }
+            "!=" => { Comparison::NE }
+            _    => { return Comparison::NONE; }
+        };
+
+        self._scanner:.next();
+        comparison
+    }
+
+    /**
+     * @returns: true iif the next token is the identifier word
+     * */
+    fn isWord(mut self, word: [c8])-> bool
+        throws SyntaxError
+    {
+        let tok = self._scanner:.peek();
+        tok.kind == TokenKind::IDENT && tok.text == word
+    }
+}

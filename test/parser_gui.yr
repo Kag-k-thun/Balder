@@ -1,0 +1,254 @@
+in parser_gui;
+
+use balder::interface::loader::parser;
+
+use std::syntax::errors;
+
+/**
+ * @returns: the document of a .gui content
+ * */
+fn read(content: [c8])-> Document
+    throws SyntaxError
+{
+    let dmut reader = GuiReader(content);
+    reader:.read()
+}
+
+/**
+ * @returns: the root of a .gui content, that has to have one
+ * */
+fn root(content: [c8])-> Node
+    throws SyntaxError
+{
+    if let Ok(r) = read(content).root {
+        return r;
+    }
+
+    throw copy SyntaxError("no root", 0us, 0us);
+}
+
+/**
+ * @returns: the error of a content that cannot be read, or none
+ * */
+fn failure(content: [c8])-> (&SyntaxError)? {
+    {
+        read(content);
+        none
+    } catch {
+        e: &SyntaxError => { (e)? }
+    }
+}
+
+/**
+ * @returns: the child nodes of a node, its slots left out
+ * */
+fn nodes(n: Node)-> [Node] {
+    let mut result: [Node] = [];
+    for c in n.children {
+        match c {
+            child: Node => { result = result ~ [child]; }
+            _ => {}
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the source of the value of an attribute of a node, "" if it is not set
+ * */
+fn attribute(n: Node, name: [c8])-> [c8] {
+    for a in n.attributes {
+        if a.name == name { return a.value.getSource(); }
+    }
+
+    ""
+}
+
+__test the_head_of_a_node {
+    let n = root("PushButton #YES .yes .primary \"Yes\";");
+    assert (n.typeName == "PushButton" && n.id == "YES");
+    assert (n.classes == ["yes", "primary"]);
+    assert (n.line == 1us && n.col == 1us);
+    if let Ok(v) = n.value {
+        assert (v.toText() == "Yes");
+    } else {
+        assert (false);
+    }
+
+    let anonymous = root("Box .fill;");
+    assert (anonymous.id == "" && anonymous.classes == ["fill"] && !anonymous.value.hasValue);
+    assert (anonymous.attributes.len == 0us && anonymous.children.len == 0us);
+
+    let bare = root("Box;");
+    assert (bare.id == "" && bare.classes.len == 0us);
+}
+
+__test ids_and_classes_come_in_any_order {
+    let n = root("Label .a #ID .b;");
+    assert (n.id == "ID" && n.classes == ["a", "b"]);
+}
+
+__test attributes_and_children_of_a_block {
+    let n = root("""
+        LinearLayout #FORM .page {
+            tab: "Form";
+            Label .heading "Tell us about yourself";
+            InputText #AGE .input { max-length: 3; only-numbers: true; }
+            PushButton .entry "Label" {
+                on-click: describe ("Label: a text");
+            }
+        }
+        """);
+
+    assert (attribute(n, "tab") == "\"Form\"");
+    let children = nodes(n);
+    assert (children.len == 3us);
+    assert (children[0].typeName == "Label" && children[0].line == 3us);
+    assert (attribute(children[1], "max-length") == "3");
+    assert (attribute(children[1], "only-numbers") == "true");
+    assert (attribute(children[2], "on-click") == "describe (\"Label: a text\")");
+}
+
+__test a_default_value_before_a_block {
+    let n = root("MenuButton #FILE .menu \"File\" { LinearLayout #FILE_MENU .popup; }");
+    if let Ok(v) = n.value {
+        assert (v.toText() == "File");
+    } else {
+        assert (false);
+    }
+
+    assert (nodes(n)[0].id == "FILE_MENU");
+}
+
+__test the_dialog_of_the_proposal {
+    let n = root("""
+        // res/dialog/message.gui
+        LinearLayout #FL .root {
+            Label #QUESTION .question "HELLO?";
+            LinearLayout #F2 .inner {
+                PushButton #YES .yes "Yes";
+                PushButton #NO .no "No";
+            }
+        }
+        """);
+
+    let inner = nodes(n)[1];
+    assert (inner.id == "F2");
+    assert (nodes(inner)[0].id == "YES" && nodes(inner)[1].id == "NO");
+    assert (nodes(inner)[1].line == 6us);
+}
+
+__test directives_and_components {
+    let doc = read("""
+        @import "res:/widgets/panel.gui";
+        @style "panel.style";
+
+        @component FieldRow ($label, $max-length: 64, $only-numbers: false, $on-validate: none) {
+            LinearLayout .field-row {
+                Label .field $label;
+                InputText #INPUT .input {
+                    max-length: $max-length;
+                    only-numbers: $only-numbers;
+                    on-validate: $on-validate;
+                }
+            }
+        }
+
+        @component Panel ($title) {
+            LinearLayout .panel {
+                LinearLayout .panel-bar {
+                    Label .panel-title $title;
+                    @slot tools;
+                }
+                LinearLayout .panel-body { @slot; }
+            }
+        }
+
+        FieldRow #AGE "Age" { max-length: 3; only-numbers: true; on-validate: age-set; }
+        """);
+
+    assert (doc.imports.len == 1us && doc.imports[0].path == "res:/widgets/panel.gui" && doc.imports[0].line == 1us);
+    assert (doc.styles.len == 1us && doc.styles[0].path == "panel.style");
+    assert (doc.components.len == 2us);
+
+    let row = doc.components[0];
+    assert (row.name == "FieldRow" && row.params.len == 4us);
+    assert (row.params[0].name == "label" && !row.params[0].value.hasValue);
+    if let Ok(v) = row.params[1].value {
+        assert (v.toInteger() == 64);
+    } else {
+        assert (false);
+    }
+
+    assert (row.root.typeName == "LinearLayout" && row.root.classes == ["field-row"]);
+    assert (attribute(nodes(row.root)[1], "on-validate") == "$on-validate");
+
+    let panel = doc.components[1];
+    let bar = nodes(panel.root)[0];
+    match bar.children[1] {
+        SlotMark(name-> n) => { assert (n == "tools"); }
+        _ => { assert (false); }
+    }
+
+    match nodes(panel.root)[1].children[0] {
+        SlotMark(name-> n) => { assert (n == ""); }
+        _ => { assert (false); }
+    }
+
+    if let Ok(r) = doc.root {
+        assert (r.typeName == "FieldRow" && r.id == "AGE" && attribute(r, "on-validate") == "age-set");
+    } else {
+        assert (false);
+    }
+}
+
+__test a_library_has_no_root {
+    let doc = read("@component Empty () { Box .empty; }");
+    assert (!doc.root.hasValue && doc.components.len == 1us && doc.components[0].params.len == 0us);
+    assert (!read("// nothing").root.hasValue);
+}
+
+/**
+ * (content, line, column)
+ * */
+@parameters ((yield c for c in [("Box", 1us, 4us),                                   // no ';' or block
+                                ("Box .fill", 1us, 10us),
+                                ("Box #A #B;", 1us, 8us),                            // a second id
+                                ("Box . fill;", 1us, 7us),                           // a class apart from its '.'
+                                ("Box #388;", 1us, 5us),                             // an id that is no name
+                                ("Box { a: 1; a: 2; }", 1us, 13us),                  // an attribute set twice
+                                ("Box { a: 1 }", 1us, 12us),
+                                ("Box { \"text\"; }", 1us, 7us),
+                                ("Box; Box;", 1us, 6us),                             // two roots
+                                ("Box { @slot; }", 1us, 7us),                        // a slot outside a component
+                                ("@slot;", 1us, 1us),
+                                ("@when (a) {}", 1us, 1us),                          // a directive of the .style
+                                ("@import panel;", 1us, 9us),
+                                ("Label $text;", 1us, 7us),                          // a parameter outside a component
+                                ("@component C ($a) { Label $b; }", 1us, 27us),      // a parameter of no one
+                                ("@component C ($a, $a) { Box; }", 1us, 19us),
+                                ("@component C ($a: $a) { Box; }", 1us, 19us),
+                                ("@component C (a) { Box; }", 1us, 15us),
+                                ("@component C () { Box; Box; }", 1us, 24us),        // two roots
+                                ("@component C () { Box { @slot; @slot; } }", 1us, 32us),
+                                ("@component C () { Box; } @component C () { Box; }", 1us, 26us),
+                                ("Box {", 1us, 6us)]))
+__test invalid_documents (content: [c8], line: usize, col: usize) {
+    if let Ok(e) = failure(content) {
+        assert (e.line == line && e.col == col);
+    } else {
+        assert (false);
+    }
+}
+
+__test errors_name_what_is_wrong {
+    let msg = {
+        read("@component C ($a) { Label $b; }");
+        ""
+    } catch {
+        e: &SyntaxError => { e.msg }
+    };
+
+    assert (msg == "unknown parameter '$b'");
+}

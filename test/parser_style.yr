@@ -1,0 +1,194 @@
+in parser_style;
+
+use balder::interface::loader::parser;
+
+use std::syntax::errors;
+
+/**
+ * @returns: the sheet of a .style content, read with no constant defined before it
+ * */
+fn read(content: [c8])-> Sheet
+    throws SyntaxError
+{
+    let dmut constants = copy Constants();
+    let dmut reader = StyleReader(content);
+    reader:.read(alias constants)
+}
+
+/**
+ * @returns: the error of a content that cannot be read, or none
+ * */
+fn failure(content: [c8])-> (&SyntaxError)? {
+    {
+        read(content);
+        none
+    } catch {
+        e: &SyntaxError => { (e)? }
+    }
+}
+
+/**
+ * @returns: the source of the value of a declaration, "" if it is not declared
+ * */
+fn declared(declarations: [Declaration], name: [c8])-> [c8] {
+    for d in declarations {
+        if d.name == name { return d.value.getSource(); }
+    }
+
+    ""
+}
+
+__test the_dialog_of_the_proposal {
+    let sheet = read("""
+        $surface: #202328;
+        $button:  #22252a;
+        $edge:    #4a5259;
+        LinearLayout.root, LinearLayout.inner {
+            background-color: $surface;
+        }
+        PushButton.yes, PushButton.no {
+            background-color: $button;
+            border: 2 $edge;
+            margin: 10;
+            flex: 1;
+        }
+        PushButton.yes:hover::label { text-color: #2fc49f; }
+        """);
+
+    assert (sheet.imports.len == 0us && sheet.fontFaces.len == 0us);
+    assert (sheet.rules.len == 3us);
+
+    let root = sheet.rules[0];
+    assert (root.selectors.len == 2us && root.selectors[1].source == "LinearLayout.inner");
+    assert (root.line == 4us && root.col == 1us);
+    assert (declared(root.declarations, "background-color") == "#202328");
+    assert (!root.condition.hasValue && root.whens.len == 0us);
+
+    let buttons = sheet.rules[1];
+    assert (buttons.declarations.len == 4us);
+    let border = buttons.declarations[1];
+    assert (border.name == "border" && border.line == 9us);
+    assert (border.value.toTuple().len == 2us && border.value.toTuple()[1].getSource() == "#4a5259");
+
+    let hover = sheet.rules[2].selectors[0].compounds[0];
+    assert (hover.states == ["hover"] && hover.part == "label");
+}
+
+__test constants_see_the_definitions_before_them {
+    let sheet = read("""
+        $pad: 6 14;
+        $pad: 0 $pad;
+        Box { padding: $pad; }
+        $pad: 1;
+        Label { padding: $pad; }
+        """);
+
+    assert (declared(sheet.rules[0].declarations, "padding") == "0 $pad");
+    assert (sheet.rules[0].declarations[0].value.toTuple().len == 3us);
+    assert (declared(sheet.rules[1].declarations, "padding") == "1");
+}
+
+__test the_scope_is_shared_with_the_sheets_read_before {
+    let dmut constants = copy Constants();
+    let dmut base = StyleReader("$accent: #388bfd;");
+    base:.read(alias constants);
+
+    let dmut reader = StyleReader("@import \"base.style\";\nPushButton { border-color: $accent; }\n$size: 12;");
+    let imports = reader:.readImports();
+    assert (imports.len == 1us && imports[0].path == "base.style" && imports[0].col == 1us);
+
+    let sheet = reader:.read(alias constants);
+    assert (sheet.imports.len == 1us);
+    assert (declared(sheet.rules[0].declarations, "border-color") == "#388bfd");
+    assert (constants.contains("size"));
+}
+
+__test when_blocks {
+    let sheet = read("""
+        $narrow: 500;
+        LinearLayout.prompt {
+            direction: row;
+            @when (width < $narrow) {
+                direction: column;
+            }
+        }
+        @when (window.width < 800) {
+            LinearLayout.inspector { display: none; }
+            Label.status {
+                font-size: 12;
+                @when (app.compact) { font-size: 10; }
+            }
+        }
+        Label { }
+        """);
+
+    assert (sheet.rules.len == 4us);
+    let prompt = sheet.rules[0];
+    assert (declared(prompt.declarations, "direction") == "row");
+    assert (prompt.whens.len == 1us && prompt.whens[0].line == 4us);
+    assert (declared(prompt.whens[0].declarations, "direction") == "column");
+    match prompt.whens[0].condition {
+        t: &Test => {
+            assert (t.variable == "width" && t.comparison == Comparison::LT);
+            if let Ok(v) = t.value {
+                assert (v.toInteger() == 500);
+            } else {
+                assert (false);
+            }
+        }
+        _ => { assert (false); }
+    }
+
+    for i in 1us .. 3us {
+        if let Ok(c) = sheet.rules[i].condition {
+            assert (c.line == 8us && c.col == 8us);
+        } else {
+            assert (false);
+        }
+    }
+
+    let status = sheet.rules[2];
+    assert (status.whens.len == 1us && declared(status.whens[0].declarations, "font-size") == "10");
+    assert (!sheet.rules[3].condition.hasValue);
+}
+
+__test font_faces {
+    let sheet = read("""
+        @font-face {
+            font-family: "Noto Sans";
+            src: "res:/fonts/noto/NotoSans-Bold.ttf";
+            font-weight: 700;
+        }
+        """);
+
+    assert (sheet.fontFaces.len == 1us && sheet.rules.len == 0us);
+    assert (sheet.fontFaces[0].line == 1us);
+    assert (declared(sheet.fontFaces[0].declarations, "font-weight") == "700");
+}
+
+/**
+ * (content, line, column)
+ * */
+@parameters ((yield c for c in [("Box { a: $b; }", 1us, 10us),                     // an unknown constant
+                                ("Box { a: 1 }", 1us, 12us),
+                                ("Box { a: 1;", 1us, 12us),
+                                ("Box a: 1; }", 1us, 8us),                         // a declaration as a selector
+                                ("color: red;", 1us, 1us),                         // a declaration outside a rule
+                                ("@when (a) { color: red; }", 1us, 13us),
+                                ("@when (a) { $x: 1; }", 1us, 13us),
+                                ("@when (a) { @when (b) { } }", 1us, 13us),
+                                ("Box { @when (a) { Label { } } }", 1us, 25us),     // a rule in the @when of a rule
+                                ("Box { @font-face { } }", 1us, 7us),
+                                ("Box { } @import \"a.style\";", 1us, 9us),          // an import after a rule
+                                ("@media (a) { }", 1us, 1us),
+                                ("@import a;", 1us, 9us),
+                                ("$x 1;", 1us, 4us),
+                                ("@when a { }", 1us, 7us),
+                                ("@when (a) Box { }", 1us, 11us)]))
+__test invalid_sheets (content: [c8], line: usize, col: usize) {
+    if let Ok(e) = failure(content) {
+        assert (e.line == line && e.col == col);
+    } else {
+        assert (false);
+    }
+}
