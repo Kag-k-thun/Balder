@@ -1,0 +1,297 @@
+in widget_registry;
+
+use balder::interface::loader::{parser, registry::_, registry::error, registry::schema};
+use balder::interface::widget;
+use balder::interface::widget::box;
+
+use std::syntax::errors;
+
+/**
+ * @returns: the document of a .gui content
+ * */
+fn read(content: [c8])-> Document
+    throws SyntaxError
+{
+    let dmut reader = GuiReader(content);
+    reader:.read()
+}
+
+/**
+ * @returns: the error of the check of a .gui content by a registry, none when the registry accepts it
+ * */
+fn failure(registry: &WidgetRegistry, content: [c8])-> (&LoadError)?
+    throws SyntaxError
+{
+    let doc = read(content);
+    {
+        registry.check(doc, "test.gui");
+        none
+    } catch {
+        e: &LoadError => { (e)? }
+    }
+}
+
+/**
+ * @returns: the error of the check of a .gui content by the registry of the built-in types, none when it accepts it
+ * */
+fn failure(content: [c8])-> (&LoadError)?
+    throws SyntaxError
+{
+    failure(WidgetRegistry(), content)
+}
+
+/**
+ * @returns: true iif the check of a content fails with reason, at line and col
+ * */
+fn refuses(content: [c8], reason: [c8], line: usize, col: usize)-> bool
+    throws SyntaxError
+{
+    if let Ok(e) = failure(content) {
+        return e.reason == reason && e.line == line && e.col == col && e.file == "test.gui";
+    }
+
+    false
+}
+
+/**
+ * @returns: the single value of a content
+ * */
+fn value(content: [c8])-> &Value
+    throws SyntaxError
+{
+    let dmut scanner = copy Scanner(content);
+    let dmut reader = ValueReader(alias scanner);
+    reader:.read()
+}
+
+/**
+ * @returns: true iif the value of a content cannot be decoded to a T
+ * */
+fn rejects{T}(content: [c8])-> bool
+    throws SyntaxError
+{
+    let v = value(content);
+    {
+        decode!{T}(v);
+        false
+    } catch {
+        _: &SyntaxError => { true }
+    }
+}
+
+__test every_built_in_type {
+    // the gallery of doc/gui-v2.md, §3, with a grid placing its cells and a menu in its menu button
+    let gallery = """
+        MenuLayout #ROOT .root {
+            LinearLayout #BAR .bar {
+                MenuButton #FILE .menu "File" {
+                    open-on-hover: true;
+                    LinearLayout #FILE_MENU .popup {
+                        PushButton #NEW .item "New page";
+                        PushButton #QUIT .item "Quit";
+                    }
+                }
+                Box .fill;
+                Label #CLOCK .clock "0 fps";
+            }
+
+            LinearLayout #BODY .body {
+                Splitter #MAIN .main {
+                    TabLayout #TABS .tabs {
+                        LinearLayout #FORM .page {
+                            tab: "Form";
+                            Label .heading "Tell us about yourself";
+                            LinearLayout .row {
+                                Label .field "Name";
+                                InputText #NAME .input { max-length: 64; }
+                            }
+                            LinearLayout .row {
+                                Label .field "Age";
+                                InputText #AGE .input "18" { max-length: 3; only-numbers: true; }
+                            }
+                        }
+
+                        FloatingLayout #SCENE_PAGE .scene-page {
+                            tab: "3D scene";
+                            Scene3D #SCENE .scene { resolution: 1280 720; }
+                            Label #FPS .fps "0 fps" { capture-events: false; }
+                        }
+
+                        LinearLayout #LAYOUTS .page {
+                            tab: "Layouts";
+                            GridLayout #GRID .grid {
+                                Box .cell-a;
+                                Label .cell "(1, 0)" { cell: 1 0; }
+                                Box .cell-b { cell: 2 0; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """;
+
+    assert (!failure(gallery).hasValue);
+}
+
+__test the_schemas_of_the_built_in_types {
+    let registry = WidgetRegistry();
+    for name in ["Box", "Label", "InputText", "PushButton", "MenuButton", "LinearLayout", "GridLayout",
+                 "FloatingLayout", "Splitter", "TabLayout", "MenuLayout", "Scene3D"] {
+        assert (registry.get(name).hasValue);
+    }
+
+    if let Ok(input) = registry.get("InputText") {
+        assert (input.defaultAttribute == "text");
+        assert (input.attribute("max-length").hasValue && input.attribute("only-numbers").hasValue);
+        assert (input.parts == ["label", "selection", "cursor"]);
+        assert (!input.children.hasValue);
+    } else {
+        assert (false);
+    }
+
+    if let Ok(menu) = registry.get("MenuLayout") {
+        if let Ok(c) = menu.children {
+            assert (c.min == 2us && c.max == 2us && c.roles == ["bar", "content"]);
+        } else {
+            assert (false);
+        }
+    } else {
+        assert (false);
+    }
+
+    if let Ok(tab) = registry.get("TabLayout") {
+        if let Ok(slot) = tab.slot("tab") {
+            assert (slot.required);
+        } else {
+            assert (false);
+        }
+    } else {
+        assert (false);
+    }
+
+    assert (!registry.get("ScrollLayout").hasValue);
+}
+
+__test unknown_types_and_attributes {
+    assert (refuses("Button;", "unknown widget type 'Button'", 1us, 1us));
+    assert (refuses("LinearLayout {\n    Box;\n    Lable \"a\";\n}", "unknown widget type 'Lable'", 3us, 5us));
+    assert (refuses("Label { color: red; }", "unknown attribute 'color' of 'Label'", 1us, 9us));
+
+    // an attribute a parent gives its children is not one of another parent
+    assert (refuses("LinearLayout { Box { tab: \"a\"; } }", "unknown attribute 'tab' of 'Box' under 'LinearLayout'", 1us, 22us));
+    assert (refuses("Box { cell: 0 0; }", "unknown attribute 'cell' of 'Box'", 1us, 7us));
+}
+
+__test values_of_the_wrong_kind {
+    assert (refuses("InputText { max-length: \"64\"; }",
+                    "attribute 'max-length' of 'InputText': expected an integer, found '\"64\"'", 1us, 25us));
+    assert (refuses("InputText { max-length: 6.4; }",
+                    "attribute 'max-length' of 'InputText': expected an integer, found '6.4'", 1us, 25us));
+    assert (refuses("InputText { only-numbers: yes; }",
+                    "attribute 'only-numbers' of 'InputText': expected one of true, false, found 'yes'", 1us, 27us));
+    assert (refuses("Scene3D { resolution: 1280; }",
+                    "attribute 'resolution' of 'Scene3D': expected two integers, found '1280'", 1us, 23us));
+    assert (refuses("Label 12;", "attribute 'text' of 'Label': expected a string, found '12'", 1us, 7us));
+    assert (refuses("GridLayout { Box { cell: 1; } }",
+                    "attribute 'cell' of 'Box' under 'GridLayout': expected two integers, found '1'", 1us, 26us));
+}
+
+__test default_values {
+    assert (refuses("Box \"a\";", "'Box' takes no default value", 1us, 5us));
+    assert (refuses("Label \"a\" { text: \"b\"; }",
+                    "attribute 'text' of 'Label' set twice, by the default value and in the block", 1us, 13us));
+    assert (!failure("Label { text: \"b\"; }").hasValue);
+}
+
+__test the_children_a_type_accepts {
+    assert (refuses("Box { Label; }", "'Box' takes no children", 1us, 7us));
+    assert (refuses("Label \"a\" { Box; }", "'Label' takes no children", 1us, 13us));
+    assert (refuses("MenuLayout { Box; }", "'MenuLayout' takes its bar then its content, found 1", 1us, 1us));
+    assert (refuses("MenuLayout { Box; Box; Box; }", "'MenuLayout' takes only its bar then its content", 1us, 24us));
+    assert (refuses("MenuButton \"File\" { Box; Box; }", "'MenuButton' takes only its popup", 1us, 26us));
+    assert (refuses("TabLayout { }", "'TabLayout' takes at least 1 child, found 0", 1us, 1us));
+
+    assert (!failure("MenuButton \"File\";").hasValue);
+    assert (!failure("LinearLayout { Box; Box; Box; Box; }").hasValue);
+}
+
+__test the_attributes_a_parent_requires {
+    assert (refuses("TabLayout {\n    Box { tab: \"a\"; }\n    Box;\n}", "a child of 'TabLayout' needs the attribute 'tab'", 3us, 5us));
+    assert (refuses("TabLayout { Box { tab: 1; } }",
+                    "attribute 'tab' of 'Box' under 'TabLayout': expected a string, found '1'", 1us, 24us));
+}
+
+__test anonymous_widgets_add_no_segment_to_the_paths {
+    let content = """
+        LinearLayout #BODY {
+            LinearLayout {
+                Label #NAME "Name";
+            }
+            LinearLayout {
+                Label #NAME "Name";
+            }
+        }
+        """;
+
+    assert (refuses(content, "'#NAME' is reachable by the path 'BODY/NAME' of the widget at line 3, column 9", 6us, 9us));
+
+    // the same id under two named widgets
+    assert (!failure("""
+        LinearLayout #BODY {
+            LinearLayout #A { Label #NAME "Name"; }
+            LinearLayout #B { Label #NAME "Name"; }
+        }
+        """).hasValue);
+
+    // a widget named like its named ancestor
+    assert (!failure("LinearLayout #A { LinearLayout { Box #A; } Box #B; }").hasValue);
+    assert (refuses("LinearLayout { Box #A; LinearLayout { Box #A; } }",
+                    "'#A' is reachable by the path 'A' of the widget at line 1, column 16", 1us, 39us));
+}
+
+__test the_popup_of_a_menu_is_under_its_button {
+    let content = """
+        LinearLayout {
+            MenuButton #FILE "File" { LinearLayout #MENU { PushButton #QUIT "Quit"; } }
+            MenuButton #EDIT "Edit" { LinearLayout #MENU { PushButton #QUIT "Quit"; } }
+        }
+        """;
+
+    assert (!failure(content).hasValue);
+    assert (refuses("LinearLayout { MenuButton \"A\" { Box #X; } Box #X; }",
+                    "'#X' is reachable by the path 'X' of the widget at line 1, column 33", 1us, 43us));
+}
+
+__test a_document_without_widgets {
+    assert (refuses("@component Empty () { Box; }", "no widget in the file", 1us, 1us));
+}
+
+__test types_registered_by_the_application {
+    let dmut registry = WidgetRegistry();
+    assert (failure(registry, "Panel;").hasValue);
+
+    let attrs: [&Attribute] = copy [copy Setter!{&Box, [c8]}("title", |dmut b, t| => { b:.setClasses(copy [t]); })];
+    registry:.register(copy WidgetSchema("Panel", |dmut m, id|-> dmut &Widget => copy Box(alias m, id),
+                                         attributes-> attrs,
+                                         defaultAttribute-> "title"));
+
+    assert (!failure(registry, "Panel \"Inspector\";").hasValue);
+    assert (failure(registry, "Panel { width: 12; }").hasValue);
+}
+
+__test the_decoding_of_the_values {
+    assert (decode!{[c8]}(value("\"Noto Sans\"")) == "Noto Sans");
+    assert (decode!{bool}(value("true")) && !decode!{bool}(value("false")));
+    assert (decode!{usize}(value("64")) == 64us);
+    assert (decode!{u32}(value("0")) == 0u32);
+    assert (decode!{(u32, u32)}(value("1280 720")) == (1280u32, 720u32));
+
+    assert (rejects!{u8}("256"));
+    assert (rejects!{usize}("12px"));
+    assert (rejects!{usize}("40%"));
+    assert (rejects!{bool}("\"true\""));
+    assert (rejects!{[c8]}("Noto"));
+    assert (rejects!{(u32, u32)}("1280 720 3"));
+    assert (rejects!{(u32, u32)}("1280 \"720\""));
+}

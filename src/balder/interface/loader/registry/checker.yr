@@ -1,0 +1,299 @@
+in checker;
+
+use balder::interface::loader::parser;
+use balder::interface::loader::registry::{error, schema};
+
+use std::syntax::errors;
+
+/**
+ * Checker of a tree of nodes against the schemas of the widget types, before any widget is created
+ * @info:
+ * =====
+ * A node is refused when its type is unknown, when it sets an attribute that neither its type nor its parent gives it,
+ * when a value is not of the kind of its attribute, when it lacks an attribute its parent requires, when its type does
+ * not accept its children, and when its id makes it reachable by the same find path as another widget. The anonymous
+ * widgets add no segment to the paths.
+ * ====
+ * */
+pub record Checker {
+
+    // The schemas of the widget types, by name
+    let _schemas: [[c8] => &WidgetSchema];
+
+    // The path of the file, for the errors
+    let _file: [c8];
+
+    // The location of the named widgets, by their find path
+    let mut _paths: [[c8] => mut (usize, usize)] = copy [];
+
+    /**
+     * @params:
+     *    - schemas: the schemas of the widget types, by name
+     *    - file: the path of the file the nodes were read from
+     * */
+    pub self (schemas: [[c8] => &WidgetSchema], file: [c8])
+        with _schemas = schemas
+        , _file = file
+    {}
+
+    /**
+     * Check a tree of nodes
+     * @throws: at the first node, attribute or value refused
+     * */
+    pub fn check(mut self, root: Node)
+        throws LoadError
+    {
+        self:.checkNode(root, none, []);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          NODES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check a node and its children
+     * @params:
+     *    - parent: the schema of the parent of the node, none for the root
+     *    - path: the find path of the parent of the node
+     * */
+    fn checkNode(mut self, node: Node, parent: (&WidgetSchema)?, path: [[c8]])
+        throws LoadError
+    {
+        let schema = if let Ok(s) = self._schemas[node.typeName] {
+            s
+        } else {
+            throw self.error("unknown widget type '" ~ node.typeName ~ "'", node.line, node.col);
+        };
+
+        self.checkDefaultValue(node, schema);
+        self.checkAttributes(node, schema, parent);
+
+        let inner = self:.checkPath(node, path);
+        let children = self.childrenOf(node);
+        self.checkChildren(node, schema, children);
+        for c in children {
+            self:.checkNode(c, (schema)?, inner);
+        }
+    }
+
+    /**
+     * @returns: the child nodes of a node
+     * @throws: at a slot of a component, that has no place outside one
+     * */
+    fn childrenOf(self, node: Node)-> [Node]
+        throws LoadError
+    {
+        let mut result: [Node] = [];
+        for c in node.children {
+            match c {
+                child: Node => { result = result ~ [child]; }
+                mark: SlotMark => {
+                    throw self.error("'@slot' outside a component", mark.line, mark.col);
+                }
+            }
+        }
+
+        result
+    }
+
+    /**
+     * Check the number of children of a node against the children its type accepts
+     * */
+    fn checkChildren(self, node: Node, schema: &WidgetSchema, children: [Node])
+        throws LoadError
+    {
+        let (min, max, roles) = if let Ok(c) = schema.children {
+            (c.min, c.max, c.roles)
+        } else {
+            (0us, 0us, [])
+        };
+
+        let what = "'" ~ node.typeName ~ "' takes ";
+        if children.len > max {
+            let excess = children[max];
+            let accepted = if max == 0us {
+                "no children"
+            } else if roles.len != 0us {
+                "only " ~ Checker::describe(roles)
+            } else {
+                "at most " ~ Checker::amount(max)
+            };
+
+            throw self.error(what ~ accepted, excess.line, excess.col);
+        }
+
+        if children.len < min {
+            let needed = if roles.len != 0us {
+                Checker::describe(roles)
+            } else {
+                "at least " ~ Checker::amount(min)
+            };
+
+            throw self.error(std::format::format("{}{}, found {}", what, needed, children.len), node.line, node.col);
+        }
+    }
+
+    /**
+     * Register the find path of a named node
+     * @params:
+     *    - path: the find path of the parent of the node
+     * @returns: the find path of the children of the node
+     * @throws: when another widget is reachable by the same path
+     * */
+    fn checkPath(mut self, node: Node, path: [[c8]])-> [[c8]]
+        throws LoadError
+    {
+        if node.id == "" {
+            return path;
+        }
+
+        let inner = path ~ [node.id];
+        let mut key = "";
+        for i, segment in inner {
+            key = if i == 0us { segment } else { key ~ "/" ~ segment };
+        }
+
+        if let Ok((line, col)) = self._paths[key] {
+            let reason = std::format::format("'#{}' is reachable by the path '{}' of the widget at line {}, column {}",
+                                             node.id, key, line, col);
+            throw self.error(reason, node.line, node.col);
+        }
+
+        self._paths[key] = (node.line, node.col);
+        inner
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          ATTRIBUTES          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check the value after the selector of a node against the default attribute of its type
+     * */
+    fn checkDefaultValue(self, node: Node, schema: &WidgetSchema)
+        throws LoadError
+    {
+        let v = if let Ok(v) = node.value { v } else { return; };
+        let attr = if let Ok(a) = schema.attribute(schema.defaultAttribute) {
+            a
+        } else {
+            throw self.error("'" ~ node.typeName ~ "' takes no default value", v.getLine(), v.getColumn());
+        };
+
+        for a in node.attributes {
+            if a.name == attr.name {
+                let reason = "attribute '" ~ a.name ~ "' of '" ~ node.typeName ~ "' set twice, by the default value and in the block";
+                throw self.error(reason, a.line, a.col);
+            }
+        }
+
+        {
+            attr.check(v);
+        } catch {
+            e: &SyntaxError => {
+                throw self.error("attribute '" ~ attr.name ~ "' of '" ~ node.typeName ~ "': " ~ e.msg, e.line, e.col);
+            }
+        }
+    }
+
+    /**
+     * Check the attributes of a node, against those of its type, then those its parent gives its children
+     * @params:
+     *    - parent: the schema of the parent of the node, none for the root
+     * */
+    fn checkAttributes(self, node: Node, schema: &WidgetSchema, parent: (&WidgetSchema)?)
+        throws LoadError
+    {
+        let under = if let Ok(p) = parent { " under '" ~ p.typeName ~ "'" } else { "" };
+        for a in node.attributes {
+            let what = "attribute '" ~ a.name ~ "' of '" ~ node.typeName ~ "'";
+            let attr = schema.attribute(a.name), slot = Checker::slotOf(parent, a.name);
+            if !attr.hasValue && !slot.hasValue {
+                throw self.error("unknown " ~ what ~ under, a.line, a.col);
+            }
+
+            {
+                if let Ok(at) = attr {
+                    at.check(a.value);
+                } else if let Ok(s) = slot {
+                    s.check(a.value);
+                }
+            } catch {
+                e: &SyntaxError => {
+                    throw self.error(what ~ under ~ ": " ~ e.msg, e.line, e.col);
+                }
+            }
+        }
+
+        if let Ok(p) = parent {
+            for s in p.slots {
+                if s.required && !Checker::sets(node, s.name) {
+                    throw self.error("a child of '" ~ p.typeName ~ "' needs the attribute '" ~ s.name ~ "'", node.line, node.col);
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: the error located at line and col of the file
+     * */
+    fn error(self, reason: [c8], line: usize, col: usize)-> &LoadError {
+        copy LoadError(self._file, reason, line, col)
+    }
+}
+
+/**
+ * The helpers of the checker
+ * */
+mod Checker {
+
+    /**
+     * @returns: the attribute named name that a parent gives its children, none if it gives none
+     * */
+    pub fn slotOf(parent: (&WidgetSchema)?, name: [c8])-> (&SlotAttribute)? {
+        if let Ok(p) = parent {
+            return p.slot(name);
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif a node sets the attribute name in its block
+     * */
+    pub fn sets(node: Node, name: [c8])-> bool {
+        for a in node.attributes {
+            if a.name == name { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the description of a number of children, for an error: "1 child", "2 children"
+     * */
+    pub fn amount(n: usize)-> [c8] {
+        if n == 1us { "1 child" } else { std::format::format("{} children", n) }
+    }
+
+    /**
+     * @returns: the description of a sequence of roles, for an error: "its bar then its content"
+     * */
+    pub fn describe(roles: [[c8]])-> [c8] {
+        let mut result = "";
+        for i, role in roles {
+            if i != 0us { result = result ~ " then "; }
+            result = result ~ "its " ~ role;
+        }
+
+        result
+    }
+}
