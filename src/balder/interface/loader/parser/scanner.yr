@@ -1,0 +1,347 @@
+in scanner;
+
+use balder::interface::loader::parser::token;
+
+use std::{stream, syntax::_};
+
+/**
+ * The punctuations splitting the content, and the characters opening a token
+ * */
+enum Tokens
+| LACC      = "{"
+| RACC      = "}"
+| LPAR      = "("
+| RPAR      = ")"
+| SEMI      = ";"
+| COMMA     = ","
+| DCOLON    = "::"
+| COLON     = ":"
+| DOT       = "."
+| GE        = ">="
+| GT        = ">"
+| LE        = "<="
+| LT        = "<"
+| EQ        = "=="
+| NE        = "!="
+| BANG      = "!"
+| SLASH     = "/"
+| STAR      = "*"
+| HASH      = "#"
+| DOLLAR    = "$"
+| AT        = "@"
+| QUOTE     = "\""
+| BACKSLASH = "\\";
+
+/**
+ * The comments, dropped by the lexer
+ * */
+enum Comments
+| SINGLE_LINE    = ("//", "\n")
+| MULTIPLE_LINES = ("/*", "*/");
+
+/**
+ * The lexer shared by the .gui and the .style files, turning the words of a std lexer into typed tokens
+ * @info:
+ * =====
+ * Spaces, line breaks and comments (// to the end of the line, /* to */) separate the tokens and are dropped, each token
+ * telling whether one preceded it: in a style selector a space is a descendant combinator, and a glued `.` a class.
+ * A number keeps its unit apart, so `40%` is the number 40 in %, while `.5` is a `.` followed by the number 5, a number
+ * requiring a leading digit.
+ * ====
+ * */
+@final
+pub class Scanner {
+
+    // The content to split
+    let _content: [c8];
+
+    // The lexer splitting the content into words and punctuations
+    let dmut _lexer: &Lexer!{c8};
+
+    // The tokens read ahead by peek, not consumed yet
+    let mut _ahead: [Token] = [];
+
+    /**
+     * @params:
+     *    - content: the content of the file to split
+     * */
+    pub self (content: [c8])
+        with _content = content
+        , _lexer = copy Lexer!{c8} (content,
+                                    tokens-> copy Tokens::__members__,
+                                    comments-> copy Comments::__members__)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          READING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Consume the next token
+     * @returns: the token, of kind EOF at the end of the content
+     * */
+    pub fn next(mut self)-> Token
+        throws SyntaxError
+    {
+        if self._ahead.len != 0 {
+            let tok = self._ahead[0];
+            self._ahead = self._ahead[1 .. $];
+            return tok;
+        }
+
+        self:.scan()
+    }
+
+    /**
+     * @returns: the next token, without consuming it
+     * */
+    pub fn peek(mut self)-> Token
+        throws SyntaxError
+    {
+        self:.peek(0us)
+    }
+
+    /**
+     * @params:
+     *    - n: the number of tokens to look past, 0 for the next one
+     * @returns: the n-th token after the next one, without consuming any
+     * */
+    pub fn peek(mut self, n: usize)-> Token
+        throws SyntaxError
+    {
+        while self._ahead.len <= n {
+            self._ahead = self._ahead ~ [self:.scan()];
+        }
+
+        self._ahead[n]
+    }
+
+    /**
+     * @returns: the text of the content between two offsets, the start of a token and the end of another
+     * */
+    pub fn source(self, start: usize, end: usize)-> [c8] {
+        self._content[start .. end]
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SCANNING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the token at the cursor of the lexer
+     * */
+    fn scan(mut self)-> Token
+        throws SyntaxError
+    {
+        let (line0, col0) = (self._lexer.getLine(), self._lexer.getColumn());
+        let (word, line, col) = self._lexer:.next();
+        if line == 0us {
+            let (eline, ecol) = (self._lexer.getLine(), self._lexer.getColumn());
+            return Token(kind-> TokenKind::EOF, line-> eline, col-> ecol, start-> self._content.len, end-> self._content.len);
+        }
+
+        let spaced = line != line0 || col != col0;
+        let start = self.offset() - word.len;
+        match word {
+            Tokens::QUOTE     => { return self:.scanString(line, col, start, spaced); }
+            Tokens::HASH      => { return self:.scanSigil(TokenKind::HASH, line, col, start, spaced); }
+            Tokens::DOLLAR    => { return self:.scanSigil(TokenKind::CONSTANT, line, col, start, spaced); }
+            Tokens::AT        => { return self:.scanSigil(TokenKind::DIRECTIVE, line, col, start, spaced); }
+            Tokens::BACKSLASH => { throw Scanner::unexpected(word, line, col); }
+        }
+
+        if Scanner::isDigit(word[0]) || (word[0] == '-' && word.len > 1us && Scanner::isDigit(word[1])) {
+            return self:.scanNumber(word, line, col, start, spaced);
+        }
+
+        if Scanner::isName(word) {
+            return Token(kind-> TokenKind::IDENT, text-> word, line-> line, col-> col, start-> start, end-> self.offset(), spaced-> spaced);
+        }
+
+        cte for t in Tokens::__members__ {
+            if word == t {
+                return Token(kind-> TokenKind::DELIM, text-> word, line-> line, col-> col, start-> start, end-> self.offset(), spaced-> spaced);
+            }
+        }
+
+        throw Scanner::unexpected(word, line, col);
+    }
+
+    /**
+     * Read a number and the unit glued to it, a '%' or letters, joining the decimal part the lexer splits at the '.'
+     * @params:
+     *    - word: the word starting with the number
+     * */
+    fn scanNumber(mut self, word: [c8], line: usize, col: usize, start: usize, spaced: bool)-> Token
+        throws SyntaxError
+    {
+        let mut text = word[0 .. Scanner::digitsEnd(word, if word[0] == '-' { 1us } else { 0us })];
+        let mut unit = word[text.len .. $];
+
+        if unit.len == 0us {
+            let cursor = self._lexer.getCursor();
+            let (dot, dline, dcol) = self._lexer:.next();
+            let (decimals, nline, ncol) = self._lexer:.next();
+            let glued = dline == line && dcol == col + word.len && nline == line && ncol == dcol + 1us;
+            if dot == Tokens::DOT && glued && decimals.len != 0us && Scanner::isDigit(decimals[0]) {
+                let digits = Scanner::digitsEnd(decimals, 0us);
+                text = self._content[start .. start + word.len + 1us + digits];
+                unit = decimals[digits .. $];
+            } else {
+                self._lexer:.rewind(expand cursor);
+            }
+        }
+
+        if unit != "%" && !Scanner::isLetters(unit) {
+            throw copy SyntaxError(std::format::format("invalid number '{}'", self._content[start .. self.offset()]), line, col);
+        }
+
+        Token(kind-> TokenKind::NUMBER, text-> text, unit-> unit, line-> line, col-> col, start-> start, end-> self.offset(), spaced-> spaced)
+    }
+
+    /**
+     * Read the name glued after a sigil (#, $, @), any name after a '#' (#388bfd), an identifier after the others
+     * */
+    fn scanSigil(mut self, kind: TokenKind, line: usize, col: usize, start: usize, spaced: bool)-> Token
+        throws SyntaxError
+    {
+        let cursor = self._lexer.getCursor();
+        let (name, nline, ncol) = self._lexer:.next();
+        let named = if kind == TokenKind::HASH { Scanner::isNameChars(name) } else { Scanner::isName(name) };
+        if nline != line || ncol != col + 1us || !named {
+            self._lexer:.rewind(expand cursor);
+            throw copy SyntaxError(std::format::format("expected a name after '{}'", self._content[start .. start + 1us]), line, col);
+        }
+
+        Token(kind-> kind, text-> name, line-> line, col-> col, start-> start, end-> self.offset(), spaced-> spaced)
+    }
+
+    /**
+     * Read a text after its opening quote, up to the closing one, resolving the escapes \" \\ \n and \t
+     * */
+    fn scanString(mut self, line: usize, col: usize, start: usize, spaced: bool)-> Token
+        throws SyntaxError
+    {
+        let dmut text = copy StringStream();
+        self._lexer:.setSkipTokens(false);
+        self._lexer:.setSkipComments(false);
+        {
+            loop {
+                let (word, wline, wcol) = self._lexer:.next();
+                match word {
+                    Tokens::QUOTE => { break; }
+                    Tokens::BACKSLASH => {
+                        let (escaped, _, _) = self._lexer:.nextChar();
+                        match escaped {
+                            "\"" => { text:.write('"'); }
+                            "\\" => { text:.write('\\'); }
+                            "n"  => { text:.write('\n'); }
+                            "t"  => { text:.write('\t'); }
+                            _    => { throw copy SyntaxError("unknown escape '\\" ~ escaped ~ "'", wline, wcol); }
+                        }
+                    }
+                    "" => { throw copy SyntaxError("unterminated string", line, col); }
+                    _  => { text:.write(word); }
+                }
+            }
+        } exit {
+            self._lexer:.setSkipTokens(true);
+            self._lexer:.setSkipComments(true);
+        }
+
+        Token(kind-> TokenKind::STRING, text-> text[], line-> line, col-> col, start-> start, end-> self.offset(), spaced-> spaced)
+    }
+
+    /**
+     * @returns: the offset of the cursor of the lexer in the content
+     * */
+    fn offset(self)-> usize {
+        let (rest, _, _) = self._lexer.getCursor();
+        self._content.len - rest.len
+    }
+}
+
+/**
+ * The helpers of the scanner
+ * */
+mod Scanner {
+
+    /**
+     * @returns: the error of a word that is not a token
+     * */
+    pub fn unexpected(word: [c8], line: usize, col: usize)-> &SyntaxError {
+        copy SyntaxError(std::format::format("unexpected '{}'", word), line, col)
+    }
+
+    /**
+     * @returns: true iif c is an ASCII letter
+     * */
+    pub fn isLetter(c: c8)-> bool {
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+    }
+
+    /**
+     * @returns: true iif c is a decimal digit
+     * */
+    pub fn isDigit(c: c8)-> bool {
+        c >= '0' && c <= '9'
+    }
+
+    /**
+     * @returns: true iif c can be part of a name
+     * */
+    pub fn isNameChar(c: c8)-> bool {
+        isLetter(c) || isDigit(c) || c == '-' || c == '_'
+    }
+
+    /**
+     * @returns: true iif word is only letters, or empty
+     * */
+    pub fn isLetters(word: [c8])-> bool {
+        for c in word {
+            if !isLetter(c) { return false; }
+        }
+
+        true
+    }
+
+    /**
+     * @returns: true iif word is a non empty sequence of characters of a name
+     * */
+    pub fn isNameChars(word: [c8])-> bool {
+        if word.len == 0us { return false; }
+        for c in word {
+            if !isNameChar(c) { return false; }
+        }
+
+        true
+    }
+
+    /**
+     * @returns: true iif word is a name: characters of a name, starting with a letter, a '_', or a '-' not followed by a digit
+     * */
+    pub fn isName(word: [c8])-> bool {
+        if !isNameChars(word) || isDigit(word[0]) { return false; }
+        word[0] != '-' || (word.len > 1us && !isDigit(word[1]))
+    }
+
+    /**
+     * @returns: the offset of the first character that is not a digit in word, from an offset
+     * */
+    pub fn digitsEnd(word: [c8], from: usize)-> usize {
+        let mut i = from;
+        while i < word.len && isDigit(word[i]) {
+            i += 1us;
+        }
+
+        i
+    }
+}

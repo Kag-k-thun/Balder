@@ -1,0 +1,197 @@
+in parser_reader;
+
+use balder::interface::loader::parser;
+
+use std::syntax::errors;
+
+/**
+ * @returns: the values of a content, checking they end it
+ * */
+fn read(content: [c8])-> &Value
+    throws SyntaxError
+{
+    let dmut scanner = copy Scanner(content);
+    let dmut reader = ValueReader(alias scanner);
+    let value = reader:.read();
+    let rest = scanner:.next();
+    if rest.kind != TokenKind::EOF {
+        throw copy SyntaxError("values followed by '" ~ rest.text ~ "'", rest.line, rest.col);
+    }
+
+    value
+}
+
+/**
+ * @returns: the error of values that cannot be read, or none
+ * */
+fn failure(content: [c8])-> (&SyntaxError)? {
+    {
+        read(content);
+        none
+    } catch {
+        e: &SyntaxError => { (e)? }
+    }
+}
+
+/**
+ * @returns: the source of each value of a slice
+ * */
+fn sources(values: [&Value])-> [[c8]] {
+    let mut result: [[c8]] = [];
+    for v in values {
+        result = result ~ [v.getSource()];
+    }
+
+    result
+}
+
+__test single_values {
+    match read("12px") {
+        Number(amount-> a, unit-> u) => { assert (a == 12.0 && u == "px"); }
+        _ => { assert (false); }
+    }
+
+    assert (read("\"Noto Sans\"").toText() == "Noto Sans");
+    assert (read("auto").toName() == "auto");
+    match read("#388bfd") {
+        Hash(text-> t) => { assert (t == "388bfd"); }
+        _ => { assert (false); }
+    }
+
+    match read("$accent") {
+        Constant(name-> n) => { assert (n == "accent"); }
+        _ => { assert (false); }
+    }
+}
+
+__test spaces_make_a_tuple_and_commas_a_list {
+    let tuple = read("6 14").toTuple();
+    assert (sources(tuple) == ["6", "14"]);
+
+    let list = read("\"DejaVu Sans Mono\", monospace").toList();
+    assert (sources(list) == ["\"DejaVu Sans Mono\"", "monospace"]);
+
+    let mixed = read("Noto Sans, monospace");
+    assert (sources(mixed.toList()) == ["Noto Sans", "monospace"]);
+    assert (sources(mixed.toList()[0].toTuple()) == ["Noto", "Sans"]);
+    assert (mixed.getSource() == "Noto Sans, monospace");
+}
+
+__test a_single_value_is_its_own_tuple_and_list {
+    let v = read("row");
+    assert (sources(v.toTuple()) == ["row"]);
+    assert (sources(v.toList()) == ["row"]);
+}
+
+__test shades_and_alphas {
+    match read("grey!10") {
+        Shade(palette-> p, level-> l) => { assert (p == "grey" && l.toInteger() == 10); }
+        _ => { assert (false); }
+    }
+
+    match read("#388bfd / 40%") {
+        Alpha(base-> b, alpha-> a) => {
+            assert (b.getSource() == "#388bfd");
+            assert (a.getSource() == "40%");
+        }
+        _ => { assert (false); }
+    }
+
+    assert (sources(read("2 black!0 / 0.6").toTuple()) == ["2", "black!0 / 0.6"]);
+}
+
+__test names_glued_by_double_colons_are_a_path {
+    assert (read("form::submit").toName() == "form::submit");
+    assert (failure("a :: b").hasValue);
+}
+
+__test calls_take_their_arguments_as_a_list {
+    match read("describe (\"Label: a text\")") {
+        Call(name-> n, args-> a) => { assert (n == "describe" && sources(a) == ["\"Label: a text\""]); }
+        _ => { assert (false); }
+    }
+
+    match read("clamp(160, 20%, 360)") {
+        Call(name-> n, args-> a) => { assert (n == "clamp" && sources(a) == ["160", "20%", "360"]); }
+        _ => { assert (false); }
+    }
+
+    match read("reset()") {
+        Call(args-> a) => { assert (a.len == 0us); }
+        _ => { assert (false); }
+    }
+}
+
+__test values_stop_before_their_end {
+    let dmut scanner = copy Scanner("padding: 6 14; }");
+    let dmut reader = ValueReader(alias scanner);
+    let decl = reader:.readDeclaration();
+    assert (decl.name == "padding" && decl.line == 1us && decl.col == 1us);
+    assert (decl.value.getSource() == "6 14");
+    assert (scanner:.next().text == "}");
+
+    let dmut inner = copy Scanner("a b) c");
+    let dmut innerReader = ValueReader(alias inner);
+    let v = innerReader:.read();
+    assert (v.getSource() == "a b");
+    assert (inner:.next().text == ")");
+}
+
+__test numbers_without_unit {
+    assert (read("0.5").toNumber() == 0.5);
+    assert (read("700").toInteger() == 700);
+    assert (read("-4").toInteger() == -4);
+}
+
+__test keywords_and_booleans {
+    assert (read("center").toKeyword(copy ["left", "center", "right"]) == "center");
+    assert (read("true").toBool());
+    assert (!read("false").toBool());
+}
+
+/**
+ * (content, line, column)
+ * */
+@parameters ((yield c for c in [("", 1us, 1us), ("12em", 1us, 1us), ("a, ", 1us, 4us), ("grey! 10", 1us, 7us),
+                                ("grey!x", 1us, 6us), ("f(a", 1us, 4us), ("a : b", 1us, 3us), ("{", 1us, 1us),
+                                ("#fff /", 1us, 7us)]))
+__test invalid_values (content: [c8], line: usize, col: usize) {
+    if let Ok(e) = failure(content) {
+        assert (e.line == line && e.col == col);
+    } else {
+        assert (false);
+    }
+}
+
+/**
+ * (content, the kind check that fails on it)
+ * */
+@parameters ((yield c for c in [("12px", 0), ("0.5", 1), ("auto", 2), ("\"a\"", 3), ("bold", 4), ("yes", 5)]))
+__test values_of_another_kind (content: [c8], check: i32) {
+    let v = read(content);
+    let failed = {
+        match check {
+            0 => { v.toNumber(); }
+            1 => { v.toInteger(); }
+            2 => { v.toText(); }
+            3 => { v.toName(); }
+            4 => { v.toKeyword(copy ["normal", "italic"]); }
+            _ => { v.toBool(); }
+        }
+        false
+    } catch {
+        e: &SyntaxError => { e.msg.len != 0us }
+    };
+
+    assert (failed);
+}
+
+__test errors_name_what_was_expected_and_what_was_found {
+    let msg = {
+        read("bold").toKeyword(copy ["normal", "italic"])
+    } catch {
+        e: &SyntaxError => { e.msg }
+    };
+
+    assert (msg == "expected one of normal, italic, found 'bold'");
+}

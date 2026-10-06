@@ -1,0 +1,302 @@
+in reader;
+
+use balder::interface::loader::parser::{scanner, token, value};
+
+use std::conv;
+use std::algorithm::searching;
+use std::syntax::errors;
+
+/**
+ * A `name: values;` of a .gui node or of a .style rule
+ * */
+@data
+pub record Declaration {
+
+    // The name of the attribute or of the property
+    pub let name: [c8];
+
+    // Its value, as read
+    pub let value: &Value;
+
+    // The line of the name, from 1
+    pub let line: usize;
+
+    // The column of the name, from 1
+    pub let col: usize;
+}
+
+/**
+ * Reader of the values written on the right of `name: …;`, the same in the .gui and the .style files
+ * @info:
+ * =====
+ * ```
+ * values  = tuple { "," tuple } ;              (* a list when there are several *)
+ * tuple   = term { term } ;                    (* a tuple when there are several *)
+ * term    = primary [ "/" primary ] ;          (* a colour and its opacity *)
+ * primary = number | string | "#" name | "$" ident
+ *         | ident "!" number                   (* a palette shade, glued *)
+ *         | ident { "::" ident }               (* a name, or a path of names, glued *)
+ *         | ident "(" [ values ] ")" ;         (* a slot with bound arguments, or a function *)
+ * ```
+ * The values end at the ';', '}' or ')' that follows them, which the reader leaves to its caller.
+ * ====
+ * */
+pub record ValueReader {
+
+    // The scanner the values are read from, shared with the parser of the file
+    let dmut _scanner: &Scanner;
+
+    // The offset after the last token read
+    let mut _end: usize = 0us;
+
+    /**
+     * @params:
+     *    - scanner: the scanner of the file, positioned before the values
+     * */
+    pub self (dmut scanner: &Scanner)
+        with _scanner = alias scanner
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          READING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a declaration, `name: values;`, the ';' included
+     * */
+    pub fn readDeclaration(mut self)-> Declaration
+        throws SyntaxError
+    {
+        let name = self:.take();
+        if name.kind != TokenKind::IDENT {
+            throw self.unexpected(name, "a name");
+        }
+
+        self:.expect(":");
+        let value = self:.read();
+        self:.expect(";");
+
+        Declaration(name-> name.text, value-> value, line-> name.line, col-> name.col)
+    }
+
+    /**
+     * Read values, up to the ';', '}' or ')' that ends them, left unread
+     * @returns: the value, a list if there are several separated by commas
+     * */
+    pub fn read(mut self)-> &Value
+        throws SyntaxError
+    {
+        let first = self._scanner:.peek();
+        let mut tuples: [&Value] = copy [self:.readTuple()];
+        while self:.isDelim(",") {
+            self:.take();
+            tuples = tuples ~ [self:.readTuple()];
+        }
+
+        if tuples.len == 1us {
+            return tuples[0];
+        }
+
+        copy List(tuples, self.source(first), first.line, first.col)
+    }
+
+    /**
+     * Read the values separated by spaces, up to a ',' or the end of the values
+     * @returns: the value, a tuple if there are several
+     * */
+    fn readTuple(mut self)-> &Value
+        throws SyntaxError
+    {
+        let first = self._scanner:.peek();
+        let mut terms: [&Value] = [];
+        loop {
+            let next = self._scanner:.peek();
+            if next.kind == TokenKind::EOF || (next.kind == TokenKind::DELIM && ValueReader::isEnd(next.text)) {
+                break;
+            }
+
+            terms = terms ~ [self:.readTerm()];
+        }
+
+        if terms.len == 0us {
+            throw self.unexpected(self._scanner:.peek(), "a value");
+        }
+
+        if terms.len == 1us {
+            return terms[0];
+        }
+
+        copy Tuple(terms, self.source(first), first.line, first.col)
+    }
+
+    /**
+     * Read a value, and the opacity after it if there is one
+     * */
+    fn readTerm(mut self)-> &Value
+        throws SyntaxError
+    {
+        let first = self._scanner:.peek();
+        let base = self:.readPrimary();
+        if !self:.isDelim("/") {
+            return base;
+        }
+
+        self:.take();
+        let alpha = self:.readPrimary();
+        copy Alpha(base, alpha, self.source(first), first.line, first.col)
+    }
+
+    /**
+     * Read a single value
+     * */
+    fn readPrimary(mut self)-> &Value
+        throws SyntaxError
+    {
+        let tok = self:.take();
+        match tok.kind {
+            TokenKind::NUMBER    => { return self.number(tok); }
+            TokenKind::STRING    => { return copy Text(tok.text, self.source(tok), tok.line, tok.col); }
+            TokenKind::HASH      => { return copy Hash(tok.text, self.source(tok), tok.line, tok.col); }
+            TokenKind::CONSTANT  => { return copy Constant(tok.text, self.source(tok), tok.line, tok.col); }
+            TokenKind::IDENT     => { return self:.readNamed(tok); }
+            _                    => {}
+        }
+
+        throw self.unexpected(tok, "a value");
+    }
+
+    /**
+     * Read what follows an identifier: the level of a shade, the rest of a path, or the arguments of a call
+     * @params:
+     *    - tok: the identifier, already read
+     * */
+    fn readNamed(mut self, tok: Token)-> &Value
+        throws SyntaxError
+    {
+        let next = self._scanner:.peek();
+        if next.kind == TokenKind::DELIM && next.text == "!" && !next.spaced {
+            self:.take();
+            let level = self:.take();
+            if level.kind != TokenKind::NUMBER || level.spaced {
+                throw self.unexpected(level, "the level of the shade");
+            }
+
+            return copy Shade(tok.text, self.number(level), self.source(tok), tok.line, tok.col);
+        }
+
+        let mut name = tok.text;
+        loop {
+            let sep = self._scanner:.peek(), part = self._scanner:.peek(1us);
+            if sep.kind != TokenKind::DELIM || sep.text != "::" || sep.spaced || part.kind != TokenKind::IDENT || part.spaced {
+                break;
+            }
+
+            self:.take();
+            self:.take();
+            name = name ~ "::" ~ part.text;
+        }
+
+        if !self:.isDelim("(") {
+            return copy Name(name, self.source(tok), tok.line, tok.col);
+        }
+
+        self:.take();
+        let args = if self:.isDelim(")") { [] } else { self:.read().toList() };
+        self:.expect(")");
+
+        copy Call(name, args, self.source(tok), tok.line, tok.col)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TOKENS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Consume the next token, remembering where it ends
+     * */
+    fn take(mut self)-> Token
+        throws SyntaxError
+    {
+        let tok = self._scanner:.next();
+        self._end = tok.end;
+        tok
+    }
+
+    /**
+     * Consume the next token, that has to be a punctuation
+     * */
+    fn expect(mut self, delim: [c8])
+        throws SyntaxError
+    {
+        let tok = self:.take();
+        if tok.kind != TokenKind::DELIM || tok.text != delim {
+            throw self.unexpected(tok, "'" ~ delim ~ "'");
+        }
+    }
+
+    /**
+     * @returns: true iif the next token is the punctuation delim
+     * */
+    fn isDelim(mut self, delim: [c8])-> bool
+        throws SyntaxError
+    {
+        let next = self._scanner:.peek();
+        next.kind == TokenKind::DELIM && next.text == delim
+    }
+
+    /**
+     * @returns: the number of a token, whose unit is one of the units of the grammar
+     * */
+    fn number(self, tok: Token)-> &Number
+        throws SyntaxError
+    {
+        if tok.unit != "" && tok.unit != "px" && tok.unit != "%" && tok.unit != "fr" {
+            throw copy SyntaxError("unknown unit '" ~ tok.unit ~ "'", tok.line, tok.col);
+        }
+
+        let amount = {
+            std::conv::to!{f64} (tok.text)
+        } catch {
+            _ => { throw copy SyntaxError("invalid number '" ~ tok.text ~ "'", tok.line, tok.col); }
+        };
+
+        let integer = !tok.text.find('.').hasValue;
+        copy Number(amount, tok.unit, integer, self.source(tok), tok.line, tok.col)
+    }
+
+    /**
+     * @returns: the text of the file from a token to the end of the last token read
+     * */
+    fn source(self, first: Token)-> [c8] {
+        self._scanner.source(first.start, self._end)
+    }
+
+    /**
+     * @returns: the error of a token that is not what was expected
+     * */
+    fn unexpected(self, tok: Token, what: [c8])-> &SyntaxError {
+        let found = if tok.kind == TokenKind::EOF { "the end of the file" } else { "'" ~ self._scanner.source(tok.start, tok.end) ~ "'" };
+        copy SyntaxError("expected " ~ what ~ ", found " ~ found, tok.line, tok.col)
+    }
+}
+
+/**
+ * The helpers of the reader
+ * */
+mod ValueReader {
+
+    /**
+     * @returns: true iif the punctuation ends a tuple
+     * */
+    pub fn isEnd(delim: [c8])-> bool {
+        delim == ";" || delim == "}" || delim == ")" || delim == ","
+    }
+}
