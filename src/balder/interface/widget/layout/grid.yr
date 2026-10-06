@@ -4,16 +4,23 @@ in grid;
 use balder::utils;
 use balder::interface::loader;
 use balder::interface::loader::registry::schema;
+use balder::interface::style::{kinds, property};
+use balder::interface::widget::alignement;
 use balder::math::vector;
 
 use std::algorithm::comparison;
 
 /**
- * A grid lays its children out in cells of equal size
+ * A grid lays its children out in cells, its columns and its rows sized by the tracks of its style
  * @info:
  * =====
  * A child is either put in a cell, or placed in the next free cell, row by row, after the cells the other children
- * take. As in a CSS grid, the grid has the columns and the rows it is given, and grows to the cells of its children.
+ * take. As in a CSS grid, the grid has the columns and the rows its style gives (`columns: 1fr 2fr 120;`), and grows to
+ * the cells of its children, a track it is not given taking 1fr: a grid given no track has cells of equal size.
+ *
+ * The tracks are sized as CSS sizes them: the lengths and the content sizes first, the auto tracks then growing from
+ * their min-content to their max-content in the free space, and the shares in fr taking what is left. A share may be
+ * smaller than the content of its cells (CSS's minmax(0, 1fr)).
  * ====
  * */
 pub class GridLayout over Layout {
@@ -21,20 +28,19 @@ pub class GridLayout over Layout {
     // The widgets in the grid, in the order of their insertion
     let dmut _childs : [GridChild] = [];
 
-    // The number of columns the grid has at least
-    let _cols : u32;
-
-    // The number of rows the grid has at least
-    let _rows : u32;
-
     // The number of columns of the grid, its children placed
     let mut _gridCols : u32 = 1;
 
     // The number of rows of the grid, its children placed
     let mut _gridRows : u32 = 1;
 
-    // Relative sizes computed on updateSize
-    let mut _relCellSize : vec2 = vec2 ();
+    // The position and the size of each column, from the left of the inner box, in pixels
+    let mut _colOffsets : [f32] = [];
+    let mut _colSizes : [f32] = [];
+
+    // The position and the size of each row, from the top of the inner box, in pixels
+    let mut _rowOffsets : [f32] = [];
+    let mut _rowSizes : [f32] = [];
 
     /*!
      * ====================================================================================================
@@ -44,15 +50,8 @@ pub class GridLayout over Layout {
      * ====================================================================================================
      */
 
-    /**
-     * @params:
-     *    - columns: the number of columns the grid has at least
-     *    - rows: the number of rows the grid has at least
-     * */
-    pub self (dmut manager : &WidgetManager, id : [c8], columns : u32 = 0, rows : u32 = 0)
+    pub self (dmut manager : &WidgetManager, id : [c8])
         with super (alias manager, id, WidgetKeys::GRID_LAYOUT)
-        , _cols = columns
-        , _rows = rows
     {}
 
     /*!
@@ -64,27 +63,31 @@ pub class GridLayout over Layout {
      */
 
     /**
-     * Compute the drawing size of the inner widgets
+     * Compute the drawing size of the inner widgets, each one stretched to its cell, the columns sized in the width of
+     * the grid, then the rows in its height, the content of a cell measured at the width of its column
      */
     over onUpdateSize (mut self) {
         self:.placeChildren ();
         if self._childs.len == 0 { return; }
 
-        let nbCells = makeVec2 (cast!f32 (self._gridCols), cast!f32 (self._gridRows));
-        let absCellSize = self._absoluteSize / nbCells;
-        self._relCellSize = absCellSize / self._absoluteSize;
-
-        if absCellSize.x <= 0.0f || absCellSize.y <= 0.0f {
+        if self._absoluteSize.x <= 0.0f || self._absoluteSize.y <= 0.0f {
             log::warn #("GridLayout", "Borders and margins are too big to display widgets");
             self:.hide ();
 
             return;
         }
 
+        let columns = self.getTracks ("columns"), rows = self.getTracks ("rows");
+        self._colSizes = GridLayout::resolveTracks (columns, self._gridCols, self._absoluteSize.x, self:.measureColumns (columns));
+        self._rowSizes = GridLayout::resolveTracks (rows, self._gridRows, self._absoluteSize.y, self:.measureRows (rows, self._colSizes));
+        self._colOffsets = GridLayout::offsets (self._colSizes);
+        self._rowOffsets = GridLayout::offsets (self._rowSizes);
+
         for j in 0us .. self._childs.len {
             let at = self._childs [j].at;
-            let absCellPos = makeVec2 (cast!f32 (at._0), cast!f32 (at._1)) * absCellSize + self._absolutePosition;
-            let (relPos, relSize) = self:.placeChild (alias self._childs [j].widget, absCellPos, absCellSize, self._depth + 1);
+            let cellPos = makeVec2 (self._colOffsets [at._0], self._rowOffsets [at._1]) + self._absolutePosition;
+            let cellSize = makeVec2 (self._colSizes [at._0], self._rowSizes [at._1]);
+            let (relPos, relSize) = self:.placeChild (alias self._childs [j].widget, cellPos, cellSize, self._depth + 1);
 
             self._childs [j].relPos = relPos;
             self._childs [j].relSize = relSize;
@@ -182,32 +185,64 @@ pub class GridLayout over Layout {
      */
 
     /**
-     * The content of a grid is its cells, all as large as the largest content of a child
+     * The content of a grid is its tracks, each one as large as its track says, from the contents of its cells
      * */
     prot over measureContentWidths (mut self)-> (f32, f32) {
         self:.placeChildren ();
 
-        let mut minWidth = 0.0f, mut maxWidth = 0.0f;
-        for dmut i in alias self._childs {
-            let (minW, maxW) = i.widget:.measureIntrinsicWidths ();
-            minWidth = max (minWidth, minW);
-            maxWidth = max (maxWidth, maxW);
-        }
-
-        let cols = cast!f32 (self._gridCols);
-        (minWidth * cols, maxWidth * cols)
+        let columns = self.getTracks ("columns");
+        let contents = self:.measureColumns (columns, all-> true);
+        (GridLayout::measureTracks (columns, self._gridCols, contents, minimum-> true),
+         GridLayout::measureTracks (columns, self._gridCols, contents, minimum-> false))
     }
 
     prot over measureContentHeight (mut self, width : f32)-> f32 {
         self:.placeChildren ();
 
-        let cellWidth = width / cast!f32 (self._gridCols);
-        let mut height = 0.0f;
+        let columns = self.getTracks ("columns"), rows = self.getTracks ("rows");
+        let colSizes = GridLayout::resolveTracks (columns, self._gridCols, width, self:.measureColumns (columns));
+        GridLayout::measureTracks (rows, self._gridRows, self:.measureRows (rows, colSizes, all-> true), minimum-> false)
+    }
+
+    /**
+     * @returns: the min-content and max-content widths of the content of each column, the largest of its cells, measured
+     * only when a track is sized by its content
+     * @params:
+     *    - columns: the tracks of the columns
+     *    - all: true to measure them whatever the tracks
+     * */
+    fn measureColumns (mut self, columns : [Track], all : bool = false)-> [(f32, f32)] {
+        let dmut result : [(f32, f32)] = copy [(0.0f, 0.0f) ; cast!usize (self._gridCols)];
+        if !all && !GridLayout::needsContent (columns) { return result; }
+
         for dmut i in alias self._childs {
-            height = max (height, i.widget:.measureIntrinsicHeight (cellWidth));
+            let (minW, maxW) = i.widget:.measureIntrinsicWidths ();
+            let c = cast!usize (i.at._0);
+            result [c] = (max (result [c]._0, minW), max (result [c]._1, maxW));
         }
 
-        height * cast!f32 (self._gridRows)
+        result
+    }
+
+    /**
+     * @returns: the height of the content of each row, the largest of its cells, each measured at the width of its
+     * column, measured only when a track is sized by its content
+     * @params:
+     *    - rows: the tracks of the rows
+     *    - colSizes: the widths of the columns
+     *    - all: true to measure them whatever the tracks
+     * */
+    fn measureRows (mut self, rows : [Track], colSizes : [f32], all : bool = false)-> [(f32, f32)] {
+        let dmut result : [(f32, f32)] = copy [(0.0f, 0.0f) ; cast!usize (self._gridRows)];
+        if !all && !GridLayout::needsContent (rows) { return result; }
+
+        for dmut i in alias self._childs {
+            let h = i.widget:.measureIntrinsicHeight (colSizes [i.at._0]);
+            let r = cast!usize (i.at._1);
+            result [r] = (max (result [r]._0, h), max (result [r]._1, h));
+        }
+
+        result
     }
 
     /*!
@@ -234,18 +269,32 @@ pub class GridLayout over Layout {
      */
 
     /**
+     * @returns: the tracks the style gives the columns or the rows, none when it gives none
+     * @params:
+     *    - name: the property, columns or rows
+     * */
+    fn getTracks (self, name : [c8])-> [Track] {
+        if let Ok (tracks) = self.getStyle ().getCustom!{[Track]} (name) {
+            return tracks;
+        }
+
+        []
+    }
+
+    /**
      * Place every child in its cell, the grid growing to the cells of its children
      * */
     fn placeChildren (mut self) {
         let cells = copy [i.cell for i in self._childs];
-        let (placed, cols, rows) = GridLayout::place (cells, self._cols, self._rows);
+        let columns = self.getTracks ("columns").len, rows = self.getTracks ("rows").len;
+        let (placed, nbCols, nbRows) = GridLayout::place (cells, cast!u32 (columns), cast!u32 (rows));
 
         for j in 0us .. self._childs.len {
             self._childs [j].at = placed [j];
         }
 
-        self._gridCols = cols;
-        self._gridRows = rows;
+        self._gridCols = nbCols;
+        self._gridRows = nbRows;
     }
 
     /**
@@ -261,20 +310,20 @@ pub class GridLayout over Layout {
 
             if self._childs.len == 0 { return none; }
 
-            let cellX = cast!u32 (inPaddingPos.x * cast!f32 (self._gridCols));
-            let cellY = cast!u32 (inPaddingPos.y * cast!f32 (self._gridRows));
+            let px = inPaddingPos * self._absoluteSize;
+            let (cellX, cellY) = if let Ok (x) = GridLayout::trackAt (self._colOffsets, self._colSizes, px.x) {
+                if let Ok (y) = GridLayout::trackAt (self._rowOffsets, self._rowSizes, px.y) {
+                    (x, y)
+                } else { return none; }
+            } else { return none; };
 
-            if cellY >= self._gridRows || cellX >= self._gridCols { return none; }
-
-            let cellPosition = makeVec2 ((self._relCellSize.x) * cast!f32 (cellX),
-                                         (self._relCellSize.y) * cast!f32 (cellY));
-
-            let relPos = (inPaddingPos - cellPosition) / self._relCellSize;
+            let relPos = (px - makeVec2 (self._colOffsets [cellX], self._rowOffsets [cellY]))
+                / makeVec2 (self._colSizes [cellX], self._rowSizes [cellY]);
             if relPos.x >= 0.0f && relPos.x <= 1.0f && relPos.y >= 0.0f && relPos.y <= 1.0f {
                 // the last child of a cell is drawn over the others
                 for j in 0us .. self._childs.len {
                     let dmut c = alias self._childs [self._childs.len - 1us - j];
-                    if c.at == (cellX, cellY) {
+                    if c.at == (cast!u32 (cellX), cast!u32 (cellY)) {
                         canBeSelf = false;
                         if let Ok (_) = c.widget.isInBorder (relPos) {
                             return (alias c.widget, relPos)?;
@@ -320,7 +369,7 @@ pub mod GridLayout {
 
     /**
      * @returns: the schema of the grid layouts, each child being put in a cell with cell: column row, or placed in the
-     * next free cell
+     * next free cell, their tracks being read from their style
      * */
     pub fn schema ()-> &WidgetSchema {
         copy WidgetSchema (WidgetKeys::GRID_LAYOUT,
@@ -328,7 +377,182 @@ pub mod GridLayout {
                            children-> (copy Inserter!{&GridLayout} (|dmut g, dmut c, _| => { g:.insertChild (alias c); }))?,
                            slots-> copy [copy SlotSetter!{&GridLayout, (u32, u32)} ("cell", |dmut g, c, cell| => {
                                g:.setCell (c, cell._0, cell._1);
-                           })])
+                           })],
+                           properties-> copy [GridLayout::columns (), GridLayout::rows ()])
+    }
+
+    /**
+     * @returns: the property of the tracks of the columns of a grid (columns: 1fr 2fr 120)
+     * */
+    pub fn columns ()-> &WidgetProperty!{[Track]} {
+        copy WidgetProperty!{[Track]} ("columns", &?tracks, affectsLayout-> true)
+    }
+
+    /**
+     * @returns: the property of the tracks of the rows of a grid (rows: auto 1fr)
+     * */
+    pub fn rows ()-> &WidgetProperty!{[Track]} {
+        copy WidgetProperty!{[Track]} ("rows", &?tracks, affectsLayout-> true)
+    }
+
+    /**
+     * Size the tracks of a grid along an axis, as CSS does: the lengths, the percentages and the content sizes first,
+     * then the auto tracks grown from their min-content to their max-content sharing the free space equally, then the
+     * shares in fr taking what is left, the auto tracks stretched to it when there is no share
+     * @params:
+     *    - tracks: the tracks the style gives, a track past them taking 1fr
+     *    - count: the number of tracks of the grid, its children placed
+     *    - space: the size of the inner box of the grid along the axis, in pixels
+     *    - contents: the min-content and max-content sizes of the content of each track, the largest of its cells
+     * @returns: the size of each track, in pixels
+     * */
+    pub fn resolveTracks (tracks : [Track], count : u32, space : f32, contents : [(f32, f32)])-> [f32] {
+        let n = cast!usize (count);
+        let dmut sizes : [f32] = copy [0.0f ; n];
+        let dmut limits : [f32] = copy [0.0f ; n];
+        let dmut shares : [f32] = copy [0.0f ; n];
+        let dmut auto : [bool] = copy [false ; n];
+
+        let mut free = space;
+        for i in 0us .. n {
+            let t = GridLayout::trackOf (tracks, i);
+            let (minC, maxC) = contents [i];
+            match t.kind {
+                TrackKind::PIXELS      => { sizes [i] = t.amount; }
+                TrackKind::PERCENT     => { sizes [i] = t.amount / 100.0f * space; }
+                TrackKind::MIN_CONTENT => { sizes [i] = minC; }
+                TrackKind::MAX_CONTENT => { sizes [i] = maxC; }
+                TrackKind::AUTO        => {
+                    sizes [i] = minC;
+                    limits [i] = max (minC, maxC);
+                    auto [i] = true;
+                }
+                _ => { shares [i] = t.amount; }
+            }
+
+            free -= sizes [i];
+        }
+
+        // the auto tracks grow to their max-content, sharing the free space equally, a track stopping at its limit
+        for _ in 0us .. n {
+            let mut growing = 0u32;
+            for i in 0us .. n {
+                if auto [i] && sizes [i] < limits [i] { growing += 1u32; }
+            }
+
+            if growing == 0u32 || free <= 0.0f { break; }
+
+            let share = free / cast!f32 (growing);
+            for i in 0us .. n {
+                if auto [i] && sizes [i] < limits [i] {
+                    let add = min (share, limits [i] - sizes [i]);
+                    sizes [i] += add;
+                    free -= add;
+                }
+            }
+        }
+
+        let mut sum = 0.0f, mut autos = 0u32;
+        for i in 0us .. n {
+            sum += shares [i];
+            if auto [i] { autos += 1u32; }
+        }
+
+        if free <= 0.0f { return sizes; }
+
+        if sum > 0.0f {
+            // a sum of shares under 1 takes only that part of the free space
+            let unit = free / max (sum, 1.0f);
+            for i in 0us .. n {
+                sizes [i] += unit * shares [i];
+            }
+        } else if autos != 0u32 {
+            let stretch = free / cast!f32 (autos);
+            for i in 0us .. n {
+                if auto [i] { sizes [i] += stretch; }
+            }
+        }
+
+        sizes
+    }
+
+    /**
+     * @returns: the size of the tracks of a grid along an axis when the grid is sized to its content, a share in fr
+     * being as large as the largest content per fr of the shares
+     * @params:
+     *    - tracks: the tracks the style gives, a track past them taking 1fr
+     *    - count: the number of tracks of the grid, its children placed
+     *    - contents: the min-content and max-content sizes of the content of each track
+     *    - minimum: true for the min-content size of the grid, false for its max-content size
+     * */
+    pub fn measureTracks (tracks : [Track], count : u32, contents : [(f32, f32)], minimum : bool)-> f32 {
+        let n = cast!usize (count);
+        let mut total = 0.0f, mut fraction = 0.0f, mut shares = 0.0f;
+        for i in 0us .. n {
+            let t = GridLayout::trackOf (tracks, i);
+            let content = if minimum { contents [i]._0 } else { contents [i]._1 };
+            match t.kind {
+                TrackKind::PIXELS      => { total += t.amount; }
+                TrackKind::MIN_CONTENT => { total += contents [i]._0; }
+                TrackKind::MAX_CONTENT => { total += contents [i]._1; }
+                TrackKind::SHARE       => {
+                    fraction = max (fraction, content / max (t.amount, 1.0f));
+                    shares += t.amount;
+                }
+                _ => { total += content; } // auto, and a percentage of a size that depends on the content
+            }
+        }
+
+        total + fraction * shares
+    }
+
+    /**
+     * @returns: the position of each track from the start of the grid, the tracks being side by side
+     * */
+    pub fn offsets (sizes : [f32])-> [f32] {
+        let dmut result : [f32] = copy [0.0f ; sizes.len];
+        let mut current = 0.0f;
+        for i in 0us .. sizes.len {
+            result [i] = current;
+            current += sizes [i];
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the index of the track a position falls in, none when it is past the last one
+     * @params:
+     *    - offsets: the positions of the tracks
+     *    - sizes: the sizes of the tracks
+     *    - pos: the position, from the start of the grid
+     * */
+    pub fn trackAt (offsets : [f32], sizes : [f32], pos : f32)-> (usize)? {
+        for i in 0us .. offsets.len {
+            if pos >= offsets [i] && pos <= offsets [i] + sizes [i] { return (i)?; }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif one of the tracks is sized by the content of its cells
+     * */
+    pub fn needsContent (tracks : [Track])-> bool {
+        for t in tracks {
+            if t.kind == TrackKind::AUTO || t.kind == TrackKind::MIN_CONTENT || t.kind == TrackKind::MAX_CONTENT {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the i-th track, 1fr past the tracks given
+     * */
+    fn trackOf (tracks : [Track], i : usize)-> Track {
+        if i < tracks.len { tracks [i] } else { Track (TrackKind::SHARE, 1.0f) }
     }
 
     /**
@@ -336,8 +560,8 @@ pub mod GridLayout {
      * the cells taken before them
      * @params:
      *    - cells: the cell of each child, none to place it in the next free cell
-     *    - columns: the number of columns the grid has at least
-     *    - rows: the number of rows the grid has at least
+     *    - columns: the number of columns the grid has at least, the tracks its style gives
+     *    - rows: the number of rows the grid has at least, the tracks its style gives
      * @returns:
      *    - .0: the cell of each child
      *    - .1: the number of columns of the grid, grown to the columns of the cells
