@@ -1,6 +1,8 @@
 in manager;
 
 use balder::interface::font::family;
+use balder::interface::loader::parser;
+use balder::interface::style::implem;
 
 /**
  * A @font-face rule of a style sheet, registering the faces of a font file in a family
@@ -21,76 +23,93 @@ pub record FontFaceRule {
     pub let style: (FontStyle)?;
 }
 
+/**
+ * Where the rules of a sheet come from, the rules of a later origin winning over those of an earlier one whatever their
+ * specificity
+ * */
+pub enum SheetOrigin
+| COMPONENT   = 0u8  // the default look of the components of a widget library(@style, BAL-65)
+| APPLICATION = 1u8; // the sheets the application loads
 
+/**
+ * What the selectors test on a widget: its type, its id, its classes and its states
+ * */
+@data
+pub record Element {
 
-record WidgetStyles {
+    // The type of the widget
+    pub let typeName: [c8];
 
-    pub let mut hover : [[c8] => mut &Style] = copy [];
-    pub let mut focus : [[c8] => mut &Style] = copy [];
-    pub let mut check : [[c8] => mut &Style] = copy [];
-    pub let mut default : [[c8] => mut &Style] = copy [];
+    // The id of the widget, "" for an anonymous one
+    pub let id: [c8] = "";
 
-    pub self () {}
+    // The classes of the widget
+    pub let classes: [[c8]] = [];
 
-    pub fn insertHover (mut self, name : [c8], style : &Style) {
-        if let Ok (f) = self.hover [name] {
-            let dmut n = copy Style ();
-            n:.merge (f);
-            n:.merge (style);
-
-            self.hover [name] = n;
-        } else {
-            self.hover [name] = style;
-        }
-    }
-
-    pub fn insertFocus (mut self, name : [c8], style : &Style) {
-        if let Ok (f) = self.focus [name] {
-            let dmut n = copy Style ();
-            n:.merge (f);
-            n:.merge (style);
-
-            self.focus [name] = n;
-        } else {
-            self.focus [name] = style;
-        }
-    }
-
-    pub fn insertCheck (mut self, name : [c8], style : &Style) {
-        if let Ok (f) = self.check [name] {
-            let dmut n = copy Style ();
-            n:.merge (f);
-            n:.merge (style);
-
-            self.check [name] = n;
-        } else {
-            self.check [name] = style;
-        }
-    }
-
-    pub fn insertDefault (mut self, name : [c8], style : &Style) {
-        if let Ok (f) = self.default [name] {
-            let dmut n = copy Style ();
-            n:.merge (f);
-            n:.merge (style);
-
-            self.default [name] = n;
-        } else {
-            self.default [name] = style;
-        }
-    }
+    // The states the widget is in
+    pub let states: [[c8]] = [];
 }
 
 /**
- * Manager of defined styles
+ * A rule held by the manager, with what places it in the cascade
+ * */
+@data
+record HeldRule {
+
+    // The rule
+    pub let rule: StyleRule;
+
+    // The origin of its sheet
+    pub let origin: SheetOrigin;
+
+    // Its position among the rules held, in the order they were added
+    pub let order: usize;
+}
+
+/**
+ * A rule matching a widget or a part, with the specificity of the most specific of its selectors that matches
+ * */
+@data
+record Match {
+
+    // The index of the rule among those held
+    pub let index: usize;
+
+    // The origin of its sheet
+    pub let origin: SheetOrigin;
+
+    // The specificity, packed by StyleManager::rank
+    pub let specificity: u64;
+}
+
+/**
+ * The rules of the loaded sheets, and the cascade computing the style of a widget or of one of its parts from them
+ * (doc/gui-v2.md, §4)
+ * @info:
+ * =====
+ * A selector matches from its last compound, which tests the widget(and names the part styled, with its states), up
+ * through the ancestors of the widget: a space looks for any ancestor, a '>' tests the parent. Every class and every
+ * state of a compound has to hold.
+ *
+ * The rules that match are applied by origin, then by specificity(ids, then classes, states and parts, then types,
+ * summed over the compounds), then in the order they were added, a later one winning a tie. A rule matching through
+ * several selectors takes the specificity of the most specific. The @when blocks of a rule come after its own
+ * declarations while their condition holds.
+ *
+ * A computed style starts from the inherited properties of the computed style of the parent(Style::inherit): a part
+ * inherits from its widget, and a widget from its parent.
+ * ====
  * */
 pub class StyleManager {
 
-    // The list of defined style classes
-    let dmut _widgets : [[c8] => WidgetStyles] = copy [];
+    // The rules of the loaded sheets, in the order they were added
+    let mut _rules: [HeldRule] = [];
+
+    // The states tested on an ancestor of the widget a selector styles, by name
+    let dmut _ancestorStates: [[c8] => bool] = copy [];
 
     // The @font-face rules read since the last call to takeFontFaces
-    let mut _fontFaces : [FontFaceRule] = [];
+    let mut _fontFaces: [FontFaceRule] = [];
 
     /*!
      * ====================================================================================================
@@ -103,7 +122,7 @@ pub class StyleManager {
     /**
      * Create an empty style manager
      * */
-    pub self () {}
+    pub self() {}
 
     /*!
      * ====================================================================================================
@@ -116,88 +135,45 @@ pub class StyleManager {
     /**
      * Register a @font-face rule, to be registered in the font manager
      * */
-    pub fn insertFontFace (mut self, rule : FontFaceRule) {
+    pub fn insertFontFace(mut self, rule: FontFaceRule) {
         self._fontFaces ~= [rule];
     }
 
     /**
      * @returns: the @font-face rules read since the last call, forgetting them
      * */
-    pub fn takeFontFaces (mut self)-> [FontFaceRule] {
+    pub fn takeFontFaces(mut self)-> [FontFaceRule] {
         let res = self._fontFaces;
         self._fontFaces = [];
         res
     }
 
     /**
-     * Register a style for a class
+     * Add the rules of a sheet, after those already added
      * @params:
-     *    - widget: the widget kind (empty means that style applies to all widgets that have not been overriden)
-     *    - name: the name of the style
-     *    - style: the registered style
+     *    - origin: where the sheet comes from
      * */
-    pub fn insertDefault (mut self, widget : [c8], name : [c8], style : &Style) {
-        if let Ok (dmut w) = alias self._widgets [widget] {
-            w:.insertDefault (name, style);
-            self._widgets [widget] = alias w;
-        } else {
-            let dmut w = WidgetStyles ();
-            w:.insertDefault (name, style);
-            self._widgets [widget] = alias w;
+    pub fn addSheet(mut self, sheet: StyleSheet, origin: SheetOrigin = SheetOrigin::APPLICATION) {
+        for rule in sheet.rules {
+            self:.insertRule(rule, origin-> origin);
         }
     }
 
     /**
-     * Register a style for a class
+     * Add a rule, after those already added
      * @params:
-     *    - widget: the widget kind (empty means that style applies to all widgets that have not been overriden)
-     *    - name: the name of the style
-     *    - style: the registered style
+     *    - origin: where the sheet of the rule comes from
      * */
-    pub fn insertHover (mut self, widget : [c8], name : [c8], style : &Style) {
-        if let Ok (dmut w) = alias self._widgets [widget] {
-            w:.insertHover (name, style);
-            self._widgets [widget] = alias w;
-        } else {
-            let dmut w = WidgetStyles ();
-            w:.insertHover (name, style);
-            self._widgets [widget] = alias w;
-        }
-    }
-
-    /**
-     * Register a style for a class
-     * @params:
-     *    - widget: the widget kind (empty means that style applies to all widgets that have not been overriden)
-     *    - name: the name of the style
-     *    - style: the registered style
-     * */
-    pub fn insertFocus (mut self, widget : [c8], name : [c8], style : &Style) {
-        if let Ok (dmut w) = alias self._widgets [widget] {
-            w:.insertFocus (name, style);
-            self._widgets [widget] = alias w;
-        } else {
-            let dmut w = WidgetStyles ();
-            w:.insertFocus (name, style);
-            self._widgets [widget] = alias w;
-        }
-    }
-
-    /**
-     * Register a style for a class
-     * @params:
-     *    - widget: the widget kind (empty means that style applies to all widgets that have not been overriden)
-     *    - name: the name of the style
-     *    - style: the registered style
-     * */
-    pub fn insertCheck (mut self, widget : [c8], name : [c8], style : &Style) {
-        if let Ok (dmut w) = alias self._widgets [widget] {
-            w:.insertCheck (name, style);
-            self._widgets [widget] = alias w;
-        } else {
-            let dmut w = WidgetStyles ();
-            w:.insertCheck (name, style);
-            self._widgets [widget] = alias w;
+    pub fn insertRule(mut self, rule: StyleRule, origin: SheetOrigin = SheetOrigin::APPLICATION) {
+        self._rules ~= [HeldRule(rule, origin, self._rules.len)];
+        for sel in rule.selectors {
+            for i, c in sel.compounds {
+                if i + 1us != sel.compounds.len {
+                    for state in c.states {
+                        self._ancestorStates[state] = true;
+                    }
+                }
+            }
         }
     }
 
@@ -210,45 +186,220 @@ pub class StyleManager {
      */
 
     /**
-     * Retreive a style from a list of class names and the kind of widget that will be rendered
-     * @params:
-     *    - classList: the list of class to load
-     * @returns: the composition of the style from the list of classes
-     * @info: the order of classList is important, last class overrides the previous one
+     * @returns: true iif a rule tests the state on an ancestor of what it styles, so that a change of that state of a
+     * widget can change the styles of its descendants
      * */
-    pub fn get (self, widget : [c8], classList : [[c8]], hover : bool, focus : bool, check : bool)-> dmut &Style {
-        let dmut resultStyle = if widget != "" {
-            alias self.get ("", classList, hover-> hover, focus-> focus, check-> check)
-        } else {
-            copy Style ()
-        };
+    pub fn isAncestorState(self, state: [c8])-> bool {
+        state in self._ancestorStates
+    }
 
-        if let Ok (w) = self._widgets [widget] {
-            for fst in classList {
-                if let Ok (s) = w.default [fst] {
-                    resultStyle:.merge (s);
-                }
+    /**
+     * Compute the style of a widget, and those of its parts
+     * @params:
+     *    - path: the widget, then its ancestors up to the root
+     *    - parent: the computed style of the parent of the widget, whose inherited properties it takes
+     *    - parts: the parts of the widget, whose styles are computed in its subItems along with those a matching rule
+     *             names
+     * @returns: the computed style
+     * */
+    pub fn compute(self, path: [Element], parent: &Style, parts: [[c8]] = [])-> &Style {
+        let dmut style = copy Style();
+        style:.inherit(parent);
+        self.cascade(alias style, path, "", []);
 
-                if hover {
-                    if let Ok (s) = w.hover [fst] {
-                        resultStyle:.merge (s);
-                    }
-                }
-
-                if focus {
-                    if let Ok (s) = w.check [fst] {
-                        resultStyle:.merge (s);
-                    }
-                }
-
-                if check {
-                    if let Ok (s) = w.check [fst] {
-                        resultStyle:.merge (s);
+        let mut names = parts;
+        for h in self._rules {
+            for sel in h.rule.selectors {
+                let last = sel.compounds[$ - 1us];
+                if last.part != "" && last.part !in names && last.partStates.len == 0us {
+                    if StyleManager::matches(sel, path, last.part, []) {
+                        names ~= [last.part];
                     }
                 }
             }
         }
 
-        alias resultStyle
+        for name in names {
+            style.subItems[name] = self.computePart(path, style, name);
+        }
+
+        style
+    }
+
+    /**
+     * Compute the style of a part of a widget, in some states of its own
+     * @params:
+     *    - path: the widget, then its ancestors up to the root
+     *    - owner: the computed style of the widget, whose inherited properties the part takes
+     *    - part: the name of the part
+     *    - states: the states the part is in
+     * @returns: the computed style of the part
+     * */
+    pub fn computePart(self, path: [Element], owner: &Style, part: [c8], states: [[c8]] = [])-> &Style {
+        let dmut style = copy Style();
+        style:.inherit(owner);
+        self.cascade(alias style, path, part, states);
+
+        style
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CASCADE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Apply the rules matching a widget, or one of its parts, to a style, in the order of the cascade
+     * */
+    fn cascade(self, dmut style: &Style, path: [Element], part: [c8], partStates: [[c8]]) {
+        let mut matched: [mut Match] = [];
+        for i, h in self._rules {
+            let applies = if let Ok(c) = h.rule.condition { self.holds(c) } else { true };
+            if applies {
+                let mut best: (u64)? = none;
+                for sel in h.rule.selectors {
+                    if StyleManager::matches(sel, path, part, partStates) {
+                        let rank = StyleManager::rank(StyleManager::specificity(sel));
+                        if let Ok(b) = best {
+                            if rank > b { best = (rank)?; }
+                        } else {
+                            best = (rank)?;
+                        }
+                    }
+                }
+
+                if let Ok(b) = best {
+                    matched ~= [Match(i, h.origin, b)];
+                }
+            }
+        }
+
+        let sorted = std::algorithm::sorting::sort(alias matched, |x, y| => StyleManager::before(x, y));
+        for m in sorted {
+            let rule = self._rules[m.index].rule;
+            style:.merge(rule.style);
+            for w in rule.whens {
+                if self.holds(w.condition) {
+                    style:.merge(w.style);
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: true iif the condition of a @when holds, which none does yet: the variables it reads come with BAL-67
+     * */
+    fn holds(self, _: &Condition)-> bool {
+        false
+    }
+}
+
+/**
+ * The matching of the selectors and their specificity
+ * */
+pub mod StyleManager {
+
+    /**
+     * @returns: true iif a selector styles a part of a widget(or the widget itself when part is "") in some states of
+     * the part
+     * @params:
+     *    - path: the widget, then its ancestors up to the root
+     *    - part: the part styled, "" for the widget
+     *    - partStates: the states the part is in
+     * */
+    pub fn matches(sel: Selector, path: [Element], part: [c8], partStates: [[c8]])-> bool {
+        if path.len == 0us || sel.compounds.len == 0us { return false; }
+
+        let last = sel.compounds[$ - 1us];
+        if last.part != part || !StyleManager::includes(partStates, last.partStates) { return false; }
+        if !StyleManager::matches(last, path[0]) { return false; }
+
+        StyleManager::matchesFrom(sel.compounds, sel.compounds.len - 1us, path, 0us)
+    }
+
+    /**
+     * @returns: true iif a compound tests the type, the id, the classes and the states of an element
+     * */
+    pub fn matches(c: Compound, e: Element)-> bool {
+        if c.typeName != "" && c.typeName != e.typeName { return false; }
+        if c.id != "" && c.id != e.id { return false; }
+
+        StyleManager::includes(e.classes, c.classes) && StyleManager::includes(e.states, c.states)
+    }
+
+    /**
+     * @returns: the specificity of a selector: its ids, its classes, states and parts, and its types
+     * */
+    pub fn specificity(sel: Selector)-> (u32, u32, u32) {
+        let mut ids = 0u32, mut tests = 0u32, mut types = 0u32;
+        for c in sel.compounds {
+            if c.id != "" { ids += 1u32; }
+            if c.part != "" { tests += 1u32; }
+            if c.typeName != "" { types += 1u32; }
+            tests += cast!u32(c.classes.len + c.states.len + c.partStates.len);
+        }
+
+        (ids, tests, types)
+    }
+
+    /**
+     * @returns: a specificity packed in a single number, ordered as the specificities
+     * */
+    pub fn rank(specificity: (u32, u32, u32))-> u64 {
+        (cast!u64(specificity._0) << 42u64) | (cast!u64(specificity._1) << 21u64) | cast!u64(specificity._2)
+    }
+
+    /**
+     * @returns: true iif a match comes before another in the cascade, and is overridden by it
+     * */
+    pub fn before(x: Match, y: Match)-> bool {
+        if x.origin != y.origin { return x.origin < y.origin; }
+        if x.specificity != y.specificity { return x.specificity < y.specificity; }
+
+        x.index < y.index
+    }
+
+    /**
+     * @returns: true iif the compounds before the i-th match the ancestors of the j-th element of the path, the i-th
+     * matching it
+     * */
+    pub fn matchesFrom(compounds: [Compound], i: usize, path: [Element], j: usize)-> bool {
+        if i == 0us { return true; }
+
+        let prev = compounds[i - 1us];
+        if prev.part != "" { return false; }
+
+        if compounds[i].combinator == Combinator::CHILD {
+            return j + 1us < path.len
+                && StyleManager::matches(prev, path[j + 1us])
+                && StyleManager::matchesFrom(compounds, i - 1us, path, j + 1us);
+        }
+
+        for k in j + 1us .. path.len {
+            if StyleManager::matches(prev, path[k]) && StyleManager::matchesFrom(compounds, i - 1us, path, k) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif every name of what is in names
+     * */
+    pub fn includes(names: [[c8]], what: [[c8]])-> bool {
+        for w in what {
+            let mut found = false;
+            for n in names {
+                if n == w { found = true; break; }
+            }
+
+            if !found { return false; }
+        }
+
+        true
     }
 }
