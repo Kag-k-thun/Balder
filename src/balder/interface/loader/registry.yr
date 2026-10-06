@@ -1,0 +1,186 @@
+/**
+ * The widget types a .gui file can use, and the creation of the widgets of a document read from it (doc/gui-v2.md, §3
+ * and §7)
+ * */
+in registry;
+
+pub mod ::schema;
+pub mod ::error;
+mod ::checker;
+
+use balder::interface::loader::parser;
+use balder::interface::loader::registry::{checker, error, schema};
+use balder::interface::widget;
+
+use std::syntax::errors;
+
+/**
+ * The registry of the widget types, mapping the name of a type to its schema
+ * @info:
+ * =====
+ * Each widget type describes itself next to its class, in its own module; the registry starts with the types of
+ * Balder, and an application registers its own. The parsers know no widget type: the tree of nodes of a .gui file is
+ * checked against the schemas, then instantiated.
+ * ====
+ * */
+@final
+pub class WidgetRegistry {
+
+    // The schemas of the widget types, by name
+    let mut _schemas: [[c8] => mut &WidgetSchema] = copy [];
+
+    /**
+     * Create a registry knowing no widget type
+     * */
+    pub self () {}
+
+    /**
+     * Register a widget type, replacing the type registered under the same name
+     * */
+    pub fn register(mut self, schema: &WidgetSchema) {
+        self._schemas[schema.typeName] = schema;
+    }
+
+    /**
+     * @returns: the schema of the type named typeName, none if no type is registered under that name
+     * */
+    pub fn get(self, typeName: [c8])-> (&WidgetSchema)? {
+        if let Ok(s) = self._schemas[typeName] {
+            return (s)?;
+        }
+
+        none
+    }
+
+    /**
+     * Check the widget tree of a document against the schemas of the widget types
+     * @params:
+     *    - file: the path of the file the document was read from, for the errors
+     * @throws: at the first node, attribute or value refused, naming the file, the line and the column
+     * */
+    pub fn check(self, doc: Document, file: [c8])
+        throws LoadError
+    {
+        let root = WidgetRegistry::rootOf(doc, file);
+        let dmut nodes = Checker(self._schemas, file);
+        nodes:.check(root);
+    }
+
+    /**
+     * Create the widgets of a document, checked first
+     * @params:
+     *    - manager: the manager of the widgets
+     *    - file: the path of the file the document was read from, for the errors
+     * @returns: the root widget
+     * @throws: when the document is refused by the check
+     * */
+    pub fn instantiate(self, dmut manager: &WidgetManager, doc: Document, file: [c8])-> dmut &Widget
+        throws LoadError
+    {
+        self.check(doc, file);
+        self.build(alias manager, WidgetRegistry::rootOf(doc, file), file)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          BUILDING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the widget of a checked node, and its children
+     * */
+    fn build(self, dmut manager: &WidgetManager, node: Node, file: [c8])-> dmut &Widget
+        throws LoadError
+    {
+        let schema = if let Ok(s) = self._schemas[node.typeName] {
+            s
+        } else {
+            throw copy LoadError(file, "unknown widget type '" ~ node.typeName ~ "'", node.line, node.col);
+        };
+
+        let dmut widget = schema.create(alias manager, node.id);
+        {
+            widget:.setClasses(node.classes);
+            if let Ok(v) = node.value {
+                if let Ok(attr) = schema.attribute(schema.defaultAttribute) {
+                    attr.apply(alias widget, v);
+                }
+            }
+
+            for a in node.attributes {
+                if let Ok(attr) = schema.attribute(a.name) {
+                    attr.apply(alias widget, a.value);
+                }
+            }
+
+            let mut index = 0us;
+            for c in node.children {
+                match c {
+                    child: Node => {
+                        if let Ok(inserter) = schema.children {
+                            let dmut w = self.build(alias manager, child, file);
+                            inserter.insert(alias widget, alias w, index);
+                            self.applySlots(schema, alias widget, w, child);
+                            index += 1us;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } catch {
+            e: &SyntaxError => {
+                widget:.dispose();
+                throw copy LoadError(file, "attribute of '" ~ node.typeName ~ "': " ~ e.msg, e.line, e.col);
+            }
+            e: &LoadError => {
+                widget:.dispose();
+                throw e;
+            }
+        }
+
+        alias widget
+    }
+
+    /**
+     * Set the attributes a widget gives its child, those of the child not being its own
+     * @params:
+     *    - schema: the schema of the parent
+     *    - node: the node of the child
+     * */
+    fn applySlots(self, schema: &WidgetSchema, dmut parent: &Widget, child: &Widget, node: Node)
+        throws SyntaxError
+    {
+        let own = self.get(node.typeName);
+        for a in node.attributes {
+            let isOwn = if let Ok(s) = own { s.attribute(a.name).hasValue } else { false };
+            if !isOwn {
+                if let Ok(slot) = schema.slot(a.name) {
+                    slot.apply(alias parent, child, a.value);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The helpers of the registry
+ * */
+mod WidgetRegistry {
+
+    /**
+     * @returns: the root node of a document
+     * @throws: when the document has none
+     * */
+    pub fn rootOf(doc: Document, file: [c8])-> Node
+        throws LoadError
+    {
+        if let Ok(root) = doc.root {
+            return root;
+        }
+
+        throw copy LoadError(file, "no widget in the file", 1us, 1us);
+    }
+}
