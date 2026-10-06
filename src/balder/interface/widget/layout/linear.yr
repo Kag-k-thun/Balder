@@ -1,14 +1,26 @@
 in linear;
 
+use balder::utils;
+use balder::core::dispose;
+use balder::interface::_;
 use balder::interface::loader;
 use balder::interface::loader::registry::schema;
+use balder::interface::style::{kinds, property};
 use balder::interface::widget::alignement;
 use balder::interface::widget::layout::flex;
 use balder::math::vector;
 
 use std::io;
 
+use ::sdl3::mouse;
+
 use ::std::algorithm::comparison;
+
+// The thickness of the scrollbar when the style sets none, in pixels
+def DEFAULT_SCROLLBAR_SIZE = 10u32;
+
+// The speed of the wheel when the style sets none
+def DEFAULT_SCROLL_SPEED = 2.0f;
 
 record Child {
     pub let dmut widget: &Widget;
@@ -24,6 +36,15 @@ record Child {
     {}
 }
 
+/**
+ * A layout of children side by side along the direction of its style, sized by their flex bases and factors
+ * @info:
+ * =====
+ * The style reads `direction` (row or column), `overflow` (hidden or scroll) and `scroll-speed`. A layout that overflows
+ * by scrolling keeps the bases of its children instead of shrinking them, and scrolls over them with the wheel or by
+ * dragging its scrollbar, styled as its part `::scrollbar`.
+ * ====
+ * */
 pub class LinearLayout over Layout {
 
     // The columns of the layout
@@ -35,8 +56,30 @@ pub class LinearLayout over Layout {
     // The relative size of the widget (may be greater than 1 if containes too much widgets to fit on screen°)
     let mut _relFullSize: f32 = 0.0f;
 
-    // True if the children keep their bases instead of shrinking, the layout being scrolled over them
-    let mut _scrolled: bool = false;
+    prot { // scrolling, when the style overflows by scrolling
+
+        // The shape displaying the scrollbar, registered when the layout first scrolls
+        let dmut _scrollbarShape: (&Shape)? = none;
+
+        // The part of the content the layout shows along its axis, 1 when it does not overflow
+        let mut _scrollLen: f32 = 1.0f;
+
+        // The part of the content scrolled over along the axis, from 0 to 1 - _scrollLen
+        let mut _scrollShift: f32 = 0.0f;
+
+        // The position and the size of the scrollbar relative to the inner box
+        let mut _relScrollBarPos: vec2 = vec2();
+        let mut _relScrollBarSize: vec2 = vec2();
+
+        // The position of the cursor in the inner box, minus the scrolled part, when the scrollbar was grabbed
+        let mut _slideStart: vec2 = vec2();
+
+        // True iif the scrollbar is grabbed, the layout having the focus while it is dragged
+        let mut _grabbed: bool = false;
+
+        // True iif the cursor is over the scrollbar
+        let mut _overBar: bool = false;
+    }
 
     /*!
      * ====================================================================================================
@@ -64,6 +107,8 @@ pub class LinearLayout over Layout {
      */
     over onUpdateSize(mut self) {
         if self._childs.len == 0 {
+            self._relFullSize = 0.0f;
+            self:.updateScroll();
             return;
         }
 
@@ -93,11 +138,38 @@ pub class LinearLayout over Layout {
             self._childs[col].relPos = relPos;
             self._childs[col].relSize = relSize;
         }
+
+        self:.updateScroll();
     }
 
     over onUpdateScissors(mut self) {
         for dmut i in alias self._childs {
             self:.clipChild(alias i.widget, i.relPos, i.relSize);
+        }
+
+        if let Ok(dmut s) = alias self._scrollbarShape {
+            let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
+            s:.setScissors(sciPos, sciSize);
+        }
+    }
+
+    over onHide(mut self) {
+        self.__super__:.onHide();
+        if let Ok(dmut s) = alias self._scrollbarShape {
+            s:.hide();
+        }
+    }
+
+    over onShow(mut self) {
+        self.__super__:.onShow();
+        if let Ok(dmut s) = alias self._scrollbarShape && self.isOverflowing() {
+            s:.show();
+        }
+    }
+
+    prot over onApplyStyle(mut self) {
+        if let Ok(dmut s) = alias self._scrollbarShape {
+            s:.setColor(self.getStyle().getSubStyle("scrollbar").getColor(WidgetShapeKind::BACKGROUND));
         }
     }
 
@@ -171,13 +243,6 @@ pub class LinearLayout over Layout {
     }
 
     /**
-     * Keep the bases of the children instead of shrinking them when they overflow, the layout being scrolled over them
-     * */
-    pub fn setScrolled(mut self, scrolled: bool) {
-        self._scrolled = scrolled;
-    }
-
-    /**
      * The current shifting of the layout
      * */
     @field
@@ -193,14 +258,28 @@ pub class LinearLayout over Layout {
         Layout::directionOf(self.getStyle()) == Direction::ROW
     }
 
-    pub over getMaxDepth(self)-> u32 {
-        let mut max = self._depth;
-        for i in self._childs {
-            let chD = i.widget.getMaxDepth();
-            if chD > max { max = chD; }
+    /**
+     * @returns: true iif the children keep their bases instead of shrinking when they overflow, the layout scrolling over
+     * them, its style overflow being scroll
+     * */
+    pub fn isScrolled(self)-> bool {
+        if let Ok(o) = self.getStyle().getCustom!{Overflow}("overflow") {
+            return o == Overflow::SCROLL;
         }
 
-        max
+        false
+    }
+
+    /**
+     * @returns: true iif the layout scrolls over children that do not fit in it
+     * */
+    pub fn isOverflowing(self)-> bool {
+        self.isScrolled() && self._scrollLen < 1.0f
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        // the scrollbar is drawn over the children
+        if self.isOverflowing() { self.getChildrenDepth() + 1 } else { self.getChildrenDepth() }
     }
 
     /**
@@ -224,6 +303,248 @@ pub class LinearLayout over Layout {
      * */
     pub over getChildren(mut self)-> dmut [&Widget] {
         return copy [alias c.widget for dmut c in alias self._childs];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        if self.isOnScrollbar(pos) {
+            if let Ok(dmut w) = alias self._lastHover {
+                w:.onLoseHoverFocus();
+                self._lastHover = none;
+            }
+
+            self._overBar = true;
+            self:.setHover(true);
+            self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_POINTER);
+            return (alias self)?;
+        }
+
+        self:.leaveScrollbar();
+        self.__super__:.onHover(pos)
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        self:.leaveScrollbar();
+        self.__super__:.onLoseHoverFocus();
+    }
+
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if self.isOnScrollbar(pos) {
+            if button == SDL_BUTTON_LEFT {
+                self._grabbed = true;
+                self._slideStart = self.toInner(pos) - self._scrollShift;
+            }
+
+            return (alias self)?;
+        }
+
+        self._grabbed = false;
+        self.__super__:.onClick(pos, button)
+    }
+
+    pub over onDoubleClick(mut self, pos: vec2)-> dmut (&Widget)? {
+        if self.isOnScrollbar(pos) {
+            return (alias self)?;
+        }
+
+        self.__super__:.onDoubleClick(pos)
+    }
+
+    /**
+     * Drag the scrollbar grabbed by a click
+     * */
+    pub over onSliding(mut self, pos: vec2, _speed_: vec2, _: u8) {
+        if self._grabbed && self.isOverflowing() {
+            let amount = self.toInner(pos) - self._slideStart;
+            self:.scrollTo(if self.isRow() { amount.x } else { amount.y });
+        }
+    }
+
+    pub over onSlidingEnd(mut self, _: u8) {
+        self._grabbed = false;
+    }
+
+    pub over onScroll(mut self, pos: vec2, amountX: i32, amountY: i32)-> bool {
+        if self.__super__:.onScroll(pos, amountX, amountY) {
+            return true;
+        }
+
+        if !self.isOverflowing() {
+            return false;
+        }
+
+        self:.scrollTo(self._scrollShift - (cast!f32(amountY) / 100.0f) * self.getScrollSpeed());
+        self:.onHover(pos);
+        true
+    }
+
+    pub over isFocusableLeftClick(self)-> bool {
+        self._grabbed
+    }
+
+    pub over loseFocusOnReleaseLeft(self)-> bool {
+        true
+    }
+
+    pub over onGainFocus(mut self) {
+        self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_POINTER);
+    }
+
+    pub over onLoseFocus(mut self) {
+        self._grabbed = false;
+        self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            if let Ok(s) = self._scrollbarShape {
+                self._manager:.getShapeDrawer():.removeShape(s.uid);
+                self._scrollbarShape = none;
+            }
+
+            self.__super__:.dispose();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SCROLLING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Keep the scrolled part within the content once laid out, and place the scrollbar, shown only when the layout
+     * scrolls over children that do not fit in it
+     * */
+    fn updateScroll(mut self) {
+        if !self.isScrolled() || self._relFullSize <= 1.0f {
+            self._scrollLen = 1.0f;
+            self._scrollShift = 0.0f;
+            if self._shift != 0.0f {
+                self:.setShift(0.0f);
+            }
+
+            if let Ok(dmut s) = alias self._scrollbarShape {
+                s:.hide();
+            }
+
+            return;
+        }
+
+        self._scrollLen = 1.0f / self._relFullSize;
+        self:.scrollTo(-self._shift / self._relFullSize);
+    }
+
+    /**
+     * Scroll the content, its part scrolled over kept within it, and place the scrollbar
+     * @params:
+     *    - shift: the part of the content to scroll over, from 0 to 1
+     * */
+    fn scrollTo(mut self, shift: f32) {
+        self._scrollShift = clamp(shift, 0.0f, 1.0f - self._scrollLen);
+        self:.setShift(-(self._scrollShift * self._relFullSize));
+
+        let sub = self.getStyle().getSubStyle("scrollbar");
+        if self.isRow() {
+            let h = if sub.hasHeight() { sub.getHeight() } else { WidgetSize(pix-> DEFAULT_SCROLLBAR_SIZE) };
+            self._relScrollBarSize = makeVec2(self._scrollLen, self.clampSize(h, self._absoluteSize.y));
+            self._relScrollBarPos = makeVec2(self._scrollShift, 1.0f - self._relScrollBarSize.y);
+        } else {
+            let w = if sub.hasWidth() { sub.getWidth() } else { WidgetSize(pix-> DEFAULT_SCROLLBAR_SIZE) };
+            self._relScrollBarSize = makeVec2(self.clampSize(w, self._absoluteSize.x), self._scrollLen);
+            self._relScrollBarPos = makeVec2(1.0f - self._relScrollBarSize.x, self._scrollShift);
+        }
+
+        if !self._scrollbarShape.hasValue {
+            self:.registerScrollbar();
+        }
+
+        if let Ok(dmut s) = alias self._scrollbarShape {
+            s:.setPosition(self._relScrollBarPos * self._absoluteSize + self._absolutePosition);
+            s:.setSize(self._relScrollBarSize * self._absoluteSize);
+            s:.setLevel(self.getChildrenDepth() + 1);
+            if !self._hidden { s:.show(); }
+        }
+    }
+
+    /**
+     * Register the shape of the scrollbar
+     * */
+    fn registerScrollbar(mut self) {
+        let dmut shDr = self._manager:.getShapeDrawer();
+        {
+            let color = self.getStyle().getSubStyle("scrollbar").getColor(WidgetShapeKind::BACKGROUND);
+            let dmut shape = shDr:.registerColorQuad(color-> color);
+            let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
+            shape:.setScissors(sciPos, sciSize);
+            self._scrollbarShape = (alias shape)?;
+        } catch {
+            err => {
+                log::error #("LinearLayout", "Failed to construct the scrollbar : ", err);
+            }
+        }
+    }
+
+    /**
+     * Give the cursor back when it leaves the scrollbar
+     * */
+    fn leaveScrollbar(mut self) {
+        if self._overBar {
+            self._overBar = false;
+            self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT);
+        }
+    }
+
+    /**
+     * @returns: true iif the cursor is over the scrollbar of a layout that overflows
+     * @params:
+     *    - pos: the position of the cursor relative to the layout
+     * */
+    fn isOnScrollbar(self, pos: vec2)-> bool {
+        if !self.isOverflowing() { return false; }
+        if let Ok(_) = self.isInPadding(pos) {
+            return self.isInSquare(self.toInner(pos), self._relScrollBarPos, self._relScrollBarPos + self._relScrollBarSize).hasValue;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: a position relative to the layout, relative to its inner box
+     * */
+    fn toInner(self, pos: vec2)-> vec2 {
+        let a = (self._absolutePosition - self._absoluteFullPosition) / self._absoluteFullSize;
+        let b = self._absoluteSize / self._absoluteFullSize;
+
+        (pos - a) / b
+    }
+
+    /**
+     * @returns: the speed of the wheel, set by the style scroll-speed
+     * */
+    fn getScrollSpeed(self)-> f32 {
+        if let Ok(speed) = self.getStyle().getCustom!{f32}("scroll-speed") {
+            return speed;
+        }
+
+        DEFAULT_SCROLL_SPEED
     }
 
     /*!
@@ -316,7 +637,7 @@ pub class LinearLayout over Layout {
 
             items[i] = FlexItem(basis-> basis,
                                 grow-> style.flexGrow.1,
-                                shrink-> if self._scrolled { 0.0f } else { style.flexShrink.1 },
+                                shrink-> if self.isScrolled() { 0.0f } else { style.flexShrink.1 },
                                 min-> max(cast!f32(size.minPix), minContent),
                                 max-> cast!f32(size.maxPix));
         }
@@ -345,6 +666,19 @@ pub class LinearLayout over Layout {
      */
 
     /**
+     * @returns: the depth of the deepest child, the layout's own when it has none
+     * */
+    fn getChildrenDepth(self)-> u32 {
+        let mut max = self._depth;
+        for i in self._childs {
+            let chD = i.widget.getMaxDepth();
+            if chD > max { max = chD; }
+        }
+
+        max
+    }
+
+    /**
      * @returns:
      *  - .0 : the widget on which the mouse is positionned
      *  - .1 : the position of the mouse relative to the widget
@@ -352,12 +686,7 @@ pub class LinearLayout over Layout {
     prot over mouseToWidget(mut self, pos: vec2, ref mut canBeSelf: bool)-> dmut (&Widget, vec2)? {
         canBeSelf = true;
 
-        let inPaddingPos = {
-            let a = (self._absolutePosition - self._absoluteFullPosition) / self._absoluteFullSize;
-            let b = (self._absoluteSize / self._absoluteFullSize);
-
-            (pos - a) / b
-        };
+        let inPaddingPos = self.toInner(pos);
 
         for i in 0 .. self._childs.len {
             let a = self._childs[i].relPos;
@@ -389,6 +718,21 @@ pub mod LinearLayout {
                           children-> (copy Inserter!{&LinearLayout}(|dmut l, dmut c, i| => {
                               l:.insertChild(alias c, level-> cast!u32(i));
                           }))?,
-                          properties-> copy [Layout::direction()])
+                          parts-> copy ["scrollbar"],
+                          properties-> copy [Layout::direction(), LinearLayout::overflow(), LinearLayout::scrollSpeed()])
+    }
+
+    /**
+     * @returns: the property of what a linear layout does with the children that do not fit in it, hidden or scroll
+     * */
+    pub fn overflow()-> &WidgetProperty!{Overflow} {
+        copy WidgetProperty!{Overflow}("overflow", &?kinds::overflow, affectsLayout-> true)
+    }
+
+    /**
+     * @returns: the property of the speed of the wheel scrolling a linear layout
+     * */
+    pub fn scrollSpeed()-> &WidgetProperty!{f32} {
+        copy WidgetProperty!{f32}("scroll-speed", &?factor)
     }
 }
