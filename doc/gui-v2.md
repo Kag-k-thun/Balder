@@ -495,7 +495,7 @@ $surface: #202328;
 $button:  #22252a;
 $edge:    #4a5259;
 
-FloatingLayout.root { background-color: grey!10; }
+FloatingLayout.root { background-color: #32383e; }
 
 LinearLayout.root, LinearLayout.inner {
     background-color: $surface;
@@ -532,7 +532,7 @@ PushButton.yes:hover        { background-color: #cccccc; border-color: #ffffff; 
 PushButton.yes:hover::label { text-color: #2fc49f; }
 
 PushButton.no::label        { text-color: #f1bcbd; }
-PushButton.no:hover         { background-color: red!40; border-color: grey!70; }
+PushButton.no:hover         { background-color: #ff4d6d; border-color: #e1e5e9; }
 PushButton.no:hover::label  { text-color: black; }
 ```
 
@@ -610,7 +610,7 @@ kind it expects, so a value is checked against its type, not against a list of k
 | length | number, optionally `px` or `%` | `12` `12px` `40%` | `{ relative: 0.4; }`, `w: 1280` |
 | size | a length, or `auto` `min-content` `max-content` | `width: auto` | unchanged keywords |
 | track | a size, or a share of the free space in `fr` | `columns: 1fr 2fr 120` | `columns: 3` |
-| colour | `#rgb` `#rrggbb` `#rrggbbaa`, palette `name!shade`, `transparent`, then an optional `/ alpha` | `#388bfd / 40%` `black!0 / 0.6` | `#388bfd : 100` (alpha out of 255) |
+| colour | as in CSS: `#rgb` `#rgba` `#rrggbb` `#rrggbbaa`, the named colours, `transparent`, `rgb()` `hsl()`, then an optional `/ alpha` (BAL-19) | `#388bfd / 40%` `black / 0.6` `rgb(56 139 253 / 40%)` | `#388bfd : 100` (alpha out of 255), the palette shades `grey!10` |
 | number | integer or decimal, leading digit required | `0.5` `700` | |
 | string | double quotes only | `"Noto Sans"` | `'…'` in `.gui` |
 | keyword | identifier from the property's own set | `row` `bold` `center` | the flat `Keywords` enums |
@@ -670,8 +670,8 @@ next popup opened.
   the grid grows to beyond those given takes `1fr`, so a grid given no track keeps cells of equal size.
 - **Code sets them inline.** `Widget.setInlineStyle` gives a widget a style applied over every rule, as the style
   attribute of an HTML element, and a registered property fills it with `set`:
-  `Layout::direction ().set (alias style, Direction::ROW)`. The v1 loader sets its `orientation`, `scrollable`,
-  `columns`, `(x:, y:)` and menu alignment that way until BAL-19 retires it.
+  `Layout::direction ().set (alias style, Direction::ROW)`. The v1 loader set its `orientation`, `scrollable`,
+  `columns`, `(x:, y:)` and menu alignment that way until BAL-19 retired it.
 
 ## 7. How a widget plugs in
 
@@ -1097,7 +1097,8 @@ Each has a recommendation.
   `display`. A new item under BAL-25, after BAL-22, since it relies on the cascade.
 - **BAL-23** registry and generic parser: [§3](#3-the-structure-file) and [§7](#7-how-a-widget-plugs-in), retiring the
   `readX`/`readXHeader` pairs.
-- **BAL-19** port of `res/` and the examples.
+- **BAL-19** port of `res/` and the examples, done: the v1 parsers are gone, the colours follow CSS, and the language
+  reference is [gui.md](gui.md).
 - **BAL-20** hot reload, which a single generic parser makes much simpler. Reloading a component file expands its
   instances again.
 - **Components** ([§8](#8-components)) have no work item yet. They need the registry of BAL-23 and add expansion,

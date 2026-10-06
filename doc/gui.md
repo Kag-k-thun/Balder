@@ -1,0 +1,355 @@
+# The .gui and .style language
+
+A `.gui` file says which widgets exist, what they say and how they behave. A `.style` file says how they look and
+where they go. Both share one lexer and one grammar of values. This page describes the language as Balder reads it
+today; [gui-v2.md](gui-v2.md) is the design it comes from, and still describes parts that are not implemented yet
+(components, signals, `@when` variables, the CSS box model).
+
+The second half of the page, from [Widget types](#widget-types) on, is generated from the widget registry and the
+property table by `gyllir run reference`, and a test fails when it no longer matches the code.
+
+## Loading the files
+
+```
+self.gui:.loadStyleFile ("res:/dialog/default.style")?;
+self.gui:.loadGUIFile ("res:/dialog/message.gui")?;
+```
+
+- `loadStyleFile` reads a sheet after the sheets it imports, decodes every rule against the widget types, registers
+  the fonts of its `@font-face` blocks and computes the styles of the widgets already loaded again. A sheet refused
+  adds no rule.
+- `loadGUIFile` reads a `.gui` file, checks every node against the widget types, then creates the widgets and makes
+  the root the content of the manager.
+- A path is qualified (`res:/`, `shaders:/`, …, relative to the project) or relative to the working directory.
+- An error names the file, the line and the column, and says what was expected:
+  `example/form/form.gui:5:32: unknown attribute 'len' of 'InputText' under 'LinearLayout'`.
+
+## Lexical rules
+
+- Spaces and line breaks separate the tokens. Comments are `// to the end of the line` and `/* … */`.
+- Identifiers are made of letters, digits, `_` and `-`: `min-content`, `on-click`, `FILE_MENU`.
+- Strings use double quotes only, with the escapes `\"`, `\\`, `\n` and `\t`.
+- Numbers need a leading digit (`0.5`, not `.5`) and may carry a unit, glued: `12`, `12px`, `40%`, `1fr`.
+
+## The structure file
+
+```
+LinearLayout #FL .root {
+    Label #QUESTION .question "HELLO?";
+    LinearLayout #F2 .inner {
+        PushButton #YES .yes "Yes";
+        PushButton #NO .no "No";
+    }
+}
+```
+
+```
+document  = node ;
+node      = Type { "#" ident | "." ident } [ values ] ( ";" | "{" { member } "}" ) ;
+member    = attribute | node ;
+attribute = ident ":" values ";" ;
+```
+
+- **A node** is its type, then an optional id after `#`, then its classes after `.`, then an optional default value,
+  then `;` or a block. Inside the block, `name: value;` is an attribute and anything starting with a type is a child.
+- **The default value** sets the default attribute of the type: the text of a `Label`, a `PushButton`, a `MenuButton`
+  or an `InputText`. Setting the same attribute in the block too is an error.
+- **Ids are optional.** Only the widgets the code looks up need one. An anonymous widget adds no segment to a find
+  path: `find ("BODY/NAME")` reaches `Label #NAME` through an unnamed `LinearLayout`. Two named widgets reachable by the
+  same path are an error at load.
+- **Attributes of the children** belong to the parent's type: `tab: "Form";` under a `TabLayout`,
+  `cell: 1 0;` under a `GridLayout`, `capture-events: false;` under a `FloatingLayout`. A grid child without a `cell`
+  takes the next free cell, row by row.
+- **Every length is in the style.** Sizes, margins, directions, tracks and positions are style properties; the only
+  size in a `.gui` file is the `resolution` a `Scene3D` renders at before being scaled to the widget.
+- `@import`, `@style` and `@component` are read but refused at load: components are not implemented yet.
+
+## The style file
+
+```
+$surface: #202328;
+$font: "Noto Sans", sans-serif;
+
+LinearLayout.root, LinearLayout.inner {
+    background-color: $surface;
+}
+
+PushButton.yes::label       { font-family: $font; text-color: #4c98fd; }
+PushButton.yes:hover        { background-color: #cccccc; }
+PushButton.yes:hover::label { text-color: #2fc49f; }
+```
+
+```
+sheet       = { import } { constant | font-face | rule | when } ;
+import      = "@import" string ";" ;
+constant    = "$" ident ":" values ";" ;
+font-face   = "@font-face" "{" { declaration } "}" ;
+rule        = selector { "," selector } "{" { declaration | rule-when } "}" ;
+rule-when   = "@when" "(" condition ")" "{" { declaration } "}" ;
+when        = "@when" "(" condition ")" "{" { rule } "}" ;
+declaration = ident ":" values ";" ;
+selector    = compound { [ ">" ] compound } ;
+compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part { ":" state } ] ;
+```
+
+### Selectors
+
+- **A compound is glued**: `PushButton.yes:hover::label`. A space between two compounds means a descendant
+  (`.sidebar PushButton`), `>` a direct child, and `,` separates selectors sharing one block.
+- **A type**, `#id`, `.class` and `:state` all have to hold. `*` or no type selects every type.
+- **States** are registered by the widget types: `:hover`, `:focus`, `:check` for every widget.
+- **Parts** style a piece of a widget, `PushButton::label`, and end their selector. A part with states of its own takes
+  them after it: `TabLayout::tab:selected` is the selected tab, `TabLayout:hover::tab` every tab of a hovered layout.
+- **Checked at load**: a type, a state, a part or a state of a part that none of the types a compound can select
+  registers is an error, as is a property affecting the layout in a rule testing a state (hovering must not move
+  anything).
+
+### Cascade
+
+- The rules matching a widget apply by origin, then by specificity (ids, then classes, states and parts, then types,
+  summed over the compounds), then in the order they were loaded, the later one winning a tie. A rule matching
+  through several of its selectors takes the specificity of the most specific one.
+- The inherited properties (`text-color`, the `font-*` properties, `text-xalign`, `text-yalign`, `text-wrap`, and those
+  a widget type registers as inherited) pass from a widget to its children and to its parts. Set the font once on a
+  container.
+- The inline style a widget is given by code (`Widget.setInlineStyle`) comes after every rule.
+
+### Constants and imports
+
+- `$name: values;` defines a constant at the top level, used as `$name` in any later value. A constant may use the
+  ones defined before it; a tuple or a list it holds is spliced where it is used: with `$pad: 6 14;`, `margin: 0 $pad;`
+  is `margin: 0 6 14;`.
+- `@import "base.style";` heads a sheet. The imported sheet is read first, in the same scope of constants, and its
+  rules come before those of the importing sheet. The path is relative to the importing sheet unless it is qualified
+  or absolute. A sheet imported twice is read once; a sheet importing itself is an error naming the chain.
+
+### Fonts
+
+```
+@font-face {
+    font-family: "Title";
+    src: "res:/fonts/noto/NotoSans-Bold.ttf";
+    font-weight: 700;     // optional, read from the file when omitted
+    font-style: normal;   // optional, read from the file when omitted
+}
+```
+
+### Conditions
+
+`@when (condition) { … }` blocks are read and checked, inside a rule (declarations) or at the top level (rules), but no
+condition holds yet: the variables they test (`width`, `window.width`, `app.mode`, …) come with BAL-67.
+
+## Values
+
+Both files read the right-hand side of `name: …;` with the same grammar. The attribute or the property decides which
+kind of value it expects.
+
+| Kind | Syntax | Examples |
+|---|---|---|
+| number | integer or decimal, leading digit required | `0.5` `700` |
+| length | a number, in `px` when it has no unit, or a percentage of the parent | `12` `12px` `40%` |
+| size | a length, `auto`, `min-content` or `max-content` | `width: max-content` |
+| track | a length, a share of the free space in `fr`, or a size keyword | `columns: 1fr 2fr 120` |
+| colour | see below | `#388bfd` `steelblue / 40%` |
+| string | double quotes | `"Noto Sans"` |
+| keyword | an identifier from the property's own set | `row` `bold` `center` |
+| tuple | values separated by spaces | `padding: 6 14` `border: 2 $edge` `cell: 1 0` |
+| list | values separated by commas | `"DejaVu Sans Mono", monospace` |
+| constant | `$name` | `$accent` |
+
+Shorthands follow the order of CSS: one value for every side, two for vertical then horizontal, three for top,
+horizontal then bottom, four clockwise from the top. A longhand after a shorthand overrides its side:
+`padding: 6; padding-left: 20;`.
+
+**Sizes today.** Until the CSS box model (BAL-64), a size keeps the semantics of the first loader: a width in pixels is
+exactly that width, a percentage is a part of the parent, an unset width or height takes the whole parent, and the
+width includes the margins. `min-width`, `max-width`, `min-height` and `max-height` bound a width or a height in
+pixels. `flex: 1` (grow 1, shrink 1, basis 0) shares the free space of a linear layout.
+
+### Colours
+
+Colours are written as in CSS:
+
+- `#rgb`, `#rgba`, `#rrggbb` and `#rrggbbaa`;
+- the 148 named colours of CSS (`black`, `white`, `steelblue`, `rebeccapurple`, …) and `transparent`;
+- `rgb()` and `hsl()`, with their arguments separated by spaces and the opacity after a `/`, `rgb(56 139 253 / 40%)`,
+  `hsl(214 98% 61%)`, or by commas with the opacity last, `rgba(56, 139, 253, 0.4)`. A channel of `rgb()` is a number
+  from 0 to 255 or a percentage; the hue of `hsl()` is in degrees, its saturation and lightness percentages. `rgba()`
+  and `hsla()` are the same functions.
+
+Any colour may be followed by `/` and an opacity, a number from 0 to 1 or a percentage, which replaces its own:
+`$accent / 40%`, `black / 0.6`. This is the one extension to CSS, to fade a constant.
+
+<!-- Generated by `gyllir run reference` from the widget registry and the property table: do not edit below. -->
+
+## Widget types
+
+The attributes of a type are set in the block of a node, `max-length: 64;`, its default attribute by the value after the selector, `Label "Name";`. The attributes of the children are set on a child by its parent's type, `tab: "Form";`. The properties are style properties the type reads beyond the common ones.
+
+### `Box`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** none
+- **Properties:** none
+
+### `FloatingLayout`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** any number
+- **Attributes of the children:** `capture-events`: true or false
+- **States:** `hover`, `focus`, `check`
+- **Parts:** none
+- **Properties:** none
+
+### `GridLayout`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** any number
+- **Attributes of the children:** `cell`: two integers of 0 or more
+- **States:** `hover`, `focus`, `check`
+- **Parts:** none
+- **Properties:** `columns`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content; `rows`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content
+
+### `InputText`
+
+- **Attributes:** `text`: a string; `max-length`: an integer of 0 or more; `only-numbers`: true or false
+- **Default attribute:** `text`
+- **Children:** none
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** `label`, `selection`, `cursor`
+- **Properties:** none
+
+### `Label`
+
+- **Attributes:** `text`: a string
+- **Default attribute:** `text`
+- **Children:** none
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** none
+- **Properties:** none
+
+### `LinearLayout`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** any number
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** `scrollbar`
+- **Properties:** `direction`: row or column; `overflow`: hidden or scroll; `scroll-speed`: a number of 0 or more
+
+### `MenuButton`
+
+- **Attributes:** `text`: a string; `open-on-hover`: true or false
+- **Default attribute:** `text`
+- **Children:** its popup, optional
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** `label`
+- **Properties:** `popup-align`: left, center or right, then top, center or bottom
+
+### `MenuLayout`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** its bar then its content
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** none
+- **Properties:** none
+
+### `PushButton`
+
+- **Attributes:** `text`: a string
+- **Default attribute:** `text`
+- **Children:** none
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** `label`
+- **Properties:** none
+
+### `Scene3D`
+
+- **Attributes:** `resolution`: two integers of 0 or more
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** none
+- **Properties:** none
+
+### `Splitter`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** any number
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** `grip`, `bbox`
+- **Properties:** `direction`: row or column
+
+### `TabLayout`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** at least 1
+- **Attributes of the children:** `tab`: a string, required
+- **States:** `hover`, `focus`, `check`
+- **Parts:** `tab` (states `hover`, `selected`)
+- **Properties:** none
+
+## Style properties
+
+Every widget reads these properties. An inherited property passes from a widget to its children and its parts. A property affecting the layout lays the interface out again when it changes, and a rule testing a state cannot set it. A shorthand sets its longhands, which cascade separately.
+
+| Property | Value | Inherited | Layout |
+|---|---|---|---|
+| `color` | a colour |  |  |
+| `background-color` | a colour |  |  |
+| `selection-color` | a colour |  |  |
+| `text-color` | a colour | yes |  |
+| `font-family` | font families separated by commas | yes | yes |
+| `font-size` | a length in px | yes | yes |
+| `font-weight` | normal, bold, or a weight from 1 to 1000 | yes | yes |
+| `font-style` | normal, italic or oblique | yes | yes |
+| `text-xalign` | left, center or right | yes |  |
+| `text-yalign` | top, center or bottom | yes |  |
+| `text-wrap` | wrap or nowrap | yes | yes |
+| `image` | a string |  |  |
+| `image-color` | a colour |  |  |
+| `image-fill` | true or false |  |  |
+| `image-keep-ratio` | true or false |  |  |
+| `border-width` | a length in px |  | yes |
+| `border-color` | a colour |  |  |
+| `radius` | a length in px |  |  |
+| `border` | a width in px and a colour, in any order, either one optional, setting `border-width`, `border-color` |  | yes |
+| `margin-top` | a length, in px or % |  | yes |
+| `margin-right` | a length, in px or % |  | yes |
+| `margin-bottom` | a length, in px or % |  | yes |
+| `margin-left` | a length, in px or % |  | yes |
+| `margin` | 1 to 4 lengths, in px or %, in the order of CSS, setting `margin-top`, `margin-right`, `margin-bottom`, `margin-left` |  | yes |
+| `padding-top` | a length, in px or % |  | yes |
+| `padding-right` | a length, in px or % |  | yes |
+| `padding-bottom` | a length, in px or % |  | yes |
+| `padding-left` | a length, in px or % |  | yes |
+| `padding` | 1 to 4 lengths, in px or %, in the order of CSS, setting `padding-top`, `padding-right`, `padding-bottom`, `padding-left` |  | yes |
+| `width` | a length, in px or %, auto, min-content or max-content |  | yes |
+| `height` | a length, in px or %, auto, min-content or max-content |  | yes |
+| `min-width` | a length in px |  | yes |
+| `max-width` | a length in px |  | yes |
+| `min-height` | a length in px |  | yes |
+| `max-height` | a length in px |  | yes |
+| `left` | a length, in px or % |  | yes |
+| `top` | a length, in px or % |  | yes |
+| `flex-grow` | a number of 0 or more |  | yes |
+| `flex-shrink` | a number of 0 or more |  | yes |
+| `flex-basis` | a length, in px or %, auto, min-content or max-content |  | yes |
+| `flex` | a number, none, auto, or a grow, a shrink and a basis, setting `flex-grow`, `flex-shrink`, `flex-basis` |  | yes |
