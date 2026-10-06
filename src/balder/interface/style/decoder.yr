@@ -1,0 +1,262 @@
+in decoder;
+
+use balder::core::error;
+use balder::interface::font::{family, registry};
+use balder::interface::loader::parser;
+use balder::interface::loader::registry;
+use balder::interface::loader::registry::error;
+use balder::interface::style::{implem, kinds, manager, property, table};
+
+use std::syntax::errors;
+
+/**
+ * The declarations of a rule that apply while a condition holds, decoded into a style
+ * */
+@data
+pub record StyleWhen {
+
+    // The condition
+    pub let condition: &Condition;
+
+    // The style of the declarations applied while it holds
+    pub let style: &Style;
+
+    // The line of the directive, from 1
+    pub let line: usize;
+
+    // The column of the directive, from 1
+    pub let col: usize;
+}
+
+/**
+ * A rule of a style sheet, its declarations decoded into a style
+ * */
+@data
+pub record StyleRule {
+
+    // The selectors sharing the block
+    pub let selectors: [Selector];
+
+    // The style of the declarations of the block, a later declaration overriding the longhands an earlier one set
+    pub let style: &Style;
+
+    // The @when blocks of the rule, coming after its own declarations in the cascade
+    pub let whens: [StyleWhen];
+
+    // The condition of the top level @when holding the rule, none when the rule always applies
+    pub let condition: (&Condition)?;
+
+    // The line of the first selector, from 1
+    pub let line: usize;
+
+    // The column of the first selector, from 1
+    pub let col: usize;
+}
+
+/**
+ * The rules and the font faces of a style sheet, decoded
+ * */
+@data
+pub record StyleSheet {
+
+    // The @font-face blocks
+    pub let fontFaces: [FontFaceRule];
+
+    // The rules, in the order of the file
+    pub let rules: [StyleRule];
+
+    /**
+     * Register the font files of the @font-face blocks in their families
+     * @throws: when a file cannot be read
+     * */
+    pub fn registerFonts(self, dmut fonts: &FontRegistry)
+        throws BalderError
+    {
+        for face in self.fontFaces {
+            fonts:.registerFile(face.src, family-> face.family, weight-> face.weight, style-> face.style);
+        }
+    }
+}
+
+/**
+ * Decoder of the declarations of a style sheet into styles (doc/gui-v2.md, §2 and §5)
+ * @info:
+ * =====
+ * A declaration names a common property (PropertyTable), or a property registered by the widget type its rule selects,
+ * by any type when the selector names none. Its value is decoded into the longhands it sets, in the order of the
+ * declarations, so `padding: 6; padding-left: 20;` sets a padding of 6 with a left side of 20. An unknown property, or a
+ * value of the wrong kind, is an error naming the file, the line, the property and the kind expected.
+ * ====
+ * */
+pub record SheetDecoder {
+
+    // The common properties
+    let _table: &PropertyTable;
+
+    // The widget types, for the properties they register
+    let _registry: &WidgetRegistry;
+
+    // The path of the file the sheet was read from, for the errors
+    let _file: [c8];
+
+    /**
+     * @params:
+     *    - registry: the widget types, for the properties they register
+     *    - file: the path of the file the sheet was read from, for the errors
+     * */
+    pub self (registry: &WidgetRegistry, file: [c8])
+        with _table = copy PropertyTable()
+        , _registry = registry
+        , _file = file
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DECODING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Decode the rules and the font faces of a sheet, its imports being left to its loader
+     * @throws: at the first declaration refused
+     * */
+    pub fn decode(self, sheet: Sheet)-> StyleSheet
+        throws LoadError
+    {
+        let mut fontFaces: [FontFaceRule] = [];
+        for face in sheet.fontFaces {
+            fontFaces = fontFaces ~ [self.decodeFontFace(face)];
+        }
+
+        let mut rules: [StyleRule] = [];
+        for rule in sheet.rules {
+            rules = rules ~ [self.decodeRule(rule)];
+        }
+
+        StyleSheet(fontFaces-> fontFaces, rules-> rules)
+    }
+
+    /**
+     * Decode the declarations of a rule, and those of its @when blocks
+     * */
+    pub fn decodeRule(self, rule: Rule)-> StyleRule
+        throws LoadError
+    {
+        let mut whens: [StyleWhen] = [];
+        for w in rule.whens {
+            whens = whens ~ [StyleWhen(condition-> w.condition,
+                                       style-> self.decodeStyle(w.declarations, rule.selectors),
+                                       line-> w.line,
+                                       col-> w.col)];
+        }
+
+        StyleRule(selectors-> rule.selectors,
+                  style-> self.decodeStyle(rule.declarations, rule.selectors),
+                  whens-> whens,
+                  condition-> rule.condition,
+                  line-> rule.line,
+                  col-> rule.col)
+    }
+
+    /**
+     * Decode declarations into a style
+     * @params:
+     *    - selectors: the selectors of their rule, whose widget types tell the properties they register
+     * */
+    pub fn decodeStyle(self, declarations: [Declaration], selectors: [Selector])-> dmut &Style
+        throws LoadError
+    {
+        let dmut style = copy Style();
+        for d in declarations {
+            let p = if let Ok(p) = self.property(d.name, selectors) {
+                p
+            } else {
+                throw copy LoadError(self._file, "unknown property '" ~ d.name ~ "'", d.line, d.col);
+            };
+
+            {
+                p.apply(alias style, d.value);
+            } catch {
+                e: &SyntaxError => { throw self.refused(d, e); }
+            }
+        }
+
+        alias style
+    }
+
+    /**
+     * Decode a @font-face block: its font-family and its src, and optionally the font-weight and the font-style of its
+     * faces, read from the file when they are not set
+     * */
+    pub fn decodeFontFace(self, face: parser::FontFace)-> FontFaceRule
+        throws LoadError
+    {
+        let mut family = "", mut src = "";
+        let mut weight: (u32)? = none;
+        let mut style: (FontStyle)? = none;
+        for d in face.declarations {
+            {
+                match d.name {
+                    "font-family" => {
+                        let names = families(d.value);
+                        if names.len != 1us {
+                            throw d.value.expected("a single font family");
+                        }
+
+                        family = names[0];
+                    }
+                    "src"         => { src = kinds::text(d.value); }
+                    "font-weight" => {
+                        let w = fontWeight(d.value);
+                        weight = (w)?;
+                    }
+                    "font-style" => {
+                        let f = fontStyle(d.value);
+                        style = (f)?;
+                    }
+                    _ => {
+                        throw copy LoadError(self._file, "unknown property '" ~ d.name ~ "' in a @font-face", d.line, d.col);
+                    }
+                }
+            } catch {
+                e: &SyntaxError => { throw self.refused(d, e); }
+                e: &LoadError   => { throw e; }
+            }
+        }
+
+        if family == "" || src == "" {
+            throw copy LoadError(self._file, "a @font-face needs a font-family and a src", face.line, face.col);
+        }
+
+        FontFaceRule(family, src, weight, style)
+    }
+
+    /**
+     * @returns: the property named name, common or registered by the widget type a selector names, none if it is
+     * neither
+     * */
+    pub fn property(self, name: [c8], selectors: [Selector])-> (&Property)? {
+        if let Ok(p) = self._table.get(name) {
+            return (p)?;
+        }
+
+        for s in selectors {
+            if s.compounds.len != 0us {
+                if let Ok(p) = self._registry.property(s.compounds[s.compounds.len - 1us].typeName, name) {
+                    return (p)?;
+                }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the error of a declaration whose value was refused, located at the value
+     * */
+    fn refused(self, d: Declaration, e: &SyntaxError)-> &LoadError {
+        copy LoadError(self._file, "property '" ~ d.name ~ "': " ~ e.msg, e.line, e.col)
+    }
+}
