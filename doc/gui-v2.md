@@ -400,11 +400,23 @@ sheet gets constants, imports, inheritance and conditions.
   `:disabled` come without touching the parser. Several states in one compound all have to hold, as in CSS; today they
   are alternatives.
 - **Parts** (`::label`, `::grip`, `::bbox`, `::tab`, `::selection`, `::cursor`) are registered by their widget the same
-  way.
-- **Specificity** is CSS's (ids, then classes, states and parts, then types), later rules winning ties. This is
-  BAL-22's to implement; the syntax only has to allow it.
-- **Inherited properties**: `text-color`, the `font-*` properties, `text-xalign`, `text-yalign` and `text-wrap` pass
-  from a widget to its children and parts. Set the font once on the root.
+  way. A part that has states of its own takes them after it, as CSS's `::part(tab):hover`:
+  `TabLayout::tab:selected` is the selected tab, `TabLayout:hover::tab` every tab of a hovered layout. A part ends its
+  selector.
+- **Checked against the registry.** A type, a state, a part or a state of a part that none of the types a compound can
+  select registers is an error at load, located at the compound. A rule testing a state, on the widget, a part or an
+  ancestor, cannot set a property that affects the layout: hovering must not move anything (BAL-44).
+- **Specificity** is CSS's (ids, then classes, states and parts, then types, summed over the compounds), later rules
+  winning ties. A rule listing several selectors takes the specificity of the most specific one that matches. The
+  sheets of the application win over the `@style` sheets of the components ([§8](#8-components)) whatever their
+  specificity.
+- **Inherited properties**: `text-color`, the `font-*` properties, `text-xalign`, `text-yalign` and `text-wrap`, and
+  the properties a widget type registers as inherited, pass from a widget to its children and parts. Set the font once
+  on the root.
+- **Computed once.** A widget keeps its computed style, computed again when it is attached, when one of its states or
+  classes changes, and when a sheet is loaded. Its descendants follow when they inherit a property that changed, or
+  when a rule tests that state on an ancestor. Only a change of a property that affects the layout lays the interface
+  out again: a `:hover` colour is repainted, not laid out.
 
 ```
 sheet       = { directive | constant | rule | when } ;
@@ -417,7 +429,7 @@ test        = "not" test | "(" condition ")" | variable [ compare value ] ;
 variable    = ident { "." ident } ;
 compare     = "<" | "<=" | ">" | ">=" | "==" | "!=" ;
 selector    = compound { [ ">" ] compound } ;                        (* a space: a descendant *)
-compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part ] ;
+compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part { ":" state } ] ;
 declaration = ident ":" values ";" ;
 ```
 
@@ -649,7 +661,7 @@ widget, touches no parser. The registry itself is BAL-23; this is the informatio
 | children accepted | none | any number |
 | slot attributes for its children | | `tab`: string |
 | states | `hover`, `focus` | `hover`, `focus` |
-| parts | `label`, `selection`, `cursor` | `tab` |
+| parts, and their states | `label`, `selection`, `cursor` | `tab` (`hover`, `selected`) |
 | style properties it reads beyond the common ones | | |
 
 Room left in the grammar for what comes next, so that later features do not break existing files:

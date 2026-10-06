@@ -4,8 +4,8 @@ use balder::core::error;
 use balder::interface::font::{family, registry};
 use balder::interface::loader::parser;
 use balder::interface::loader::registry;
-use balder::interface::loader::registry::error;
-use balder::interface::style::{implem, kinds, manager, property, table};
+use balder::interface::loader::registry::{error, schema};
+use balder::interface::style::{implem, kinds, manager, table};
 
 use std::syntax::errors;
 
@@ -86,6 +86,10 @@ pub record StyleSheet {
  * by any type when the selector names none. Its value is decoded into the longhands it sets, in the order of the
  * declarations, so `padding: 6; padding-left: 20;` sets a padding of 6 with a left side of 20. An unknown property, or a
  * value of the wrong kind, is an error naming the file, the line, the property and the kind expected.
+ *
+ * The selectors are checked against the widget types: a type, a state, a part or a state of a part none of the types
+ * they can select registers is an error, as a part anywhere but at the end of a selector. A rule testing a state cannot
+ * set a property that affects the layout: hovering a widget must not move it.
  * ====
  * */
 pub record SheetDecoder {
@@ -144,6 +148,10 @@ pub record SheetDecoder {
     pub fn decodeRule(self, rule: Rule)-> StyleRule
         throws LoadError
     {
+        for sel in rule.selectors {
+            self.checkSelector(sel);
+        }
+
         let mut whens: [StyleWhen] = [];
         for w in rule.whens {
             whens = whens ~ [StyleWhen(condition-> w.condition,
@@ -169,12 +177,18 @@ pub record SheetDecoder {
         throws LoadError
     {
         let dmut style = copy Style();
+        let stateful = SheetDecoder::testsAState(selectors);
         for d in declarations {
             let p = if let Ok(p) = self.property(d.name, selectors) {
                 p
             } else {
                 throw copy LoadError(self._file, "unknown property '" ~ d.name ~ "'", d.line, d.col);
             };
+
+            if stateful && p.affectsLayout {
+                throw copy LoadError(self._file, "property '" ~ d.name ~ "' affects the layout, which a rule testing a state cannot change",
+                                     d.line, d.col);
+            }
 
             {
                 p.apply(alias style, d.value);
@@ -253,10 +267,127 @@ pub record SheetDecoder {
         none
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SELECTORS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check that the types, the states, the parts and the states of the parts of a selector are registered by the
+     * widget types its compounds can select, and that a part ends it
+     * */
+    pub fn checkSelector(self, sel: Selector)
+        throws LoadError
+    {
+        for i, c in sel.compounds {
+            let schemas = self._registry.selectable(c.typeName);
+            if schemas.len == 0us {
+                throw copy LoadError(self._file, "unknown widget type '" ~ c.typeName ~ "'", c.line, c.col);
+            }
+
+            for state in c.states {
+                if !SheetDecoder::anyHasState(schemas, state) {
+                    throw self.unknown("state ':" ~ state ~ "'", c);
+                }
+            }
+
+            if c.part != "" {
+                if i != sel.compounds.len - 1us {
+                    throw copy LoadError(self._file, "a part ends its selector, found '::" ~ c.part ~ "' before a combinator",
+                                         c.line, c.col);
+                }
+
+                if !SheetDecoder::anyHasPart(schemas, c.part) {
+                    throw self.unknown("part '::" ~ c.part ~ "'", c);
+                }
+
+                for state in c.partStates {
+                    if !SheetDecoder::anyHasPartState(schemas, c.part, state) {
+                        throw self.unknown("state ':" ~ state ~ "' of the part '::" ~ c.part ~ "'", c);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: the error of a state or a part a compound tests, which none of the types it can select registers
+     * @params:
+     *    - what: what is tested, with its kind ("state ':hover'")
+     * */
+    fn unknown(self, what: [c8], c: Compound)-> &LoadError {
+        if c.typeName != "" {
+            return copy LoadError(self._file, "unknown " ~ what ~ " of '" ~ c.typeName ~ "'", c.line, c.col);
+        }
+
+        copy LoadError(self._file, "unknown " ~ what, c.line, c.col)
+    }
+
     /**
      * @returns: the error of a declaration whose value was refused, located at the value
      * */
     fn refused(self, d: Declaration, e: &SyntaxError)-> &LoadError {
         copy LoadError(self._file, "property '" ~ d.name ~ "': " ~ e.msg, e.line, e.col)
+    }
+}
+
+/**
+ * The helpers of the decoder
+ * */
+mod SheetDecoder {
+
+    /**
+     * @returns: true iif one of the selectors tests a state, of a widget or of a part
+     * */
+    pub fn testsAState(selectors: [Selector])-> bool {
+        for sel in selectors {
+            for c in sel.compounds {
+                if c.states.len != 0us || c.partStates.len != 0us { return true; }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif one of the schemas registers the state
+     * */
+    pub fn anyHasState(schemas: [&WidgetSchema], state: [c8])-> bool {
+        for s in schemas {
+            for st in s.states {
+                if st == state { return true; }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif one of the schemas registers the part
+     * */
+    pub fn anyHasPart(schemas: [&WidgetSchema], part: [c8])-> bool {
+        for s in schemas {
+            for p in s.parts {
+                if p == part { return true; }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif one of the schemas registers the part with the state
+     * */
+    pub fn anyHasPartState(schemas: [&WidgetSchema], part: [c8], state: [c8])-> bool {
+        for s in schemas {
+            for st in s.statesOf(part) {
+                if st == state { return true; }
+            }
+        }
+
+        false
     }
 }

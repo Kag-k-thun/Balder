@@ -110,9 +110,12 @@ pub class Widget {
     }
 
     prv { // states
-        let mut _hover : bool = false;
-        let mut _focus : bool = false;
-        let mut _check : bool = false;
+
+        // The states the widget is in, as the style sheets select them (:hover), among those its type registers
+        let mut _states : [[c8]] = [];
+
+        // The part of its parent the widget draws, styled by the parent, "" for a widget styled by the sheets
+        let mut _ownerPart : [c8] = "";
     }
 
 
@@ -814,8 +817,25 @@ pub class Widget {
      * Method called when the widget is attached to a window
      * */
     pub fn onAttach (mut self, parent : (&Widget)?) {
-        self._attached = true;
         self._parent = parent;
+        if self._ownerPart == "" {
+            self._currentStyle = self:.computeStyle ();
+        } else if let Ok (p) = parent {
+            self._currentStyle = p.getStyle ().getSubStyle (self._ownerPart);
+        }
+
+        self._attached = true;
+    }
+
+    /**
+     * Make the widget a part of the widget it is attached to, its style being set by that widget from the style of the
+     * part instead of being computed from the sheets
+     * @params:
+     *    - part: the name of the part
+     * */
+    @{final}
+    pub fn setOwnerPart (mut self, part : [c8]) {
+        self._ownerPart = part;
     }
 
     /**
@@ -834,14 +854,35 @@ pub class Widget {
      */
 
     /**
+     * Enter or leave a state, computing the style of the widget again, and those of its descendants when a rule tests
+     * the state on an ancestor
+     * @params:
+     *    - state: the name of the state, as the style sheets select it (:hover)
+     *    - set: true to enter the state, false to leave it
+     * */
+    @{final}
+    prot fn setState (mut self, state : [c8], set : bool) {
+        if self.hasState (state) == set { return; }
+        if set {
+            self._states ~= [state];
+        } else {
+            let mut rest : [[c8]] = [];
+            for s in self._states {
+                if s != state { rest ~= [s]; }
+            }
+
+            self._states = rest;
+        }
+
+        self:.reloadStyle (deep-> self._manager:.getStyleManager ().isAncestorState (state));
+    }
+
+    /**
      * Set to true iif the widget is focused
      * */
     @{final}
     pub fn setFocus (mut self, set : bool) {
-        if self._focus != set {
-            self._focus = set;
-            self:.reloadStyle ();
-        }
+        self:.setState ("focus", set);
     }
 
     /**
@@ -849,10 +890,7 @@ pub class Widget {
      * */
     @{final}
     prot fn setHover (mut self, set : bool) {
-        if self._hover != set {
-            self._hover = set;
-            self:.reloadStyle ();
-        }
+        self:.setState ("hover", set);
     }
 
     /**
@@ -860,20 +898,17 @@ pub class Widget {
      * */
     @{final}
     prot fn setChecked (mut self, set : bool) {
-        if self._check != set {
-            self._check = set;
-            self:.reloadStyle ();
-        }
+        self:.setState ("check", set);
     }
 
     /**
-     * Set the classes of the widget, the later ones overriding the styles of the earlier ones
+     * Set the classes of the widget, computing the styles of the widget and of its descendants again
      * */
     @{final}
     pub fn setClasses (mut self, classes : [[c8]]) {
         if self._classes != classes {
             self._classes = classes;
-            self:.reloadStyle ();
+            self:.reloadStyle (deep-> true);
         }
     }
 
@@ -890,7 +925,7 @@ pub class Widget {
      * */
     @{final}
     pub fn isHover (self)-> bool {
-        self._hover
+        self.hasState ("hover")
     }
 
     /**
@@ -898,7 +933,7 @@ pub class Widget {
      * */
     @{final}
     pub fn isChecked (self)-> bool {
-        self._check
+        self.hasState ("check")
     }
 
     /**
@@ -906,7 +941,19 @@ pub class Widget {
      * */
     @{final}
     pub fn isFocus (self)-> bool {
-        self._focus
+        self.hasState ("focus")
+    }
+
+    /**
+     * @returns: true iif the widget is in a state
+     * */
+    @{final}
+    pub fn hasState (self, state : [c8])-> bool {
+        for s in self._states {
+            if s == state { return true; }
+        }
+
+        false
     }
 
     /**
@@ -936,6 +983,19 @@ pub class Widget {
     @{final}
     pub fn getClasses (self)-> [[c8]] {
         self._classes
+    }
+
+    /**
+     * @returns: what the selectors of the style sheets test on the widget, then on each of its ancestors up to the root
+     * */
+    @{final}
+    pub fn getStylePath (self)-> [Element] {
+        let own = copy [Element (self.typeName, id-> self.id, classes-> self._classes, states-> self._states)];
+        if let Ok (p) = self._parent {
+            return own ~ p.getStylePath ();
+        }
+
+        own
     }
 
 
@@ -1066,16 +1126,67 @@ pub class Widget {
      */
 
     /**
-     * Load the hover style
+     * Compute the style of the widget again, and those of its descendants when theirs can depend on it, laying the
+     * interface out again only if a property that affects the layout changed
+     * @params:
+     *    - deep: true to compute the styles of every descendant again
      * */
     @{final}
-    pub fn reloadStyle (mut self) {
-        let newStyle = self._manager:.getStyleManager ().get (self.typeName,
-                                                              self._classes,
-                                                              self._hover,
-                                                              self._focus,
-                                                              self._check);
-        self:.setStyle (newStyle);
+    pub fn reloadStyle (mut self, deep : bool = false) {
+        if self:.restyle (deep) {
+            self._manager:.updateWidgets ();
+        }
+    }
+
+    /**
+     * Compute the style of the widget again, and those of its descendants when they inherit a property that changed,
+     * applying at once the changes that do not affect the layout
+     * @params:
+     *    - deep: true to compute the styles of every descendant again
+     * @returns: true iif a property that affects the layout changed, in the widget or in a descendant
+     * */
+    @{final}
+    pub fn restyle (mut self, deep : bool)-> bool {
+        if !self._attached || self._ownerPart != "" { return false; }
+
+        let newStyle = self:.computeStyle ();
+        let inherited = !self._currentStyle.sameInherited (newStyle);
+        let mut layout = !self._currentStyle.sameLayout (newStyle);
+        let look = !self._currentStyle.sameLook (newStyle);
+
+        self._currentStyle = newStyle;
+        if !layout && look {
+            self:.applyStyle ();
+        }
+
+        if (deep || inherited) && self:.restyleChildren (deep) {
+            layout = true;
+        }
+
+        layout
+    }
+
+    /**
+     * Compute the styles of the children again
+     * @params:
+     *    - deep: true to compute the styles of every descendant again
+     * @returns: true iif a property that affects the layout changed, in a child or in one of its descendants
+     * */
+    prot fn restyleChildren (mut self, deep : bool)-> bool {
+        deep;
+        false
+    }
+
+    /**
+     * @returns: the style of the widget computed from the sheets, the inherited properties taken from its parent, with
+     * the styles of the parts its type registers
+     * */
+    @{final}
+    fn computeStyle (mut self)-> &Style {
+        let parent = if let Ok (p) = self._parent { p.getStyle () } else { copy Style () };
+        let parts = if let Ok (schema) = self._manager:.getRegistry ().get (self.typeName) { schema.parts } else { [] };
+
+        self._manager:.getStyleManager ().compute (self.getStylePath (), parent, parts-> parts)
     }
 
     /**
@@ -1084,20 +1195,17 @@ pub class Widget {
     @{final}
     pub fn setStyle (mut self, newStyle : &Style) {
         if self._attached {
-            // no need to resize of the dimension did not change
-            if !self._currentStyle.sameDimension (newStyle) {
+            // the interface is laid out again only when a property that affects the layout changed
+            if !self._currentStyle.sameLayout (newStyle) {
                 self._currentStyle = newStyle;
                 self._manager:.updateWidgets ();
             }
 
-            // but color might have
-            else if !self._currentStyle.sameColors (newStyle) {
+            // the others are applied to the shapes
+            else if !self._currentStyle.sameLook (newStyle) {
                 self._currentStyle = newStyle;
                 self:.applyStyle ();
             }
-
-            // else exactly the same styles (no change required)
-            // log::debug #("Widget", "Set style :", self.id, "=>", self._classes, self._hover, self._focus, self._check);
         }
 
         self._currentStyle = newStyle;

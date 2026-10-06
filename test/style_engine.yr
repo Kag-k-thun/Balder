@@ -1,0 +1,183 @@
+in style_engine;
+
+use balder::interface::loader::parser;
+use balder::interface::loader::registry;
+use balder::interface::loader::registry::error;
+use balder::interface::style;
+use balder::interface::style::manager;
+
+use std::syntax::errors;
+
+/**
+ * @returns: the rules of a .style content, decoded with the built-in types
+ * */
+fn sheetOf(content: [c8])-> StyleSheet
+    throws SyntaxError, LoadError
+{
+    let dmut constants = copy Constants();
+    let dmut reader = StyleReader(content);
+    SheetDecoder(WidgetRegistry(), "test.style").decode(reader:.read(alias constants))
+}
+
+/**
+ * @returns: a manager holding the rules of a .style content
+ * */
+fn managerOf(content: [c8])-> &StyleManager
+    throws SyntaxError, LoadError
+{
+    let dmut m = copy StyleManager();
+    m:.addSheet(sheetOf(content));
+    m
+}
+
+/**
+ * @returns: the radius computed for the widget of a path, its parent styled by default, 0 when no rule sets it
+ * */
+fn radius(m: &StyleManager, path: [Element])-> u32 {
+    let s = m.compute(path, copy Style());
+    if s.radius._0 { s.radius._1 } else { 0u32 }
+}
+
+/**
+ * @returns: the selector of a content
+ * */
+fn selector(content: [c8])-> Selector
+    throws SyntaxError
+{
+    let dmut scanner = copy Scanner(content);
+    let dmut reader = SelectorReader(alias scanner);
+    reader:.read()
+}
+
+__test a_compound_tests_the_type_the_id_the_classes_and_the_states {
+    let m = managerOf("Label { radius: 1; } .a.b { radius: 2; } Label:hover:focus { radius: 3; } #ID { radius: 4; }");
+    assert (radius(m, copy [Element("Label")]) == 1u32);
+    assert (radius(m, copy [Element("Box")]) == 0u32);
+    assert (radius(m, copy [Element("Label", classes-> copy ["a"])]) == 1u32);
+    assert (radius(m, copy [Element("Box", classes-> copy ["b", "c", "a"])]) == 2u32);
+
+    // every state of the compound has to hold
+    assert (radius(m, copy [Element("Label", states-> copy ["hover"])]) == 1u32);
+    assert (radius(m, copy [Element("Label", states-> copy ["focus", "hover"])]) == 3u32);
+
+    assert (radius(m, copy [Element("Label", id-> "ID", classes-> copy ["a", "b"], states-> copy ["hover", "focus"])]) == 4u32);
+}
+
+__test the_combinators_walk_up_the_ancestors {
+    let m = managerOf("LinearLayout.bar > Label { radius: 1; } .side Label { radius: 2; } .a > .b Label { radius: 3; }");
+    assert (radius(m, copy [Element("Label"), Element("LinearLayout", classes-> copy ["bar"])]) == 1u32);
+    assert (radius(m, copy [Element("Label"), Element("Box"), Element("LinearLayout", classes-> copy ["bar"])]) == 0u32);
+    assert (radius(m, copy [Element("Label"), Element("Box"), Element("Box"), Element("Box", classes-> copy ["side"])]) == 2u32);
+    assert (radius(m, copy [Element("Label", classes-> copy ["side"])]) == 0u32);
+
+    // the nearest .b is not under a .a, a farther one is
+    let deep = copy [Element("Label"),
+                     Element("Box", classes-> copy ["b"]),
+                     Element("Box", classes-> copy ["c"]),
+                     Element("Box", classes-> copy ["b"]),
+                     Element("Box", classes-> copy ["a"])];
+    assert (radius(m, deep) == 3u32);
+}
+
+__test the_specificity_counts_the_ids_the_tests_and_the_types {
+    assert (StyleManager::specificity(selector("Label")) == (0u32, 0u32, 1u32));
+    assert (StyleManager::specificity(selector("*")) == (0u32, 0u32, 0u32));
+    assert (StyleManager::specificity(selector(".a > PushButton#x.b:hover::label")) == (1u32, 4u32, 1u32));
+    assert (StyleManager::specificity(selector("LinearLayout TabLayout::tab:selected:hover")) == (0u32, 3u32, 2u32));
+}
+
+__test the_most_specific_rule_wins_then_the_last {
+    let m = managerOf("#x { radius: 1; } Label.a { radius: 2; } Label { radius: 3; } .a { radius: 4; }");
+    assert (radius(m, copy [Element("Label", id-> "x", classes-> copy ["a"])]) == 1u32);
+    assert (radius(m, copy [Element("Label", classes-> copy ["a"])]) == 2u32);
+    assert (radius(m, copy [Element("Box", classes-> copy ["a"])]) == 4u32);
+
+    // a rule matching through several selectors takes the specificity of the most specific
+    let list = managerOf(".a, Label#x { radius: 1; } #x { radius: 2; }");
+    assert (radius(list, copy [Element("Label", id-> "x", classes-> copy ["a"])]) == 1u32);
+    assert (radius(list, copy [Element("Box", id-> "x", classes-> copy ["a"])]) == 2u32);
+}
+
+__test a_state_rule_cascades_over_the_base_rule {
+    let m = managerOf("PushButton.yes { radius: 2; background-color: #202328; } PushButton.yes:hover { background-color: #cccccc; }");
+    let base = m.compute(copy [Element("PushButton", classes-> copy ["yes"])], copy Style());
+    let hover = m.compute(copy [Element("PushButton", classes-> copy ["yes"], states-> copy ["hover"])], copy Style());
+    assert (hover.radius == (true, 2u32));
+    assert (hover.backgroundColor._0 && hover.backgroundColor._1 != base.backgroundColor._1);
+    assert (hover.sameLayout(base) && !hover.sameLook(base));
+}
+
+__test the_sheets_of_the_application_win_over_those_of_the_components {
+    let dmut m = copy StyleManager();
+    m:.addSheet(sheetOf("Label { radius: 1; }"));
+    m:.addSheet(sheetOf("#x.a { radius: 2; } Box { radius: 3; }"), origin-> SheetOrigin::COMPONENT);
+    m:.addSheet(sheetOf("Box.a { radius: 4; }"));
+
+    assert (radius(m, copy [Element("Label", id-> "x", classes-> copy ["a"])]) == 1u32);
+    assert (radius(m, copy [Element("Box")]) == 3u32);
+    assert (radius(m, copy [Element("Box", classes-> copy ["a"])]) == 4u32);
+}
+
+__test the_inherited_properties_pass_to_the_children {
+    let m = managerOf("LinearLayout { font-size: 30; text-color: #ff0000; radius: 5; } Label.small { font-size: 12; }");
+    let layout = m.compute(copy [Element("LinearLayout")], copy Style());
+    let label = m.compute(copy [Element("Label"), Element("LinearLayout")], layout);
+    assert (label.fontSize == (true, 30u32));
+    assert (label.textColor == layout.textColor && label.textColor._0);
+    assert (!label.radius._0);
+    assert (label.sameInherited(layout) && !label.sameLook(layout));
+
+    let small = m.compute(copy [Element("Label", classes-> copy ["small"]), Element("LinearLayout")], layout);
+    assert (small.fontSize == (true, 12u32));
+    assert (!small.sameInherited(layout));
+
+    // through a widget setting nothing
+    let box = m.compute(copy [Element("Box"), Element("LinearLayout")], layout);
+    let inner = m.compute(copy [Element("Label"), Element("Box"), Element("LinearLayout")], box);
+    assert (inner.fontSize == (true, 30u32));
+}
+
+__test the_parts_inherit_from_their_widget {
+    let m = managerOf("PushButton { font-size: 20; text-color: #ffffff; } PushButton::label { radius: 1; }"
+                      ~ " PushButton:hover::label { text-color: #000000; } InputText::cursor { radius: 2; }");
+    let button = m.compute(copy [Element("PushButton")], copy Style(), parts-> copy ["label"]);
+    let label = button.getSubStyle("label");
+    assert (label.fontSize == (true, 20u32) && label.radius == (true, 1u32));
+    assert (label.textColor == button.textColor);
+
+    let hovered = m.compute(copy [Element("PushButton", states-> copy ["hover"])], copy Style(), parts-> copy ["label"]);
+    assert (hovered.getSubStyle("label").textColor._1 != label.textColor._1);
+    assert (hovered.sameLayout(button) && !hovered.sameLook(button));
+
+    // a part no rule names is computed when the widget asks for it, a part a rule names always
+    let input = m.compute(copy [Element("InputText")], copy Style());
+    assert ("cursor" in input.subItems && "label" !in input.subItems);
+    let asked = m.compute(copy [Element("InputText")], copy Style(), parts-> copy ["label", "cursor"]);
+    assert ("label" in asked.subItems && asked.getSubStyle("cursor").radius == (true, 2u32));
+}
+
+__test a_part_has_states_of_its_own {
+    let m = managerOf("TabLayout::tab { radius: 1; } TabLayout::tab:selected { radius: 2; } TabLayout::tab:hover { radius: 3; }"
+                      ~ " TabLayout:hover::tab { radius: 4; }");
+    let path = copy [Element("TabLayout")];
+    let own = m.compute(path, copy Style(), parts-> copy ["tab"]);
+    assert (own.getSubStyle("tab").radius._1 == 1u32);
+    assert (m.computePart(path, own, "tab", states-> copy ["selected"]).radius._1 == 2u32);
+    assert (m.computePart(path, own, "tab", states-> copy ["hover"]).radius._1 == 3u32);
+    assert (m.computePart(path, own, "tab", states-> copy ["selected", "hover"]).radius._1 == 3u32);
+
+    // the states of the layout are not those of its tabs
+    let hovered = copy [Element("TabLayout", states-> copy ["hover"])];
+    assert (m.computePart(hovered, own, "tab").radius._1 == 4u32);
+}
+
+__test the_when_blocks_wait_for_their_variables {
+    let m = managerOf("Label { radius: 1; @when (width < 500) { radius: 2; } } @when (window.width < 800) { Label { radius: 3; } }");
+    assert (radius(m, copy [Element("Label")]) == 1u32);
+}
+
+__test the_states_tested_on_an_ancestor {
+    let m = managerOf(".a:hover Label { text-color: red; } Label:focus { text-color: red; } .b:check > .c Label { radius: 1; }");
+    assert (m.isAncestorState("hover") && m.isAncestorState("check"));
+    assert (!m.isAncestorState("focus"));
+}
