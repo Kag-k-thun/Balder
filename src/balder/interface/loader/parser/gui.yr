@@ -1,0 +1,426 @@
+in gui;
+
+use balder::interface::loader::parser::{document, reader, scanner};
+
+use std::syntax::errors;
+
+/**
+ * Reader of a .gui file into the tree of its nodes, without knowing any widget type (doc/gui-v2.md, §3 and §8)
+ * @info:
+ * =====
+ * ```
+ * document  = { directive | component } [ node ] ;
+ * directive = "@import" string ";" | "@style" string ";" ;
+ * component = "@component" Type "(" [ param { "," param } ] ")" "{" node "}" ;
+ * param     = "$" ident [ ":" tuple ] ;
+ * node      = Type { "#" ident | "." ident } [ values ] ( ";" | "{" { member } "}" ) ;
+ * member    = attribute | node | slot ;
+ * attribute = ident ":" values ";" ;
+ * slot      = "@slot" [ ident ] ";" ;                (* only inside a component *)
+ * ```
+ * An identifier followed by a ':' starts an attribute, any other one a child node. The reader checks what the grammar
+ * alone decides: one id per node, an attribute set once per node, one root per component, the parameters a component
+ * uses being its own, and its slots being distinct. Whether a type exists and takes the attributes and children it is
+ * given is decided by the registry, when the tree is instantiated.
+ * ====
+ * */
+pub record GuiReader {
+
+    // The scanner of the file
+    let dmut _scanner: &Scanner;
+
+    // True while the root of a component is read
+    let mut _inComponent: bool = false;
+
+    // The parameters of the component being read
+    let mut _params: [[c8]] = [];
+
+    // The slots of the component being read, "" for the unnamed one
+    let mut _slots: [[c8]] = [];
+
+    /**
+     * @params:
+     *    - content: the content of the .gui file
+     * */
+    pub self (content: [c8])
+        with _scanner = copy Scanner(content)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          READING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the whole content
+     * @returns: the document of the file
+     * */
+    pub fn read(mut self)-> Document
+        throws SyntaxError
+    {
+        let mut imports: [Include] = [];
+        let mut styles: [Include] = [];
+        let mut components: [Component] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::EOF {
+                break;
+            }
+
+            if tok.kind != TokenKind::DIRECTIVE {
+                let root = self:.readNode();
+                let end = self._scanner:.next();
+                if end.kind != TokenKind::EOF {
+                    throw self._scanner.expected(end, "the end of the file after the root widget");
+                }
+
+                return Document(imports-> imports, styles-> styles, components-> components, root-> (root)?);
+            }
+
+            match tok.text {
+                "import"    => { imports = imports ~ [self:.readInclude()]; }
+                "style"     => { styles = styles ~ [self:.readInclude()]; }
+                "component" => {
+                    let component = self:.readComponent();
+                    for c in components {
+                        if c.name == component.name {
+                            throw copy SyntaxError("component '" ~ c.name ~ "' declared twice", component.line, component.col);
+                        }
+                    }
+
+                    components = components ~ [component];
+                }
+                _ => {
+                    throw self:.unknownDirective();
+                }
+            }
+        }
+
+        Document(imports-> imports, styles-> styles, components-> components, root-> none)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DIRECTIVES          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a directive naming a file, `@import "file.gui";` or `@style "file.style";`
+     * */
+    fn readInclude(mut self)-> Include
+        throws SyntaxError
+    {
+        let at = self._scanner:.next();
+        let path = self._scanner:.next();
+        if path.kind != TokenKind::STRING {
+            throw self._scanner.expected(path, "the path of a file");
+        }
+
+        self._scanner:.expect(";");
+        Include(path-> path.text, line-> at.line, col-> at.col)
+    }
+
+    /**
+     * Read the declaration of a component, `@component Name ($param, …) { node }`
+     * */
+    fn readComponent(mut self)-> Component
+        throws SyntaxError
+    {
+        let at = self._scanner:.next();
+        let name = self._scanner:.next();
+        if name.kind != TokenKind::IDENT {
+            throw self._scanner.expected(name, "the name of the component");
+        }
+
+        let params = self:.readParams();
+        self._scanner:.expect("{");
+
+        let mut names: [[c8]] = [];
+        for p in params {
+            names = names ~ [p.name];
+        }
+
+        self._inComponent = true;
+        self._params = names;
+        self._slots = [];
+        let root = self:.readNode();
+        self._inComponent = false;
+        self._params = [];
+        self._slots = [];
+
+        let end = self._scanner:.next();
+        if end.kind == TokenKind::IDENT {
+            throw copy SyntaxError("a component has a single root widget", end.line, end.col);
+        }
+
+        if end.kind != TokenKind::DELIM || end.text != "}" {
+            throw self._scanner.expected(end, "'}'");
+        }
+
+        Component(name-> name.text, params-> params, root-> root, line-> at.line, col-> at.col)
+    }
+
+    /**
+     * Read the parameters of a component, between parentheses
+     * */
+    fn readParams(mut self)-> [Param]
+        throws SyntaxError
+    {
+        self._scanner:.expect("(");
+        let mut params: [Param] = [];
+        if self._scanner:.isDelim(")") {
+            self._scanner:.next();
+            return params;
+        }
+
+        loop {
+            let name = self._scanner:.next();
+            if name.kind != TokenKind::CONSTANT {
+                throw self._scanner.expected(name, "a parameter");
+            }
+
+            for p in params {
+                if p.name == name.text {
+                    throw copy SyntaxError("parameter '$" ~ name.text ~ "' declared twice", name.line, name.col);
+                }
+            }
+
+            let value: (&Value)? = if self._scanner:.isDelim(":") {
+                self._scanner:.next();
+                let dmut values = ValueReader(alias self._scanner);
+                let v = values:.readTuple();
+                self.checkParams(v);
+                (v)?
+            } else {
+                none
+            };
+
+            params = params ~ [Param(name-> name.text, value-> value, line-> name.line, col-> name.col)];
+            if !self._scanner:.isDelim(",") {
+                break;
+            }
+
+            self._scanner:.next();
+        }
+
+        self._scanner:.expect(")");
+        params
+    }
+
+    /**
+     * Read a slot of a component, `@slot;` or `@slot name;`
+     * */
+    fn readSlot(mut self)-> SlotMark
+        throws SyntaxError
+    {
+        let at = self._scanner:.next();
+        if !self._inComponent {
+            throw copy SyntaxError("'@slot' outside a component", at.line, at.col);
+        }
+
+        let name = if self._scanner:.peek().kind == TokenKind::IDENT { self._scanner:.next().text } else { "" };
+        for s in self._slots {
+            if s == name {
+                let what = if name == "" { "the unnamed slot" } else { "slot '" ~ name ~ "'" };
+                throw copy SyntaxError(what ~ " declared twice", at.line, at.col);
+            }
+        }
+
+        self._slots = self._slots ~ [name];
+        self._scanner:.expect(";");
+        SlotMark(name, (at.line, at.col))
+    }
+
+    /**
+     * @returns: the error of the directive at the cursor, that is not one of the directives of a .gui file
+     * */
+    fn unknownDirective(mut self)-> &SyntaxError
+        throws SyntaxError
+    {
+        let at = self._scanner:.next();
+        if at.text == "slot" {
+            return copy SyntaxError("'@slot' outside a component", at.line, at.col);
+        }
+
+        copy SyntaxError("unknown directive '@" ~ at.text ~ "'", at.line, at.col)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          NODES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a node, from its type to its ';' or the '}' closing its block
+     * */
+    fn readNode(mut self)-> Node
+        throws SyntaxError
+    {
+        let head = self._scanner:.next();
+        if head.kind != TokenKind::IDENT {
+            throw self._scanner.expected(head, "a widget");
+        }
+
+        let (id, classes) = self:.readSelector();
+        let value = self:.readDefaultValue();
+        if self._scanner:.isDelim(";") {
+            self._scanner:.next();
+            return Node(head.text, id, classes, value, [], [], (head.line, head.col));
+        }
+
+        self._scanner:.expect("{");
+        let mut attributes: [Declaration] = [];
+        let mut children: [Member] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::DELIM && tok.text == "}" {
+                self._scanner:.next();
+                break;
+            }
+
+            if tok.kind == TokenKind::DIRECTIVE && tok.text == "slot" {
+                let slot: Member = self:.readSlot();
+                children = children ~ [slot];
+            } else if tok.kind == TokenKind::DIRECTIVE {
+                throw self:.unknownDirective();
+            } else if tok.kind == TokenKind::IDENT && self._scanner:.isDelim(1us, ":") {
+                let attr = self:.readAttribute();
+                for a in attributes {
+                    if a.name == attr.name {
+                        throw copy SyntaxError("attribute '" ~ attr.name ~ "' set twice", attr.line, attr.col);
+                    }
+                }
+
+                attributes = attributes ~ [attr];
+            } else if tok.kind == TokenKind::IDENT {
+                let child: Member = self:.readNode();
+                children = children ~ [child];
+            } else {
+                throw self._scanner.expected(tok, "an attribute, a widget or '}'");
+            }
+        }
+
+        Node(head.text, id, classes, value, attributes, children, (head.line, head.col))
+    }
+
+    /**
+     * Read the id and the classes following the type of a node, in any order
+     * @returns: the id, "" if there is none, and the classes
+     * */
+    fn readSelector(mut self)-> ([c8], [[c8]])
+        throws SyntaxError
+    {
+        let mut id = "";
+        let mut classes: [[c8]] = [];
+        loop {
+            let tok = self._scanner:.peek();
+            if tok.kind == TokenKind::HASH {
+                self._scanner:.next();
+                if !Scanner::isName(tok.text) {
+                    throw copy SyntaxError("invalid id '#" ~ tok.text ~ "'", tok.line, tok.col);
+                }
+
+                if id != "" {
+                    throw copy SyntaxError("a second id '#" ~ tok.text ~ "'", tok.line, tok.col);
+                }
+
+                id = tok.text;
+            } else if tok.kind == TokenKind::DELIM && tok.text == "." {
+                self._scanner:.next();
+                let name = self._scanner:.next();
+                if name.kind != TokenKind::IDENT || name.spaced {
+                    throw self._scanner.expected(name, "a class name glued to the '.'");
+                }
+
+                classes = classes ~ [name.text];
+            } else {
+                break;
+            }
+        }
+
+        (id, classes)
+    }
+
+    /**
+     * Read the values between the selector of a node and the ';' or the '{' that follows them
+     * @returns: the values, none if there are none
+     * */
+    fn readDefaultValue(mut self)-> (&Value)?
+        throws SyntaxError
+    {
+        let tok = self._scanner:.peek();
+        if tok.kind == TokenKind::DELIM && (tok.text == ";" || tok.text == "{") {
+            return none;
+        }
+
+        if tok.kind == TokenKind::EOF || (tok.kind == TokenKind::DELIM && ValueReader::isEnd(tok.text)) {
+            throw self._scanner.expected(tok, "';' or '{'");
+        }
+
+        let dmut values = ValueReader(alias self._scanner);
+        let value = values:.read();
+        self.checkParams(value);
+        (value)?
+    }
+
+    /**
+     * Read an attribute of a node, `name: values;`
+     * */
+    fn readAttribute(mut self)-> Declaration
+        throws SyntaxError
+    {
+        let dmut values = ValueReader(alias self._scanner);
+        let attr = values:.readDeclaration();
+        self.checkParams(attr.value);
+        attr
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHECKS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check that every $name of a value is a parameter of the component being read
+     * @throws: at the first one that is not
+     * */
+    fn checkParams(self, v: &Value)
+        throws SyntaxError
+    {
+        match v {
+            c: &Constant => {
+                for p in self._params {
+                    if p == c.name { return; }
+                }
+
+                throw copy SyntaxError("unknown parameter '$" ~ c.name ~ "'", c.getLine(), c.getColumn());
+            }
+            t: &Tuple => {
+                for item in t.items { self.checkParams(item); }
+            }
+            l: &List => {
+                for item in l.items { self.checkParams(item); }
+            }
+            a: &Alpha => {
+                self.checkParams(a.base);
+                self.checkParams(a.alpha);
+            }
+            c: &Call => {
+                for arg in c.args { self.checkParams(arg); }
+            }
+            _ => {}
+        }
+    }
+}
