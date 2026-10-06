@@ -1,0 +1,221 @@
+in style_decoder;
+
+use balder::interface::{style::_, style::kinds, style::property};
+use balder::interface::font::{family, registry};
+use balder::interface::loader::{parser, registry::_, registry::error, registry::schema};
+use balder::interface::widget;
+use balder::interface::widget::{alignement, box};
+
+use std::syntax::errors;
+
+/**
+ * @returns: the sheet of a .style content decoded with the types of a registry
+ * */
+fn decode(registry: &WidgetRegistry, content: [c8])-> StyleSheet
+    throws SyntaxError, LoadError
+{
+    let dmut constants = copy Constants();
+    let dmut reader = StyleReader(content);
+    SheetDecoder(registry, "test.style").decode(reader:.read(alias constants))
+}
+
+/**
+ * @returns: the sheet of a .style content decoded with the built-in types
+ * */
+fn decode(content: [c8])-> StyleSheet
+    throws SyntaxError, LoadError
+{
+    decode(WidgetRegistry(), content)
+}
+
+/**
+ * @returns: the error of the decoding of a content, none when it is decoded
+ * */
+fn failure(registry: &WidgetRegistry, content: [c8])-> (&LoadError)?
+    throws SyntaxError
+{
+    {
+        decode(registry, content);
+        none
+    } catch {
+        e: &LoadError => { (e)? }
+        e: &SyntaxError => { throw e; }
+    }
+}
+
+/**
+ * @returns: true iif the decoding of a content fails with reason, at line and col
+ * */
+fn refuses(registry: &WidgetRegistry, content: [c8], reason: [c8], line: usize, col: usize)-> bool
+    throws SyntaxError
+{
+    if let Ok(e) = failure(registry, content) {
+        return e.reason == reason && e.line == line && e.col == col && e.file == "test.style";
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the decoding of a content with the built-in types fails with reason, at line and col
+ * */
+fn refuses(content: [c8], reason: [c8], line: usize, col: usize)-> bool
+    throws SyntaxError
+{
+    refuses(WidgetRegistry(), content, reason, line, col)
+}
+
+/**
+ * @returns: a registry knowing a Panel type, which reads a boolean property collapsed and a number property columns
+ * */
+fn withPanel()-> &WidgetRegistry {
+    let dmut registry = WidgetRegistry();
+    let props: [&Property] = copy [copy WidgetProperty!{bool}("collapsed", &?boolean, affectsLayout-> true),
+                                   copy WidgetProperty!{u32}("columns", &?pixels)];
+    registry:.register(copy WidgetSchema("Panel", |dmut m, id|-> dmut &Widget => copy Box(alias m, id),
+                                         properties-> props));
+    registry
+}
+
+__test the_rules_keep_their_selectors_and_their_order {
+    let sheet = decode("Box.a { width: 10; }\nLabel, PushButton:hover::label { text-color: #fff; }");
+    assert (sheet.rules.len == 2us);
+    assert (sheet.rules[0].selectors[0].source == "Box.a");
+    assert (sheet.rules[0].style.width._0 && !sheet.rules[0].style.textColor._0);
+    assert (sheet.rules[1].selectors.len == 2us && sheet.rules[1].line == 2us);
+    assert (sheet.rules[1].style.textColor._0 && !sheet.rules[1].style.width._0);
+}
+
+__test the_when_blocks_are_decoded_apart {
+    let sheet = decode("Box {\n    width: 10;\n    @when (width < 500) { width: 20; height: 5; }\n}\n"
+                       ~ "@when (window.width < 800) { Label { font-size: 12; } }");
+    assert (sheet.rules.len == 2us);
+
+    let rule = sheet.rules[0];
+    assert (!rule.condition.hasValue);
+    assert (rule.style.width._1 == WidgetSize(pix-> 10u32) && !rule.style.height._0);
+    assert (rule.whens.len == 1us && rule.whens[0].line == 3us && rule.whens[0].col == 5us);
+    assert (rule.whens[0].style.width._1 == WidgetSize(pix-> 20u32) && rule.whens[0].style.height._0);
+
+    assert (sheet.rules[1].condition.hasValue && sheet.rules[1].style.fontSize._1 == 12u32);
+}
+
+__test an_unknown_property {
+    assert (refuses("Box {\n    colr: red;\n}", "unknown property 'colr'", 2us, 5us));
+    assert (refuses("Box { size: 12; }", "unknown property 'size'", 1us, 7us));
+}
+
+/**
+ * (declaration, reason, column of the value)
+ * */
+@parameters ((yield c for c in [("width: red;", "property 'width': expected a size, found 'red'", 12us),
+                                ("color: 12;", "property 'color': expected a colour, found '12'", 12us),
+                                ("margin: 1 2 3 4 5;", "property 'margin': expected 1 to 4 values, found '1 2 3 4 5'", 13us),
+                                ("padding: 1 red;", "property 'padding': expected a length, found 'red'", 16us),
+                                ("min-width: 10%;", "property 'min-width': expected a length in px, found '10%'", 16us),
+                                ("text-wrap: yes;", "property 'text-wrap': expected one of wrap, nowrap, found 'yes'", 16us),
+                                ("flex: 1 2;", "property 'flex': expected a number, none, auto, or a grow, a shrink and a basis, found '1 2'", 11us),
+                                ("border: 1 2;", "property 'border': expected a width and a colour, found '1 2'", 13us),
+                                ("font-weight: 0;", "property 'font-weight': expected a font weight, normal, bold or from 1 to 1000, found '0'", 18us)]))
+__test a_value_of_the_wrong_kind (declaration: [c8], reason: [c8], col: usize) {
+    assert (refuses("Box {\n    " ~ declaration ~ "\n}", reason, 2us, col));
+}
+
+__test an_error_in_a_when_block {
+    assert (refuses("Box {\n    @when (width < 500) {\n        height: big;\n    }\n}",
+                    "property 'height': expected a size, found 'big'", 3us, 17us));
+}
+
+__test the_font_faces {
+    let sheet = decode("@font-face { font-family: \"Title\"; src: \"res:/fonts/noto/NotoSans-Bold.ttf\"; font-weight: 500; }\n"
+                       ~ "@font-face { src: \"res:/fonts/noto/NotoSans-Italic.ttf\"; font-family: Title; font-style: italic; }");
+    assert (sheet.fontFaces.len == 2us);
+
+    let bold = sheet.fontFaces[0];
+    assert (bold.family == "Title" && bold.src == "res:/fonts/noto/NotoSans-Bold.ttf");
+    assert (bold.weight == (500u32)? && !bold.style.hasValue);
+
+    let italic = sheet.fontFaces[1];
+    assert (italic.family == "Title" && !italic.weight.hasValue && italic.style == (FontStyle::ITALIC)?);
+}
+
+__test the_font_faces_are_registered {
+    let sheet = decode("@font-face { font-family: \"Title\"; src: \"res:/fonts/noto/NotoSans-Bold.ttf\"; font-weight: 500; }");
+    let dmut fonts = copy FontRegistry(systemDirs-> []);
+    assert (!fonts.isRegistered("Title"));
+
+    sheet.registerFonts(alias fonts);
+    assert (fonts.isRegistered("Title"));
+    if let Ok(m) = fonts:.resolve("Title", weight-> 500u32) {
+        assert (m.face.weight == 500u32);
+    } else {
+        assert (false);
+    }
+}
+
+/**
+ * (font face, reason, line, column)
+ * */
+@parameters ((yield c for c in [("@font-face { src: \"a.ttf\"; }", "a @font-face needs a font-family and a src", 1us, 1us),
+                                ("@font-face { font-family: Mono; }", "a @font-face needs a font-family and a src", 1us, 1us),
+                                ("@font-face { font-family: A, B; src: \"a.ttf\"; }",
+                                 "property 'font-family': expected a single font family, found 'A, B'", 1us, 27us),
+                                ("@font-face { font-family: Mono; src: a; }", "property 'src': expected a string, found 'a'", 1us, 38us),
+                                ("@font-face { font-family: Mono; src: \"a.ttf\"; font-size: 12; }",
+                                 "unknown property 'font-size' in a @font-face", 1us, 47us),
+                                ("@font-face { font-family: Mono; src: \"a.ttf\"; font-weight: 0; }",
+                                 "property 'font-weight': expected a font weight, normal, bold or from 1 to 1000, found '0'", 1us, 60us),
+                                ("@font-face { font-family: Mono; src: \"a.ttf\"; font-style: slanted; }",
+                                 "property 'font-style': expected one of normal, italic, oblique, found 'slanted'", 1us, 59us)]))
+__test wrong_font_faces (content: [c8], reason: [c8], line: usize, col: usize) {
+    assert (refuses(content, reason, line, col));
+}
+
+__test the_properties_registered_by_a_widget_type {
+    let registry = withPanel();
+    let style = decode(registry, "Panel { collapsed: true; columns: 3; width: 10; }").rules[0].style;
+    assert (style.getCustom!{bool}("collapsed") == (true)?);
+    assert (style.getCustom!{u32}("columns") == (3u32)?);
+    assert (style.width._0);
+
+    // a value of another type than the one asked is none, as an unset one
+    assert (!style.getCustom!{u32}("collapsed").hasValue);
+    assert (!style.getCustom!{bool}("hidden").hasValue);
+}
+
+__test a_widget_property_is_known_to_the_selectors_naming_its_type {
+    let registry = withPanel();
+    assert (refuses(registry, "Label { collapsed: true; }", "unknown property 'collapsed'", 1us, 9us));
+    assert (!failure(registry, "Label.x, Panel.y { collapsed: true; }").hasValue);
+    assert (!failure(registry, ".x { collapsed: true; }").hasValue);
+    assert (!failure(registry, "Panel::label { collapsed: true; }").hasValue);
+    assert (refuses(registry, "Panel { collapsed: 1; }", "property 'collapsed': expected one of true, false, found '1'", 1us, 20us));
+    assert (refuses(registry, "Box { collapsed: true; }", "unknown property 'collapsed'", 1us, 7us));
+    assert (refuses("Panel { collapsed: true; }", "unknown property 'collapsed'", 1us, 9us));
+}
+
+__test the_widget_properties_cascade_and_compare {
+    let registry = withPanel();
+    let sheet = decode(registry, "Panel { collapsed: true; columns: 3; } Panel { collapsed: false; } Panel { columns: 3; }");
+    let dmut s = copy Style();
+    s:.merge(sheet.rules[0].style);
+    s:.merge(sheet.rules[1].style);
+    assert (s.getCustom!{bool}("collapsed") == (false)?);
+    assert (s.getCustom!{u32}("columns") == (3u32)?);
+
+    assert (!s.sameDimension(sheet.rules[0].style));
+    assert (sheet.rules[2].style.sameDimension(decode(registry, "Panel { columns: 3; }").rules[0].style));
+}
+
+__test the_flags_of_a_widget_property {
+    let registry = withPanel();
+    if let Ok(p) = registry.property("Panel", "collapsed") {
+        assert (p.affectsLayout && !p.inherited);
+    } else {
+        assert (false);
+    }
+
+    assert (registry.property("", "columns").hasValue);
+    assert (!registry.property("Label", "columns").hasValue);
+    assert (!registry.property("Nothing", "columns").hasValue);
+}
