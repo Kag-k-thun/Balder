@@ -1,0 +1,152 @@
+in sheets;
+
+use balder::core::error;
+use balder::interface::loader;
+use balder::interface::loader::parser;
+use balder::interface::loader::registry;
+use balder::interface::loader::registry::error;
+use balder::interface::style::decoder;
+
+use std::fs::path;
+use std::syntax::errors;
+
+/**
+ * Loader of a .style file and of the sheets it imports, decoded against the widget types (doc/gui-v2.md, §4)
+ * @info:
+ * =====
+ * The sheets named by the @import directives heading a sheet are read before the rest of it, in the order of the
+ * directives and in the same scope of constants: the constants they define are seen by the sheet importing them, and
+ * their rules come before its own in the cascade. The path of an import is relative to the directory of the sheet
+ * importing it, unless it is qualified (`res:/`) or absolute. A sheet imported several times is read at its first
+ * import only, and a sheet importing itself, directly or not, is an error naming the chain of its imports.
+ * ====
+ * */
+pub record SheetLoader {
+
+    // The widget types, for the properties they register and the selectors they check
+    let _registry: &WidgetRegistry;
+
+    // The scope of the constants, shared by the sheets
+    let dmut _constants: &Constants = copy Constants();
+
+    // The paths of the sheets read
+    let mut _read: [[c8]] = [];
+
+    // The paths of the sheets being read, each one importing the next
+    let mut _chain: [[c8]] = [];
+
+    // The sheets decoded, in the order of the cascade
+    let mut _sheets: [StyleSheet] = [];
+
+    /**
+     * @params:
+     *    - registry: the widget types, for the properties they register and the selectors they check
+     * */
+    pub self (registry: &WidgetRegistry)
+        with _registry = registry
+    {}
+
+    /**
+     * Load a .style file and the sheets it imports
+     * @params:
+     *    - path: the path of the file, qualified (res:/) or not, naming it in the errors
+     * @returns: the decoded sheets, each one after those it imports
+     * @throws: when a file cannot be read, when a sheet cannot be read or decoded, or when a sheet imports itself
+     * */
+    pub fn load(mut self, path: [c8])-> [StyleSheet]
+        throws BalderError
+    {
+        self:.readSheet(path, readFile(path));
+        self._sheets
+    }
+
+    /**
+     * Read a sheet after the sheets it imports, and decode it
+     * @params:
+     *    - path: the path of the sheet
+     *    - content: the content of the sheet
+     * */
+    fn readSheet(mut self, path: [c8], content: [c8])
+        throws LoadError
+    {
+        self._read ~= [path];
+        self._chain ~= [path];
+
+        let dmut reader = StyleReader(content);
+        {
+            for i in reader:.readImports() {
+                let target = SheetLoader::resolve(path, i.path);
+                if SheetLoader::contains(self._chain, target) {
+                    throw copy LoadError(path, "'" ~ target ~ "' imports itself: " ~ SheetLoader::join(self._chain ~ [target]), i.line, i.col);
+                }
+
+                if !SheetLoader::contains(self._read, target) {
+                    let imported = {
+                        readFile(target)
+                    } catch {
+                        _: &BalderError => {
+                            throw copy LoadError(path, "cannot read the imported sheet '" ~ target ~ "'", i.line, i.col);
+                        }
+                    };
+
+                    self:.readSheet(target, imported);
+                }
+            }
+
+            let sheet = reader:.read(alias self._constants);
+            self._sheets ~= [SheetDecoder(self._registry, path).decode(sheet)];
+        } catch {
+            e: &SyntaxError => { throw copy LoadError(path, e.msg, e.line, e.col); }
+            e: &LoadError   => { throw e; }
+        }
+
+        self._chain = self._chain[0us .. self._chain.len - 1us];
+    }
+}
+
+/**
+ * The helpers of the loader
+ * */
+pub mod SheetLoader {
+
+    /**
+     * @returns: the path of a sheet imported by another one: relative to the directory of the importing sheet, unless
+     * it is qualified (res:/) or absolute
+     * @params:
+     *    - from: the path of the importing sheet
+     *    - to: the path written in the @import
+     * */
+    pub fn resolve(from: [c8], to: [c8])-> [c8] {
+        let target = Path(to);
+        let parts = target.parts();
+        let qualified = parts.len != 0us && parts[0].len != 0us && parts[0][$ - 1us] == ':';
+        if qualified || target.isAbsolute() {
+            return to;
+        }
+
+        Path(from).parent().push(target).normalize().toStr()
+    }
+
+    /**
+     * @returns: true iif name is one of the names
+     * */
+    pub fn contains(names: [[c8]], name: [c8])-> bool {
+        for n in names {
+            if n == name { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the paths of a chain of imports, separated by arrows
+     * */
+    pub fn join(chain: [[c8]])-> [c8] {
+        let mut result = "";
+        for i, p in chain {
+            result = if i == 0us { p } else { result ~ " -> " ~ p };
+        }
+
+        result
+    }
+}
