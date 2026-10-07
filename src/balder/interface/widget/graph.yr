@@ -1,0 +1,617 @@
+in graph;
+
+use balder::utils;
+use balder::core::dispose;
+use balder::interface::{drawer, shape, style};
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::text::label;
+use balder::math::vector;
+
+use std::{format, unit};
+use std::algorithm::comparison;
+use std::time::dur;
+
+/**
+ * The values of a graph over the last frames, the oldest first
+ * */
+pub record FrameSeries {
+
+    // The number of values kept, the older ones being dropped
+    pub let capacity: usize;
+
+    // The values, a ring whose oldest value is _len slots before _next
+    let mut _values: [mut f32];
+
+    // The slot of the next value
+    let mut _next: usize = 0us;
+
+    // The number of values held, at most capacity
+    let mut _len: usize = 0us;
+
+    /**
+     * @params:
+     *    - capacity: the number of values kept
+     * */
+    pub self (capacity: usize)
+        with capacity = capacity
+        , _values = copy [0.0f; capacity]
+    {}
+
+    /**
+     * Append the value of a new frame, dropping the oldest one when the series is full
+     * */
+    pub fn push(mut self, value: f32) {
+        if self.capacity == 0us { return; }
+
+        self._values[self._next] = value;
+        self._next = (self._next + 1us) % self.capacity;
+        self._len = min(self._len + 1us, self.capacity);
+    }
+
+    /**
+     * @returns: the number of values held
+     * */
+    pub fn len(self)-> usize {
+        self._len
+    }
+
+    /**
+     * @returns: the i-th value held, the oldest being the 0-th
+     * @assume: i < len
+     * */
+    pub fn get(self, i: usize)-> f32 {
+        self._values[(self._next + self.capacity - self._len + i) % self.capacity]
+    }
+
+    /**
+     * @returns: the value of the last frame, 0 if the series is empty
+     * */
+    pub fn last(self)-> f32 {
+        if self._len == 0us { return 0.0f; }
+        self.get(self._len - 1us)
+    }
+
+    /**
+     * @returns: the value the top of the graph stands for, the largest value held, or the reference if it is larger
+     * @params:
+     *    - reference: the value always fitting in the graph (the frame budget), 0 for none
+     * */
+    pub fn scale(self, reference: f32)-> f32 {
+        let mut result = reference;
+        for i in 0us .. self._len {
+            result = max(result, self.get(i));
+        }
+
+        result
+    }
+}
+
+/**
+ * A graph of the last frames of the window, three graphs one above the other: the time the CPU and the GPU spent on
+ * each frame, and the device memory held by the window; each bar stands for a frame, the newest on the right, and each
+ * graph has a line at its scale, the frame budget for the times and the memory of the device for the memory
+ * @info: the parts cpu, gpu and memory style the label of each graph, its bars being drawn in the text colour of the part
+ * */
+pub class FrameGraph over Widget {
+
+    // The graph of the time the rendering thread worked on the frames, in milliseconds
+    let dmut _cpu: &GraphLane;
+
+    // The graph of the time the GPU spent on the frames, in milliseconds
+    let dmut _gpu: &GraphLane;
+
+    // The graph of the device memory, in megabytes, its top being the memory of the device
+    let dmut _memory: &GraphLane;
+
+    // The number of frames the graphs show
+    let mut _nbFrames: usize = 60us;
+
+    // The index of the last frame measured, a new one adding a bar to each graph
+    let mut _lastFrame: u64 = 0u64;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "FrameGraph")
+        , _cpu = copy GraphLane(alias manager, "cpu", makeVec4(0.18f, 0.77f, 0.62f, 1.0f))
+        , _gpu = copy GraphLane(alias manager, "gpu", makeVec4(0.30f, 0.60f, 0.99f, 1.0f))
+        , _memory = copy GraphLane(alias manager, "memory", makeVec4(0.83f, 0.60f, 0.13f, 1.0f))
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Change the number of frames the graphs show, the frames measured until now being dropped
+     * */
+    pub fn setNbFrames(mut self, nb: usize) {
+        self._nbFrames = max(1us, nb);
+        if self._attached {
+            let dmut drawer = self._manager:.getShapeDrawer();
+            self._cpu:.setNbFrames(alias drawer, self._nbFrames);
+            self._gpu:.setNbFrames(alias drawer, self._nbFrames);
+            self._memory:.setNbFrames(alias drawer, self._nbFrames);
+            self:.onUpdateSize();
+        }
+    }
+
+    /**
+     * @returns: the number of frames the graphs show
+     * */
+    pub fn getNbFrames(self)-> usize {
+        self._nbFrames
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          ATTACH/DETACH          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+
+        let dmut drawer = self._manager:.getShapeDrawer();
+        self._cpu:.setNbFrames(alias drawer, self._nbFrames);
+        self._gpu:.setNbFrames(alias drawer, self._nbFrames);
+        self._memory:.setNbFrames(alias drawer, self._nbFrames);
+
+        self._cpu:.attach((self)?);
+        self._gpu:.attach((self)?);
+        self._memory:.attach((self)?);
+    }
+
+    prot over onApplyStyle(mut self) {
+        let style = self.getStyle();
+        self._cpu:.applyStyle(style);
+        self._gpu:.applyStyle(style);
+        self._memory:.applyStyle(style);
+    }
+
+    over onHide(mut self) {
+        self._cpu:.hide();
+        self._gpu:.hide();
+        self._memory:.hide();
+    }
+
+    over onShow(mut self) {
+        self._cpu:.show();
+        self._gpu:.show();
+        self._memory:.show();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZES          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    over onUpdateSize(mut self) {
+        let gap = GRAPH_GAP;
+        let h = max(0.0f, (self._absoluteSize.y - 2.0f * gap) / 3.0f);
+        let size = makeVec2(self._absoluteSize.x, h);
+
+        let mut pos = self._absolutePosition;
+        self._cpu:.place(pos, size, self._depth);
+
+        pos.y += h + gap;
+        self._gpu:.place(pos, size, self._depth);
+
+        pos.y += h + gap;
+        self._memory:.place(pos, size, self._depth);
+
+        self:.onUpdateScissors();
+    }
+
+    over onUpdateScissors(mut self) {
+        let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
+        self._cpu:.setScissors(sciPos, sciSize);
+        self._gpu:.setScissors(sciPos, sciSize);
+        self._memory:.setScissors(sciPos, sciSize);
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        self._cpu.getMaxDepth()
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TICK EVENTS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add the frames presented since the last tick to the graphs, the last one only: a tick lasts less than a frame
+     * */
+    pub over onTick(mut self, _: Duration) {
+        if !self._attached || !self.isDrawn() { return; }
+
+        let dmut window = self._manager:.getWindow();
+        let stats = window.getFrameStats();
+        if stats.index == self._lastFrame { return; }
+        self._lastFrame = stats.index;
+
+        let budget = toMillis(window.getFrameDuration());
+        let cpu = toMillis(stats.cpu);
+        let gpu = toMillis(stats.gpu);
+        let memory = toMegabytes(stats.memory);
+        let available = toMegabytes(stats.available);
+
+        self._cpu:.push(cpu, budget, format("CPU {:.2} ms", cpu));
+        self._gpu:.push(gpu, budget, format("GPU {:.2} ms", gpu));
+        self._memory:.push(memory, available, format("Memory {} / {}", writeSize(stats.memory), writeSize(stats.available)));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          MEASURE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        (GRAPH_MIN_WIDTH, GRAPH_WIDTH)
+    }
+
+    prot over measureContentHeight(mut self, _: f32)-> f32 {
+        3.0f * GRAPH_HEIGHT + 2.0f * GRAPH_GAP
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSABLE          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            if self._attached {
+                let dmut drawer = self._manager:.getShapeDrawer();
+                self._cpu:.dispose(alias drawer);
+                self._gpu:.dispose(alias drawer);
+                self._memory:.dispose(alias drawer);
+            }
+
+            self._super_:.dispose();
+        }
+    }
+}
+
+/**
+ * The frame graphs in a .gui file
+ * */
+pub mod FrameGraph {
+
+    /**
+     * @returns: the schema of the frame graphs, whose attribute frames is the number of frames they show
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("FrameGraph",
+                          |dmut m, id|-> dmut &Widget => copy FrameGraph(alias m, id),
+                          attributes-> copy [copy Setter!{&FrameGraph, usize}("frames", |dmut g, n| => { g:.setNbFrames(n); })],
+                          parts-> copy ["cpu", "gpu", "memory"])
+    }
+}
+
+// The smallest height of the bar of a frame of a value, in pixels, so that a small value (the memory used out of the
+// memory of the device) does not leave the graph empty
+def MIN_BAR_HEIGHT = 2.0f;
+
+// The space between two graphs, in pixels
+def GRAPH_GAP = 4.0f;
+
+// The height of a graph when the height of the widget is its content, in pixels
+def GRAPH_HEIGHT = 40.0f;
+
+// The width of the graphs when the width of the widget is its content, the smallest one, in pixels
+def GRAPH_WIDTH = 240.0f;
+def GRAPH_MIN_WIDTH = 120.0f;
+
+/**
+ * One of the graphs of a frame graph: a label writing its last value over a bar per frame
+ * */
+class GraphLane {
+
+    // The part of the frame graph styling the graph
+    let _part: [c8];
+
+    // The label writing the last value of the graph
+    let dmut _label: &Label;
+
+    // The bars of the graph, one per frame, the oldest on the left
+    let dmut _bars: [&Shape] = [];
+
+    // The line at the reference value of the graph, its scale (the frame budget, the memory of the device)
+    let dmut _line: (&Shape)? = none;
+
+    // The values of the last frames, and the reference value
+    let mut _series: FrameSeries = FrameSeries(0us);
+    let mut _reference: f32 = 0.0f;
+
+    // The colour of the graph, the text colour of the part when it is styled, the bars being lighter for the label to
+    // stand out over them
+    let mut _color: vec4;
+    let _defaultColor: vec4;
+
+    // The rectangle of the graph in the window, and its depth
+    let mut _pos: vec2 = vec2();
+    let mut _size: vec2 = vec2();
+    let mut _depth: u32 = 0u32;
+
+    // True iif the frame graph is drawn
+    let mut _shown: bool = true;
+
+    /**
+     * @params:
+     *    - part: the part of the frame graph styling the graph
+     *    - color: the colour of the bars when the part sets no text colour
+     * */
+    pub self (dmut manager: &WidgetManager, part: [c8], color: vec4)
+        with _part = part
+        , _label = copy Label(alias manager, "")
+        , _color = color
+        , _defaultColor = color
+    {
+        self._label:.forceNoWrap(true);
+        self._label:.setOwnerPart(part);
+    }
+
+    /**
+     * Attach the label of the graph to the frame graph
+     * */
+    pub fn attach(mut self, parent: (&Widget)?) {
+        self._label:.onAttach(parent);
+    }
+
+    /**
+     * Create the bars of a number of frames, removing the previous ones
+     * */
+    pub fn setNbFrames(mut self, dmut drawer: &ShapeDrawer, nb: usize) {
+        self:.removeShapes(alias drawer);
+        self._series = FrameSeries(nb);
+
+        {
+            for _ in 0us .. nb {
+                let dmut bar = drawer:.registerColorQuad(color-> barColor(self._color), level-> self._depth);
+                self._bars ~= [alias bar];
+            }
+
+            let dmut line = drawer:.registerColorQuad(color-> lineColor(self._color), level-> self._depth);
+            self._line = (alias line)?;
+        } catch {
+            err => {
+                log::error #("FrameGraph", "Failed to create the bars of the graph", self._part, err);
+            }
+        }
+
+        if !self._shown {
+            self:.hide();
+        }
+    }
+
+    /**
+     * Take the style of the part of the graph from the style of the frame graph
+     * */
+    pub fn applyStyle(mut self, style: &Style) {
+        if let Ok(inner) = style.subItems[self._part] {
+            self._label:.setStyle(inner);
+            self._color = inner.getColor(WidgetShapeKind::TEXT);
+        } else {
+            self._color = self._defaultColor;
+        }
+
+        for dmut b in alias self._bars {
+            b:.setColor(barColor(self._color));
+        }
+
+        if let Ok(dmut l) = alias self._line {
+            l:.setColor(lineColor(self._color));
+        }
+    }
+
+    /**
+     * Place the graph in a rectangle of the window
+     * @params:
+     *    - pos: the top left corner of the graph, in pixels
+     *    - size: the size of the graph, in pixels
+     *    - depth: the depth of the frame graph, the label being drawn over the bars
+     * */
+    pub fn place(mut self, pos: vec2, size: vec2, depth: u32) {
+        self._pos = pos;
+        self._size = size;
+        self._depth = depth;
+
+        self._label:.setSize(pos, size, depth + 1u32);
+        for dmut b in alias self._bars {
+            b:.setLevel(depth);
+        }
+
+        if let Ok(dmut l) = alias self._line {
+            l:.setLevel(depth);
+        }
+
+        self:.updateBars();
+    }
+
+    /**
+     * Cut the graph to the scissors of the frame graph
+     * */
+    pub fn setScissors(mut self, pos: vec2, size: vec2) {
+        self._label:.setScissors(pos, size);
+        for dmut b in alias self._bars {
+            b:.setScissors(pos, size);
+        }
+
+        if let Ok(dmut l) = alias self._line {
+            l:.setScissors(pos, size);
+        }
+    }
+
+    /**
+     * Add the value of a new frame to the graph
+     * @params:
+     *    - value: the value of the frame
+     *    - reference: the value always fitting in the graph, at which the line is drawn if the graph has one
+     *    - text: the text of the label
+     * */
+    pub fn push(mut self, value: f32, reference: f32, text: [c8]) {
+        self._series:.push(value);
+        self._reference = reference;
+        self._label:.setText(text);
+        self:.updateBars();
+    }
+
+    /**
+     * Hide the graph
+     * */
+    pub fn hide(mut self) {
+        self._shown = false;
+        self._label:.hide();
+        for dmut b in alias self._bars {
+            b:.hide();
+        }
+
+        if let Ok(dmut l) = alias self._line {
+            l:.hide();
+        }
+    }
+
+    /**
+     * Show the graph
+     * */
+    pub fn show(mut self) {
+        self._shown = true;
+        self._label:.show();
+        for dmut b in alias self._bars {
+            b:.show();
+        }
+
+        if let Ok(dmut l) = alias self._line {
+            l:.show();
+        }
+    }
+
+    /**
+     * @returns: the depth of the label, drawn over the bars
+     * */
+    pub fn getMaxDepth(self)-> u32 {
+        self._label.getMaxDepth()
+    }
+
+    /**
+     * Remove the shapes of the graph and dispose its label
+     * */
+    pub fn dispose(mut self, dmut drawer: &ShapeDrawer) {
+        self:.removeShapes(alias drawer);
+        self._label:.dispose();
+    }
+
+    /**
+     * Size the bars to the values of the frames, the newest on the right
+     * */
+    fn updateBars(mut self) {
+        let nb = self._bars.len;
+        if nb == 0us { return; }
+
+        let scale = self._series.scale(self._reference);
+        let width = self._size.x / cast!f32(cast!u64(nb));
+        let bottom = self._pos.y + self._size.y;
+
+        // the bars of the frames not measured yet, on the left, are empty
+        let empty = nb - self._series.len();
+        for i in 0us .. nb {
+            let value = if i < empty { 0.0f } else { self._series.get(i - empty) };
+            let h = if scale > 0.0f && value > 0.0f {
+                min(self._size.y, max(MIN_BAR_HEIGHT, self._size.y * value / scale))
+            } else { 0.0f };
+
+            self._bars[i]:.setPosition(makeVec2(self._pos.x + cast!f32(cast!u64(i)) * width, bottom - h));
+            self._bars[i]:.setSize(makeVec2(max(1.0f, width - 1.0f), h));
+        }
+
+        if let Ok(dmut l) = alias self._line {
+            let y = if scale > 0.0f { bottom - self._size.y * self._reference / scale } else { bottom };
+            l:.setPosition(makeVec2(self._pos.x, y));
+            l:.setSize(makeVec2(self._size.x, 1.0f));
+        }
+    }
+
+    /**
+     * Remove the bars and the line of the graph from the drawer
+     * */
+    fn removeShapes(mut self, dmut drawer: &ShapeDrawer) {
+        for b in self._bars {
+            drawer:.removeShape(b.uid);
+        }
+
+        if let Ok(l) = self._line {
+            drawer:.removeShape(l.uid);
+        }
+
+        self._bars = [];
+        self._line = none;
+    }
+}
+
+/**
+ * @returns: a duration in milliseconds
+ * */
+fn toMillis(d: Duration)-> f32 {
+    cast!f32(d.allMicros) / 1000.0f
+}
+
+/**
+ * @returns: a size in bytes in megabytes
+ * */
+fn toMegabytes(bytes: usize)-> f32 {
+    cast!f32(cast!u64(bytes)) / (1024.0f * 1024.0f)
+}
+
+/**
+ * @returns: a size in bytes rounded down to the megabyte, its gigabytes and its megabytes separated by a space (22GB
+ * 827MB), a size under a megabyte being written whole
+ * */
+fn writeSize(bytes: usize)-> [c8] {
+    let size = MemorySize::B(bytes);
+    let gb = size.gigabytes;
+    let mb = size.megabytes % 1024us;
+
+    if gb > 0us && mb > 0us { return format("{} {}", MemorySize::GB(gb), MemorySize::MB(mb)); }
+    if gb > 0us { return format("{}", MemorySize::GB(gb)); }
+    if mb > 0us { return format("{}", MemorySize::MB(mb)); }
+    format("{}", size)
+}
+
+/**
+ * @returns: the colour of the bars of a graph of a colour
+ * */
+fn barColor(color: vec4)-> vec4 {
+    makeVec4(color.xyz, 0.55f * color.w)
+}
+
+/**
+ * @returns: the colour of the line at the reference value of a graph whose bars have a colour
+ * */
+fn lineColor(color: vec4)-> vec4 {
+    makeVec4(1.0f, 1.0f, 1.0f, 0.5f * color.w)
+}
