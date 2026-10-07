@@ -16,7 +16,7 @@ use ::sdl3::mouse;
 use ::std::algorithm::comparison;
 
 // The thickness of the scrollbar when the style sets none, in pixels
-def DEFAULT_SCROLLBAR_SIZE = 10u32;
+def DEFAULT_SCROLLBAR_SIZE = 10.0f;
 
 // The speed of the wheel when the style sets none
 def DEFAULT_SCROLL_SPEED = 2.0f;
@@ -39,6 +39,10 @@ record Child {
  * A layout of children side by side along the direction of its style, sized by their flex bases and factors
  * @info:
  * =====
+ * Along the axis, an auto size is the size of the content, shrinking down to its min-content; across it, an auto size
+ * is stretched to the layout, and the other sizes are placed at its start. The margins of the children sit outside
+ * their sizes.
+ *
  * The style reads `direction` (row or column), `overflow` (hidden or scroll) and `scroll-speed`. A layout that overflows
  * by scrolling keeps the bases of its children instead of shrinking them, and scrolls over them with the wheel or by
  * dragging its scrollbar, styled as its part `::scrollbar`.
@@ -102,7 +106,7 @@ pub class LinearLayout over Layout {
 
     /**
      * Compute the drawing size of the inner widgets, sized along the axis of the layout from their flex bases, growth and
-     * shrink factors, and across it from their style (stretched to the layout when unset)
+     * shrink factors, and across it from their style (stretched to the layout when auto)
      */
     over onUpdateSize(mut self) {
         if self._childs.len == 0 {
@@ -111,29 +115,27 @@ pub class LinearLayout over Layout {
             return;
         }
 
-        let (mainSize, crossSize) = if self.isRow() {
-            (self._absoluteSize.x, self._absoluteSize.y)
-        } else {
-            (self._absoluteSize.y, self._absoluteSize.x)
-        };
-
-        let (mains, crosses) = self:.measureChildren(mainSize, crossSize);
+        let container = self._absoluteSize;
+        let mainSize = if self.isRow() { container.x } else { container.y };
+        let (mains, crosses) = self:.sizeChildren(container);
 
         let mut current = 0.0f;
         for col in 0 .. self._childs.len {
-            let relMain = mains[col] / mainSize;
+            let dmut w = alias self._childs[col].widget;
+            let margins = w.getMarginSize(container);
             let (wpos, wsize) = if self.isRow() {
+                let height = w:.measureHeight(mains[col], container, stretch-> true);
                 (makeVec2(current + self._shift, 0.0f) * self._absoluteSize + self._absolutePosition,
-                 makeVec2(mains[col], crosses[col]))
+                 makeVec2(mains[col], height) + margins)
             } else {
                 (makeVec2(0.0f, current + self._shift) * self._absoluteSize + self._absolutePosition,
-                 makeVec2(crosses[col], mains[col]))
+                 makeVec2(crosses[col], mains[col]) + margins)
             };
 
-            current += relMain;
+            current += (if self.isRow() { wsize.x } else { wsize.y }) / mainSize;
             self._relFullSize = current;
 
-            let (relPos, relSize) = self:.placeChild(alias self._childs[col].widget, wpos, wsize, self._depth + 1);
+            let (relPos, relSize) = self:.placeChild(alias w, wpos, wsize, self._depth + 1);
             self._childs[col].relPos = relPos;
             self._childs[col].relSize = relSize;
         }
@@ -234,7 +236,8 @@ pub class LinearLayout over Layout {
             self._childs[col].relPos = wpos;
             self._childs[col].widget:.setSize(wpos * self._absoluteSize + self._absolutePosition,
                                               wsize,
-                                              self._depth + 1);
+                                              self._depth + 1,
+                                              self._absoluteSize);
         }
 
         self._shift = scroll;
@@ -462,12 +465,12 @@ pub class LinearLayout over Layout {
 
         let sub = self.getStyle().getSubStyle("scrollbar");
         if self.isRow() {
-            let h = if sub.hasHeight() { sub.getHeight() } else { WidgetSize(pix-> DEFAULT_SCROLLBAR_SIZE) };
-            self._relScrollBarSize = makeVec2(self._scrollLen, self.clampSize(h, self._absoluteSize.y));
+            let h = (sub.height._1).resolve(self._absoluteSize.y) ?? DEFAULT_SCROLLBAR_SIZE;
+            self._relScrollBarSize = makeVec2(self._scrollLen, h / self._absoluteSize.y);
             self._relScrollBarPos = makeVec2(self._scrollShift, 1.0f - self._relScrollBarSize.y);
         } else {
-            let w = if sub.hasWidth() { sub.getWidth() } else { WidgetSize(pix-> DEFAULT_SCROLLBAR_SIZE) };
-            self._relScrollBarSize = makeVec2(self.clampSize(w, self._absoluteSize.x), self._scrollLen);
+            let w = (sub.width._1).resolve(self._absoluteSize.x) ?? DEFAULT_SCROLLBAR_SIZE;
+            self._relScrollBarSize = makeVec2(w / self._absoluteSize.x, self._scrollLen);
             self._relScrollBarPos = makeVec2(1.0f - self._relScrollBarSize.x, self._scrollShift);
         }
 
@@ -576,15 +579,16 @@ pub class LinearLayout over Layout {
     prot over measureContentHeight(mut self, width: f32)-> f32 {
         if self._childs.len == 0 { return 0.0f; }
 
+        let container = makeVec2(width, INDEFINITE_SIZE);
         let mut height = 0.0f;
         if self.isRow() {
-            let (mains, _) = self:.measureChildren(width, 0.0f);
+            let (mains, _) = self:.sizeChildren(container);
             for i, dmut c in alias self._childs {
                 height = max(height, c.widget:.measureIntrinsicHeight(mains[i]));
             }
         } else {
             for dmut c in alias self._childs {
-                let w = if c.widget.getStyle().hasWidth() { c.widget:.measureWidth(width) } else { width };
+                let w = c.widget:.measureWidth(container, stretch-> true);
                 height += c.widget:.measureIntrinsicHeight(w);
             }
         }
@@ -593,67 +597,38 @@ pub class LinearLayout over Layout {
     }
 
     /**
-     * Measure the sizes of the children along the axis of the layout and across it
+     * Size the children along the axis of the layout, from their flex bases, growth and shrink factors, each one
+     * between its bounds, an auto lower bound being its min-content, capped by its size when it is a length
      * @params:
-     *    - mainSize: the size of the layout along its axis, in pixels
-     *    - crossSize: the size of the layout across its axis, in pixels
-     * @returns: the size of each child along the axis, its basis grown or shrunk to the layout, and across it
+     *    - container: the content box of the layout, its height being INDEFINITE_SIZE when a row is measured
+     * @returns: the size of the border box of each child along the axis, its basis grown or shrunk to the layout, and
+     * across the axis of a column, its width being known before its height, which may depend on it, in pixels
      * */
-    fn measureChildren(mut self, mainSize: f32, crossSize: f32)-> ([f32], [f32]) {
+    fn sizeChildren(mut self, container: vec2)-> ([f32], [f32]) {
         let n                      = self._childs.len;
         let dmut items: [FlexItem] = copy [FlexItem(); n];
-        let dmut crosses: [f32]    = copy [crossSize; n];
+        let dmut crosses: [f32]    = copy [0.0f; n];
+        let mut space              = if self.isRow() { container.x } else { container.y };
 
         for i in 0us .. n {
-            let dmut w = alias self._childs[i].widget;
-            let style  = w.getStyle();
-
-            // the width of a child of a column is known before its height, which may depend on it
-            if !self.isRow() && style.hasWidth() {
-                crosses[i] = w:.measureWidth(crossSize);
-            }
-
-            let (size, basis, minContent) = if self.isRow() {
-                let size = style.getWidth();
-                let basis = if style.hasFlexBasis() {
-                    w:.resolveWidth(style.flexBasis.1, mainSize)
-                } else {
-                    w:.measureWidth(mainSize)
-                };
-                let minContent = if size.isContent() { w:.measureIntrinsicWidths()._0 } else { 0.0f };
-                (size, basis, minContent)
+            let dmut w  = alias self._childs[i].widget;
+            let margins = w.getMarginSize(container);
+            if self.isRow() {
+                space -= margins.x;
             } else {
-                let size = style.getHeight();
-                let basis = if style.hasFlexBasis() {
-                    w:.resolveHeight(style.flexBasis.1, crosses[i], mainSize)
-                } else {
-                    w:.measureHeight(crosses[i], mainSize)
-                };
-
-                let minContent = if size.isContent() { w:.measureIntrinsicHeight(crosses[i]) } else { 0.0f };
-                (size, basis, minContent)
-            };
-
-            items[i] = FlexItem(basis-> basis,
-                                grow-> style.flexGrow.1,
-                                shrink-> if self.isScrolled() { 0.0f } else { style.flexShrink.1 },
-                                min-> max(cast!f32(size.minPix), minContent),
-                                max-> cast!f32(size.maxPix));
-        }
-
-        let mains = resolveFlexibleLengths(items, mainSize);
-
-        // the height of a child of a row is known once its width is
-        if self.isRow() {
-            for i in 0us .. n {
-                let dmut w = alias self._childs[i].widget;
-                if w.getStyle().hasHeight() {
-                    crosses[i] = w:.measureHeight(mains[i], crossSize);
-                }
+                space -= margins.y;
+                crosses[i] = w:.measureWidth(container, stretch-> true);
             }
+
+            let item = w:.measureFlexItem(self.isRow(), container, width-> crosses[i]);
+            items[i] = FlexItem(basis-> item.basis,
+                                grow-> item.grow,
+                                shrink-> if self.isScrolled() { 0.0f } else { item.shrink },
+                                min-> item.min,
+                                max-> item.max);
         }
 
-        (mains, crosses)
+        (resolveFlexibleLengths(items, max(0.0f, space)), crosses)
     }
 
     /*!
