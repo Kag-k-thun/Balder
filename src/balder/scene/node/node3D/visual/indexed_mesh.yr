@@ -3,12 +3,16 @@ in indexed_mesh;
 use balder::core::{_, driver::_};
 use balder::core::config::shader::_;
 use balder::core::shader::{_, buffers::_};
-use balder::math::matrix;
-use balder::scene::node::node3D::visual::_;
+use balder::math::{matrix, vector};
+use balder::scene::node::node3D::{camera, visual::_, visual::lod};
 use balder::utils::log;
+
+use std::time::dur;
 
 /**
  * Mesh with two buffers, one for vertices, and one for indices
+ * @info: the index buffer holds the levels of detail of the mesh one after the other, all drawn from the same vertices;
+ * a change of level cross-fades the two levels with a dithering, during FADE_DURATION
  */
 pub class IndexedMesh3D over VisualInstance3D {
 
@@ -20,11 +24,27 @@ pub class IndexedMesh3D over VisualInstance3D {
         // The data of the mesh to upload on device
         let mut _array : (MeshArray)? = none;
 
-        // The list of points defining the triangles of the mesh
-        let mut _indices : [u32] = [];
+        // The levels of detail of the mesh, the indices dropped after the upload
+        let mut _lods : LodChain;
 
         // Destroy the array after uploading (meaning it can be detached and reattached to the scene)
         let mut _destroyOnUpload : bool = false;
+
+    }
+
+    prot { // Levels of detail
+
+        // The level drawn, the incoming one during a cross-fade
+        let mut _level : usize = 0us;
+
+        // The outgoing level of the cross-fade in progress
+        let mut _fadingLevel : (usize)? = none;
+
+        // The progress of the cross-fade, from 0 to 1
+        let mut _fade : f32 = 0.0f;
+
+        // False until a first level is selected after entering the scene, that one is not faded in
+        let mut _selected : bool = false;
 
     }
 
@@ -64,12 +84,12 @@ pub class IndexedMesh3D over VisualInstance3D {
     /**
      * Create a new indexed mesh
      * @params:
-     *    - device: the device used to allocate and render the mesh
-     *    - indices: the indices of the points forming the mesh
+     *    - lods: the levels of detail of the mesh, LodChain (indices) for the indices of the full mesh only
+     *    - array: the vertices of the mesh
      */
     pub self  (name : [c8],
                dmut parent : &Node,
-               indices : [u32],
+               lods : LodChain,
                array : MeshArray,
                dmut material : &Material,
                shadow : bool = true,
@@ -78,7 +98,7 @@ pub class IndexedMesh3D over VisualInstance3D {
         with super (name, alias parent, array.aabb (), shadow)
         , _material = alias material
         , _array = (array?)
-        , _indices = indices
+        , _lods = lods
         , _destroyOnUpload = destroyOnUpload
 
     {}
@@ -95,17 +115,19 @@ pub class IndexedMesh3D over VisualInstance3D {
         self:.destroyBuffers (alias scene);
 
         {
-            if let Ok (array) = self._array && self._indices.len != 0 {
+            if let Ok (array) = self._array && self._lods.indices.len != 0 {
                 let dmut win = scene:.getWindow ();
             
-                let dmut ibo = copy IndexBufferObject!{u32} (win:.getVulkanDevice (), self._indices);
+                let dmut ibo = copy IndexBufferObject!{u32} (win:.getVulkanDevice (), self._lods.indices);
                 self._ibo = (alias ibo)?;
 
                 let dmut vbo = copy VertexBufferObject ();
                 self._vbo = (alias vbo)?;
 
-                let dmut world = copy UniformBufferObject (win:.getVulkanDevice (), mat4::size);
-                world:.setData (0, self._transformation, commit-> true);                                
+                // the world transformation, then the progress of the cross-fade, padded to a vec4
+                let dmut world = copy UniformBufferObject (win:.getVulkanDevice (), mat4::size + vec4::size);
+                world:.setData (0, self._transformation, commit-> false);
+                world:.setData (mat4::size, self._fade, commit-> true);
                 self._world = (alias world)?;
 
                 self:.configureVertices (win:.getVulkanDevice (), array, self._material, self._castShadow);
@@ -122,8 +144,10 @@ pub class IndexedMesh3D over VisualInstance3D {
 
         if self._destroyOnUpload {
             self._array = none;
-            self._indices = [];
+            self._lods.indices = [];
         }
+
+        self._selected = false;
     }
 
     pub over onExit (mut self, dmut scene : &Scene) {
@@ -222,21 +246,96 @@ pub class IndexedMesh3D over VisualInstance3D {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ===============================          LEVELS OF DETAIL          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Select the level whose error, seen from the camera at the point of the bounding sphere closest to it, stays
+     * under the threshold; a cross-fade in progress finishes before another level is selected
+     * */
+    pub over selectLod (mut self, camera : &Camera, height : f32, threshold : f32, delta : Duration)-> bool {
+        if self._lods.levels.len < 2us || !self._world.hasValue { return false; }
+
+        if self._fadingLevel.hasValue {
+            self._fade += cast!f32 (delta.allMillis) / FADE_DURATION;
+            if self._fade < 1.0f {
+                self:.writeFade ();
+                return false;
+            }
+
+            // the fade stays at 1, so the commands still recorded with both levels draw the incoming one only
+            self._fade = 1.0f;
+            self:.writeFade ();
+            self._fadingLevel = none;
+            return true;
+        }
+
+        let (center, radius) = self.boundingSphere ();
+        let eye = camera.position;
+        let distance = (eye - center).length ();
+        let closest = if distance > radius { center + (eye - center) * (radius / distance) } else { eye };
+
+        let unitSize = camera.screenSize (closest, self.worldScale ()) * height;
+        let level = self._lods.select (self._level, unitSize, threshold);
+        if level == self._level && self._selected { return false; }
+
+        if self._selected {
+            self._fadingLevel = (self._level)?;
+            self._fade = 0.0f;
+            self:.writeFade ();
+        }
+
+        self._level = level;
+        self._selected = true;
+        true
+    }
+
+    /**
+     * Write the progress of the cross-fade in the world uniform buffer
+     * */
+    fn writeFade (mut self) {
+        if let Ok (dmut world) = alias self._world {
+            world:.setData (mat4::size, self._fade, commit-> true);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ====================================          DRAWING          =====================================
      * ====================================================================================================
      * ====================================================================================================
      */
 
     /**
-     * Register the mesh using the command allocator
+     * Register the mesh using the command allocator, the two levels of a cross-fade, their first instance telling the
+     * shaders which one is which
      * @assume: the command allocator is in load mode
      * @params:
      *    - cmd: the command allocator in which the mesh has to be registered
      */
     pub over register (mut self, dmut cmd : &IndexedDrawCommandAllocator) {
-        if let Ok (ibo) = self._ibo {
-            cmd:.registerIndexedObject (ibo.getNbPoints ());
+        if !self._ibo.hasValue { return; }
+
+        if let Ok (fading) = self._fadingLevel {
+            let outgoing = self._lods.levels [fading], incoming = self._lods.levels [self._level];
+            cmd:.registerIndexedObject (outgoing.count, firstIndex-> outgoing.firstIndex, firstInstance-> OUTGOING_DRAW);
+            cmd:.registerIndexedObject (incoming.count, firstIndex-> incoming.firstIndex, firstInstance-> INCOMING_DRAW);
+        } else {
+            let level = self._lods.levels [self._level];
+            cmd:.registerIndexedObject (level.count, firstIndex-> level.firstIndex);
         }
+    }
+
+    /**
+     * @returns: the number of draws registered by the mesh
+     * */
+    fn getNbDraws (self)-> u32 {
+        if !self._ibo.hasValue { 0u32 }
+        else if self._fadingLevel.hasValue { 2u32 }
+        else { 1u32 }
     }
 
     /**
@@ -261,7 +360,9 @@ pub class IndexedMesh3D over VisualInstance3D {
             i.select (cmd.getCommandBuffer ());
         }
 
-        cmd:.drawNextIndexed ();
+        for _ in 0u32 .. self.getNbDraws () {
+            cmd:.drawNextIndexed ();
+        }
     }
 
     /**
@@ -284,7 +385,9 @@ pub class IndexedMesh3D over VisualInstance3D {
             i.select (cmd.getCommandBuffer ());
         }
 
-        cmd:.drawNextIndexed ();
+        for _ in 0u32 .. self.getNbDraws () {
+            cmd:.drawNextIndexed ();
+        }
     }
 
     /*!
@@ -369,3 +472,18 @@ pub class IndexedMesh3D over VisualInstance3D {
     }
 
 }
+
+/**
+ * The time a cross-fade between two levels of detail lasts, in milliseconds
+ * */
+def FADE_DURATION = 250.0f;
+
+/**
+ * The first instance of the draw of the outgoing level of a cross-fade, read by the shaders (0 draws a level alone)
+ * */
+def OUTGOING_DRAW = 1u32;
+
+/**
+ * The first instance of the draw of the incoming level of a cross-fade
+ * */
+def INCOMING_DRAW = 2u32;
