@@ -276,6 +276,16 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Parts:** none
 - **Properties:** none
 
+### `FrameGraph`
+
+- **Attributes:** `frames`: an integer of 0 or more
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **States:** `hover`, `focus`, `check`
+- **Parts:** `cpu`, `gpu`, `memory`
+- **Properties:** none
+
 ### `GridLayout`
 
 - **Attributes:** none
