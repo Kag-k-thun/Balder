@@ -1,0 +1,157 @@
+in lod;
+
+pub mod ::simplify;
+
+use balder::math::vector;
+use balder::scene::node::node3D::visual::lod::simplify;
+
+/**
+ * A level of detail of a mesh, a range of its index buffer
+ * */
+pub record LodLevel {
+
+    // The offset of the first index of the level in the index buffer
+    pub let mut firstIndex : u32 = 0u32;
+
+    // The number of indices of the level
+    pub let mut count : u32 = 0u32;
+
+    // The largest distance from the level to the full mesh, in the unit of the positions of the mesh
+    pub let mut error : f32 = 0.0f;
+
+    pub self (firstIndex : u32, count : u32, error : f32)
+        with firstIndex = firstIndex
+        , count = count
+        , error = error
+    {}
+
+}
+
+/**
+ * The levels of detail of a mesh, sharing its vertices: the indices of every level follow each other in one index
+ * buffer, the full mesh first, so a level is drawn by drawing a range of that buffer
+ * */
+pub record LodChain {
+
+    // The indices of every level, the full mesh first
+    pub let mut indices : [u32] = [];
+
+    // The levels, from the full mesh to the coarsest
+    pub let mut levels : [LodLevel] = [];
+
+    /**
+     * A chain of one level, the full mesh
+     * */
+    pub self (indices : [u32])
+        with indices = indices
+        , levels = copy [LodLevel (0u32, cast!u32 (indices.len), 0.0f)]
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SELECTION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Select the coarsest level whose error stays under a threshold once drawn
+     * @info: a level only gets coarser when its error is a fifth under the threshold, so a mesh at the boundary
+     * between two levels does not switch between them at each move of the camera
+     * @params:
+     *    - current: the level drawn
+     *    - unitSize: the size on screen of one unit of the positions of the mesh
+     *    - threshold: the largest error to draw, in the unit of unitSize
+     * @returns: the level to draw
+     * */
+    pub fn select (self, current : usize, unitSize : f32, threshold : f32)-> usize {
+        if self.levels.len == 0us { return 0us; }
+
+        let mut level = if current < self.levels.len { current } else { self.levels.len - 1us };
+        while level > 0us && self.levels [level].error * unitSize > threshold {
+            level -= 1us;
+        }
+
+        if level == current {
+            while level + 1us < self.levels.len && self.levels [level + 1us].error * unitSize <= threshold * HYSTERESIS {
+                level += 1us;
+            }
+        }
+
+        level
+    }
+
+}
+
+/**
+ * The fraction of the threshold under which the error of a coarser level has to be to switch to it
+ * */
+def HYSTERESIS = 0.8f;
+
+/**
+ * Build the levels of detail of a mesh, each level having a fraction of the triangles of the previous one
+ * @info: one simplification of the full mesh, stopped at each level, so the error of every level is measured against
+ * the full mesh; the chain stops when a level cannot remove a quarter of the triangles of the previous one without
+ * going over the error limit
+ * @params:
+ *    - positions: the positions of the vertices of the mesh
+ *    - indices: the triangles of the mesh
+ *    - maxLevels: the largest number of levels, the full mesh included
+ *    - ratio: the fraction of the triangles of a level kept in the next one
+ *    - maxError: the largest error of a level, relative to the largest dimension of the mesh
+ *    - minTriangles: the number of triangles under which no coarser level is built
+ * @returns: the chain of levels
+ * */
+pub fn buildLodChain (positions : [vec3],
+                      indices : [u32],
+                      maxLevels : usize = 5us,
+                      ratio : f32 = 0.5f,
+                      maxError : f32 = 0.05f,
+                      minTriangles : usize = 64us)-> LodChain
+{
+    let mut chain = LodChain (indices);
+    let mut previous = indices.len;
+    let dmut simplifier = Simplifier (positions, indices);
+
+    while chain.levels.len < maxLevels && previous / 3us > minTriangles {
+        let target = cast!usize (cast!u64 (cast!f32 (cast!u64 (previous / 3us)) * ratio)) * 3us;
+        let (simplified, error) = simplifier:.simplify (target, maxError);
+        if simplified.len == 0us || simplified.len * 4us > previous * 3us { break; }
+
+        chain.levels = chain.levels ~ [LodLevel (cast!u32 (chain.indices.len), cast!u32 (simplified.len), error)];
+        chain.indices = chain.indices ~ simplified;
+        previous = simplified.len;
+    }
+
+    chain
+}
+
+/**
+ * Point the indices of the vertices drawing the same data to the first of them
+ * @info: an importer splits vertices on attributes the shaders never read (tangents...), each split vertex being
+ * another wedge of its position for the simplification, which cannot move a position with more than two of them
+ * @params:
+ *    - indices: the triangles of the mesh
+ *    - vertices: the data drawn of the vertices, 'stride' floats each
+ *    - stride: the number of floats of a vertex
+ * @returns: the indices, each vertex replaced by the first one drawing the same data
+ * */
+pub fn weldVertices (indices : [u32], vertices : [f32], stride : usize)-> [u32] {
+    if stride == 0us { return indices; }
+
+    let nbVertices = vertices.len / stride;
+    let dmut first : [[f32] => u32] = copy [];
+    let dmut welded = copy [0u32 ; nbVertices];
+    for i in 0us .. nbVertices {
+        let data = vertices [i * stride .. (i + 1us) * stride];
+        if let Ok (j) = first [data] {
+            welded [i] = j;
+        } else {
+            first [data] = cast!u32 (i);
+            welded [i] = cast!u32 (i);
+        }
+    }
+
+    copy [welded [i] for i in indices]
+}
