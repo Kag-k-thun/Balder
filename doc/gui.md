@@ -317,7 +317,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** any number
 - **Attributes of the children:** none
 - **States:** `hover`, `focus`, `check`
-- **Parts:** `grip`, `bbox`
+- **Parts:** `grip` (states `hover`), `bbox`
 - **Properties:** `direction`: row or column
 
 ### `TabLayout`
