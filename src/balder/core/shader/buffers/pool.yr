@@ -1,0 +1,313 @@
+in pool;
+
+use balder::core::{dispose, error, memory::_};
+use balder::core::driver::device;
+
+use std::algorithm::comparison;
+
+use ::vulkan::core;
+
+#if DEBUG
+use balder::utils::log;
+#end
+
+/**
+ * The vertices and the indices of a mesh in a geometry pool
+ * */
+@final
+pub class GeometryRange {
+
+    // The pool holding the range
+    let dmut _pool: &GeometryPool;
+
+    // The first vertex of the range, the vertex offset of its draws
+    pub let vertexOffset: u32;
+
+    // The number of vertices of the range
+    pub let nbVertices: u32;
+
+    // The first index of the range, its indices counting from its first vertex
+    pub let firstIndex: u32;
+
+    // The number of indices of the range
+    pub let nbIndices: u32;
+
+    // True once the range was given back to the pool
+    let mut _freed: bool = false;
+
+    pub self (dmut pool: &GeometryPool, vertexOffset: u32, nbVertices: u32, firstIndex: u32, nbIndices: u32)
+        with _pool = alias pool
+        , vertexOffset = vertexOffset
+        , nbVertices = nbVertices
+        , firstIndex = firstIndex
+        , nbIndices = nbIndices
+    {}
+
+    // Disposing from the collector races with the GPU, the range has to be retired
+#if DEBUG
+    __dtor(mut self) {
+        if !self._freed {
+            log::warn #("Dispose", self.__typeinfo__.name, "collected without being retired");
+        }
+    }
+#end
+
+    impl Disposable {
+
+        /**
+         * Give the range back to the pool
+         * @warning: through a retire, the recordings in use may still draw it
+         * */
+        pub over dispose(mut self) {
+            if self._freed { return; }
+
+            self._freed = true;
+            self._pool:.free(self.vertexOffset, self.nbVertices, self.firstIndex, self.nbIndices);
+        }
+    }
+}
+
+/**
+ * Vertices and indices of the meshes drawn by a pipeline, suballocated in one vertex buffer and one index buffer, so
+ * the draws of the meshes bind them once and are placed by their first index and their vertex offset
+ * @info: a buffer full is replaced by a larger one holding the same content at the same offsets, the replaced one being
+ * retired, so the recordings using it are done again
+ * */
+@final
+pub class GeometryPool {
+
+    // The device the buffers are allocated on
+    let dmut _device: &VulkanDevice;
+
+    // The number of floats of a vertex
+    let _stride: u32;
+
+    // The buffer holding the vertices
+    let dmut _vertices: (&Buffer)? = none;
+
+    // The buffer holding the indices
+    let dmut _indices: (&Buffer)? = none;
+
+    // The vertices in use, in vertices
+    let dmut _vertexSlots: &SegmentList = copy SegmentList(0us);
+
+    // The indices in use, in indices
+    let dmut _indexSlots: &SegmentList = copy SegmentList(0us);
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create an empty pool, its buffers being allocated by the first range
+     * @params:
+     *    - device: the device the buffers are allocated on
+     *    - stride: the number of floats of a vertex
+     * */
+    pub self (dmut device: &VulkanDevice, stride: u32)
+        with _device = alias device
+        , _stride = stride
+    {}
+
+    // Disposing from the collector races with the GPU and with the device teardown, the object has to be retired
+#if DEBUG
+    __dtor(mut self) {
+        if self._vertices.hasValue {
+            log::warn #("Dispose", self.__typeinfo__.name, "collected without being retired");
+        }
+    }
+#end
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of floats of a vertex
+     * */
+    pub fn getStride(self)-> u32 {
+        self._stride
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          ALLOCATION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Place a mesh in the pool and upload it
+     * @params:
+     *    - vertices: the vertices of the mesh, 'stride' floats each
+     *    - indices: the indices of the mesh, counting from its first vertex
+     * @returns: the range of the mesh, to retire once not drawn anymore
+     * */
+    pub fn alloc(mut self, vertices: [f32], indices: [u32])-> dmut &GeometryRange
+        throws BalderError
+    {
+        let nbVertices = vertices.len / cast!usize(self._stride);
+        if nbVertices == 0us || indices.len == 0us {
+            throw copy BalderError("Cannot place an empty mesh in a geometry pool");
+        }
+
+        atomic self {
+            let vertexOffset = self:.reserve(true, nbVertices);
+            let firstIndex   = self:.reserve(false, indices.len);
+
+            if let Ok(dmut vbo) = alias self._vertices {
+                vbo:.updateAt(vertexOffset * cast!usize(self._stride) * f32::size, vertices);
+            }
+
+            if let Ok(dmut ibo) = alias self._indices {
+                ibo:.updateAt(firstIndex * u32::size, indices);
+            }
+
+            return copy GeometryRange(alias self,
+                                      cast!u32(vertexOffset),
+                                      cast!u32(nbVertices),
+                                      cast!u32(firstIndex),
+                                      cast!u32(indices.len));
+        }
+    }
+
+    /**
+     * Give back the vertices and the indices of a range
+     * */
+    pub fn free(mut self, vertexOffset: u32, nbVertices: u32, firstIndex: u32, nbIndices: u32) {
+        atomic self {
+            if !self._vertices.hasValue { return; }
+
+            self._vertexSlots:.free(cast!usize(vertexOffset), cast!usize(nbVertices));
+            self._indexSlots:.free(cast!usize(firstIndex), cast!usize(nbIndices));
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Bind the vertex and the index buffers of the pool for the next draws
+     * @info: binds the buffers of the moment, holding the ranges placed until then
+     * */
+    pub fn select(self, cmd: VkCommandBuffer) {
+        atomic self {
+            if let Ok(vbo) = self._vertices {
+                let buffer = vbo.getVulkanBuffer();
+                let offset = 0u64;
+                vkCmdBindVertexBuffers(cmd, 0u32, 1u32, &buffer, &offset);
+            }
+
+            if let Ok(ibo) = self._indices {
+                vkCmdBindIndexBuffer(cmd, ibo.getVulkanBuffer(), 0u64, VkIndexType::VK_INDEX_TYPE_UINT32);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve 'size' elements in the vertex or the index buffer, replacing it with a larger one when it is full
+     * @atomic
+     * @params:
+     *    - vertices: true for the vertex buffer, false for the index buffer
+     *    - size: the number of elements to reserve
+     * @returns: the first element reserved
+     * */
+    fn reserve(mut self, vertices: bool, size: usize)-> usize
+        throws BalderError
+    {
+        let dmut slots = if vertices { alias self._vertexSlots } else { alias self._indexSlots };
+        if let Ok(offset) = slots:.alloc(size, 1us) { return offset; }
+
+        let capacity = max(max(slots.getSize() * 2us, slots.getReservedEnd() + size), MIN_ELEMENTS);
+        let elemSize = if vertices { cast!usize(self._stride) * f32::size } else { u32::size };
+        let usage    = if vertices {
+            VkBufferUsageFlagBits::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+        } else {
+            VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+        };
+
+        let dmut larger = self._device
+            :.getMemoryAllocator()
+            :.allocBuffer(capacity * elemSize,
+                          cast!u32(usage
+                                   | VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                   | VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_DST_BIT),
+                          cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+
+        // the content keeps its offsets, the recordings binding the replaced buffer are done again
+        if vertices {
+            if let Ok(dmut o) = alias self._vertices {
+                larger:.copyFrom(o, slots.getSize() * elemSize);
+                self._device:.retire(&o:.dispose);
+            }
+
+            self._vertices = (alias larger)?;
+        } else {
+            if let Ok(dmut o) = alias self._indices {
+                larger:.copyFrom(o, slots.getSize() * elemSize);
+                self._device:.retire(&o:.dispose);
+            }
+
+            self._indices = (alias larger)?;
+        }
+
+        slots:.grow(capacity);
+        if let Ok(offset) = slots:.alloc(size, 1us) { return offset; }
+
+        throw copy BalderError("Failed to reserve a range in a geometry pool");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            atomic self {
+                if let Ok(dmut vbo) = alias self._vertices {
+                    vbo:.dispose();
+                    self._vertices = none;
+                }
+
+                if let Ok(dmut ibo) = alias self._indices {
+                    ibo:.dispose();
+                    self._indices = none;
+                }
+
+                self._vertexSlots = copy SegmentList(0us);
+                self._indexSlots = copy SegmentList(0us);
+            }
+        }
+    }
+}
+
+/**
+ * The smallest number of vertices, or of indices, a buffer of a pool holds
+ * */
+def MIN_ELEMENTS = 4096us;
