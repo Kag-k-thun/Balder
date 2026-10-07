@@ -6,15 +6,14 @@ layout (location = 1) in vec3 inNormals;
 // The cross-fade of the draw, see the vertex shader
 layout (location = 3) flat in vec2 inFade;
 
+// The material of the object
+layout (location = 4) flat in uint inMaterial;
+
 layout (location = 0) out vec3 position;
 layout (location = 1) out vec3 normals;
 layout (location = 2) out vec3 binormals;
 layout (location = 3) out vec4 albedo;
 layout (location = 4) out uint materialID;
-
-layout(set = 0, binding = 2) uniform Material {    
-    uint materialID;
-} material;
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -45,5 +44,5 @@ void main() {
     normals = vec3 (inNormals);
     binormals = vec3 (inNormals);
     albedo = vec4 (1, 1, 1, 1); 
-    materialID = material.materialID;
+    materialID = inMaterial;
 }
