@@ -89,6 +89,9 @@ pub class Window {
         // Semaphore posted when a frame is requested
         let dmut _frameSemaphore: &Semaphore = copy Semaphore();
 
+        // True when the window was exposed since the last frame, the next one being drawn without waiting
+        let mut _exposed: bool = false;
+
         // The minimal duration of a frame, by default 60 frames per second
         let mut _frameDuration: Duration = dur::millis(16u64) + dur::micros(666u64);
 
@@ -239,7 +242,9 @@ pub class Window {
     pub fn configureInputEvents(mut self) {
         let dmut input = self:.getInputManager();
 
-        input:.windowResized():.connect(alias self._box, &self:.onResize);
+        // Woken from the main thread as soon as the events are pumped, under Wayland the compositor waits for the
+        // frame of a size to resize the window again
+        input:.windowResized():.connect(alias self._app:.getRootSlotEmitter(), &self:.onResize);
         input:.windowExposed():.connect(alias self._app:.getRootSlotEmitter(), &self:.onExpose);
     }
 
@@ -302,6 +307,11 @@ pub class Window {
      * Slot called when the window is exposed
      * */
     pub fn onExpose(mut self) {
+        // Under Wayland, a resized window gets its new size once a frame is presented, the frame is drawn right away
+        atomic self {
+            self._exposed = true;
+        }
+
         self:.requestFrame();
     }
 
@@ -889,7 +899,20 @@ pub class Window {
         if (self._frameDuration > tick) {
             let x = Instant::now();
             let r = self._frameDuration - tick - dur::micros(1u64);
-            sleep(r);
+            let deadline = x + r;
+
+            // The frame of a resized or exposed window is drawn right away, woken by the frame request of the event
+            loop {
+                if self:.takeExposed() || self.isResized() {
+                    self._frameTimer:.reset();
+                    return;
+                }
+
+                let now = Instant::now();
+                if now >= deadline { break; }
+
+                self._frameSemaphore:.wait(timeout-> deadline - now);
+            }
 
             let z = (Instant::now() - x) - r;
             self._frameTimer:.reset(z);
@@ -900,6 +923,25 @@ pub class Window {
             // Idle since the last frame, the next one starts a frame duration from now
             self._frameTimer:.reset();
         }
+    }
+
+    /**
+     * @returns: true iif the window was exposed since the last call
+     */
+    fn takeExposed(mut self)-> bool {
+        atomic self {
+            let exposed = self._exposed;
+            self._exposed = false;
+            exposed
+        }
+    }
+
+    /**
+     * @returns: true iif the window was resized since the swap chain was created
+     */
+    fn isResized(self)-> bool {
+        let (w, h) = self.getDimension();
+        !self._vkDevice.isSizedFor(w, h)
     }
 
     /**
