@@ -24,6 +24,36 @@ pub def REFERENCE_DPI = 96.0f;
 lazy dmut __FIRST_WINDOW__ = copy [true];
 
 /**
+ * The measures of the last frame of a window
+ */
+pub record FrameStats {
+
+    // The number of frames presented by the window, the measures changing with it
+    pub let index: u64;
+
+    // The time the rendering thread worked on the last frame, without its waits (for the layout, the image of the swap
+    // chain and the previous submission of the frame slot)
+    pub let cpu: Duration;
+
+    // The time the GPU spent on the passes of the last frame whose submission was awaited
+    pub let gpu: Duration;
+
+    // The size in bytes of the device memory held by the window
+    pub let memory: usize;
+
+    // The size in bytes of the memory local to the device of the window
+    pub let available: usize;
+
+    pub self (index: u64, cpu: Duration, gpu: Duration, memory: usize, available: usize)
+        with index = index
+        , cpu = cpu
+        , gpu = gpu
+        , memory = memory
+        , available = available
+    {}
+}
+
+/**
  * Class managing a window and vulkan devices to enable 3D rendering
  */
 pub class Window {
@@ -103,6 +133,15 @@ pub class Window {
 
         // The number of frame rendered during the last second
         let mut _lastNbFrame: u32 = 0;
+
+        // The number of frames presented since the window started rendering
+        let mut _frameIndex: u64 = 0u64;
+
+        // The time the rendering thread worked on the last frame presented, without its waits
+        let mut _cpuTime: Duration = dur::micros(0u64);
+
+        // The time the current frame waited when it started, for the layout, the image and the previous submission
+        let mut _frameWait: Duration = dur::micros(0u64);
 
         // The mailbox to receive signals
         let dmut _box: &SlotEmitter = copy SlotEmitter();
@@ -388,6 +427,26 @@ pub class Window {
      * */
     pub fn getNbFramesLastSecond(self)-> u32 {
         self._lastNbFrame
+    }
+
+    /**
+     * @returns: the measures of the last frame presented: the time the CPU and the GPU spent on it, and the device memory
+     * held by the window out of the memory of the device
+     * */
+    pub fn getFrameStats(self)-> FrameStats {
+        let (index, cpu) = atomic self {
+            (self._frameIndex, self._cpuTime)
+        };
+
+        let gpu = if let Ok(pipe) = self._pipeline { pipe.getGpuTime() } else { dur::micros(0u64) };
+        FrameStats(index, cpu, gpu, self._vkDevice.getUsedMemory(), self._vkDevice.getAvailableMemory())
+    }
+
+    /**
+     * @returns: the shortest duration of a frame, the inverse of the configured frame rate
+     * */
+    pub fn getFrameDuration(self)-> Duration {
+        self._frameDuration
     }
 
     /**
@@ -711,13 +770,22 @@ pub class Window {
         log::debug #("Window", "start rendering thread");
 
         while self._isRunning {
+            let start = Instant::now();
             self._box:.emit();
             let image = self:.startFrame();
 
             if (image >= 0) {
                 self:.submitFrame();
+
+                // The present may wait for the presentation engine, it is not counted
+                let cpu = (Instant::now() - start) - self._frameWait;
                 self:.presentFrame(image);
                 self._nbFrame += 1u32;
+
+                atomic self {
+                    self._cpuTime = cpu;
+                    self._frameIndex += 1u64;
+                }
             } else {
                 if let Ok(dmut pipe) = alias self._pipeline {
                     pipe:.forceRedraw();
@@ -987,6 +1055,7 @@ pub class Window {
 
             // A frame drawn at the new size of the window with the layout of the previous one would show the widgets
             // misplaced until the next frame
+            let wait = Instant::now();
             self:.awaitLayout(w, h);
 
             // The frame is the one of the image acquired, its previous submission is awaited once it is known
@@ -995,6 +1064,7 @@ pub class Window {
                 pipe:.waitPreviousFrame();
             }
 
+            self._frameWait = Instant::now() - wait;
             image
         } else {
             -1
