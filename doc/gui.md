@@ -3,7 +3,7 @@
 A `.gui` file says which widgets exist, what they say and how they behave. A `.style` file says how they look and
 where they go. Both share one lexer and one grammar of values. This page describes the language as Balder reads it
 today; [gui-v2.md](gui-v2.md) is the design it comes from, and still describes parts that are not implemented yet
-(components, signals, `@when` variables, the CSS box model).
+(components, signals, the CSS box model).
 
 The second half of the page, from [Widget types](#widget-types) on, is generated from the widget registry and the
 property table by `gyllir run reference`, and a test fails when it no longer matches the code.
@@ -136,8 +136,54 @@ compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part {
 
 ### Conditions
 
-`@when (condition) { … }` blocks are read and checked, inside a rule (declarations) or at the top level (rules), but no
-condition holds yet: the variables they test (`width`, `window.width`, `app.mode`, …) come with BAL-67.
+A `@when (condition) { … }` block applies while its condition holds. Inside a rule it holds declarations, which keep the
+specificity of the rule and come after its own declarations. At the top level it holds rules, which apply while the
+condition holds. Any property can be set, sizes included.
+
+```
+$narrow: 560;
+
+LinearLayout.row {
+    direction: row;
+    @when (width < $narrow) { direction: column; }
+}
+
+@when (window.width < 900) {
+    LinearLayout.inspector { display: none; }
+}
+
+@when (app.mode == edit and not app.read-only) {
+    LinearLayout.toolbar { display: normal; }
+}
+```
+
+| Variable | Value |
+|---|---|
+| `width`, `height` | the space available to the widget: the content box of its nearest ancestor whose size on that axis is fixed, the window for the root |
+| `window.width`, `window.height` | the size of the window, in layout pixels |
+| `window.scale` | the display scale, 1.5 on an output scaled to 150% |
+| `window.density` | the physical pixels in a layout pixel |
+| `window.dpi` | the dots per inch of the display |
+| `app.name` | a string, a number or a boolean published by the application: `manager:.setVariable ("mode", "edit")` |
+
+- A test compares a variable to a value with `<` `<=` `>` `>=` `==` `!=`, and tests combine with `and`, `or` (`and`
+  binding tighter), `not` and parentheses. A variable alone tests a boolean: true, a number other than 0, a string
+  other than `""`.
+- Numbers compare to numbers, without a unit or in `px`. Strings and booleans compare to keywords and strings with `==`
+  and `!=` (`app.mode == edit`, `app.compact == true`). A variable that is not set, or a value of another kind than the
+  variable, makes its test false.
+- A variable other than these, a percentage, a value that is neither a number, a keyword nor a string, an order
+  between strings, or a keyword compared to `width`, `height` or a variable of the window, is an error at load.
+- An ancestor's size is fixed on an axis when it does not depend on its content: the root, a size in `px`, a percentage
+  or an `auto` size stretched in an ancestor of a fixed size (across a linear layout, both sides set in a floating
+  layout), the content of a tab or of a menu layout, a pane of a splitter across its axis, or along it when its
+  `min-width` (`min-height`) is a length. A condition never measures what it can change.
+- A resize, a change of scale or a `setVariable` styles again the widgets matched by rules reading that variable, then
+  lays them out again.
+
+`display: none` takes a widget out of the layout (it takes no space, its margins included) and out of the drawing, with
+its descendants; `display: normal`, the default, puts it back. A widget hidden by code (`Widget.hide`) stays hidden
+whatever its style says.
 
 ## Values
 
@@ -379,3 +425,4 @@ Every widget reads these properties. An inherited property passes from a widget 
 | `flex-shrink` | a number of 0 or more |  | yes |
 | `flex-basis` | a length, in px or %, auto, min-content or max-content |  | yes |
 | `flex` | a number, none, auto, or a grow, a shrink and a basis, setting `flex-grow`, `flex-shrink`, `flex-basis` |  | yes |
+| `display` | none or normal |  | yes |

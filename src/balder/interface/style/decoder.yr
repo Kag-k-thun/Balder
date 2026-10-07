@@ -5,7 +5,7 @@ use balder::interface::font::{family, registry};
 use balder::interface::loader::parser;
 use balder::interface::loader::registry;
 use balder::interface::loader::registry::{error, schema};
-use balder::interface::style::{implem, kinds, manager, table};
+use balder::interface::style::{conditions, implem, kinds, manager, table};
 
 use std::syntax::errors;
 
@@ -90,6 +90,10 @@ pub record StyleSheet {
  * The selectors are checked against the widget types: a type, a state, a part or a state of a part none of the types
  * they can select registers is an error, as a part anywhere but at the end of a selector. A rule testing a state cannot
  * set a property that affects the layout: hovering a widget must not move it.
+ *
+ * The conditions of the @when blocks read width, height, the variables of the window or those of the application
+ * (app.name), any other being an error. A variable is compared to a number in px or without unit, a keyword or a string;
+ * '<', '<=', '>' and '>=' compare numbers only, and the variables of the layout and of the window are numbers.
  * ====
  * */
 pub record SheetDecoder {
@@ -152,8 +156,13 @@ pub record SheetDecoder {
             self.checkSelector(sel);
         }
 
+        if let Ok(c) = rule.condition {
+            self.checkCondition(c);
+        }
+
         let mut whens: [StyleWhen] = [];
         for w in rule.whens {
+            self.checkCondition(w.condition);
             whens = whens ~ [StyleWhen(condition-> w.condition,
                                        style-> self.decodeStyle(w.declarations, rule.selectors),
                                        line-> w.line,
@@ -313,6 +322,68 @@ pub record SheetDecoder {
         }
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CONDITIONS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check that the tests of a condition read known variables, and compare them to values of their kind
+     * */
+    pub fn checkCondition(self, c: &Condition)
+        throws LoadError
+    {
+        if let t: &Test = c {
+            self.checkTest(t);
+        } else if let n: &Not = c {
+            self.checkCondition(n.operand);
+        } else if let a: &And = c {
+            for o in a.operands { self.checkCondition(o); }
+        } else if let o: &Or = c {
+            for x in o.operands { self.checkCondition(x); }
+        }
+    }
+
+    /**
+     * Check that a test reads a known variable, and compares it to a value of its kind
+     * */
+    fn checkTest(self, t: &Test)
+        throws LoadError
+    {
+        if !isKnown(t.variable) {
+            throw copy LoadError(self._file, "unknown variable '" ~ t.variable ~ "'", t.line, t.col);
+        }
+
+        let value = if let Ok(v) = t.value { v } else { return; };
+        let isNumber = if let Number(unit-> u) = value {
+            if u != "" && u != "px" {
+                throw self.refused(value, "a number, or a length in px");
+            }
+
+            true
+        } else {
+            match value {
+                Name() => {}
+                Text() => {}
+                _      => { throw self.refused(value, "a number, a length in px, a keyword or a string"); }
+            }
+
+            false
+        };
+
+        if isNumber { return; }
+        if t.comparison != Comparison::EQ && t.comparison != Comparison::NE {
+            throw self.refused(value, "a number to order");
+        }
+
+        if isNumeric(t.variable) {
+            throw self.refused(value, "a number, '" ~ t.variable ~ "' being one");
+        }
+    }
+
     /**
      * @returns: the error of a state or a part a compound tests, which none of the types it can select registers
      * @params:
@@ -324,6 +395,14 @@ pub record SheetDecoder {
         }
 
         copy LoadError(self._file, "unknown " ~ what, c.line, c.col)
+    }
+
+    /**
+     * @returns: the error of a value compared in a condition that is not of the kind expected, located at the value
+     * */
+    fn refused(self, value: &Value, what: [c8])-> &LoadError {
+        let e = value.expected(what);
+        copy LoadError(self._file, e.msg, e.line, e.col)
     }
 
     /**

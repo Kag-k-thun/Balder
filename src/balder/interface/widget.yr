@@ -8,6 +8,7 @@ use balder::interface::font::{chain, layout};
 use balder::interface::loader::parser;
 use balder::interface::shape;
 use balder::interface::shape::text;
+use balder::interface::style::conditions;
 use balder::interface::widget::sizing;
 use balder::interface::widget::layout::{flex, menu};
 use balder::math::vector;
@@ -116,8 +117,19 @@ pub class Widget {
         // The style set by code on the widget, applied over the rules of the sheets
         let mut _inlineStyle : &Style = copy Style ();
 
-        // True iif the widget is not displayed (and does not receive events)
+        // True iif the widget is hidden by code (and does not receive events), whatever its style says
         let mut _hidden : bool = false;
+
+        // True iif the style of the widget displays it, as it was last applied to its shapes and its children
+        let mut _displayed : bool = true;
+
+        // The variables read by the conditions of the rules matching the widget, its style being computed again when
+        // one of them changes
+        let mut _reads : [[c8]] = [];
+
+        // The space available to the widget when its style was last computed, read by the conditions as width and
+        // height
+        let mut _available : vec2 = vec2 ();
 
     }
 
@@ -182,7 +194,7 @@ pub class Widget {
             
             let dmut shape = shDr:.registerColorQuad (color-> self._currentStyle.getColor (c), level-> self._depth);
             self._shapes [c] = alias shape;
-            if self._hidden { shape:.hide (); }
+            if !self.isDrawn () { shape:.hide (); }
         } catch {
             _ => {
                 log::error #("Widget", "Failed to create color shape : ", c);
@@ -204,7 +216,7 @@ pub class Widget {
             
             let dmut shape = shDr:.registerTextureQuad (texture-> alias texture, level-> self._depth);
             self._shapes [c] = alias shape;
-            if self._hidden { shape:.hide (); }
+            if !self.isDrawn () { shape:.hide (); }
         } catch {
             err => {
                 log::error #("Widget", "Failed to create texture shape : ", c, " => ", err);
@@ -234,7 +246,7 @@ pub class Widget {
 
             let dmut shape = shDr:.registerText (alias chain, text, level-> self._depth);
             self._shapes [c] = alias shape;
-            if self._hidden { shape:.hide (); }
+            if !self.isDrawn () { shape:.hide (); }
         } catch {
             err => {
                 log::error #("Widget", "Failed to create text shape : ", c, " => ", err);
@@ -431,10 +443,99 @@ pub class Widget {
         self:.computePostBorderSize ();
         self:.computePostPaddingSize ();
 
-        self:.onUpdateSize ();
+        // a widget out of the layout leaves its children where they are, hidden with it
+        if self._currentStyle.isDisplayed () {
+            self:.onUpdateSize ();
+        }
+
         self:.applyStyle ();
     }
 
+
+    /**
+     * @returns: the space available to the widget, read by the conditions of the style sheets as width and height: on
+     * each axis, the content box of its nearest ancestor whose size on that axis is fixed, the window for the root
+     * @info: an ancestor of a fixed size does not move when the conditions change the style of what it contains, so
+     * that a condition never measures what it changes
+     * */
+    @{final}
+    pub fn getAvailableSize (self)-> vec2 {
+        if let Ok (p) = self._parent {
+            return makeVec2 (p.getFixedContent (true), p.getFixedContent (false));
+        }
+
+        self._manager.getLayoutSize ()
+    }
+
+    /**
+     * @returns: true iif the size of the widget on an axis depends neither on its content nor on what its content can
+     * change: the root, filling the window, or a widget its parent sizes from boxes of a fixed size only (fixesSizeOf)
+     * @params:
+     *    - row: true for the width, false for the height
+     * */
+    @{final}
+    pub fn isSizeFixed (self, row : bool)-> bool {
+        if let Ok (p) = self._parent {
+            return self._ownerPart == "" && p.fixesSizeOf (self, row);
+        }
+
+        true
+    }
+
+    /**
+     * @returns: true iif the widget gives a child a size on an axis that depends neither on the content of the child
+     * nor on what it can change, false unless the layout knows better
+     * @params:
+     *    - child: the child
+     *    - row: true for the width, false for the height
+     * */
+    prot fn fixesSizeOf (self, _ : &Widget, _ : bool)-> bool {
+        false
+    }
+
+    /**
+     * @returns: true iif a child sized from its style in the content box of the widget, an auto size filling it, has a
+     * fixed size on an axis: a length in px, or a percentage or auto in a widget whose size is fixed on that axis, its
+     * bounds not depending on its content
+     * @params:
+     *    - child: the child
+     *    - row: true for the width, false for the height
+     * */
+    @{final}
+    prot fn fixesStretched (self, child : &Widget, row : bool)-> bool {
+        let style = child.getStyle ();
+        let (size, lower, upper) = if row {
+            (style.width._1, style.minWidth._1, style.maxWidth._1)
+        } else {
+            (style.height._1, style.minHeight._1, style.maxHeight._1)
+        };
+
+        if needsContent (lower) || needsContent (upper) { return false; }
+
+        match size.sizing {
+            Sizing::LENGTH => { size.length.unit == Unit::PX || self.isSizeFixed (row) }
+            Sizing::AUTO   => { self.isSizeFixed (row) }
+            _              => { false }
+        }
+    }
+
+    /**
+     * @returns: the size of the content box of the widget on an axis if its size on that axis is fixed, that of its
+     * nearest ancestor of a fixed size otherwise
+     * */
+    @{final}
+    fn getFixedContent (self, row : bool)-> f32 {
+        if self.isSizeFixed (row) {
+            return if row { self._absoluteSize.x } else { self._absoluteSize.y };
+        }
+
+        if let Ok (p) = self._parent {
+            return p.getFixedContent (row);
+        }
+
+        let window = self._manager.getLayoutSize ();
+        if row { window.x } else { window.y }
+    }
 
     /**
      * Lay the widget out again after its content changed, the whole interface when its size can depend on its content,
@@ -532,7 +633,8 @@ pub class Widget {
 
     /**
      * Measure the border-box width of the widget in a container, its width resolved against the container, an auto
-     * width stretched to the container or fitted to its content in it, then clamped to its bounds
+     * width stretched to the container or fitted to its content in it, then clamped to its bounds, 0 for a widget out
+     * of the layout (display: none)
      * @params:
      *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
      *    - stretch: true for an auto width to fill the container, false for it to fit the content in it
@@ -554,6 +656,8 @@ pub class Widget {
     @{final}
     pub fn measureWidth (mut self, container : vec2, space : f32, stretch : bool)-> f32 {
         let style = self._currentStyle;
+        if !style.isDisplayed () { return 0.0f; }
+
         let frame = self.getFrame (container).x;
         let fill = stretch && space >= 0.0f;
         let content = self:.contentWidths ((style.width._1).isAuto () && !fill,
@@ -594,6 +698,8 @@ pub class Widget {
     @{final}
     pub fn measureHeight (mut self, width : f32, container : vec2, space : f32, stretch : bool)-> f32 {
         let style = self._currentStyle;
+        if !style.isDisplayed () { return 0.0f; }
+
         let frame = self.getFrame (container);
         let fill = stretch && space >= 0.0f;
         let content = self:.contentHeight ((style.height._1).isAuto () && !fill, width - frame.x,
@@ -617,6 +723,8 @@ pub class Widget {
      * */
     @{final}
     pub fn resolveWidth (mut self, size : Size, container : vec2)-> (f32)? {
+        if !self._currentStyle.isDisplayed () { return (0.0f)?; }
+
         resolveBox (size, container.x, self.getFrame (container).x, self:.contentWidths (false, copy [size]))
     }
 
@@ -630,6 +738,8 @@ pub class Widget {
      * */
     @{final}
     pub fn resolveHeight (mut self, size : Size, width : f32, container : vec2)-> (f32)? {
+        if !self._currentStyle.isDisplayed () { return (0.0f)?; }
+
         let frame = self.getFrame (container);
         resolveBox (size, container.y, frame.y, self:.contentHeight (false, width - frame.x, copy [size]))
     }
@@ -645,6 +755,8 @@ pub class Widget {
     @{final}
     pub fn measureFlexItem (mut self, row : bool, container : vec2, width : f32 = 0.0f)-> FlexItem {
         let style = self._currentStyle;
+        if !style.isDisplayed () { return FlexItem (shrink-> 0.0f, max-> 0.0f); }
+
         let frame = self.getFrame (container);
         if row {
             flexItemOf (style.width._1, style.flexBasis._1, style.minWidth._1, style.maxWidth._1, container.x, frame.x,
@@ -664,6 +776,8 @@ pub class Widget {
     @{final}
     pub fn measureIntrinsicWidths (mut self)-> (f32, f32) {
         let style = self._currentStyle;
+        if !style.isDisplayed () { return (0.0f, 0.0f); }
+
         let container = makeVec2 (INDEFINITE_SIZE, INDEFINITE_SIZE);
         let frame = self.getFrame (container).x;
         let margins = self.getMarginSize (container).x;
@@ -687,6 +801,8 @@ pub class Widget {
      * */
     @{final}
     pub fn measureIntrinsicHeight (mut self, width : f32)-> f32 {
+        if !self._currentStyle.isDisplayed () { return 0.0f; }
+
         let container = makeVec2 (INDEFINITE_SIZE, INDEFINITE_SIZE);
         self:.measureHeight (width, container, stretch-> false) + self.getMarginSize (container).y
     }
@@ -869,33 +985,43 @@ pub class Widget {
      */
 
     /**
-     * Hide the widget and all its shapes
+     * Hide the widget and all its shapes, whatever its style says
      * */
     @{final}
     pub fn hide (mut self) {
         self:.onHide ();
 
-        if !self._hidden {
+        if self.isDrawn () {
             self:.hideShapes ();
-            self._hidden = true;
+        }
+
+        self._hidden = true;
+        self:.applyStyle ();
+    }
+
+    /**
+     * Show the widget and all its shapes, unless its style displays none
+     * */
+    @{final}
+    pub fn show (mut self) {
+        let wasDrawn = self.isDrawn ();
+        self._hidden = false;
+        if self._displayed {
+            self:.onShow ();
+            if !wasDrawn {
+                self:.showShapes ();
+            }
         }
 
         self:.applyStyle ();
     }
 
     /**
-     * Show the widget and all its shapes
+     * @returns: true iif the widget is drawn: neither hidden by code nor displayed none by its style
      * */
     @{final}
-    pub fn show (mut self) {
-        self:.onShow ();
-
-        if self._hidden {
-            self:.showShapes ();
-            self._hidden = false;
-        }
-
-        self:.applyStyle ();
+    pub fn isDrawn (self)-> bool {
+        !self._hidden && self._displayed
     }
 
 
@@ -1319,8 +1445,52 @@ pub class Widget {
     fn computeStyle (mut self)-> &Style {
         let parent = if let Ok (p) = self._parent { p.getStyle () } else { copy Style () };
         let parts = if let Ok (schema) = self._manager:.getRegistry ().get (self.typeName) { schema.parts } else { [] };
+        let path = self.getStylePath ();
 
-        self._manager:.getStyleManager ().compute (self.getStylePath (), parent, parts-> parts, inline-> (self._inlineStyle)?)
+        self._reads = self._manager:.getStyleManager ().reads (path);
+        let available = if self.readsAvailable () {
+            self._available = self.getAvailableSize ();
+            (self._available)?
+        } else { none };
+
+        let scope = ConditionScope (self._manager.getStyleVariables (), available-> available);
+        self._manager:.getStyleManager ().compute (path, parent, parts-> parts, inline-> (self._inlineStyle)?, scope-> scope)
+    }
+
+    /**
+     * Compute the style of the widget again when one of the variables its conditions read changed, or when they read
+     * width or height and the space available to it changed since its style was computed
+     * @params:
+     *    - names: the variables that changed
+     * @returns: true iif a property that affects the layout changed, in the widget or in a descendant
+     * */
+    pub fn restyleConditions (mut self, names : [[c8]])-> bool {
+        if !self._attached || self._ownerPart != "" { return false; }
+
+        let mut changed = false;
+        for r in self._reads {
+            for n in names {
+                if r == n { changed = true; }
+            }
+        }
+
+        if !changed && self.readsAvailable () {
+            changed = self.getAvailableSize () != self._available;
+        }
+
+        if changed { self:.restyle (false) } else { false }
+    }
+
+    /**
+     * @returns: true iif the conditions of the rules matching the widget read the space available to it
+     * */
+    @{final}
+    fn readsAvailable (self)-> bool {
+        for r in self._reads {
+            if r == AvailableVariable::WIDTH || r == AvailableVariable::HEIGHT { return true; }
+        }
+
+        false
     }
 
     /**
@@ -1353,6 +1523,7 @@ pub class Widget {
     prv fn applyStyle (mut self) {
         if !self._attached { return; }
 
+        self:.applyDisplay ();
         if self._hasBackground {
             self:.loadBackTexture ();
             self:.loadBackColor ();
@@ -1371,6 +1542,27 @@ pub class Widget {
         self:.onApplyStyle ();
     }
 
+
+    /**
+     * Take the display of the current style: a widget displayed none hides its shapes and its children, which are shown
+     * again when it is displayed normal, unless it is hidden by code
+     * */
+    @{final}
+    prv fn applyDisplay (mut self) {
+        let displayed = self._currentStyle.isDisplayed ();
+        if displayed == self._displayed { return; }
+
+        self._displayed = displayed;
+        if self._hidden { return; }
+
+        if displayed {
+            self:.onShow ();
+            self:.showShapes ();
+        } else {
+            self:.onHide ();
+            self:.hideShapes ();
+        }
+    }
 
     /**
      * Apply the background image style in case of update
@@ -1401,7 +1593,7 @@ pub class Widget {
                     {
                         let dmut newShape = shDr:.registerTextureQuad (texture-> self._backgroundTexture:.clone ());
                         self._shapes [WidgetShapeKind::IMAGE] = alias newShape;
-                        if self._hidden { newShape:.hide (); }
+                        if !self.isDrawn () { newShape:.hide (); }
 
                         self._backgroundTextureSize = makeVec2 (self._backgroundTexture.get ().width,
                                                                 self._backgroundTexture.get ().height);
@@ -1459,7 +1651,7 @@ pub class Widget {
             self.getScissors (pos, size)
         };
 
-        if self._hidden {
+        if !self.isDrawn () {
             ws:.hide ();
         } else {
             ws:.setPosition (pos);
@@ -1613,6 +1805,8 @@ pub class Widget {
      * */
     @{final}
     pub fn getMarginSize (self, container : vec2)-> vec2 {
+        if !self._currentStyle.isDisplayed () { return makeVec2 (0.0f, 0.0f); }
+
         let margin = self.getMargins (container);
         makeVec2 (margin.z + margin.w, margin.x + margin.y)
     }

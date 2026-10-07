@@ -10,7 +10,7 @@ length lives in the style sheet and means what it reads like, components, signal
 |---|---|---|
 | Where do sizes live? | Every size and position of the layout in `.style`. The render resolution of a `Scene3D` stays in the `.gui`: it is the size the scene is rendered at before being scaled to the widget, not a layout size ([§3](#3-the-structure-file)). | Proposed |
 | What do sizes mean? | CSS semantics: `width` is the border box, margins sit outside it, `%` is of the parent, unset means `auto` (sized to the content along a layout's axis, stretched across it). | Done (BAL-64) |
-| Layouts that change with the space? | BAL-53's `flex-wrap`, `justify-content`, `align-items` and `gap`, plus `@when (…)` blocks testing the available space, the window (size, scale, density, dpi) and variables published by the application. | Proposed |
+| Layouts that change with the space? | BAL-53's `flex-wrap`, `justify-content`, `align-items` and `gap`, plus `@when (…)` blocks testing the available space, the window (size, scale, density, dpi) and variables published by the application. | `@when` done (BAL-67) |
 | Two files or one? | Keep two, with one lexer and one value grammar. | Proposed |
 | What replaces `(class: "x", orientation: horizontal)`? | `Type #id .class "default value" { attr: value; children }`. Ids are optional. | Proposed |
 | Inline styles in `.gui`? | No. Every visual property is reachable from a selector, `#id` included. | Open |
@@ -1086,7 +1086,8 @@ Each has a recommendation.
 12. **What `width` measures in `@when`.** The nearest ancestor with a size that does not depend on its content is CSS's
     container-query rule, and it cannot loop. Testing the direct parent is simpler to explain, but a content-sized
     parent could then flip between two layouts every frame. *Recommendation: the nearest ancestor with a fixed size*,
-    the window at worst.
+    the window at worst. *Adopted in BAL-67*, each layout telling which of its children it sizes without their
+    content (gui.md, "Conditions").
 
 ## 11. What follows from it
 
@@ -1094,8 +1095,8 @@ Each has a recommendation.
   `WidgetSize` and the box model.
 - **BAL-22** selector engine: [§4](#4-the-style-file)'s selectors, specificity, cascade and inheritance.
 - **BAL-53** wrapping and alignment, written in the v2 grammar.
-- **`@when`** ([§4](#conditional-rules-when)) has no work item yet: the variables, the evaluation on change and
-  `display`. A new item under BAL-25, after BAL-22, since it relies on the cascade.
+- **BAL-67** `@when` ([§4](#conditional-rules-when)), done: the variables, the evaluation on change and `display`;
+  `theme` and `pointer` wait for getters on `Window`.
 - **BAL-23** registry and generic parser: [§3](#3-the-structure-file) and [§7](#7-how-a-widget-plugs-in), retiring the
   `readX`/`readXHeader` pairs.
 - **BAL-64** the box model of [§2](#2-sizes), done: border-box sizes, percentages of the parent's content box, `auto`

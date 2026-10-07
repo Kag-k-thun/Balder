@@ -15,6 +15,7 @@ use balder::utils;
 use balder::core::{_, application::_};
 use balder::interface::_;
 use balder::interface::loader::registry;
+use balder::interface::style::conditions;
 use balder::math::vector;
 
 use std::math;
@@ -23,6 +24,10 @@ use std::time::dur;
 
 use ::sdl3::mouse;
 
+
+// The passes of a layout at most, a pass laying the widgets out again when the space available to a widget changed the
+// result of a condition its style reads
+def MAX_LAYOUT_PASSES = 4us;
 
 @final
 pub class WidgetManager {
@@ -47,6 +52,9 @@ pub class WidgetManager {
 
     // The widget types the .gui files can use
     let dmut _registry : &WidgetRegistry = copy WidgetRegistry ();
+
+    // The variables of the window and of the application the conditions of the style sheets read
+    let dmut _variables : &StyleVariables = copy StyleVariables ();
 
     // The slot emitter used to receive signals
     let dmut _box : &SlotEmitter = copy SlotEmitter ();
@@ -118,6 +126,8 @@ pub class WidgetManager {
                 log::error #("WidgetManager", "Failed to configure shape drawer", err);
             }
         }
+
+        self:.updateWindowVariables ();
     }
 
     __dtor (mut self) {
@@ -197,6 +207,37 @@ pub class WidgetManager {
         self:.updateWidgets ();
     }
 
+    /**
+     * Publish a variable of the application, read by the conditions of the style sheets as app.name, the widgets whose
+     * rules read it being styled again
+     * @params:
+     *    - name: the name of the variable, without the app. prefix
+     *    - value: a string, compared to the keywords and the strings
+     * */
+    pub fn setVariable (mut self, name : [c8], value : [c8]) {
+        self:.publish (name, VariableValue (value));
+    }
+
+    /**
+     * Publish a variable of the application, read by the conditions of the style sheets as app.name
+     * @params:
+     *    - name: the name of the variable, without the app. prefix
+     *    - value: a number, compared to the numbers and the lengths in px
+     * */
+    pub fn setVariable (mut self, name : [c8], value : f64) {
+        self:.publish (name, VariableValue (value));
+    }
+
+    /**
+     * Publish a variable of the application, read by the conditions of the style sheets as app.name
+     * @params:
+     *    - name: the name of the variable, without the app. prefix
+     *    - value: a boolean, tested alone (app.compact) or compared to true and false
+     * */
+    pub fn setVariable (mut self, name : [c8], value : bool) {
+        self:.publish (name, VariableValue (value));
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -252,6 +293,21 @@ pub class WidgetManager {
      * */
     pub fn getStyleManager (mut self)-> dmut &StyleManager {
         alias self._styleManager
+    }
+
+    /**
+     * @returns: the variables of the window and of the application the conditions of the style sheets read
+     * */
+    pub fn getStyleVariables (self)-> &StyleVariables {
+        self._variables
+    }
+
+    /**
+     * @returns: the size of the window in layout pixels, the unit of the lengths of the style
+     * */
+    pub fn getLayoutSize (self)-> vec2 {
+        let dim = self._drawer.getDimension ();
+        makeVec2 (cast!f32 (dim.x), cast!f32 (dim.y))
     }
 
     /**
@@ -324,13 +380,24 @@ pub class WidgetManager {
      */
 
     /**
-     * Method called when the layout of widgets is updated
+     * Lay the widgets out at the size of the window, again while the space available to a widget whose conditions read
+     * it changes its style in a way that affects the layout
+     * @info: a condition measures an ancestor whose size its result cannot change, so the passes end; they are bounded
+     * all the same
      * */
     pub fn updateWidgets (mut self) {
         if let Ok (dmut root) = alias self._content {
-            let dim = self._drawer.getDimension ();
-            root:.setSize (makeVec2 (0.0f, 0.0f), makeVec2 (cast!f32 (dim.x), cast!f32 (dim.y)), 0);
-            root:.setScissors (makeVec2 (0.0f, 0.0f), makeVec2 (cast!f32 (dim.x), cast!f32 (dim.y)));
+            let size = self.getLayoutSize ();
+            let readsAvailable = self._styleManager.isRead (AvailableVariable::WIDTH)
+                || self._styleManager.isRead (AvailableVariable::HEIGHT);
+
+            for _ in 0us .. MAX_LAYOUT_PASSES {
+                root:.setSize (makeVec2 (0.0f, 0.0f), size, 0);
+                root:.setScissors (makeVec2 (0.0f, 0.0f), size);
+                if !readsAvailable || !root:.restyleConditions ([]) {
+                    break;
+                }
+            }
         }
     }
 
@@ -391,12 +458,64 @@ pub class WidgetManager {
             self._resized = none;
             self._drawer:.onWindowResize (w, h);
 
+            let changed = self:.updateWindowVariables ();
+            if let Ok (dmut root) = alias self._content && changed.len != 0us {
+                root:.restyleConditions (changed);
+            }
+
             self:.updateWidgets ();
             self._drawer:.redraw ();
             return (w, h)?;
         }
 
         none
+    }
+
+    /**
+     * Set the variables of the window from its size in layout pixels and its scale
+     * @returns: the names of the variables whose value changed
+     * */
+    fn updateWindowVariables (mut self)-> [[c8]] {
+        let size = self.getLayoutSize ();
+        let mut changed : [[c8]] = [];
+        changed = self:.setWindowVariable (WindowVariable::WIDTH, size.x, changed);
+        changed = self:.setWindowVariable (WindowVariable::HEIGHT, size.y, changed);
+        changed = self:.setWindowVariable (WindowVariable::SCALE, self._window.getScale (), changed);
+        changed = self:.setWindowVariable (WindowVariable::DENSITY, self._window.getPixelDensity (), changed);
+        changed = self:.setWindowVariable (WindowVariable::DPI, self._window.getDpi (), changed);
+
+        changed
+    }
+
+    /**
+     * Set a variable of the window
+     * @params:
+     *    - changed: the names of the variables whose value changed so far
+     * @returns: changed, with the name of the variable if its value changed
+     * */
+    fn setWindowVariable (mut self, name : [c8], value : f32, changed : [[c8]])-> [[c8]] {
+        if self._variables:.set (name, VariableValue (cast!f64 (value))) {
+            return changed ~ [name];
+        }
+
+        changed
+    }
+
+    /**
+     * Set a variable of the application, the widgets whose conditions read it being styled again, and laid out again
+     * if their layout changed
+     * */
+    fn publish (mut self, name : [c8], value : VariableValue) {
+        let full = APP_PREFIX ~ name;
+        if !self._variables:.set (full, value) || !self._styleManager.isRead (full) {
+            return;
+        }
+
+        if let Ok (dmut root) = alias self._content {
+            if root:.restyleConditions (copy [full]) {
+                self:.updateWidgets ();
+            }
+        }
     }
 
     /**

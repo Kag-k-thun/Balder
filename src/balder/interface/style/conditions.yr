@@ -1,0 +1,323 @@
+/**
+ * The evaluation of the conditions of the `@when` blocks: the variables they read, and whether they hold
+ * (doc/gui-v2.md, §4)
+ * */
+in conditions;
+
+use balder::interface::loader::parser;
+use balder::math::vector;
+
+/**
+ * The variables of the window, set by the widget manager
+ * */
+pub enum WindowVariable
+| WIDTH   = "window.width"   // the width of the window, in layout pixels
+| HEIGHT  = "window.height"  // the height of the window, in layout pixels
+| SCALE   = "window.scale"   // the display scale, 1.5 on an output scaled to 150%
+| DENSITY = "window.density" // the physical pixels in a layout pixel
+| DPI     = "window.dpi";    // the dots per inch of the display
+
+/**
+ * The variables of the space available to a widget, measured by the layout
+ * */
+pub enum AvailableVariable
+| WIDTH  = "width"
+| HEIGHT = "height";
+
+// The prefix of the variables the application publishes
+pub def APP_PREFIX = "app.";
+
+/**
+ * The kind of the value of a variable
+ * */
+pub enum VariableKind
+| NUMBER = 0u8
+| TEXT   = 1u8
+| BOOL   = 2u8;
+
+/**
+ * The value of a variable the conditions read: a number, a string or a boolean
+ * */
+pub record VariableValue {
+
+    // The kind of the value
+    pub let kind: VariableKind;
+
+    // The value of a number
+    pub let number: f64 = 0.0;
+
+    // The value of a string
+    pub let text: [c8] = "";
+
+    // The value of a boolean
+    pub let flag: bool = false;
+
+    pub self (number: f64)
+        with kind = VariableKind::NUMBER
+        , number = number
+    {}
+
+    pub self (text: [c8])
+        with kind = VariableKind::TEXT
+        , text = text
+    {}
+
+    pub self (flag: bool)
+        with kind = VariableKind::BOOL
+        , flag = flag
+    {}
+
+    pub fn opEquals(self, other: VariableValue)-> bool {
+        self.kind == other.kind && self.number == other.number && self.text == other.text && self.flag == other.flag
+    }
+
+    /**
+     * @returns: the value tested as a boolean, the variable written alone: a boolean, a number other than 0, a string
+     * other than ""
+     * */
+    pub fn isTrue(self)-> bool {
+        match self.kind {
+            VariableKind::BOOL   => { self.flag }
+            VariableKind::NUMBER => { self.number != 0.0 }
+            _                    => { self.text != "" }
+        }
+    }
+}
+
+/**
+ * The variables of the window and of the application, by name (window.width, app.mode)
+ * */
+pub class StyleVariables {
+
+    let dmut _values: [[c8] => VariableValue] = copy [];
+
+    pub self () {}
+
+    /**
+     * Set a variable
+     * @returns: true iif its value changed
+     * */
+    pub fn set(mut self, name: [c8], value: VariableValue)-> bool {
+        if let Ok(old) = self._values[name] {
+            if old == value { return false; }
+        }
+
+        self._values[name] = value;
+        true
+    }
+
+    /**
+     * @returns: the value of a variable, none if it was never set
+     * */
+    pub fn get(self, name: [c8])-> (VariableValue)? {
+        if let Ok(v) = self._values[name] {
+            return (v)?;
+        }
+
+        none
+    }
+}
+
+/**
+ * What the conditions read when the style of a widget is computed: the variables of the window and of the application,
+ * and the space available to the widget
+ * */
+pub record ConditionScope {
+
+    // The variables of the window and of the application, none when no variable is set
+    let _variables: (&StyleVariables)?;
+
+    // The space available to the widget (width, height), none outside a layout
+    let _available: (vec2)?;
+
+    /**
+     * A scope where no variable is set, every test being false
+     * */
+    pub self ()
+        with _variables = none
+        , _available = none
+    {}
+
+    /**
+     * @params:
+     *    - variables: the variables of the window and of the application
+     *    - available: the space available to the widget, read as width and height
+     * */
+    pub self (variables: &StyleVariables, available: (vec2)? = none)
+        with _variables = (variables)?
+        , _available = available
+    {}
+
+    /**
+     * @returns: the value of a variable, none if it is not set
+     * */
+    pub fn get(self, name: [c8])-> (VariableValue)? {
+        if let Ok(a) = self._available {
+            if name == AvailableVariable::WIDTH { return (VariableValue(cast!f64(a.x)))?; }
+            if name == AvailableVariable::HEIGHT { return (VariableValue(cast!f64(a.y)))?; }
+        }
+
+        if let Ok(v) = self._variables {
+            return v.get(name);
+        }
+
+        none
+    }
+}
+
+/**
+ * @returns: true iif a condition holds in a scope, a test reading a variable that is not set being false
+ * */
+pub fn holds(c: &Condition, scope: ConditionScope)-> bool {
+    if let t: &Test = c {
+        return holdsTest(t, scope);
+    }
+
+    if let n: &Not = c {
+        return !holds(n.operand, scope);
+    }
+
+    if let a: &And = c {
+        for o in a.operands {
+            if !holds(o, scope) { return false; }
+        }
+
+        return true;
+    }
+
+    if let o: &Or = c {
+        for x in o.operands {
+            if holds(x, scope) { return true; }
+        }
+    }
+
+    false
+}
+
+/**
+ * @returns: the variables a condition reads, each one once, in the order they are written
+ * */
+pub fn reads(c: &Condition)-> [[c8]] {
+    let mut result: [[c8]] = [];
+    for name in readsAll(c) {
+        if !isIn(result, name) { result ~= [name]; }
+    }
+
+    result
+}
+
+/**
+ * @returns: true iif a variable can be read by a condition: width, height, a variable of the window, or a variable of
+ * the application (app.name)
+ * */
+pub fn isKnown(name: [c8])-> bool {
+    if isNumeric(name) { return true; }
+
+    name.len > APP_PREFIX.len && name[0us .. APP_PREFIX.len] == APP_PREFIX
+}
+
+/**
+ * @returns: true iif the variable is a number set by the layout or the window
+ * */
+pub fn isNumeric(name: [c8])-> bool {
+    cte for v in AvailableVariable::__members__ {
+        if name == v { return true; }
+    }
+
+    cte for v in WindowVariable::__members__ {
+        if name == v { return true; }
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif a test holds in a scope
+ * */
+fn holdsTest(t: &Test, scope: ConditionScope)-> bool {
+    let variable = if let Ok(v) = scope.get(t.variable) { v } else { return false; };
+    if let Ok(value) = t.value {
+        return compare(variable, t.comparison, value);
+    }
+
+    variable.isTrue()
+}
+
+/**
+ * @returns: true iif a variable compares to a value, a number to a number in px or without unit, a string or a boolean
+ * to a keyword or a string, and false for values of different kinds
+ * */
+fn compare(variable: VariableValue, comparison: Comparison, value: &Value)-> bool {
+    if let Number(amount-> a) = value {
+        if variable.kind != VariableKind::NUMBER { return false; }
+        return match comparison {
+            Comparison::LT => { variable.number < a }
+            Comparison::LE => { variable.number <= a }
+            Comparison::GT => { variable.number > a }
+            Comparison::GE => { variable.number >= a }
+            Comparison::EQ => { variable.number == a }
+            Comparison::NE => { variable.number != a }
+            _              => { false }
+        };
+    }
+
+    let word = match value {
+        Name(name-> n) => { n }
+        Text(text-> t) => { t }
+        _              => { return false; }
+    };
+
+    let same = match variable.kind {
+        VariableKind::TEXT => { variable.text == word }
+        VariableKind::BOOL => {
+            if word != "true" && word != "false" { return false; }
+            variable.flag == (word == "true")
+        }
+        _ => { return false; }
+    };
+
+    match comparison {
+        Comparison::EQ => { same }
+        Comparison::NE => { !same }
+        _              => { false }
+    }
+}
+
+/**
+ * @returns: the variables a condition reads, in the order they are written
+ * */
+fn readsAll(c: &Condition)-> [[c8]] {
+    if let t: &Test = c {
+        return copy [t.variable];
+    }
+
+    if let n: &Not = c {
+        return readsAll(n.operand);
+    }
+
+    let operands = if let a: &And = c {
+        a.operands
+    } else if let o: &Or = c {
+        o.operands
+    } else {
+        []
+    };
+
+    let mut result: [[c8]] = [];
+    for o in operands {
+        result ~= readsAll(o);
+    }
+
+    result
+}
+
+/**
+ * @returns: true iif name is one of the names
+ * */
+fn isIn(names: [[c8]], name: [c8])-> bool {
+    for n in names {
+        if n == name { return true; }
+    }
+
+    false
+}
