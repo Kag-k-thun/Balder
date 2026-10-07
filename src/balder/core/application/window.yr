@@ -105,6 +105,25 @@ pub class Window {
         let dmut _box: &SlotEmitter = copy SlotEmitter();
     }
 
+    prot { // layout
+
+        // The size in pixels the widgets of the window were last laid out at
+        let mut _layoutSize: (u32, u32) = (0u32, 0u32);
+
+        // The size in pixels a frame waits for the widgets to be laid out at
+        let mut _layoutRequest: (u32, u32)? = none;
+
+        // Emitted from the rendering thread when a layout is requested, to wake the thread laying the widgets out
+        let dmut _layoutRequested: &DirectSignal!{()} = copy DirectSignal!{()}();
+
+        // Semaphore posted when the widgets are laid out
+        let dmut _layoutSemaphore: &Semaphore = copy Semaphore();
+
+        // The longest a frame waits for the widgets to be laid out at its size, before being drawn with the layout of
+        // the previous one
+        let mut _layoutTimeout: Duration = dur::millis(50u64);
+    }
+
     /**
      * ======================================================================================================
      * ======================================================================================================
@@ -705,6 +724,63 @@ pub class Window {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * =====================================          LAYOUT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Connect the function waking the thread laying the widgets of the window out, called from the rendering thread
+     * when a frame waits for them to be laid out at its size
+     * @info: without one, the frames never wait for a layout
+     * */
+    pub fn connectLayoutRequest(mut self, f: dg ()-> void) {
+        atomic self {
+            self._layoutRequested:.connect(f);
+        }
+    }
+
+    /**
+     * Disconnect a function connected by connectLayoutRequest
+     * */
+    pub fn disconnectLayoutRequest(mut self, f: dg ()-> void) {
+        atomic self {
+            self._layoutRequested:.disconnect(f);
+        }
+    }
+
+    /**
+     * @returns: the size in pixels a frame waits for the widgets to be laid out at, none if no frame waits
+     * */
+    pub fn getLayoutRequest(self)-> (u32, u32)? {
+        atomic self {
+            self._layoutRequest
+        }
+    }
+
+    /**
+     * Inform the frames that the widgets are laid out at a size and committed, the frame waiting for that size is
+     * drawn
+     * @params:
+     *    - w: the width in pixels the widgets are laid out at
+     *    - h: the height in pixels
+     * */
+    pub fn laidOut(mut self, w: u32, h: u32) {
+        atomic self {
+            self._layoutSize = (w, h);
+            if let Ok(req) = self._layoutRequest {
+                if req == (w, h) {
+                    self._layoutRequest = none;
+                }
+            }
+        }
+
+        self._layoutSemaphore:.post();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * =====================================          TIMER          ======================================
      * ====================================================================================================
      * ====================================================================================================
@@ -867,6 +943,10 @@ pub class Window {
         return if let Ok(dmut pipe) = alias self._pipeline {
             pipe:.prepareFrame();
 
+            // A frame drawn at the new size of the window with the layout of the previous one would show the widgets
+            // misplaced until the next frame
+            self:.awaitLayout(w, h);
+
             // The frame is the one of the image acquired, its previous submission is awaited once it is known
             let image = self._vkDevice:.acquireNextImage();
             if image >= 0 {
@@ -877,6 +957,37 @@ pub class Window {
         } else {
             -1
         };
+    }
+
+    /**
+     * Wait for the widgets to be laid out at the size of the frame, if they were laid out at another one
+     * @info: waits for _layoutTimeout at most, the thread laying them out might be busy (a modal dialog for example);
+     * a request not served in time is not waited for again, the frames being drawn with the previous layout until then
+     * */
+    fn awaitLayout(mut self, w: u32, h: u32) {
+        let wait = atomic self {
+            if w == 0u32 || h == 0u32 || self._layoutSize == (w, h) || self._layoutRequested.len == 0us {
+                false
+            } else {
+                let pending = self._layoutRequest.hasValue;
+                self._layoutRequest = (w, h)?;
+                self._layoutRequested:.emit();
+                !pending
+            }
+        };
+
+        if !wait { return; }
+
+        let deadline = Instant::now() + self._layoutTimeout;
+        loop {
+            let done = atomic self { self._layoutSize == (w, h) };
+            if done { break; }
+
+            let now = Instant::now();
+            if now >= deadline { break; }
+
+            self._layoutSemaphore:.wait(timeout-> deadline - now);
+        }
     }
 
     /**
