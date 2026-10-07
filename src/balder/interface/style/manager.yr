@@ -2,7 +2,7 @@ in manager;
 
 use balder::interface::font::family;
 use balder::interface::loader::parser;
-use balder::interface::style::implem;
+use balder::interface::style::{conditions, implem};
 
 /**
  * A @font-face rule of a style sheet, registering the faces of a font file in a family
@@ -64,6 +64,9 @@ record HeldRule {
 
     // Its position among the rules held, in the order they were added
     pub let order: usize;
+
+    // The variables read by its condition and by those of its @when blocks
+    pub let reads: [[c8]];
 }
 
 /**
@@ -94,7 +97,9 @@ record Match {
  * The rules that match are applied by origin, then by specificity(ids, then classes, states and parts, then types,
  * summed over the compounds), then in the order they were added, a later one winning a tie. A rule matching through
  * several selectors takes the specificity of the most specific. The @when blocks of a rule come after its own
- * declarations while their condition holds.
+ * declarations while their condition holds, and a rule of a top level @when applies while its condition holds, the
+ * conditions being evaluated in the scope of the widget(conditions.yr). The variables the conditions of the rules
+ * matching a widget read tell which changes compute its style again(reads).
  *
  * A computed style starts from the inherited properties of the computed style of the parent(Style::inherit): a part
  * inherits from its widget, and a widget from its parent. The inline style of a widget, set by code, comes after every
@@ -108,6 +113,9 @@ pub class StyleManager {
 
     // The states tested on an ancestor of the widget a selector styles, by name
     let dmut _ancestorStates: [[c8] => bool] = copy [];
+
+    // The variables read by the conditions of the rules, by name
+    let dmut _variables: [[c8] => bool] = copy [];
 
     /*!
      * ====================================================================================================
@@ -147,7 +155,12 @@ pub class StyleManager {
      *    - origin: where the sheet of the rule comes from
      * */
     pub fn insertRule(mut self, rule: StyleRule, origin: SheetOrigin = SheetOrigin::APPLICATION) {
-        self._rules ~= [HeldRule(rule, origin, self._rules.len)];
+        let reads = StyleManager::readsOf(rule);
+        for name in reads {
+            self._variables[name] = true;
+        }
+
+        self._rules ~= [HeldRule(rule, origin, self._rules.len, reads)];
         for sel in rule.selectors {
             for i, c in sel.compounds {
                 if i + 1us != sel.compounds.len {
@@ -176,6 +189,32 @@ pub class StyleManager {
     }
 
     /**
+     * @returns: true iif the condition of a rule reads the variable, so that a change of its value can change styles
+     * */
+    pub fn isRead(self, name: [c8])-> bool {
+        name in self._variables
+    }
+
+    /**
+     * @returns: the variables read by the conditions of the rules matching a widget or one of its parts, whatever the
+     * states of the part, each one once
+     * @params:
+     *    - path: the widget, then its ancestors up to the root
+     * */
+    pub fn reads(self, path: [Element])-> [[c8]] {
+        let mut result: [[c8]] = [];
+        for h in self._rules {
+            if h.reads.len != 0us && StyleManager::matchesAny(h.rule, path) {
+                for name in h.reads {
+                    if !StyleManager::includes(result, copy [name]) { result ~= [name]; }
+                }
+            }
+        }
+
+        result
+    }
+
+    /**
      * Compute the style of a widget, and those of its parts
      * @params:
      *    - path: the widget, then its ancestors up to the root
@@ -183,12 +222,15 @@ pub class StyleManager {
      *    - parts: the parts of the widget, whose styles are computed in its subItems along with those a matching rule
      *             names
      *    - inline: the inline style of the widget, applied over the rules
+     *    - scope: what the conditions read, none of them holding by default
      * @returns: the computed style
      * */
-    pub fn compute(self, path: [Element], parent: &Style, parts: [[c8]] = [], inline: (&Style)? = none)-> &Style {
+    pub fn compute(self, path: [Element], parent: &Style, parts: [[c8]] = [], inline: (&Style)? = none,
+                   scope: ConditionScope = ConditionScope())-> &Style
+    {
         let dmut style = copy Style();
         style:.inherit(parent);
-        self.cascade(alias style, path, "", []);
+        self.cascade(alias style, path, "", [], scope);
         if let Ok(i) = inline {
             style:.merge(i);
         }
@@ -206,7 +248,7 @@ pub class StyleManager {
         }
 
         for name in names {
-            style.subItems[name] = self.computePart(path, style, name);
+            style.subItems[name] = self.computePart(path, style, name, scope-> scope);
         }
 
         style
@@ -219,12 +261,15 @@ pub class StyleManager {
      *    - owner: the computed style of the widget, whose inherited properties the part takes
      *    - part: the name of the part
      *    - states: the states the part is in
+     *    - scope: what the conditions read, none of them holding by default
      * @returns: the computed style of the part
      * */
-    pub fn computePart(self, path: [Element], owner: &Style, part: [c8], states: [[c8]] = [])-> &Style {
+    pub fn computePart(self, path: [Element], owner: &Style, part: [c8], states: [[c8]] = [],
+                       scope: ConditionScope = ConditionScope())-> &Style
+    {
         let dmut style = copy Style();
         style:.inherit(owner);
-        self.cascade(alias style, path, part, states);
+        self.cascade(alias style, path, part, states, scope);
 
         style
     }
@@ -240,10 +285,10 @@ pub class StyleManager {
     /**
      * Apply the rules matching a widget, or one of its parts, to a style, in the order of the cascade
      * */
-    fn cascade(self, dmut style: &Style, path: [Element], part: [c8], partStates: [[c8]]) {
+    fn cascade(self, dmut style: &Style, path: [Element], part: [c8], partStates: [[c8]], scope: ConditionScope) {
         let mut matched: [mut Match] = [];
         for i, h in self._rules {
-            let applies = if let Ok(c) = h.rule.condition { self.holds(c) } else { true };
+            let applies = if let Ok(c) = h.rule.condition { holds(c, scope) } else { true };
             if applies {
                 let mut best: (u64)? = none;
                 for sel in h.rule.selectors {
@@ -268,18 +313,11 @@ pub class StyleManager {
             let rule = self._rules[m.index].rule;
             style:.merge(rule.style);
             for w in rule.whens {
-                if self.holds(w.condition) {
+                if holds(w.condition, scope) {
                     style:.merge(w.style);
                 }
             }
         }
-    }
-
-    /**
-     * @returns: true iif the condition of a @when holds, which none does yet: the variables it reads come with BAL-67
-     * */
-    fn holds(self, _: &Condition)-> bool {
-        false
     }
 }
 
@@ -304,6 +342,40 @@ pub mod StyleManager {
         if !StyleManager::matches(last, path[0]) { return false; }
 
         StyleManager::matchesFrom(sel.compounds, sel.compounds.len - 1us, path, 0us)
+    }
+
+    /**
+     * @returns: true iif one of the selectors of a rule matches a widget, or one of its parts in the states the selector
+     * tests on it
+     * @params:
+     *    - path: the widget, then its ancestors up to the root
+     * */
+    pub fn matchesAny(rule: StyleRule, path: [Element])-> bool {
+        for sel in rule.selectors {
+            if sel.compounds.len != 0us {
+                let last = sel.compounds[$ - 1us];
+                if StyleManager::matches(sel, path, last.part, last.partStates) { return true; }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the variables read by the condition of a rule and by those of its @when blocks, each one once
+     * */
+    pub fn readsOf(rule: StyleRule)-> [[c8]] {
+        let mut all: [[c8]] = if let Ok(c) = rule.condition { conditions::reads(c) } else { [] };
+        for w in rule.whens {
+            all ~= conditions::reads(w.condition);
+        }
+
+        let mut result: [[c8]] = [];
+        for name in all {
+            if !StyleManager::includes(result, copy [name]) { result ~= [name]; }
+        }
+
+        result
     }
 
     /**
