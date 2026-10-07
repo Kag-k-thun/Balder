@@ -147,7 +147,7 @@ kind of value it expects.
 | Kind | Syntax | Examples |
 |---|---|---|
 | number | integer or decimal, leading digit required | `0.5` `700` |
-| length | a number, in `px` when it has no unit, or a percentage of the parent | `12` `12px` `40%` |
+| length | a number, in `px` when it has no unit, or a percentage of the parent's content box | `12` `12px` `40%` |
 | size | a length, `auto`, `min-content` or `max-content` | `width: max-content` |
 | track | a length, a share of the free space in `fr`, or a size keyword | `columns: 1fr 2fr 120` |
 | colour | see below | `#388bfd` `steelblue / 40%` |
@@ -161,10 +161,34 @@ Shorthands follow the order of CSS: one value for every side, two for vertical t
 horizontal then bottom, four clockwise from the top. A longhand after a shorthand overrides its side:
 `padding: 6; padding-left: 20;`.
 
-**Sizes today.** Until the CSS box model (BAL-64), a size keeps the semantics of the first loader: a width in pixels is
-exactly that width, a percentage is a part of the parent, an unset width or height takes the whole parent, and the
-width includes the margins. `min-width`, `max-width`, `min-height` and `max-height` bound a width or a height in
-pixels. `flex: 1` (grow 1, shrink 1, basis 0) shares the free space of a linear layout.
+### Sizes
+
+Sizes mean what they mean in CSS, so that the number written is the size seen:
+
+- **`width` and `height` are the border box**: the content, the paddings and the borders. The margins sit outside it:
+  `width: 120; margin: 4;` draws a box 120 wide that takes 128 in its parent.
+- **A percentage is a part of the parent's content box** on the same axis, for the sizes, their bounds, the margins,
+  the paddings and the positions alike. While a parent sized by its content measures it, a percentage size stands for
+  `auto` and a percentage margin or padding for 0.
+- **Unset is `auto`**, resolved by the parent:
+
+  | Parent | Along its axis | Across it |
+  |---|---|---|
+  | `LinearLayout`, `Splitter` | the size of the content, its max-content, shrinking down to its min-content | stretched to the layout |
+  | `GridLayout` | stretched to the cell | stretched to the cell |
+  | `FloatingLayout` | the size of the content, fitted in the layout; `left` and `right` both set give the width, `top` and `bottom` the height | |
+  | window, tab page, `MenuLayout` | stretched | stretched |
+
+  A size that is not auto is placed at the start of the space its parent gives it.
+- **The bounds are properties of their own**: `min-width`, `max-width`, `min-height` and `max-height` take a length,
+  `min-content` or `max-content`, and each cascades on its own. An unset lower bound is `auto`: the min-content along
+  the axis of a linear layout or a splitter, so that a text is never cut mid-word, and 0 elsewhere. An unset upper
+  bound is `none`.
+- **A size along the axis of a linear layout is a preferred size**: `width: 120` is a flex basis of 120 that shrinks
+  down to its `min-width` when the line overflows. `flex: none` keeps it rigid, and `flex: 1` (grow 1, shrink 1,
+  basis 0) shares the free space.
+- **A floating child** is placed by `left`, `top`, `right` and `bottom` from the sides of the layout's content box, at
+  its top left corner when it sets none, against the right (or the bottom) side when it sets only that one.
 
 ### Colours
 
@@ -343,12 +367,14 @@ Every widget reads these properties. An inherited property passes from a widget 
 | `padding` | 1 to 4 lengths, in px or %, in the order of CSS, setting `padding-top`, `padding-right`, `padding-bottom`, `padding-left` |  | yes |
 | `width` | a length, in px or %, auto, min-content or max-content |  | yes |
 | `height` | a length, in px or %, auto, min-content or max-content |  | yes |
-| `min-width` | a length in px |  | yes |
-| `max-width` | a length in px |  | yes |
-| `min-height` | a length in px |  | yes |
-| `max-height` | a length in px |  | yes |
+| `min-width` | a length, in px or %, auto, min-content or max-content |  | yes |
+| `max-width` | a length, in px or %, none, min-content or max-content |  | yes |
+| `min-height` | a length, in px or %, auto, min-content or max-content |  | yes |
+| `max-height` | a length, in px or %, none, min-content or max-content |  | yes |
 | `left` | a length, in px or % |  | yes |
 | `top` | a length, in px or % |  | yes |
+| `right` | a length, in px or % |  | yes |
+| `bottom` | a length, in px or % |  | yes |
 | `flex-grow` | a number of 0 or more |  | yes |
 | `flex-shrink` | a number of 0 or more |  | yes |
 | `flex-basis` | a length, in px or %, auto, min-content or max-content |  | yes |
