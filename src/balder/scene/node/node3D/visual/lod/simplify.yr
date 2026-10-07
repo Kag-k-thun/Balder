@@ -1,0 +1,683 @@
+in simplify;
+
+use balder::math::vector;
+
+use std::algorithm::sorting;
+
+
+/**
+ * Simplifies a mesh by collapsing its edges in the order of the error they add, the vertices kept being vertices of
+ * the mesh, so a simplified mesh draws with the same vertex buffer
+ * @info: a quadric error metric (Garland and Heckbert); the borders and the attribute seams (vertices sharing a
+ * position) only collapse along themselves, so the silhouette of an open mesh and the texture of a seam stay in place;
+ * the simplifier keeps its state between two calls of simplify, the next call going on from the triangles the last one
+ * returned, its quadrics still holding the planes of the original mesh
+ * */
+pub record Simplifier {
+
+    // The positions of the vertices, moved into a unit box
+    let mut _positions : [vec3] = [];
+
+    // The largest dimension of the mesh, the unit of the errors in _positions
+    let mut _extent : f32 = 1.0f;
+
+    // For each vertex, the first vertex with the same position
+    let mut _remap : [u32] = [];
+
+    // For each vertex, the next vertex with the same position, in a cycle
+    let mut _wedge : [u32] = [];
+
+    // The kind of each vertex
+    let mut _kinds : [VertexKind] = [];
+
+    // For each vertex, the vertex its open edge goes to
+    let dmut _loopout : [u32] = [];
+
+    // For each vertex, the vertex its open edge comes from
+    let dmut _loopback : [u32] = [];
+
+    // The quadrics of the positions, QUADRIC_SIZE floats each
+    let dmut _quadrics : [f32] = [];
+
+    // The triangles of the simplified mesh
+    let dmut _result : [u32] = [];
+
+    // The largest squared error of a collapse, relative to _extent
+    let mut _error : f32 = 0.0f;
+
+    /**
+     * Prepare the simplification of a mesh
+     * @params:
+     *    - positions: the positions of the vertices
+     *    - indices: the triangles of the mesh, three indices each
+     * */
+    pub self (positions : [vec3], indices : [u32]) {
+        let (scaled, extent) = rescale (positions);
+        let (remap, wedge) = buildPositionRemap (scaled, indices);
+        let dmut result = removeDegenerates (indices, remap);
+        let (openout, openinc, kinds) = classify (result, remap, wedge, positions.len);
+
+        self._quadrics = buildQuadrics (scaled, result, remap, openout, kinds);
+        self._positions = scaled;
+        self._extent = extent;
+        self._remap = remap;
+        self._wedge = wedge;
+        self._kinds = kinds;
+        self._loopout = copy openout;
+        self._loopback = copy openinc;
+        self._result = alias result;
+    }
+
+    /**
+     * Go on simplifying the mesh
+     * @params:
+     *    - targetCount: the number of indices to reach
+     *    - targetError: the largest error to add, relative to the largest dimension of the mesh
+     * @returns:
+     *    - .0: the indices of the simplified triangles, as many as targetCount or more when the error stops it first
+     *    - .1: the largest distance from the simplified mesh to the original one, in the unit of the positions
+     * */
+    pub fn simplify (mut self, targetCount : usize, targetError : f32)-> ([u32], f32) {
+        let errorLimit = targetError * targetError;
+        while self._result.len > targetCount {
+            let (offsets, nexts, prevs) = buildTriangleAdjacency (self._result, self._remap);
+            let picked = pickEdgeCollapses (self._positions, self._result, self._remap, self._loopout, self._kinds, self._quadrics);
+            if picked.len == 0us { break; }
+
+            let collapses = sortByError (picked);
+            let dmut collapseRemap = copy [cast!u32 (i) for i in 0us .. self._positions.len];
+
+            let goal = (self._result.len - targetCount) / 3us;
+            let (count, error) = performEdgeCollapses (self._positions, self._remap, self._wedge, self._kinds,
+                                                       offsets, nexts, prevs, collapses,
+                                                       alias self._quadrics, alias collapseRemap, goal, errorLimit);
+            if count == 0us { break; }
+            if error > self._error { self._error = error; }
+
+            self._result = remapIndices (self._result, self._remap, collapseRemap);
+            remapEdgeLoops (alias self._loopout, collapseRemap);
+            remapEdgeLoops (alias self._loopback, collapseRemap);
+        }
+
+        (copy self._result, core::math::sqrt (self._error) * self._extent)
+    }
+
+}
+
+/**
+ * The kind of a vertex, telling along which edges it can be collapsed
+ * */
+enum VertexKind
+| MANIFOLD = 0u8  // inside a surface, without attribute discontinuity: collapses along any edge
+| BORDER   = 1u8  // on the open border of a surface: collapses along that border
+| SEAM     = 2u8  // one of the two vertices of an attribute seam: collapses along the seam, with its twin
+| LOCKED   = 3u8; // anything else: never moves
+
+/**
+ * The number of floats of a quadric: a00, a11, a22, a10, a20, a21, b0, b1, b2, c, and the weight of its planes
+ * */
+def QUADRIC_SIZE = 11us;
+
+/**
+ * The marker of a vertex without an open edge
+ * */
+def NO_VERTEX = u32::max;
+
+/**
+ * The weight of the planes along the borders and the seams, against the planes of the triangles
+ * */
+def BORDER_WEIGHT = 2.0f;
+
+/**
+ * Simplify a mesh, see Simplifier
+ * @params:
+ *    - positions: the positions of the vertices
+ *    - indices: the triangles of the mesh, three indices each
+ *    - targetCount: the number of indices to reach
+ *    - targetError: the largest error to add, relative to the largest dimension of the mesh
+ * @returns:
+ *    - .0: the indices of the simplified triangles, as many as targetCount or more when the error stops it first
+ *    - .1: the largest distance from the simplified mesh to the original one, in the unit of the positions
+ * */
+pub fn simplify (positions : [vec3], indices : [u32], targetCount : usize, targetError : f32)-> ([u32], f32) {
+    let dmut simplifier = Simplifier (positions, indices);
+    simplifier:.simplify (targetCount, targetError)
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===================================          POSITIONS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * Move the positions into a unit box, so the errors are relative to the size of the mesh
+ * @returns:
+ *    - .0: the moved positions
+ *    - .1: the largest dimension of the mesh, 1 for a flat or empty one
+ * */
+fn rescale (positions : [vec3])-> ([vec3], f32) {
+    if positions.len == 0us { return ([], 1.0f); }
+
+    let mut min = positions [0], mut max = positions [0];
+    for p in positions {
+        if p.x < min.x { min.x = p.x; }
+        if p.y < min.y { min.y = p.y; }
+        if p.z < min.z { min.z = p.z; }
+        if p.x > max.x { max.x = p.x; }
+        if p.y > max.y { max.y = p.y; }
+        if p.z > max.z { max.z = p.z; }
+    }
+
+    let size = max - min;
+    let mut extent = size.x;
+    if size.y > extent { extent = size.y; }
+    if size.z > extent { extent = size.z; }
+    if extent <= 0.0f { extent = 1.0f; }
+
+    let scale = 1.0f / extent;
+    (copy [(p - min) * scale for p in positions], extent)
+}
+
+/**
+ * Group the vertices sharing a position (the wedges of a seam), among the vertices the triangles use
+ * @returns:
+ *    - .0: for each vertex, the first vertex with the same position (itself for an unused vertex)
+ *    - .1: for each vertex, the next vertex with the same position, in a cycle (itself for an unused vertex)
+ * */
+fn buildPositionRemap (positions : [vec3], indices : [u32])-> ([u32], [u32]) {
+    let dmut used = copy [false ; positions.len];
+    let mut nbUsed = 0us;
+    for i in indices if !used [i] {
+        used [i] = true;
+        nbUsed += 1us;
+    }
+
+    let dmut sorted = copy [(0.0f, 0.0f, 0.0f, 0u32) ; nbUsed];
+    let mut count = 0us;
+    for i in 0us .. positions.len if used [i] {
+        sorted [count] = (positions [i].x, positions [i].y, positions [i].z, cast!u32 (i));
+        count += 1us;
+    }
+
+    sort (alias sorted, |a, b| => {
+        if a._0 != b._0 { a._0 < b._0 }
+        else if a._1 != b._1 { a._1 < b._1 }
+        else if a._2 != b._2 { a._2 < b._2 }
+        else { a._3 < b._3 }
+    });
+
+    let dmut remap = copy [cast!u32 (i) for i in 0us .. positions.len];
+    let dmut wedge = copy [cast!u32 (i) for i in 0us .. positions.len];
+
+    let mut start = 0us;
+    while start < sorted.len {
+        let mut end = start + 1us;
+        while end < sorted.len && sorted [end]._0 == sorted [start]._0 && sorted [end]._1 == sorted [start]._1 && sorted [end]._2 == sorted [start]._2 {
+            end += 1us;
+        }
+
+        for j in start .. end {
+            remap [sorted [j]._3] = sorted [start]._3;
+            wedge [sorted [j]._3] = if j + 1us == end { sorted [start]._3 } else { sorted [j + 1us]._3 };
+        }
+
+        start = end;
+    }
+
+    (remap, wedge)
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =================================          CLASSIFICATION          =================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * Find the open edges of the mesh, and the kind of each vertex from them
+ * @returns:
+ *    - .0: for each vertex, the vertex its open edge goes to (NO_VERTEX when none, the vertex itself when several)
+ *    - .1: for each vertex, the vertex its open edge comes from (same markers)
+ *    - .2: the kind of each vertex
+ * */
+fn classify (indices : [u32], remap : [u32], wedge : [u32], nbVertices : usize)-> ([u32], [u32], [VertexKind]) {
+    let (offsets, targets) = buildHalfEdges (indices, nbVertices);
+
+    let dmut openout = copy [NO_VERTEX ; nbVertices];
+    let dmut openinc = copy [NO_VERTEX ; nbVertices];
+    for i in 0us .. nbVertices {
+        for k in offsets [i] .. offsets [i + 1us] {
+            let a = cast!u32 (i), b = targets [k];
+            if !hasHalfEdge (offsets, targets, b, a) {
+                openout [a] = if openout [a] == NO_VERTEX { b } else { a };
+                openinc [b] = if openinc [b] == NO_VERTEX { a } else { b };
+            }
+        }
+    }
+
+    let dmut kinds = copy [VertexKind::LOCKED ; nbVertices];
+    for i in 0us .. nbVertices if remap [i] == cast!u32 (i) {
+        let v = cast!u32 (i);
+        kinds [i] = if wedge [i] == v {
+            let a = openinc [i], b = openout [i];
+            if a == NO_VERTEX && b == NO_VERTEX { VertexKind::MANIFOLD }
+            else if a != NO_VERTEX && b != NO_VERTEX && a != v && b != v { VertexKind::BORDER }
+            else { VertexKind::LOCKED }
+        } else if wedge [wedge [i]] == v {
+            let w = wedge [i];
+            let a = openinc [i], b = openout [i], c = openinc [w], d = openout [w];
+            let single = a != NO_VERTEX && b != NO_VERTEX && c != NO_VERTEX && d != NO_VERTEX && a != v && b != v && c != w && d != w;
+
+            // the two sides of a seam go along each other, in opposite directions
+            if single && remap [a] == remap [d] && remap [b] == remap [c] && remap [a] != remap [b] { VertexKind::SEAM }
+            else { VertexKind::LOCKED }
+        } else {
+            VertexKind::LOCKED
+        };
+    }
+
+    for i in 0us .. nbVertices {
+        kinds [i] = kinds [remap [i]];
+    }
+
+    (openout, openinc, kinds)
+}
+
+/**
+ * Build the half edges going out of each vertex
+ * @returns:
+ *    - .0: for each vertex, the offset of its first half edge in .1, and the total count at the end
+ *    - .1: the vertices the half edges go to
+ * */
+fn buildHalfEdges (indices : [u32], nbVertices : usize)-> ([usize], [u32]) {
+    let dmut offsets = copy [0us ; nbVertices + 1us];
+    for i in indices { offsets [i + 1u32] += 1us; }
+    for i in 0us .. nbVertices { offsets [i + 1us] += offsets [i]; }
+
+    let dmut fill = copy offsets;
+    let dmut targets = copy [0u32 ; indices.len];
+    for t in 0us .. indices.len / 3us {
+        for e in 0us .. 3us {
+            let a = indices [t * 3us + e], b = indices [t * 3us + (e + 1us) % 3us];
+            targets [fill [a]] = b;
+            fill [a] += 1us;
+        }
+    }
+
+    (offsets, targets)
+}
+
+/**
+ * @returns: true iif a triangle goes from a to b
+ * */
+fn hasHalfEdge (offsets : [usize], targets : [u32], a : u32, b : u32)-> bool {
+    for k in offsets [a] .. offsets [a + 1u32] {
+        if targets [k] == b { return true; }
+    }
+
+    false
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===================================          QUADRICS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * Accumulate the planes of the triangles, and of the borders and seams, into the quadrics of their vertices
+ * @returns: the quadrics, QUADRIC_SIZE floats for each vertex, filled at the first vertex of each position
+ * */
+fn buildQuadrics (positions : [vec3], indices : [u32], remap : [u32], loopout : [u32], kinds : [VertexKind])-> dmut [f32] {
+    let dmut quadrics = copy [0.0f ; positions.len * QUADRIC_SIZE];
+    for t in 0us .. indices.len / 3us {
+        let i0 = remap [indices [t * 3us]], i1 = remap [indices [t * 3us + 1us]], i2 = remap [indices [t * 3us + 2us]];
+        let p0 = positions [i0], p1 = positions [i1], p2 = positions [i2];
+
+        let n = (p1 - p0).cross (p2 - p0);
+        let area = n.length ();
+        if area <= 0.0f { continue; }
+
+        let normal = n / area;
+        let d = -normal.dot (p0);
+        for i in [i0, i1, i2] {
+            addPlane (alias quadrics, i, normal, d, area);
+        }
+
+        // the planes going through the open edges, orthogonal to their triangle, keep the borders in place
+        for e in 0us .. 3us {
+            let a = indices [t * 3us + e], b = indices [t * 3us + (e + 1us) % 3us];
+            let k = kinds [a];
+            if (k == VertexKind::BORDER || k == VertexKind::SEAM) && loopout [a] == b {
+                let pa = positions [remap [a]], pb = positions [remap [b]];
+                let edge = pb - pa;
+                let length = edge.length ();
+                if length <= 0.0f { continue; }
+
+                let side = edge.cross (normal).normalized ();
+                let weight = length * length * BORDER_WEIGHT;
+                addPlane (alias quadrics, remap [a], side, -side.dot (pa), weight);
+                addPlane (alias quadrics, remap [b], side, -side.dot (pa), weight);
+            }
+        }
+    }
+
+    alias quadrics
+}
+
+/**
+ * Add the plane (normal, d) with a weight to the quadric at index i
+ * */
+fn addPlane (dmut quadrics : [f32], i : u32, normal : vec3, d : f32, weight : f32) {
+    let q = cast!usize (i) * QUADRIC_SIZE;
+    quadrics [q]       += weight * normal.x * normal.x;
+    quadrics [q + 1us] += weight * normal.y * normal.y;
+    quadrics [q + 2us] += weight * normal.z * normal.z;
+    quadrics [q + 3us] += weight * normal.x * normal.y;
+    quadrics [q + 4us] += weight * normal.x * normal.z;
+    quadrics [q + 5us] += weight * normal.y * normal.z;
+    quadrics [q + 6us] += weight * normal.x * d;
+    quadrics [q + 7us] += weight * normal.y * d;
+    quadrics [q + 8us] += weight * normal.z * d;
+    quadrics [q + 9us] += weight * d * d;
+    quadrics [q + 10us] += weight;
+}
+
+/**
+ * Add the quadric at index src into the one at index dst
+ * */
+fn addQuadric (dmut quadrics : [f32], dst : u32, src : u32) {
+    let d = cast!usize (dst) * QUADRIC_SIZE, s = cast!usize (src) * QUADRIC_SIZE;
+    for k in 0us .. QUADRIC_SIZE {
+        quadrics [d + k] += quadrics [s + k];
+    }
+}
+
+/**
+ * @returns: the mean squared distance from p to the planes of the quadric at index i
+ * */
+fn quadricError (quadrics : [f32], i : u32, p : vec3)-> f32 {
+    let q = cast!usize (i) * QUADRIC_SIZE;
+    let rx = 2.0f * (quadrics [q + 6us] + quadrics [q + 3us] * p.y) + quadrics [q] * p.x;
+    let ry = 2.0f * (quadrics [q + 7us] + quadrics [q + 5us] * p.z) + quadrics [q + 1us] * p.y;
+    let rz = 2.0f * (quadrics [q + 8us] + quadrics [q + 4us] * p.x) + quadrics [q + 2us] * p.z;
+
+    let r = quadrics [q + 9us] + rx * p.x + ry * p.y + rz * p.z;
+    let w = quadrics [q + 10us];
+    if w == 0.0f { return 0.0f; }
+
+    if r < 0.0f { -r / w } else { r / w }
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===================================          COLLAPSES          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: true iif a vertex of kind 'from' can be moved onto a vertex of kind 'to'
+ * */
+fn canCollapse (from : VertexKind, to : VertexKind)-> bool {
+    match from {
+        VertexKind::MANIFOLD => { true }
+        VertexKind::BORDER => { to == VertexKind::BORDER }
+        VertexKind::SEAM => { to == VertexKind::SEAM }
+        _ => { false }
+    }
+}
+
+/**
+ * @returns: true iif an edge between vertices of these kinds is shared by two triangles, so is seen twice
+ * */
+fn hasOpposite (k0 : VertexKind, k1 : VertexKind)-> bool {
+    if k0 == VertexKind::MANIFOLD || k1 == VertexKind::MANIFOLD { return true; }
+    k0 == VertexKind::SEAM && k1 == VertexKind::SEAM
+}
+
+/**
+ * List the edges that can be collapsed, in the direction adding the least error
+ * @returns: the collapses (error, vertex moved, vertex it moves onto)
+ * */
+fn pickEdgeCollapses (positions : [vec3], indices : [u32], remap : [u32], loopout : [u32], kinds : [VertexKind], quadrics : [f32])-> dmut [(f32, u32, u32)] {
+    let dmut collapses = copy [(0.0f, 0u32, 0u32) ; indices.len];
+    let mut count = 0us;
+
+    for t in 0us .. indices.len / 3us {
+        for e in 0us .. 3us {
+            let i0 = indices [t * 3us + e], i1 = indices [t * 3us + (e + 1us) % 3us];
+            let r0 = remap [i0], r1 = remap [i1];
+            let k0 = kinds [i0], k1 = kinds [i1];
+
+            // the vertices of two different borders, or seams, are joined by an inner edge, not by their loop
+            if k0 == k1 && (k0 == VertexKind::BORDER || k0 == VertexKind::SEAM) && loopout [i0] != i1 { continue; }
+
+            // an edge between two triangles is seen once from each, keep one of them
+            if hasOpposite (k0, k1) && r1 > r0 { continue; }
+
+            let forward = canCollapse (k0, k1), backward = canCollapse (k1, k0);
+            if !forward && !backward { continue; }
+
+            let e0 = if forward { quadricError (quadrics, r0, positions [i1]) } else { f32::max };
+            let e1 = if backward { quadricError (quadrics, r1, positions [i0]) } else { f32::max };
+
+            collapses [count] = if e0 <= e1 { (e0, i0, i1) } else { (e1, i1, i0) };
+            count += 1us;
+        }
+    }
+
+    alias collapses [0us .. count]
+}
+
+/**
+ * Collapse the edges in the order of their error, each vertex moving at most once, until the goal
+ * @params:
+ *    - collapses: the collapses, sorted by error
+ *    - goal: the number of triangles to remove
+ *    - errorLimit: the largest error a collapse can add
+ * @returns:
+ *    - .0: the number of collapsed edges
+ *    - .1: the largest error added by a collapse
+ * */
+fn performEdgeCollapses (positions : [vec3],
+                         remap : [u32],
+                         wedge : [u32],
+                         kinds : [VertexKind],
+                         offsets : [usize],
+                         nexts : [u32],
+                         prevs : [u32],
+                         collapses : [(f32, u32, u32)],
+                         dmut quadrics : [f32],
+                         dmut collapseRemap : [u32],
+                         goal : usize,
+                         errorLimit : f32)-> (usize, f32)
+{
+    // every vertex can only move once a pass, and the cheapest collapses are spread over the mesh rather than packed
+    // on its flattest part: past 1.5 times the error of the median collapse needed, the pass stops early
+    let edgeGoal = goal / 2us;
+    let errorGoal = if edgeGoal < collapses.len { 1.5f * collapses [edgeGoal]._0 } else { f32::max };
+
+    let dmut locked = copy [false ; positions.len];
+    let mut triangles = 0us, mut edges = 0us, mut maxError = 0.0f;
+
+    for c in collapses {
+        let (error, i0, i1) = c;
+        if error > errorLimit { break; }
+        if triangles >= goal { break; }
+        if error > errorGoal && triangles > goal / 10us { break; }
+
+        let r0 = remap [i0], r1 = remap [i1];
+        if locked [r0] || locked [r1] { continue; }
+        if hasTriangleFlips (positions, remap, offsets, nexts, prevs, collapseRemap, i0, i1) { continue; }
+
+        if kinds [i0] == VertexKind::SEAM {
+            // the twin of the vertex moves onto the twin of the target, on the other side of the seam
+            collapseRemap [i0] = i1;
+            collapseRemap [wedge [i0]] = wedge [i1];
+        } else {
+            collapseRemap [i0] = i1;
+        }
+
+        addQuadric (alias quadrics, r1, r0);
+        locked [r0] = true;
+        locked [r1] = true;
+
+        triangles += if kinds [i0] == VertexKind::BORDER { 1us } else { 2us };
+        edges += 1us;
+        if error > maxError { maxError = error; }
+    }
+
+    (edges, maxError)
+}
+
+/**
+ * @returns: true iif moving i0 onto i1 turns one of the triangles around i0 over
+ * */
+fn hasTriangleFlips (positions : [vec3],
+                     remap : [u32],
+                     offsets : [usize],
+                     nexts : [u32],
+                     prevs : [u32],
+                     collapseRemap : [u32],
+                     i0 : u32,
+                     i1 : u32)-> bool
+{
+    let r0 = remap [i0], r1 = remap [i1];
+    let p0 = positions [i0], p1 = positions [i1];
+
+    for k in offsets [r0] .. offsets [r0 + 1u32] {
+        let a = collapseRemap [nexts [k]], b = collapseRemap [prevs [k]];
+
+        // the triangles around the collapsed edge disappear
+        if remap [a] == r1 || remap [b] == r1 { continue; }
+
+        let pa = positions [a], pb = positions [b];
+        let edge = pb - pa;
+        let before = edge.cross (p0 - pa), after = edge.cross (p1 - pa);
+
+        // a rotation of the normal by more than ~75 degrees is a flip as well, it folds the surface
+        if before.dot (after) <= 0.25f * before.length () * after.length () { return true; }
+    }
+
+    false
+}
+
+/**
+ * Sort the collapses by increasing error, with a radix sort of the bits of the errors: their order is the order of
+ * the errors, which are never negative
+ * @returns: the sorted collapses
+ * */
+fn sortByError (collapses : [(f32, u32, u32)])-> [(f32, u32, u32)] {
+    let keys = copy [floatBits (c._0) for c in collapses];
+    let dmut order = copy [cast!u32 (i) for i in 0us .. collapses.len];
+    let dmut sorted = copy [0u32 ; collapses.len];
+
+    for shift in [0u32, 8u32, 16u32, 24u32] {
+        let dmut starts = copy [0us ; 257us];
+        for i in order { starts [((keys [i] >> shift) & 255u32) + 1u32] += 1us; }
+        for b in 0us .. 256us { starts [b + 1us] += starts [b]; }
+
+        for i in order {
+            let b = (keys [i] >> shift) & 255u32;
+            sorted [starts [b]] = i;
+            starts [b] += 1us;
+        }
+
+        for k in 0us .. order.len { order [k] = sorted [k]; }
+    }
+
+    copy [collapses [i] for i in order]
+}
+
+/**
+ * @returns: the bits of a float
+ * */
+fn floatBits (f : f32)-> u32 {
+    unsafe { *(cast!{*u32} (cast!{*void} (&f))) }
+}
+
+/**
+ * Build the triangles around each position
+ * @returns:
+ *    - .0: for each vertex, the offset of its first triangle in .1 and .2 (filled at the first vertex of each position)
+ *    - .1: the vertex following the position in each triangle
+ *    - .2: the vertex preceding the position in each triangle
+ * */
+fn buildTriangleAdjacency (indices : [u32], remap : [u32])-> ([usize], [u32], [u32]) {
+    let dmut offsets = copy [0us ; remap.len + 1us];
+    for i in indices { offsets [remap [i] + 1u32] += 1us; }
+    for i in 0us .. remap.len { offsets [i + 1us] += offsets [i]; }
+
+    let dmut fill = copy offsets;
+    let dmut nexts = copy [0u32 ; indices.len];
+    let dmut prevs = copy [0u32 ; indices.len];
+    for t in 0us .. indices.len / 3us {
+        for e in 0us .. 3us {
+            let r = remap [indices [t * 3us + e]];
+            nexts [fill [r]] = indices [t * 3us + (e + 1us) % 3us];
+            prevs [fill [r]] = indices [t * 3us + (e + 2us) % 3us];
+            fill [r] += 1us;
+        }
+    }
+
+    (offsets, nexts, prevs)
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===================================          REMAPPING          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the triangles whose three vertices are at different positions
+ * */
+fn removeDegenerates (indices : [u32], remap : [u32])-> dmut [u32] {
+    let identity = copy [cast!u32 (i) for i in 0us .. remap.len];
+    remapIndices (indices, remap, identity)
+}
+
+/**
+ * Move the vertices of the triangles where the collapses sent them, dropping the triangles that collapsed
+ * @returns: the remaining triangles
+ * */
+fn remapIndices (indices : [u32], remap : [u32], collapseRemap : [u32])-> dmut [u32] {
+    let dmut result = copy [0u32 ; indices.len];
+    let mut count = 0us;
+    for t in 0us .. indices.len / 3us {
+        let a = collapseRemap [indices [t * 3us]], b = collapseRemap [indices [t * 3us + 1us]], c = collapseRemap [indices [t * 3us + 2us]];
+        let ra = remap [a], rb = remap [b], rc = remap [c];
+        if ra != rb && rb != rc && ra != rc {
+            result [count] = a;
+            result [count + 1us] = b;
+            result [count + 2us] = c;
+            count += 3us;
+        }
+    }
+
+    alias result [0us .. count]
+}
+
+/**
+ * Follow the collapses in the open edges of the borders and the seams
+ * */
+fn remapEdgeLoops (dmut edges : [u32], collapseRemap : [u32]) {
+    for i in 0us .. edges.len if edges [i] != NO_VERTEX {
+        let l = edges [i];
+        let r = collapseRemap [l];
+
+        // the edge collapsed onto i itself, i now goes where l went
+        edges [i] = if r == cast!u32 (i) { edges [l] } else { r };
+    }
+}
