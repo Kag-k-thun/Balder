@@ -7,6 +7,7 @@ pub mod ::image2D;
 pub mod ::buffer;
 pub mod ::dyn_buffer;
 pub mod ::interval;
+pub mod ::in_flight;
 
 use balder::core::{_, memory::_};
 use balder::core::driver::device;
@@ -51,6 +52,9 @@ pub class MemoryAllocator {
 
     // The list of commited dynamic buffers
     let dmut _commitedDynamicBuffers: [usize => &DynamicBuffer] = copy [];
+
+    // The writes of the buffers with a copy per frame in flight, called at the submission of each frame
+    let dmut _inFlight: [usize => dg (u32)-> void] = copy [];
 
     // The list of mapped allocations
     let dmut _mapped: [usize => *void] = copy [];
@@ -235,6 +239,59 @@ pub class MemoryAllocator {
         }
     }
 
+    /**
+     * Write the copies of a frame of the in flight buffers, with the bytes modified since they were last written
+     * @assume: the previous submission of the frame was awaited
+     * @params:
+     *    - frame: the frame being submitted
+     * */
+    pub fn flushInFlight(mut self, frame: u32) {
+        // Written outside the lock of the allocator, a buffer allocates its copies under its own lock
+        let flushes = atomic self {
+            let mut flushes: [dg (u32)-> void] = [];
+            for _, f in self._inFlight {
+                flushes ~= [f];
+            }
+
+            flushes
+        };
+
+        for f in flushes {
+            f(frame);
+        }
+    }
+
+    /**
+     * Write the copy of each frame of a buffer at the submission of the frame, until it is forgotten
+     * @params:
+     *    - uid: the uniq id of the buffer, see nextBufferId
+     *    - flush: writes the copy of the frame given as parameter
+     * */
+    pub fn registerInFlight(mut self, uid: usize, flush: dg (u32)-> void) {
+        atomic self {
+            self._inFlight[uid] = flush;
+        }
+    }
+
+    /**
+     * Stop writing the copies of a disposed buffer
+     * */
+    pub fn forgetInFlight(mut self, uid: usize) {
+        atomic self {
+            self._inFlight:.remove(uid);
+        }
+    }
+
+    /**
+     * @returns: a new uniq id of buffer
+     * */
+    pub fn nextBufferId(mut self)-> usize {
+        atomic self {
+            self._lastBufferId += 1;
+            self._lastBufferId
+        }
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -330,6 +387,27 @@ pub class MemoryAllocator {
 
             return copy DynamicBuffer(uid, alias self, memAlloc, alias buf, alias localData);
         }
+    }
+
+    /**
+     * Allocate a host visible buffer with one copy per frame in flight, each written at the submission of its frame
+     * @params:
+     *    - size: the size of the buffer in bytes
+     *    - bufferUsage: the usage of the copies
+     * @returns: the buffer, written at each submission until it is disposed
+     * */
+    pub fn allocInFlightBuffer(mut self, size: usize, bufferUsage: VkBufferUsageFlags)-> dmut &InFlightBuffer
+        throws BalderError
+    {
+        if size == 0 {
+            throw copy BalderError("Cannot allocate an empty buffer");
+        }
+
+        // Allocated outside the lock of the allocator, the copies being allocated under the lock of the buffer
+        let dmut buffer = copy InFlightBuffer(self:.nextBufferId(), alias self._device, size, bufferUsage);
+        self:.registerInFlight(buffer.uid, &buffer:.flush);
+
+        alias buffer
     }
 
     /*!
