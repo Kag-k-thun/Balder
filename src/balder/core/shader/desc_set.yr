@@ -1,13 +1,16 @@
 in desc_set;
 
-use balder::core::{_, config::shader::_, shader::{texture, buffers::_}};
-
+use balder::core::_;
+use balder::core::config::shader::_;
+use balder::core::memory::in_flight;
+use balder::core::shader::{buffers::_, texture};
 use balder::utils::log;
 
-use ::vulkan::core;
 use std::io;
 
 use ::etc::c::memory;
+
+use ::vulkan::core;
 
 /**
  * Ancestor of all descriptor sets
@@ -31,6 +34,9 @@ pub class DescriptorSet {
 
         // The samplers for textures
         let dmut _samplers: [[c8] => VkSampler] = copy [];
+
+        // The generation of the in flight buffers bound as storage buffers in the set of each frame, 0 when unbound
+        let dmut _inFlight: [[c8] => [u32]] = copy [];
     }
 
     /*!
@@ -174,6 +180,50 @@ pub class DescriptorSet {
 
             vkUpdateDescriptorSets(device.getDeviceHandle(), 1, &descWrite, 0, null);
         }
+    }
+
+    /**
+     * Bind the copy of a frame of an in flight buffer as a storage buffer, the set of the frame being written only when
+     * the copies changed since it was last bound (the buffer was enlarged)
+     * @assume: the set of the frame is not used by a submission in flight, e.g. while recording the frame
+     * @params:
+     *    - name: the name of the storage buffer
+     *    - buffer: the buffer to bind
+     *    - frame: the frame whose set is written
+     * */
+    pub fn setBuffer(mut self, name: [c8], buffer: &InFlightBuffer, frame: u32) {
+        let generation = buffer.getGeneration() + 1u32;
+        if let Ok(bound) = self._inFlight[name] {
+            if bound[frame] == generation { return; }
+        }
+
+        let un = if let Ok(un) = self._cfg.buffers[name] {
+            un
+        } else {
+            log::error #("DescriptorSet", "Set buffer impossible :", name);
+            return;
+        };
+
+        // read before the handle, a buffer enlarged in between is bound again by the next call
+        let mut bufferInfo = VkDescriptorBufferInfo();
+        bufferInfo.range = cast!u64(buffer.getSize());
+        bufferInfo.buffer = buffer.getVulkanBuffer(frame);
+        bufferInfo.offset = 0;
+
+        let mut descWrite = VkWriteDescriptorSet();
+        descWrite.sType = VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descWrite.dstSet = self._set[frame];
+        descWrite.dstBinding = un.binding;
+        descWrite.dstArrayElement = 0;
+        descWrite.descriptorType = VkDescriptorType::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descWrite.descriptorCount = 1;
+        descWrite.pBufferInfo = &bufferInfo;
+
+        vkUpdateDescriptorSets(self._shader:.getDevice().getDeviceHandle(), 1, &descWrite, 0, null);
+
+        let mut bound: [mut u32] = if let Ok(b) = self._inFlight[name] { copy b } else { copy [0u32; self._set.len] };
+        bound[frame] = generation;
+        self._inFlight[name] = copy bound;
     }
 
     /*!
