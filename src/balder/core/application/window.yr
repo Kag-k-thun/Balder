@@ -89,6 +89,9 @@ pub class Window {
         // Semaphore posted when a frame is requested
         let dmut _frameSemaphore: &Semaphore = copy Semaphore();
 
+        // True when the window was exposed since the last frame, the next one being drawn without waiting
+        let mut _exposed: bool = false;
+
         // The minimal duration of a frame, by default 60 frames per second
         let mut _frameDuration: Duration = dur::millis(16u64) + dur::micros(666u64);
 
@@ -103,6 +106,25 @@ pub class Window {
 
         // The mailbox to receive signals
         let dmut _box: &SlotEmitter = copy SlotEmitter();
+    }
+
+    prot { // layout
+
+        // The size in pixels the widgets of the window were last laid out at
+        let mut _layoutSize: (u32, u32) = (0u32, 0u32);
+
+        // The size in pixels a frame waits for the widgets to be laid out at
+        let mut _layoutRequest: (u32, u32)? = none;
+
+        // Emitted from the rendering thread when a layout is requested, to wake the thread laying the widgets out
+        let dmut _layoutRequested: &DirectSignal!{()} = copy DirectSignal!{()}();
+
+        // Semaphore posted when the widgets are laid out
+        let dmut _layoutSemaphore: &Semaphore = copy Semaphore();
+
+        // The longest a frame waits for the widgets to be laid out at its size, before being drawn with the layout of
+        // the previous one
+        let mut _layoutTimeout: Duration = dur::millis(50u64);
     }
 
     /**
@@ -220,7 +242,9 @@ pub class Window {
     pub fn configureInputEvents(mut self) {
         let dmut input = self:.getInputManager();
 
-        input:.windowResized():.connect(alias self._box, &self:.onResize);
+        // Woken from the main thread as soon as the events are pumped, under Wayland the compositor waits for the
+        // frame of a size to resize the window again
+        input:.windowResized():.connect(alias self._app:.getRootSlotEmitter(), &self:.onResize);
         input:.windowExposed():.connect(alias self._app:.getRootSlotEmitter(), &self:.onExpose);
     }
 
@@ -273,8 +297,7 @@ pub class Window {
      * Slot called when the window is resized
      * */
     pub fn onResize(mut self, w: u32, h: u32) {
-        self._vkDevice:.windowResize();
-
+        // the swap chain is created again at the start of the next frame, if it was not already for that size
         self._w = w;
         self._h = h;
         self:.requestFrame();
@@ -284,6 +307,11 @@ pub class Window {
      * Slot called when the window is exposed
      * */
     pub fn onExpose(mut self) {
+        // Under Wayland, a resized window gets its new size once a frame is presented, the frame is drawn right away
+        atomic self {
+            self._exposed = true;
+        }
+
         self:.requestFrame();
     }
 
@@ -683,26 +711,81 @@ pub class Window {
         log::debug #("Window", "start rendering thread");
 
         while self._isRunning {
-            {
-                self._box:.emit();
-                let image = self:.startFrame();
+            self._box:.emit();
+            let image = self:.startFrame();
 
-                if (image >= 0) {
-                    self:.submitFrame();
-                    self:.presentFrame(image);
-                    self._nbFrame += 1u32;
-                } else {
-                    if let Ok(dmut pipe) = alias self._pipeline {
-                        pipe:.forceRedraw();
-                    }
+            if (image >= 0) {
+                self:.submitFrame();
+                self:.presentFrame(image);
+                self._nbFrame += 1u32;
+            } else {
+                if let Ok(dmut pipe) = alias self._pipeline {
+                    pipe:.forceRedraw();
                 }
-
-                self:.waitFrame();
             }
+
+            self:.waitFrame();
         }
 
         self:.waitIdle();
         log::debug #("Window", "Quit thread loop");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          LAYOUT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Connect the function waking the thread laying the widgets of the window out, called from the rendering thread
+     * when a frame waits for them to be laid out at its size
+     * @info: without one, the frames never wait for a layout
+     * */
+    pub fn connectLayoutRequest(mut self, f: dg ()-> void) {
+        atomic self {
+            self._layoutRequested:.connect(f);
+        }
+    }
+
+    /**
+     * Disconnect a function connected by connectLayoutRequest
+     * */
+    pub fn disconnectLayoutRequest(mut self, f: dg ()-> void) {
+        atomic self {
+            self._layoutRequested:.disconnect(f);
+        }
+    }
+
+    /**
+     * @returns: the size in pixels a frame waits for the widgets to be laid out at, none if no frame waits
+     * */
+    pub fn getLayoutRequest(self)-> (u32, u32)? {
+        atomic self {
+            self._layoutRequest
+        }
+    }
+
+    /**
+     * Inform the frames that the widgets are laid out at a size and committed, the frame waiting for that size is
+     * drawn
+     * @params:
+     *    - w: the width in pixels the widgets are laid out at
+     *    - h: the height in pixels
+     * */
+    pub fn laidOut(mut self, w: u32, h: u32) {
+        atomic self {
+            self._layoutSize = (w, h);
+            if let Ok(req) = self._layoutRequest {
+                if req == (w, h) {
+                    self._layoutRequest = none;
+                }
+            }
+        }
+
+        self._layoutSemaphore:.post();
     }
 
     /*!
@@ -816,7 +899,20 @@ pub class Window {
         if (self._frameDuration > tick) {
             let x = Instant::now();
             let r = self._frameDuration - tick - dur::micros(1u64);
-            sleep(r);
+            let deadline = x + r;
+
+            // The frame of a resized or exposed window is drawn right away, woken by the frame request of the event
+            loop {
+                if self:.takeExposed() || self.isResized() {
+                    self._frameTimer:.reset();
+                    return;
+                }
+
+                let now = Instant::now();
+                if now >= deadline { break; }
+
+                self._frameSemaphore:.wait(timeout-> deadline - now);
+            }
 
             let z = (Instant::now() - x) - r;
             self._frameTimer:.reset(z);
@@ -827,6 +923,25 @@ pub class Window {
             // Idle since the last frame, the next one starts a frame duration from now
             self._frameTimer:.reset();
         }
+    }
+
+    /**
+     * @returns: true iif the window was exposed since the last call
+     */
+    fn takeExposed(mut self)-> bool {
+        atomic self {
+            let exposed = self._exposed;
+            self._exposed = false;
+            exposed
+        }
+    }
+
+    /**
+     * @returns: true iif the window was resized since the swap chain was created
+     */
+    fn isResized(self)-> bool {
+        let (w, h) = self.getDimension();
+        !self._vkDevice.isSizedFor(w, h)
     }
 
     /**
@@ -863,14 +978,58 @@ pub class Window {
      * Start a new vulkan rendering pass
      */
     fn startFrame(mut self)-> i32 {
+        // The resize signals reach the thread at the start of the frame, the window may have been resized since
+        let (w, h) = self.getDimension();
+        self._vkDevice:.checkWindowSize(w, h);
+
         return if let Ok(dmut pipe) = alias self._pipeline {
-            pipe:.waitPreviousFrame();
+            pipe:.prepareFrame();
+
+            // A frame drawn at the new size of the window with the layout of the previous one would show the widgets
+            // misplaced until the next frame
+            self:.awaitLayout(w, h);
+
+            // The frame is the one of the image acquired, its previous submission is awaited once it is known
             let image = self._vkDevice:.acquireNextImage();
+            if image >= 0 {
+                pipe:.waitPreviousFrame();
+            }
 
             image
         } else {
             -1
         };
+    }
+
+    /**
+     * Wait for the widgets to be laid out at the size of the frame, if they were laid out at another one
+     * @info: waits for _layoutTimeout at most, the thread laying them out might be busy (a modal dialog for example);
+     * a request not served in time is not waited for again, the frames being drawn with the previous layout until then
+     * */
+    fn awaitLayout(mut self, w: u32, h: u32) {
+        let wait = atomic self {
+            if w == 0u32 || h == 0u32 || self._layoutSize == (w, h) || self._layoutRequested.len == 0us {
+                false
+            } else {
+                let pending = self._layoutRequest.hasValue;
+                self._layoutRequest = (w, h)?;
+                self._layoutRequested:.emit();
+                !pending
+            }
+        };
+
+        if !wait { return; }
+
+        let deadline = Instant::now() + self._layoutTimeout;
+        loop {
+            let done = atomic self { self._layoutSize == (w, h) };
+            if done { break; }
+
+            let now = Instant::now();
+            if now >= deadline { break; }
+
+            self._layoutSemaphore:.wait(timeout-> deadline - now);
+        }
     }
 
     /**

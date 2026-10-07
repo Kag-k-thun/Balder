@@ -59,6 +59,9 @@ pub class VulkanDevice {
 
         // True when the window was resized and the swap chain needs to be recreated
         let mut _resizingWindow: bool = false;
+
+        // The size in pixels of the window the current frame is drawn for, the swap chain being created again at it
+        let mut _frameSize: (u32, u32) = (0u32, 0u32);
     }
 
     prot {
@@ -75,7 +78,7 @@ pub class VulkanDevice {
         // The allocator used to allocate descriptor sets
         let dmut _descPool: (&DescriptorAllocator)? = none;
 
-        // The index of the frame being drawn
+        // The index of the frame being drawn, the index of the image of the swap chain it draws to
         let mut _currentFrame: u32 = 0u32;
     }
 
@@ -83,6 +86,12 @@ pub class VulkanDevice {
 
         // Semaphore used to signal when an image is ready
         let dmut _imageAvailableSem: [VkSemaphore] = [];
+
+        // The index of the semaphore the next image is acquired with, the semaphores being used in turn
+        let mut _acquireIndex: u32 = 0u32;
+
+        // The frame whose submission last waited for each semaphore of acquisition, -1 if none
+        let mut _acquireFrame: [mut i32] = [];
     }
 
     prot {
@@ -457,10 +466,10 @@ pub class VulkanDevice {
     }
 
     /**
-     * @returns: the semaphore to wait for the present image to be available
+     * @returns: the semaphore signaled when the image of the current frame is available, the one it was acquired with
      * */
-    pub fn getImageAvailableSemaphores(self)-> [VkSemaphore] {
-        self._imageAvailableSem
+    pub fn getAcquireSemaphore(self)-> VkSemaphore {
+        self._imageAvailableSem[self._acquireIndex]
     }
 
     /**
@@ -481,25 +490,51 @@ pub class VulkanDevice {
     }
 
     /**
-     * The window size changed so we need to inform the device
+     * Mark the swap chain outdated if it was created for another size of window, so it is created again before the
+     * next frame is drawn
+     * @params:
+     *    - w: the width of the window in pixels
+     *    - h: the height of the window in pixels
      */
-    pub fn windowResize(mut self) {
-        self._resizingWindow = true;
+    pub fn checkWindowSize(mut self, w: u32, h: u32) {
+        self._frameSize = (w, h);
+        if !self.isSizedFor(w, h) {
+            self._resizingWindow = true;
+        }
     }
 
     /**
-     * Wait for an image to be available for rendering, and return its index
-     * @returns:
-     *    - .0: the image index
-     *    - .1: true iif the image index is different from current frame, and therefore fences have to be awaited again
+     * @returns: false iif the swap chain was created for another size of window than 'w' x 'h' pixels, a window of
+     * no size (minimized) having no swap chain to create
+     */
+    pub fn isSizedFor(self, w: u32, h: u32)-> bool {
+        if w == 0u32 || h == 0u32 { return true; }
+        if let Ok(swp) = self._swapChain {
+            return swp.isSizedFor(w, h);
+        }
+
+        true
+    }
+
+    /**
+     * Wait for an image to be available for rendering, the current frame being the one drawing to it
+     * @info: the images are not acquired in turn (mailbox, a swap chain created again), so a frame draws to the
+     * framebuffers of its image and signals the semaphores of its image, which the present of the image waits
+     * @returns: the image index, -1 if the swap chain has to be created again
      */
     pub fn acquireNextImage(mut self)-> i32 {
-        if let Ok(swp) = self._swapChain {
+        if let Ok(dmut swp) = alias self._swapChain {
+            // The semaphore was waited by the submission of a previous frame, it is reused once that one is finished
+            let previous = self._acquireFrame[self._acquireIndex];
+            if previous >= 0 {
+                swp:.getRenderPass():.waitRender(cast!u32(previous));
+            }
+
             let mut imageIndex = 0u32;
             let result = vkAcquireNextImageKHR(self._device,
                                                swp.chain,
                                                u64::max,
-                                               self._imageAvailableSem[self._currentFrame],
+                                               self._imageAvailableSem[self._acquireIndex],
                                                null,
                                                alias &imageIndex);
             if (result == VkResult::VK_ERROR_OUT_OF_DATE_KHR) {
@@ -510,6 +545,8 @@ pub class VulkanDevice {
                 return -1;
             }
 
+            self._currentFrame = imageIndex;
+            self._acquireFrame[self._acquireIndex] = cast!i32(imageIndex);
             return cast!i32(imageIndex);
         }
 
@@ -530,7 +567,7 @@ pub class VulkanDevice {
                     return r;
                 }
 
-                self._currentFrame = (self._currentFrame + 1u32) % cast!u32(swp.nbFrames);
+                self._acquireIndex = (self._acquireIndex + 1u32) % cast!u32(self._imageAvailableSem.len);
                 return VkResult::VK_SUCCESS;
             }
         }
@@ -711,6 +748,8 @@ pub class VulkanDevice {
                 throw copy BalderError("Failed to create available semaphore");
             }
         }
+
+        self._acquireFrame = copy [-1; self._imageAvailableSem.len];
     }
 
     /**
@@ -719,7 +758,7 @@ pub class VulkanDevice {
     prv fn createTransferPass(mut self)
         throws BalderError
     {
-        let dmut trn = copy VulkanTransferPass(alias self, self._imageAvailableSem);
+        let dmut trn = copy VulkanTransferPass(alias self);
         self._transferPass = (alias trn)?;
     }
 
@@ -754,8 +793,19 @@ pub class VulkanDevice {
         atomic self {
             if let Ok(dmut swp) = alias self._swapChain {
                 if let Ok(dmut win) = alias self._win {
-                    swp:.reconfigure(alias win, self._cfg);
+                    // The size the frame was checked against, the window may have been resized again since
+                    let size = if self._frameSize._0 == 0u32 || self._frameSize._1 == 0u32 {
+                        win.getDimension()
+                    } else {
+                        self._frameSize
+                    };
+
+                    swp:.reconfigure(alias win, self._cfg, size);
                     self._currentFrame = 0;
+
+                    // The device is idle, no submission waits for a semaphore of acquisition anymore
+                    self._acquireIndex = 0;
+                    self._acquireFrame = copy [-1; self._imageAvailableSem.len];
                 } else {
                     throw copy BalderError("Malformed device");
                 }
@@ -1055,6 +1105,7 @@ pub class VulkanDevice {
                 }
 
                 self._imageAvailableSem = [];
+                self._acquireFrame = [];
 
                 if (self._device != null) {
                     vkDestroyDevice(self._device, null);
