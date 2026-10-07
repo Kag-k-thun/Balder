@@ -9,7 +9,7 @@ length lives in the style sheet and means what it reads like, components, signal
 | Question | Proposal | Status |
 |---|---|---|
 | Where do sizes live? | Every size and position of the layout in `.style`. The render resolution of a `Scene3D` stays in the `.gui`: it is the size the scene is rendered at before being scaled to the widget, not a layout size ([§3](#3-the-structure-file)). | Proposed |
-| What do sizes mean? | CSS semantics: `width` is the border box, margins sit outside it, `%` is of the parent, unset means `auto` (sized to the content along a layout's axis, stretched across it). | Proposed |
+| What do sizes mean? | CSS semantics: `width` is the border box, margins sit outside it, `%` is of the parent, unset means `auto` (sized to the content along a layout's axis, stretched across it). | Done (BAL-64) |
 | Layouts that change with the space? | BAL-53's `flex-wrap`, `justify-content`, `align-items` and `gap`, plus `@when (…)` blocks testing the available space, the window (size, scale, density, dpi) and variables published by the application. | Proposed |
 | Two files or one? | Keep two, with one lexer and one value grammar. | Proposed |
 | What replaces `(class: "x", orientation: horizontal)`? | `Type #id .class "default value" { attr: value; children }`. Ids are optional. | Proposed |
@@ -659,7 +659,7 @@ next popup opened.
 | `scroll-speed` | `LinearLayout` | a number of 0 or more | `2` |
 | `columns`, `rows` | `GridLayout` | one or more tracks: a length, `%`, `fr`, `auto`, `min-content`, `max-content` | none |
 | `popup-align` | `MenuButton` | `left`/`center`/`right` then `top`/`center`/`bottom` | `left bottom` |
-| `left`, `top` | every widget, read by a `FloatingLayout` | a length | `0` |
+| `left`, `top`, `right`, `bottom` | every widget, read by a `FloatingLayout` | a length | unset, at the top left corner |
 
 - **A layout scrolls itself.** `overflow: scroll` keeps the bases of the children instead of shrinking them, and the
   layout scrolls over them with the wheel or by dragging its scrollbar, styled as its part `LinearLayout::scrollbar`.
@@ -1046,11 +1046,12 @@ Each has a recommendation.
 
 1. **Border-box widths, margins outside.** This is the largest semantic change: every `width` written today with a
    margin grows by twice that margin. The port in BAL-19 would subtract the margins where the exact pixel width
-   matters. *Recommendation: adopt it.* It is the precondition for sizes meaning what they say.
+   matters. *Recommendation: adopt it.* It is the precondition for sizes meaning what they say. *Adopted in BAL-64*,
+   the port subtracting the margins from the heights of the form.
 2. **Can a pixel width shrink?** CSS lets `width: 120` shrink in a flex line down to its `min-width`. Today it is
    rigid. Keeping it rigid is less surprising for fixed chrome, while shrinking avoids overflow when the window is
    small. *Recommendation: CSS behaviour*, with `flex: none` for the rigid case. The default `min-width: auto`
-   (min-content) already stops text from being cut.
+   (min-content) already stops text from being cut. *Adopted in BAL-64.*
 3. **Orientation: style or structure?** Under the rule of [§1](#1-what-goes-in-which-file), `direction` is
    presentation, and a theme could turn a toolbar vertical. But a `.gui` reader can then no longer see whether a layout
    is a row or a column. *Recommendation: style*, named in the class (`.row`, `.toolbar`) as the gallery already does.
@@ -1097,6 +1098,8 @@ Each has a recommendation.
   `display`. A new item under BAL-25, after BAL-22, since it relies on the cascade.
 - **BAL-23** registry and generic parser: [§3](#3-the-structure-file) and [§7](#7-how-a-widget-plugs-in), retiring the
   `readX`/`readXHeader` pairs.
+- **BAL-64** the box model of [§2](#2-sizes), done: border-box sizes, percentages of the parent's content box, `auto`
+  resolved by the parent, the bounds as properties of their own, and `right`/`bottom` for the floating children.
 - **BAL-19** port of `res/` and the examples, done: the v1 parsers are gone, the colours follow CSS, and the language
   reference is [gui.md](gui.md).
 - **BAL-20** hot reload, which a single generic parser makes much simpler. Reloading a component file expands its
