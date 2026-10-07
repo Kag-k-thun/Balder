@@ -5,10 +5,11 @@ use balder::core::{application::_, dispose};
 use balder::core::shader::texture;
 use balder::interface::_;
 use balder::interface::font::{chain, layout};
+use balder::interface::loader::parser;
 use balder::interface::shape;
 use balder::interface::shape::text;
-use balder::interface::widget::alignement;
-use balder::interface::widget::layout::menu;
+use balder::interface::widget::sizing;
+use balder::interface::widget::layout::{flex, menu};
 use balder::math::vector;
 
 pub mod ::layout;
@@ -19,6 +20,10 @@ pub mod ::alignement;
 pub mod ::sizing;
 
 use std::{io, time::_, algorithm::comparison, fs::path};
+
+// The size of a container that is not known yet, when a parent measures its content: a percentage of it is auto for
+// a size, and 0 for a margin or a padding
+pub def INDEFINITE_SIZE = -1.0f;
 
 pub enum WidgetShapeKind: u8
 | BACKGROUND = 1
@@ -51,7 +56,10 @@ pub class Widget {
     let dmut _menuContext : (&MenuLayout)? = none;
 
 
-    prot { // widget sizes, a widget has 4 sizes, outer, margin, border, inner
+    prot { // widget sizes, 4 boxes: the margin box the widget is placed in, its border, padding and content boxes
+
+        // The size of the content box of the parent, the percentages of the margins and the paddings being parts of it
+        let mut _containerSize : vec2 = vec2 ();
 
         // The inner size
         let mut _absolutePosition : vec2 = vec2 ();
@@ -384,17 +392,32 @@ pub class Widget {
      */
 
     /**
-     * Set the size of the widget in absolute position and size in pixels
+     * Set the size of the widget in absolute position and size in pixels, the space it is placed in being its container
      * @params:
-     *   - pos: the position of the widget in pixels
-     *   - size: the size of the widget in pixels
+     *   - pos: the position of the margin box of the widget in pixels
+     *   - size: the size of the margin box of the widget in pixels
      *   - depth: the depth of the widget in pixels
      * */
     @{final}
     pub fn setSize (mut self, pos : vec2, size : vec2, depth : u32) {
+        self:.setSize (pos, size, depth, size);
+    }
+
+    /**
+     * Set the size of the widget in absolute position and size in pixels
+     * @params:
+     *   - pos: the position of the margin box of the widget in pixels
+     *   - size: the size of the margin box of the widget in pixels
+     *   - depth: the depth of the widget in pixels
+     *   - container: the size of the content box of the parent, the percentages of the margins and paddings being parts
+     *                of it
+     * */
+    @{final}
+    pub fn setSize (mut self, pos : vec2, size : vec2, depth : u32, container : vec2) {
         self._depth = depth + 5;
         self._absoluteFullSize = size;
         self._absoluteFullPosition = pos;
+        self._containerSize = container;
 
         self:.computeSize ();
     }
@@ -414,11 +437,13 @@ pub class Widget {
 
 
     /**
-     * Lay the widget out again after its content changed, the whole interface when its size depends on its content
+     * Lay the widget out again after its content changed, the whole interface when its size can depend on its content,
+     * a part being placed by the widget owning it whatever its content
      * */
     @{final}
     prot fn relayout (mut self) {
-        if self._currentStyle.getWidth ().isContent () || self._currentStyle.getHeight ().isContent () {
+        let fixed = (self._currentStyle.width._1).isLength () && (self._currentStyle.height._1).isLength ();
+        if self._ownerPart == "" && !fixed {
             self._manager:.updateWidgets ();
         } else {
             self:.computeSize ();
@@ -506,81 +531,200 @@ pub class Widget {
      */
 
     /**
-     * Measure the outer width the widget asks for, its style width resolved against the width of its parent, the content
-     * being measured when the width is auto, min-content or max-content
+     * Measure the border-box width of the widget in a container, its width resolved against the container, an auto
+     * width stretched to the container or fitted to its content in it, then clamped to its bounds
      * @params:
-     *    - parent: the width of the space the parent lays the widget out in, in pixels
-     * @returns: the outer width, margins included, in pixels
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     *    - stretch: true for an auto width to fill the container, false for it to fit the content in it
+     * @returns: the width of the border box, in pixels
      * */
     @{final}
-    pub fn measureWidth (mut self, parent : f32)-> f32 {
-        self:.resolveWidth (self._currentStyle.getWidth (), parent)
+    pub fn measureWidth (mut self, container : vec2, stretch : bool)-> f32 {
+        self:.measureWidth (container, container.x, stretch-> stretch)
     }
 
     /**
-     * Measure the outer height the widget asks for at a width, its style height resolved against the height of its
-     * parent, the content being laid out in the width when the height is auto, min-content or max-content
+     * Measure the border-box width of the widget in a space of its container
      * @params:
-     *    - width: the outer width of the widget, in pixels
-     *    - parent: the height of the space the parent lays the widget out in, in pixels
-     * @returns: the outer height, margins included, in pixels
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     *    - space: the width the margin box of an auto width fills or fits in, INDEFINITE_SIZE for its max-content
+     *    - stretch: true for an auto width to fill the space, false for it to fit the content in it
+     * @returns: the width of the border box, in pixels
      * */
     @{final}
-    pub fn measureHeight (mut self, width : f32, parent : f32)-> f32 {
-        self:.resolveHeight (self._currentStyle.getHeight (), width, parent)
+    pub fn measureWidth (mut self, container : vec2, space : f32, stretch : bool)-> f32 {
+        let style = self._currentStyle;
+        let frame = self.getFrame (container).x;
+        let fill = stretch && space >= 0.0f;
+        let content = self:.contentWidths ((style.width._1).isAuto () && !fill,
+                                                   copy [style.width._1, style.minWidth._1, style.maxWidth._1]);
+
+        let width = if let Ok (w) = resolveBox (style.width._1, container.x, frame, content) {
+            w
+        } else {
+            autoBox (space, self.getMarginSize (container).x, frame, content, stretch-> fill)
+        };
+
+        clampBox (width, boundsOf (style.minWidth._1, style.maxWidth._1, container.x, frame, content))
     }
 
     /**
-     * Resolve a width of the widget (its style width, or its flex basis) against the width of its parent
+     * Measure the border-box height of the widget at a width, its height resolved against the container, an auto height
+     * stretched to the container or the height of its content laid out in the width, then clamped to its bounds
+     * @params:
+     *    - width: the width of the border box, in pixels
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     *    - stretch: true for an auto height to fill the container, false for it to be the height of the content
+     * @returns: the height of the border box, in pixels
+     * */
+    @{final}
+    pub fn measureHeight (mut self, width : f32, container : vec2, stretch : bool)-> f32 {
+        self:.measureHeight (width, container, container.y, stretch-> stretch)
+    }
+
+    /**
+     * Measure the border-box height of the widget at a width, in a space of its container
+     * @params:
+     *    - width: the width of the border box, in pixels
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     *    - space: the height the margin box of a stretched auto height fills, INDEFINITE_SIZE for the content height
+     *    - stretch: true for an auto height to fill the space, false for it to be the height of the content
+     * @returns: the height of the border box, in pixels
+     * */
+    @{final}
+    pub fn measureHeight (mut self, width : f32, container : vec2, space : f32, stretch : bool)-> f32 {
+        let style = self._currentStyle;
+        let frame = self.getFrame (container);
+        let fill = stretch && space >= 0.0f;
+        let content = self:.contentHeight ((style.height._1).isAuto () && !fill, width - frame.x,
+                                                   copy [style.height._1, style.minHeight._1, style.maxHeight._1]);
+
+        let height = if let Ok (h) = resolveBox (style.height._1, container.y, frame.y, content) {
+            h
+        } else {
+            autoBox (space, self.getMarginSize (container).y, frame.y, content, stretch-> fill)
+        };
+
+        clampBox (height, boundsOf (style.minHeight._1, style.maxHeight._1, container.y, frame.y, content))
+    }
+
+    /**
+     * Resolve a width of the widget (its style width, or its flex basis) against its container
      * @params:
      *    - size: the width to resolve
-     *    - parent: the width of the space the parent lays the widget out in, in pixels
-     * @returns: the outer width, margins included, in pixels
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     * @returns: the width of the border box in pixels, none for auto, and for a percentage of an unknown container
      * */
     @{final}
-    pub fn resolveWidth (mut self, size : WidgetSize, parent : f32)-> f32 {
-        if !size.isContent () { return size.resolve (parent); }
-
-        let (minContent, maxContent) = self:.measureOuterContentWidths ();
-        size.resolve (parent, minContent-> minContent, maxContent-> maxContent)
+    pub fn resolveWidth (mut self, size : Size, container : vec2)-> (f32)? {
+        resolveBox (size, container.x, self.getFrame (container).x, self:.contentWidths (false, copy [size]))
     }
 
     /**
-     * Resolve a height of the widget (its style height, or its flex basis) against the height of its parent
+     * Resolve a height of the widget (its style height, or its flex basis) against its container
      * @params:
      *    - size: the height to resolve
-     *    - width: the outer width of the widget, in pixels
-     *    - parent: the height of the space the parent lays the widget out in, in pixels
-     * @returns: the outer height, margins included, in pixels
+     *    - width: the width of the border box, the content being laid out in it, in pixels
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     * @returns: the height of the border box in pixels, none for auto, and for a percentage of an unknown container
      * */
     @{final}
-    pub fn resolveHeight (mut self, size : WidgetSize, width : f32, parent : f32)-> f32 {
-        if !size.isContent () { return size.resolve (parent); }
-
-        let content = self:.measureOuterContentHeight (width);
-        size.resolve (parent, minContent-> content, maxContent-> content)
+    pub fn resolveHeight (mut self, size : Size, width : f32, container : vec2)-> (f32)? {
+        let frame = self.getFrame (container);
+        resolveBox (size, container.y, frame.y, self:.contentHeight (false, width - frame.x, copy [size]))
     }
 
     /**
-     * Measure the widths the widget asks to a parent sized to its content
-     * @returns: the min-content and max-content outer widths, margins included, in pixels
+     * Measure the item of a flex line sizing the widget along the axis of a linear layout or a splitter
+     * @params:
+     *    - row: true to size its width, false its height
+     *    - container: the content box of the layout, a component being INDEFINITE_SIZE when it is unknown
+     *    - width: the width of the border box, the content being laid out in it, when its height is sized, in pixels
+     * @returns: the item, sizing the border box from its flex basis, size, bounds and factors
+     * */
+    @{final}
+    pub fn measureFlexItem (mut self, row : bool, container : vec2, width : f32 = 0.0f)-> FlexItem {
+        let style = self._currentStyle;
+        let frame = self.getFrame (container);
+        if row {
+            flexItemOf (style.width._1, style.flexBasis._1, style.minWidth._1, style.maxWidth._1, container.x, frame.x,
+                        self:.measureContentWidths (), style.flexGrow._1, style.flexShrink._1)
+        } else {
+            let content = self:.contentHeight (true, width - frame.x, []);
+            flexItemOf (style.height._1, style.flexBasis._1, style.minHeight._1, style.maxHeight._1, container.y,
+                        frame.y, content, style.flexGrow._1, style.flexShrink._1)
+        }
+    }
+
+    /**
+     * Measure the widths the widget asks to a parent sized to its content: its width when it is a length, the widths of
+     * its content otherwise, clamped to its bounds, a percentage of the parent standing for auto
+     * @returns: the min-content and max-content widths of the margin box, in pixels
      * */
     @{final}
     pub fn measureIntrinsicWidths (mut self)-> (f32, f32) {
-        let (minContent, maxContent) = self:.measureOuterContentWidths ();
-        self._currentStyle.getWidth ().contribute (minContent, maxContent)
+        let style = self._currentStyle;
+        let container = makeVec2 (INDEFINITE_SIZE, INDEFINITE_SIZE);
+        let frame = self.getFrame (container).x;
+        let margins = self.getMarginSize (container).x;
+        let content = self:.measureContentWidths ();
+
+        let bounds = boundsOf (style.minWidth._1, style.maxWidth._1, INDEFINITE_SIZE, frame, content);
+        let (minWidth, maxWidth) = if let Ok (w) = resolveBox (style.width._1, INDEFINITE_SIZE, frame, content) {
+            (w, w)
+        } else {
+            (content._0 + frame, content._1 + frame)
+        };
+
+        (clampBox (minWidth, bounds) + margins, clampBox (maxWidth, bounds) + margins)
     }
 
     /**
      * Measure the height the widget asks to a parent sized to its content, at a width
      * @params:
-     *    - width: the outer width of the widget, in pixels
-     * @returns: the outer height, margins included, in pixels
+     *    - width: the width of the border box, in pixels
+     * @returns: the height of the margin box, in pixels
      * */
     @{final}
     pub fn measureIntrinsicHeight (mut self, width : f32)-> f32 {
-        let content = self:.measureOuterContentHeight (width);
-        self._currentStyle.getHeight ().contribute (content, content)._1
+        let container = makeVec2 (INDEFINITE_SIZE, INDEFINITE_SIZE);
+        self:.measureHeight (width, container, stretch-> false) + self.getMarginSize (container).y
+    }
+
+    /**
+     * @returns: the min-content and max-content widths of the content, (0, 0) when they are not needed
+     * @params:
+     *    - needed: true if the content is needed whatever the sizes
+     *    - sizes: the sizes to resolve, the content being needed when one of them is min-content or max-content
+     * */
+    @{final}
+    fn contentWidths (mut self, needed : bool, sizes : [Size])-> (f32, f32) {
+        for s in sizes {
+            if needsContent (s) { return self:.measureContentWidths (); }
+        }
+
+        if needed { self:.measureContentWidths () } else { (0.0f, 0.0f) }
+    }
+
+    /**
+     * @returns: the height of the content laid out in a width, twice (as its min-content and its max-content), (0, 0)
+     * when it is not needed
+     * @params:
+     *    - needed: true if the content is needed whatever the sizes
+     *    - width: the width of the content box, in pixels
+     *    - sizes: the sizes to resolve, the content being needed when one of them is min-content or max-content
+     * */
+    @{final}
+    fn contentHeight (mut self, needed : bool, width : f32, sizes : [Size])-> (f32, f32) {
+        let mut need = needed;
+        for s in sizes {
+            if needsContent (s) { need = true; }
+        }
+
+        if !need { return (0.0f, 0.0f); }
+
+        let h = self:.measureContentHeight (max (0.0f, width));
+        (h, h)
     }
 
     /**
@@ -600,38 +744,6 @@ pub class Widget {
      * */
     prot fn measureContentHeight (mut self, _ : f32)-> f32 {
         0.0f
-    }
-
-    /**
-     * @returns: the min-content and max-content outer widths of the content, margins, borders and paddings included
-     * */
-    @{final}
-    fn measureOuterContentWidths (mut self)-> (f32, f32) {
-        let (minContent, maxContent) = self:.measureContentWidths ();
-        (self.getOuterSize (makeVec2 (minContent, 0.0f)).x, self.getOuterSize (makeVec2 (maxContent, 0.0f)).x)
-    }
-
-    /**
-     * @returns: the outer height of the content laid out in the inner width of an outer width
-     * */
-    @{final}
-    fn measureOuterContentHeight (mut self, width : f32)-> f32 {
-        let inner = max (0.0f, width - self.getInsets (makeVec2 (width, 0.0f)).x);
-        self.getOuterSize (makeVec2 (0.0f, self:.measureContentHeight (inner))).y
-    }
-
-    /**
-     * @returns: the outer size whose inner size is 'inner', the relative margins and paddings being parts of the outer
-     * size it converges to
-     * */
-    @{final}
-    fn getOuterSize (self, inner : vec2)-> vec2 {
-        let mut full = inner;
-        for _ in 0 .. 4 {
-            full = inner + self.getInsets (full);
-        }
-
-        full
     }
 
     /*!
@@ -1374,40 +1486,6 @@ pub class Widget {
      */
 
     /**
-     * Clamp a size from a relative size to another relative size, but with garantee of pixel maximum and minimum size
-     */
-    @{final}
-    fn clampSize (self, clamp : WidgetSize, viewport : f32) -> f32 {
-        let size = std::algorithm::comparison::max (0.0f, clamp.relative);
-
-        let px_x =  cast!u32 (size * viewport);
-        let size_x = if (px_x < clamp.minPix) {
-            clamp.minPix
-        } else if (px_x > clamp.maxPix) {
-            clamp.maxPix
-        } else { px_x };
-
-        cast!f32 (size_x) / viewport
-    }
-
-    /**
-     * Clamp a size from a relative size to another relative size, but with garantee of pixel maximum and minimum size
-     */
-    @{final}
-    fn clampSize (self, x : f32, clamp : WidgetSize, viewport : f32) -> f32 {
-        let size = std::algorithm::comparison::max (0.0f, x);
-
-        let px_x = cast!u32 (size * viewport);
-        let size_x = if (px_x < clamp.minPix) {
-            clamp.minPix
-        } else if (px_x > clamp.maxPix) {
-            clamp.maxPix
-        } else { px_x };
-
-        cast!f32 (size_x) / viewport
-    }
-
-    /**
      * @returns: true if the point is in the square
      * */
     @{final}
@@ -1461,14 +1539,14 @@ pub class Widget {
      */
 
     /**
-     * Compute the size of the outer part of the widget
+     * Compute the size of the border box, the margin box less the margins
      * */
     @{final}
     prv fn computePostMarginSize (mut self) {
         self._absolutePostMarginSize = self._absoluteFullSize;
         self._absolutePostMarginPosition = self._absoluteFullPosition;
 
-        let margin = self.getMarginSize (self._absoluteFullSize);
+        let margin = self.getMargins (self._containerSize);
 
         self._absolutePostMarginSize.y -= margin.x;
         self._absolutePostMarginSize.y -= margin.y;
@@ -1480,33 +1558,31 @@ pub class Widget {
     }
 
     /**
-     * Compute the size of the middle part of the widget
+     * Compute the size of the padding box, the border box less the borders
      * */
     @{final}
     prv fn computePostBorderSize (mut self) {
         self._absolutePostBorderSize = self._absolutePostMarginSize;
         self._absolutePostBorderPosition = self._absolutePostMarginPosition;
 
-        let border = self.getBorderSize (self._absoluteFullSize);
+        let border = self.getBorderWidth ();
 
-        self._absolutePostBorderSize.x -= border.x;
-        self._absolutePostBorderSize.x -= border.y;
-        self._absolutePostBorderPosition.x += border.x;
+        self._absolutePostBorderSize.x -= 2.0f * border;
+        self._absolutePostBorderPosition.x += border;
 
-        self._absolutePostBorderSize.y -= border.y;
-        self._absolutePostBorderPosition.y += border.y;
-        self._absolutePostBorderSize.y -= border.y;
+        self._absolutePostBorderSize.y -= 2.0f * border;
+        self._absolutePostBorderPosition.y += border;
     }
 
     /**
-     * Compute the size of the inner part of the widget
+     * Compute the size of the content box, the padding box less the paddings
      * */
     @{final}
     prv fn computePostPaddingSize (mut self) {
         self._absoluteSize = self._absolutePostBorderSize;
         self._absolutePosition = self._absolutePostBorderPosition;
 
-        let padding = self.getPaddingSize (self._absoluteFullSize);
+        let padding = self.getPaddings (self._containerSize);
 
         self._absoluteSize.y -= padding.x;
         self._absolutePosition.y += padding.x;
@@ -1515,19 +1591,6 @@ pub class Widget {
         self._absoluteSize.x -= padding.z;
         self._absolutePosition.x += padding.z;
         self._absoluteSize.x -= padding.w;
-    }
-
-
-    /**
-     * @returns: the line width of the border, (horizontal, vertical)
-     * @params:
-     *    - full: the outer size of the widget
-     * */
-    fn getBorderSize (self, _ : vec2)-> vec2 {
-        if self._currentStyle.borderWidth.0 {
-            let pixel = cast!f32 (self._currentStyle.borderWidth.1);
-            makeVec2 (pixel, pixel)
-        } else { vec2 () }
     }
 
     /**
@@ -1544,50 +1607,68 @@ pub class Widget {
     }
 
     /**
+     * @returns: the space the margins take around the border box, (horizontal, vertical)
+     * @params:
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     * */
+    @{final}
+    pub fn getMarginSize (self, container : vec2)-> vec2 {
+        let margin = self.getMargins (container);
+        makeVec2 (margin.z + margin.w, margin.x + margin.y)
+    }
+
+    /**
+     * @returns: the space the borders and the paddings take in the border box, (horizontal, vertical)
+     * @params:
+     *    - container: the size of the content box of the parent, a component being INDEFINITE_SIZE when it is unknown
+     * */
+    @{final}
+    pub fn getFrame (self, container : vec2)-> vec2 {
+        let padding = self.getPaddings (container);
+        let border = 2.0f * self.getBorderWidth ();
+        makeVec2 (border + padding.z + padding.w, border + padding.x + padding.y)
+    }
+
+    /**
+     * @returns: the line width of the border, in pixels
+     * */
+    fn getBorderWidth (self)-> f32 {
+        if self._currentStyle.borderWidth.0 {
+            cast!f32 (self._currentStyle.borderWidth.1)
+        } else { 0.0f }
+    }
+
+    /**
      * @returns: the size of the margins (top, bottom, left, right)
      * @params:
-     *    - full: the outer size of the widget, the relative margins being parts of it
+     *    - container: the size of the content box of the parent, the percentages being parts of it on the same axis
      * */
-    fn getMarginSize (self, full : vec2)-> vec4 {
-        self.getSides (self._currentStyle.getMargins (), full)
+    fn getMargins (self, container : vec2)-> vec4 {
+        self.getSides (self._currentStyle.getMargins (), container)
     }
 
     /**
      * @returns: the size of the paddings (top, bottom, left, right)
      * @params:
-     *    - full: the outer size of the widget, the relative paddings being parts of it
+     *    - container: the size of the content box of the parent, the percentages being parts of it on the same axis
      * */
-    fn getPaddingSize (self, full : vec2)-> vec4 {
-        self.getSides (self._currentStyle.getPaddings (), full)
+    fn getPaddings (self, container : vec2)-> vec4 {
+        self.getSides (self._currentStyle.getPaddings (), container)
     }
 
     /**
      * @returns: the size of the four sides of a margin or a padding (top, bottom, left, right)
      * @params:
-     *    - sides: the sizes of the top, bottom, left and right sides
-     *    - full: the outer size of the widget, the relative sides being parts of it
+     *    - sides: the lengths of the top, bottom, left and right sides
+     *    - container: the size of the content box of the parent, the percentages being parts of it on the same axis,
+     *                 and 0 when it is unknown
      * */
     @{final}
-    fn getSides (self, sides : [WidgetSize; 4], full : vec2)-> vec4 {
-        makeVec4 ((sides [0]).resolve (full.y),
-                  (sides [1]).resolve (full.y),
-                  (sides [2]).resolve (full.x),
-                  (sides [3]).resolve (full.x))
-    }
-
-    /**
-     * @returns: the space the margins, the borders and the paddings take in an outer size, (horizontal, vertical)
-     * @params:
-     *    - full: the outer size of the widget
-     * */
-    @{final}
-    fn getInsets (self, full : vec2)-> vec2 {
-        let margin = self.getMarginSize (full);
-        let border = self.getBorderSize (full);
-        let padding = self.getPaddingSize (full);
-
-        makeVec2 (margin.z + margin.w + border.x + border.y + padding.z + padding.w,
-                  margin.x + margin.y + border.y + border.y + padding.x + padding.y)
+    fn getSides (self, sides : [Length; 4], container : vec2)-> vec4 {
+        makeVec4 ((sides [0]).resolve (container.y),
+                  (sides [1]).resolve (container.y),
+                  (sides [2]).resolve (container.x),
+                  (sides [3]).resolve (container.x))
     }
 
 }
