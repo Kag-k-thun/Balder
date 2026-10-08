@@ -1,0 +1,163 @@
+in scene_visibility;
+
+use balder::math::{bounds, matrix, utils, vector};
+use balder::scene::_;
+use balder::scene::node::_;
+use balder::scene::node::node3D::visual;
+use balder::scene::utils::visibility;
+
+use ::vulkan::core;
+
+/**
+ * A root with no scene, for the nodes of the tests to hang from
+ * */
+class Root over Node {
+
+    pub self ()
+        with super("")
+    {}
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+}
+
+/**
+ * A 3D node with the volume of the cube of side 2 centered on its origin, counting the changes of its culling
+ * */
+class Block over VisualInstance3D {
+
+    // The number of times the block was culled or drawn again
+    pub let mut changes: usize = 0us;
+
+    pub self (name: [c8], dmut parent: &Node, position: vec3)
+        with super(name, alias parent, Aabb(makeVec3(-1.0f, -1.0f, -1.0f), makeVec3(1.0f, 1.0f, 1.0f)), false)
+    {
+        self.position = position;
+    }
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+    pub over setCulled(mut self, culled: bool)-> bool {
+        self.changes += 1us;
+        self._super_:.setCulled(culled)
+    }
+
+    pub over getDraws(self)-> [VkDrawIndexedIndirectCommand] {
+        []
+    }
+
+}
+
+/**
+ * @returns: the projection by the view of a camera at a position looking down -z, with a vertical field of view of
+ * 90°, a square aspect, seeing from 1 to 20 units in front of it
+ * */
+fn viewProj(eye: vec3)-> mat4 {
+    let proj = perspective!{f32}(radian(90.0f), 1.0f, 1.0f, 20.0f);
+    let view = lookAt!{f32}(eye, eye + makeVec3(0.0f, 0.0f, -1.0f), makeVec3(0.0f, 1.0f, 0.0f));
+
+    proj * view
+}
+
+__test the_instances_the_camera_does_not_see_are_culled {
+    let dmut root = copy Root();
+    let dmut front = copy Block("front", alias root, makeVec3(0.0f, 0.0f, -5.0f));
+    let dmut behind = copy Block("behind", alias root, makeVec3(0.0f, 0.0f, 5.0f));
+
+    let dmut vis = VisibilityScene();
+    vis:.insert(alias front);
+    vis:.insert(alias behind);
+
+    assert (!vis:.update(viewProj(vec3()), 100.0f, 0.0f));
+    assert (!front.culled && behind.culled);
+    assert (vis:.getVisible().len == 1us);
+    assert (vis.stats.considered == 2us && vis.stats.outside == 1us && vis.stats.visible == 1us);
+}
+
+__test the_instances_are_drawn_again_when_the_camera_turns_to_them {
+    let dmut root = copy Root();
+    let dmut front = copy Block("front", alias root, makeVec3(0.0f, 0.0f, -5.0f));
+    let dmut aside = copy Block("aside", alias root, makeVec3(30.0f, 0.0f, -5.0f));
+
+    let dmut vis = VisibilityScene();
+    vis:.insert(alias front);
+    vis:.insert(alias aside);
+
+    vis:.update(viewProj(vec3()), 100.0f, 0.0f);
+    assert (!front.culled && aside.culled);
+
+    vis:.update(viewProj(makeVec3(30.0f, 0.0f, 0.0f)), 100.0f, 0.0f);
+    assert (front.culled && !aside.culled);
+}
+
+__test the_culling_is_kept_until_the_view_or_the_instances_change {
+    let dmut root = copy Root();
+    let dmut block = copy Block("block", alias root, makeVec3(0.0f, 0.0f, 5.0f));
+
+    let dmut vis = VisibilityScene();
+    vis:.insert(alias block);
+    vis:.update(viewProj(vec3()), 100.0f, 0.0f);
+    assert (block.culled && block.changes == 1us);
+
+    // a move the visibility is not told about
+    block.position = makeVec3(0.0f, 0.0f, -5.0f);
+    vis:.update(viewProj(vec3()), 100.0f, 0.0f);
+    assert (block.culled && block.changes == 1us);
+
+    vis:.moved(alias block);
+    vis:.update(viewProj(vec3()), 100.0f, 0.0f);
+    assert (!block.culled && block.changes == 2us);
+}
+
+__test the_instances_too_small_on_screen_are_culled {
+    let dmut root = copy Root();
+    // the scale of a node applies to its position too, the block stands 15 units away
+    let dmut block = copy Block("block", alias root, makeVec3(0.0f, 0.0f, -1500.0f));
+    block.scale = makeVec3(0.01f, 0.01f, 0.01f);
+
+    let dmut vis = VisibilityScene();
+    vis:.insert(alias block);
+
+    vis:.update(viewProj(vec3()), 100.0f, 0.0f);
+    assert (!block.culled);
+
+    vis:.update(viewProj(vec3()), 100.0f, 1.0f);
+    assert (block.culled && vis.stats.small == 1us);
+}
+
+__test a_removed_instance_is_not_culled_anymore {
+    let dmut root = copy Root();
+    let dmut front = copy Block("front", alias root, makeVec3(0.0f, 0.0f, -5.0f));
+    let dmut behind = copy Block("behind", alias root, makeVec3(0.0f, 0.0f, 5.0f));
+
+    let dmut vis = VisibilityScene();
+    vis:.insert(alias front);
+    vis:.insert(alias behind);
+    vis:.update(viewProj(vec3()), 100.0f, 0.0f);
+
+    vis:.remove(front);
+    vis:.update(viewProj(makeVec3(0.0f, 0.0f, 10.0f)), 100.0f, 0.0f);
+
+    assert (vis.len == 1us);
+    assert (!front.culled && front.changes == 0us);
+    assert (!behind.culled);
+    assert (vis.stats.considered == 1us);
+}
+
+__test another_view_finds_its_instances_without_culling_them {
+    let dmut root = copy Root();
+    let dmut front = copy Block("front", alias root, makeVec3(0.0f, 0.0f, -5.0f));
+    let dmut behind = copy Block("behind", alias root, makeVec3(0.0f, 0.0f, 5.0f));
+
+    let dmut vis = VisibilityScene();
+    vis:.insert(alias front);
+    vis:.insert(alias behind);
+    vis:.update(viewProj(vec3()), 100.0f, 0.0f);
+
+    // a light behind the camera, looking at both
+    let (ids, stats) = vis:.cull(ViewVolume(viewProj(makeVec3(0.0f, 0.0f, 10.0f)), 100.0f), 0.0f);
+    assert (ids.len == 2us && stats.visible == 2us);
+    assert (!front.culled && behind.culled);
+}
