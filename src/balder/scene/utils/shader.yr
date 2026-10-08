@@ -32,9 +32,6 @@ pub record ShaderNodeScene {
     // The drawable nodes in a hierarchy of their world boxes, and those seen by the camera
     let dmut _visibility : VisibilityScene = VisibilityScene ();
 
-    // The list of drawable nodes that casts shadows
-    let dmut _shadowMeshes : [usize => &VisualInstance3D] = copy [];    
-
     // The array containing the list of materials used by the drawable nodes
     let dmut _materials : &MaterialArray = copy MaterialArray ();
 
@@ -82,6 +79,17 @@ pub record ShaderNodeScene {
         // The array containing the list of lights in the scene
         let dmut _spotLights : &LightArray = copy LightArray ();
         
+    }
+
+    prv { // Shadows
+
+        // The subpass of the shadow map when a light casts shadows, the shaders drawing their casters in it
+        let dmut _shadowPass : (&DrawSubpass)? = none;
+
+        // The buffer holding the camera of each cascade of the shadow map, the view of the light, and their offsets
+        let mut _shadowCameras : (&UniformBufferObject)? = none;
+        let mut _shadowOffsets : [usize] = [];
+
     }
 
     prv { // Deferred
@@ -313,6 +321,7 @@ pub record ShaderNodeScene {
                         }
                     }
 
+                    self:.castGroupShadows (alias g);
                     self._groups [shCfg.name] = alias g;
                 }
             }
@@ -487,6 +496,129 @@ pub record ShaderNodeScene {
         self._sortedUpdate = update;
         for _, dmut g in alias self._groups {
             g:.sort (eye);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SHADOWS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the drawable nodes casting shadows in the cascades of a shadow map, those of the shaders loaded later too,
+     * the cascades seeing none of them until they are culled (see cullShadows)
+     * @params:
+     *    - pass: the subpass of the shadow map
+     *    - cameras: the buffer holding the camera of each cascade, the view of the light
+     *    - offsets: the offset of the camera of each cascade in the buffer
+     * */
+    pub fn castShadows (mut self, dmut pass : &DrawSubpass, cameras : &UniformBufferObject, offsets : [usize]) {
+        self._shadowPass = (alias pass)?;
+        self._shadowCameras = cameras?;
+        self._shadowOffsets = offsets;
+        for _, dmut g in alias self._groups {
+            self:.castGroupShadows (alias g);
+        }
+    }
+
+    /**
+     * Stop drawing the drawable nodes in a shadow map
+     * */
+    pub fn stopShadows (mut self) {
+        if let Ok (dmut win) = alias self._window {
+            for _, dmut g in alias self._groups {
+                g:.stopShadows (alias win);
+            }
+        }
+
+        self._shadowPass = none;
+        self._shadowCameras = none;
+        self._shadowOffsets = [];
+    }
+
+    /**
+     * @returns: the box enclosing the drawable nodes in world space
+     * */
+    pub fn casterBounds (mut self)-> Aabb {
+        self._visibility:.bounds ()
+    }
+
+    /**
+     * @returns: the number of times a drawable node moved, entered or left, the nodes seen through a view changing only
+     * when it changes
+     * */
+    pub fn visibilityChanges (self)-> usize {
+        self._visibility.changes
+    }
+
+    /**
+     * Draw in each cascade of the shadow map the nodes casting shadows it sees, and none of the others
+     * @params:
+     *    - volumes: the volume each cascade sees
+     *    - threshold: the size under which a cascade does not draw a node, in texels of the cascade
+     * @returns: true iif the commands have to be recorded again to draw them (the device has no multi-draw)
+     * */
+    pub fn cullShadows (mut self, volumes : [ViewVolume], threshold : f32)-> bool {
+        let mut redraw = false;
+        for i, v in volumes {
+            let (seen, _) = self._visibility:.cull (v, threshold);
+            for _, dmut g in alias self._groups {
+                if g:.seeShadows (i, seen) { redraw = true; }
+            }
+        }
+
+        redraw
+    }
+
+    /**
+     * Lay out the draws of the nodes casting shadows for the recording of a frame of the shadow map
+     * */
+    pub fn layoutShadows (mut self, frame : u32) {
+        for _, dmut g in alias self._groups {
+            g:.layoutShadows (frame);
+        }
+    }
+
+    /**
+     * Record the draws of the nodes casting shadows a cascade sees, one multi-draw per shader
+     * @assume: the draws of the frame are laid out (see layoutShadows), the viewport is the one of the cascade
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the recording of the shadow map
+     *    - cascade: the index of the cascade
+     * */
+    pub fn drawShadows (mut self, frame : u32, dmut cmd : &IndexedDrawCommandAllocator, cascade : usize) {
+        for name, dmut g in alias self._groups {
+            {
+                g:.drawShadows (frame, alias cmd, cascade);
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to draw the shadows of the nodes of the shader", name, err);
+                }
+            }
+        }
+    }
+
+    /**
+     * Draw the nodes of a shader casting shadows in the shadow map, when a light casts shadows
+     * */
+    fn castGroupShadows (mut self, dmut g : &ShaderGroup) {
+        if let Ok (dmut win) = alias self._window {
+            if let Ok (dmut pass) = alias self._shadowPass {
+                if let Ok (cameras) = self._shadowCameras {
+                    {
+                        let (w, h) = pass.getDimension ();
+                        g:.castShadows (alias win, pass.getRenderPass (), w, h, cameras, self._shadowOffsets);
+                    } catch {
+                        err => {
+                            log::error #("Scene", "Failed to draw the shadows of the shader", err);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -731,6 +863,9 @@ pub record ShaderNodeScene {
             }
 
             self._groups = copy [];
+            self._shadowPass = none;
+            self._shadowCameras = none;
+            self._shadowOffsets = [];
             self._cull = none;
             self._pyramid = none;
             self._gpuCulling = false;

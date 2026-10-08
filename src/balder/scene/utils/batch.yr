@@ -7,8 +7,10 @@ use balder::core::shader::{_, buffers::_};
 use balder::math::vector;
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
-use balder::scene::utils::draw_stats;
+use balder::scene::utils::{casters, draw_stats};
 use balder::utils::log;
+
+use ::vulkan::core;
 
 /**
  * The size of the slot of an object in the storage buffer of the 3D shaders: its world (mat4), the progress of its
@@ -116,6 +118,9 @@ pub class SceneDraws {
     // The geometry of the instance, shared with the instances of the same mesh
     let dmut _geometry: &SharedGeometry;
 
+    // The casters of shadows of the shader
+    let dmut _casters: &ShadowCasters;
+
     // The slot of the instance in the objects of the shader
     pub let slot: u32;
 
@@ -125,10 +130,16 @@ pub class SceneDraws {
     // True once the slot and the geometry were given back
     let mut _freed: bool = false;
 
-    pub self (dmut objects: &ObjectStorage, dmut batch: &InstanceBatch, dmut geometry: &SharedGeometry, slot: u32, inPlace: bool)
+    pub self (dmut objects: &ObjectStorage,
+              dmut batch: &InstanceBatch,
+              dmut geometry: &SharedGeometry,
+              dmut casters: &ShadowCasters,
+              slot: u32,
+              inPlace: bool)
         with _objects = alias objects
         , _batch = alias batch
         , _geometry = alias geometry
+        , _casters = alias casters
         , slot = slot
         , _inPlace = inPlace
     {}
@@ -168,6 +179,18 @@ pub class SceneDraws {
     pub fn setDraws(mut self, owner: usize, draws: [InstanceDraw])-> bool {
         self._batch:.update(owner, draws);
         !self._inPlace
+    }
+
+    /**
+     * Set the draws of the instance in the shadow map, drawn by the cascades seeing it, the instance casting shadows
+     * from then on
+     * @params:
+     *    - owner: the uniq id of the instance
+     *    - draws: the draws of the level of detail of the instance, as many each time
+     * @returns: true iif the recordings have to be done again to draw the modification (the device has no multi-draw)
+     * */
+    pub fn setShadowDraws(mut self, owner: usize, draws: [InstanceDraw])-> bool {
+        self._casters:.set(owner, draws)
     }
 
     /*!
@@ -252,6 +275,9 @@ pub class ShaderGroup {
     // The cull shader of the scene when the instances are culled on the GPU, none when they are culled on the CPU
     let dmut _cull: (&ComputeShader)? = none;
 
+    // The instances casting shadows, and their draws in the cascades of the shadow map
+    let dmut _casters: &ShadowCasters;
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -270,6 +296,7 @@ pub class ShaderGroup {
         , _camera = shader:.get():.allocateDescriptorSet(DescriptorContext::CAMERA)
         , _geometry = copy GeometryPool(alias shader:.get():.getDevice(), vertexStride(cfg))
         , _objects = copy ObjectStorage(alias shader:.get():.getDevice(), OBJECT_STRIDE)
+        , _casters = copy ShadowCasters(shader:.get():.getDevice().isMultiDraw())
         throws BalderError
     {}
 
@@ -336,6 +363,7 @@ pub class ShaderGroup {
         copy SceneDraws(alias self._objects,
                         alias batch.draws,
                         alias geometry,
+                        alias self._casters,
                         slot,
                         self._shader:.get():.getDevice().isMultiDraw())
     }
@@ -435,6 +463,8 @@ pub class ShaderGroup {
      *    - node: the instance
      * */
     pub fn release(mut self, dmut window: &Window, material: &Material, node: &VisualInstance3D) {
+        self._casters:.remove(node.uid);
+
         let key = material.getBatchKey();
         if let Ok(dmut b) = alias self._batches[key] {
             b.nodes:.remove(node.uid);
@@ -621,6 +651,92 @@ pub class ShaderGroup {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * =====================================          SHADOW          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the instances casting shadows in the cascades of a shadow map, with the shadow pipeline of the shader (built
+     * once, for every shadow map of the same format)
+     * @params:
+     *    - window: the window retiring the resources of the cascades drawn before
+     *    - renderPass: the render pass of the shadow map
+     *    - width: the width of the shadow map
+     *    - height: the height of the shadow map
+     *    - cameras: the buffer holding the view of the light of each cascade
+     *    - offsets: the offset of the camera of each cascade in the buffer
+     * */
+    pub fn castShadows(mut self,
+                       dmut window: &Window,
+                       renderPass: VkRenderPass,
+                       width: u32,
+                       height: u32,
+                       cameras: &UniformBufferObject,
+                       offsets: [usize])
+        throws BalderError
+    {
+        if let dmut sh: &RasterShader = alias self._shader:.get() {
+            if !sh.hasShadow() {
+                sh:.configureShadow(renderPass, width, height);
+            }
+        }
+
+        self._casters:.start(alias window, alias self._shader:.get(), cameras, offsets);
+    }
+
+    /**
+     * Stop drawing the instances in a shadow map
+     * @params:
+     *    - window: the window retiring the resources of the cascades, the recordings in use still drawing with them
+     * */
+    pub fn stopShadows(mut self, dmut window: &Window) {
+        self._casters:.stop(alias window);
+    }
+
+    /**
+     * Draw the instances casting shadows a cascade sees, and none of the others
+     * @params:
+     *    - cascade: the index of the cascade
+     *    - seen: the uniq ids of the instances the cascade sees, of the shader or not
+     * @returns: true iif the recordings have to be done again to draw them (the device has no multi-draw)
+     * */
+    pub fn seeShadows(mut self, cascade: usize, seen: [usize])-> bool {
+        self._casters:.see(cascade, seen)
+    }
+
+    /**
+     * Lay out the draws of the instances casting shadows in the cascades, for the recording of a frame of the shadow map
+     * */
+    pub fn layoutShadows(mut self, frame: u32) {
+        self._casters:.layout(frame, self._objects);
+    }
+
+    /**
+     * Record the draws of the instances casting shadows a cascade sees, with the shadow pipeline of the shader
+     * @assume: the draws of the frame are laid out (see layoutShadows), the viewport is the one of the cascade
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the recording of the shadow map
+     *    - cascade: the index of the cascade
+     * */
+    pub fn drawShadows(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator, cascade: usize)
+        throws BalderError
+    {
+        if !self._casters.isCasting() { return; }
+
+        if let sh: &RasterShader = self._shader:.get() {
+            if !sh.hasShadow() { return; }
+
+            sh.selectShadow(cmd.getCommandBuffer());
+            self._geometry.select(cmd.getCommandBuffer());
+            self._casters:.draw(frame, alias cmd, cascade);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ====================================          CULLING          =====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -684,6 +800,7 @@ pub class ShaderGroup {
             }
         }
 
+        self._casters:.stop(alias window);
         self._batches = copy [];
         self._meshes = copy [];
         window:.retire(alias self._camera);
