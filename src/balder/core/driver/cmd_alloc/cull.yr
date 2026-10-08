@@ -1,0 +1,205 @@
+in cull;
+
+use balder::core::config::shader::uniform;
+use balder::core::driver::subpass;
+use balder::core::shader;
+use balder::core::shader::buffers::instance_batch;
+
+use ::vulkan::core;
+
+/**
+ * The phase of the cull pass culling the candidates
+ * */
+def CULL_PHASE = 0u32;
+
+/**
+ * The phase of the cull pass writing the commands
+ * */
+def COMMANDS_PHASE = 1u32;
+
+/**
+ * The push constant of the cull shader
+ * */
+@data
+record CullPush {
+
+    // The number of candidates, as many as the templates at most
+    pub let count: u32;
+
+    // The phase of the pass
+    pub let phase: u32;
+
+    // The height of the view, in pixels
+    pub let height: f32;
+
+    // The size on screen in pixels under which an instance is culled
+    pub let minPixels: f32;
+}
+
+/**
+ * The cull command allocator records the cull passes of the batches culled on the GPU, before the render pass of a draw
+ * subpass begins: the counters of the batches cleared, the candidates culled, the commands written, then the counters
+ * copied for the CPU, each step of every batch separated from the next one by a barrier
+ * @info: the steps are recorded for every batch before the next one starts, so the batches share the barriers:
+ *    - clear of each batch, afterClear
+ *    - cull of each batch, afterCull
+ *    - writeCommands of each batch, afterCommands (the draws read the commands and the instances from then)
+ *    - readBack of each batch, afterReadBack
+ * @assume: the subpass is being prepared (see DrawSubpass::onPrepare), outside of its render pass
+ * */
+@final
+pub class CullCommandAllocator over CommandAllocator {
+
+    /**
+     * Create a cull command allocator recording in the current recording of a subpass
+     * @params:
+     *    - pass: the subpass being recorded
+     * */
+    pub self (dmut pass: &DrawSubpass)
+        with super(alias pass)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          STEPS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Clear the counters of the cull pass of a batch
+     * @info: does nothing unless the batch was laid out for the current frame to be culled on the GPU
+     * */
+    pub fn clear(mut self, batch: &InstanceBatch) {
+        let frame = self._pass.getCurrentFrame();
+        if let Ok(counters) = batch.getCounterBuffer(frame) {
+            vkCmdFillBuffer(self.getCommandBuffer(), counters.getVulkanBuffer(), 0u64, cast!u64(counters.getSize()), 0u32);
+        }
+    }
+
+    /**
+     * Cull the candidates of a batch, the instances seen being written in the range of their template
+     * @assume: the cull shader and the descriptor sets of the batch are bound
+     * @params:
+     *    - shader: the cull shader
+     *    - batch: the batch, nothing being done unless it was laid out for the current frame to be culled on the GPU
+     *    - height: the height of the view, in pixels
+     *    - minPixels: the size on screen in pixels under which an instance is culled, 0 to cull those outside the view only
+     * */
+    pub fn cull(mut self, dmut shader: &ComputeShader, batch: &InstanceBatch, height: f32, minPixels: f32) {
+        self:.dispatch(alias shader, batch, CULL_PHASE, height, minPixels);
+    }
+
+    /**
+     * Write the commands drawing the instances seen in the range of each template of a batch, and their number
+     * @assume: the candidates of the batch are culled, the cull shader and the descriptor sets of the batch are bound
+     * */
+    pub fn writeCommands(mut self, dmut shader: &ComputeShader, batch: &InstanceBatch) {
+        self:.dispatch(alias shader, batch, COMMANDS_PHASE, 0.0f, 0.0f);
+    }
+
+    /**
+     * Copy the header of the counters of a batch for the CPU, read once the submission of the frame is over
+     * @assume: the commands of the batch are written
+     * */
+    pub fn readBack(mut self, batch: &InstanceBatch) {
+        let frame = self._pass.getCurrentFrame();
+        if let Ok(counters) = batch.getCounterBuffer(frame) {
+            if let Ok(readback) = batch.getReadbackBuffer(frame) {
+                let mut region = VkBufferCopy();
+                region.size = cast!u64(batch.getCounterHeaderSize());
+
+                vkCmdCopyBuffer(self.getCommandBuffer(), counters.getVulkanBuffer(), readback.getVulkanBuffer(), 1u32, &region);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          BARRIERS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Make the counters cleared visible to the cull of the candidates
+     * */
+    pub fn afterClear(mut self) {
+        self:.barrier(VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT | VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT);
+    }
+
+    /**
+     * Make the instances seen and their counters visible to the writing of the commands
+     * */
+    pub fn afterCull(mut self) {
+        self:.barrier(VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT | VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT);
+    }
+
+    /**
+     * Make the commands, their number and the instances seen visible to the draws and to the copy of the counters
+     * */
+    pub fn afterCommands(mut self) {
+        self:.barrier(VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT
+                      | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+                      | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VkAccessFlagBits::VK_ACCESS_INDIRECT_COMMAND_READ_BIT
+                      | VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT
+                      | VkAccessFlagBits::VK_ACCESS_TRANSFER_READ_BIT);
+    }
+
+    /**
+     * Make the counters copied visible to the CPU, once the submission is over
+     * */
+    pub fn afterReadBack(mut self) {
+        self:.barrier(VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_HOST_BIT,
+                      VkAccessFlagBits::VK_ACCESS_HOST_READ_BIT);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Dispatch a phase of the cull pass of a batch, one thread per candidate or per template
+     * */
+    fn dispatch(mut self, dmut shader: &ComputeShader, batch: &InstanceBatch, phase: u32, height: f32, minPixels: f32) {
+        let frame = self._pass.getCurrentFrame();
+        let count = batch.getCount(frame);
+        if count == 0u32 || !batch.isCulled(frame) { return; }
+
+        let groupSize = shader.getGroupSizes()[0];
+        if groupSize == 0u32 { return; }
+
+        let cmd = self.getCommandBuffer();
+        shader:.setPush(cmd, UniformNames::CULL, CullPush(count, phase, height, minPixels));
+        vkCmdDispatch(cmd, (count + groupSize - 1u32) / groupSize, 1u32, 1u32);
+    }
+
+    /**
+     * Record a memory barrier between two stages
+     * */
+    fn barrier(mut self, srcStage: u32, srcAccess: u32, dstStage: u32, dstAccess: u32) {
+        let mut b = VkMemoryBarrier();
+        b.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = srcAccess;
+        b.dstAccessMask = dstAccess;
+
+        vkCmdPipelineBarrier(self.getCommandBuffer(), srcStage, dstStage, 0u32, 1u32, &b, 0u32, null, 0u32, null);
+    }
+}
