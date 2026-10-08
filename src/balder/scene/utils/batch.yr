@@ -10,8 +10,6 @@ use balder::scene::node::node3D::visual::{material, mesh};
 use balder::scene::utils::draw_stats;
 use balder::utils::log;
 
-use ::vulkan::core;
-
 /**
  * The size of the slot of an object in the storage buffer of the 3D shaders: its world (mat4), the progress of its
  * cross-fade (f32), its material (u32) and its world box (two vec4), laid out as std430 aligns them
@@ -505,19 +503,31 @@ pub class ShaderGroup {
 
     /**
      * Record the cull of the candidates of the material keys culled on the GPU
-     * @assume: the counters are cleared, the cull pass of the scene is bound (see CullPass::select)
+     * @assume: the counters are cleared, the cull pass of the scene is bound (see CullPass::select); for the late cull,
+     * the first commands are drawn and the depth pyramid built
      * @params:
      *    - frame: the frame being recorded
      *    - cmd: the command allocator of the cull passes
+     *    - late: false for the first cull, true for the second one testing the candidates against the depth pyramid
+     *    - width: the width of the view, in pixels
      *    - height: the height of the view, in pixels
      *    - minPixels: the size on screen in pixels under which an instance is culled
+     *    - levels: the number of levels of the depth pyramid, 0 when the occluded instances are not culled
      * */
-    pub fn cull(mut self, frame: u32, dmut cmd: &CullCommandAllocator, height: f32, minPixels: f32) {
+    pub fn cull(mut self,
+                frame: u32,
+                dmut cmd: &CullCommandAllocator,
+                late: bool,
+                width: f32,
+                height: f32,
+                minPixels: f32,
+                levels: u32)
+    {
         if let Ok(dmut shader) = alias self._cull {
             for _, b in self._batches {
                 if let Ok(set) = b.cullSet {
                     set.select(frame, cmd.getCommandBuffer());
-                    cmd:.cull(alias shader, b.draws, height, minPixels);
+                    cmd:.cull(alias shader, b.draws, late, width, height, minPixels, levels);
                 }
             }
         }
@@ -526,13 +536,15 @@ pub class ShaderGroup {
     /**
      * Record the writing of the commands of the material keys culled on the GPU
      * @assume: the candidates are culled, the cull pass of the scene is bound
+     * @params:
+     *    - late: false for the commands of the first cull, true for those of the second one
      * */
-    pub fn writeCommands(mut self, frame: u32, dmut cmd: &CullCommandAllocator) {
+    pub fn writeCommands(mut self, frame: u32, dmut cmd: &CullCommandAllocator, late: bool) {
         if let Ok(dmut shader) = alias self._cull {
             for _, b in self._batches {
                 if let Ok(set) = b.cullSet {
                     set.select(frame, cmd.getCommandBuffer());
-                    cmd:.writeCommands(alias shader, b.draws);
+                    cmd:.writeCommands(alias shader, b.draws, late);
                 }
             }
         }
@@ -554,15 +566,17 @@ pub class ShaderGroup {
      * @params:
      *    - frame: the frame being recorded
      *    - cmd: the command allocator of the recording
+     *    - late: false for the draws of the first cull, true for those of the second one (the material keys culled on
+     *            the GPU only)
      * */
-    pub fn drawDepth(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator)
+    pub fn drawDepth(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator, late: bool)
         throws BalderError
     {
         if let sh: &RasterShader = self._shader:.get() {
             if !sh.hasPrepass() { return; }
 
             sh.selectPrepass(cmd.getCommandBuffer());
-            self:.drawBatches(frame, alias cmd);
+            self:.drawBatches(frame, alias cmd, late);
         }
     }
 
@@ -572,27 +586,32 @@ pub class ShaderGroup {
      * @params:
      *    - frame: the frame being recorded
      *    - cmd: the command allocator of the recording
+     *    - late: false for the draws of the first cull, true for those of the second one (the material keys culled on
+     *            the GPU only)
      * */
-    pub fn draw(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator)
+    pub fn draw(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator, late: bool)
         throws BalderError
     {
         self._shader:.get().select(cmd.getCommandBuffer());
-        self:.drawBatches(frame, alias cmd);
+        self:.drawBatches(frame, alias cmd, late);
     }
 
     /**
      * Record the multi-draws of the material keys with the pipeline selected
      * */
-    fn drawBatches(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator) {
+    fn drawBatches(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator, late: bool) {
         self._camera.select(frame, cmd.getCommandBuffer());
         self._geometry.select(cmd.getCommandBuffer());
 
         for _, dmut b in alias self._batches {
             if b.count == 0u32 { continue; }
 
+            let culled = b.draws.isCulled(frame);
+            if late && !culled { continue; }
+
             b.set.select(frame, cmd.getCommandBuffer());
-            if b.draws.isCulled(frame) {
-                cmd:.drawIndexedCount(b.draws);
+            if culled {
+                cmd:.drawIndexedCount(b.draws, late);
             } else {
                 cmd:.drawIndexed(b.draws, 0u32, b.count);
             }
@@ -635,7 +654,8 @@ pub class ShaderGroup {
                                   UniformNames::TEMPLATES => draws.getTemplateBuffer(frame),
                                   UniformNames::COUNTERS => draws.getCounterBuffer(frame),
                                   UniformNames::COMMANDS => draws.getCulledCommandBuffer(frame),
-                                  UniformNames::INSTANCES => draws.getWordBuffer(frame)] {
+                                  UniformNames::INSTANCES => draws.getWordBuffer(frame),
+                                  UniformNames::VISIBILITY => draws.getVisibilityBuffer(frame)] {
             if let Ok(b) = buffer {
                 set:.setBuffer(name, b, frame);
             }

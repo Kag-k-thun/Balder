@@ -18,6 +18,13 @@ pub class DrawSubpass over VulkanSubpass {
         // The render pass of the subpass
         let dmut _renderPass: VkRenderPass = null;
 
+        // The render pass resuming the subpass after an interruption, its attachments loaded instead of cleared, null
+        // when the subpass renders to the screen
+        let dmut _resumePass: VkRenderPass = null;
+
+        // True while a render pass of the subpass is recorded
+        let mut _inRenderPass: bool = false;
+
         // The color used when clearing an image of the swap chain;
         let dmut _clearColor: [VkClearValue] = [];
     }
@@ -121,19 +128,98 @@ pub class DrawSubpass over VulkanSubpass {
     prot over startRecording(mut self) {
         self.__super__:.startRecording();
         self._onPrepare:.emit();
+        self:.beginRenderPass(self._renderPass, self._clearColor);
+    }
 
+    /**
+     * Stop the drawing pass
+     * */
+    prot over stopRecording(mut self) {
+        if self._inRenderPass {
+            vkCmdEndRenderPass(self._nextCommandBuffer[self._currentFrame]);
+            self._inRenderPass = false;
+        }
+
+        self.__super__:.stopRecording();
+    }
+
+    /**
+     * End the render pass being recorded, to record the commands a render pass cannot hold (compute dispatches, the
+     * barriers between them and the draws) in the middle of the subpass
+     * @info: the attachments are stored, in the layout they have at the end of the subpass (the depth attachment is
+     * read only)
+     * @assume: called by a slot of onDraw, then resume is called before recording draws again
+     * */
+    pub fn interrupt(mut self) {
+        if !self._inRenderPass { return; }
+
+        vkCmdEndRenderPass(self._nextCommandBuffer[self._currentFrame]);
+        self._inRenderPass = false;
+    }
+
+    /**
+     * Begin again the render pass of the subpass after an interruption, its attachments loaded as they were stored
+     * @info: the attachments written before the interruption, and the buffers written by the compute passes recorded
+     * during it, are made visible to the draws by a barrier, the render pass keeping the dependencies of the first one
+     * @info: does nothing unless the subpass renders to textures and was interrupted
+     * */
+    pub fn resume(mut self) {
+        if self._inRenderPass || self._resumePass == null { return; }
+
+        let mut b = VkMemoryBarrier();
+        b.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                          | VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                          | VkAccessFlagBits::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                          | VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                          | VkAccessFlagBits::VK_ACCESS_INDIRECT_COMMAND_READ_BIT
+                          | VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
+
+        vkCmdPipelineBarrier(self._nextCommandBuffer[self._currentFrame],
+                             VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VkPipelineStageFlagBits::VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                             | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0u32,
+                             1u32,
+                             &b,
+                             0u32,
+                             null,
+                             0u32,
+                             null);
+
+        self:.beginRenderPass(self._resumePass, []);
+    }
+
+    /**
+     * Begin a render pass on the framebuffer of the current frame, and set the dynamic state of the subpass
+     * @params:
+     *    - renderPass: the render pass to begin
+     *    - clear: the clear values of its attachments
+     * */
+    fn beginRenderPass(mut self, renderPass: VkRenderPass, clear: [VkClearValue]) {
         let mut pass = VkRenderPassBeginInfo();
         pass.sType = VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        pass.renderPass = self._renderPass;
+        pass.renderPass = renderPass;
         pass.renderArea.extent.width = self._width;
         pass.renderArea.extent.height = self._height;
-        pass.clearValueCount = cast!{u32} (self._clearColor.len);
-        pass.pClearValues = self._clearColor.ptr;
+        pass.clearValueCount = cast!{u32} (clear.len);
+        pass.pClearValues = clear.ptr;
         pass.framebuffer = self._framebuffers[self._currentFrame];
 
         vkCmdBeginRenderPass(self._nextCommandBuffer[self._currentFrame],
                              &pass,
                              VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
+        self._inRenderPass = true;
 
         let mut viewport = VkViewport();
         viewport.width = cast!{f32} (self._width);
@@ -148,15 +234,6 @@ pub class DrawSubpass over VulkanSubpass {
         vkCmdSetScissor(self._nextCommandBuffer[self._currentFrame], 0, 1, &scissor);
 
         vkCmdSetDepthBias(self._nextCommandBuffer[self._currentFrame], 1.25f, 0.0f, 1.75f);
-    }
-
-    /**
-     * Stop the drawing pass
-     * */
-    prot over stopRecording(mut self) {
-        vkCmdEndRenderPass(self._nextCommandBuffer[self._currentFrame]);
-
-        self.__super__:.stopRecording();
     }
 
     /**
@@ -311,12 +388,30 @@ pub class DrawSubpass over VulkanSubpass {
      */
 
     /**
-     * Create the render pass for the subpass
+     * Create the render pass of the subpass, and the render pass resuming it after an interruption
      * */
     fn createRenderPassToTextures(mut self, textures: [&OutputTexture])
         throws BalderError
     {
         if textures.len == 0 { throw copy BalderError("Empty subpass"); }
+
+        self._renderPass = self:.createTexturePass(textures, false);
+        self._resumePass = self:.createTexturePass(textures, true);
+    }
+
+    /**
+     * Create a render pass drawing in textures
+     * @info: the depth is stored, read by the passes following the subpass (the composition, a depth pyramid...)
+     * @params:
+     *    - textures: the attachments
+     *    - resume: false for the render pass clearing the attachments (their clear values being set), true for the
+     *              render pass loading them as the subpass left them
+     * @returns: the render pass
+     * */
+    fn createTexturePass(mut self, textures: [&OutputTexture], resume: bool)-> dmut VkRenderPass
+        throws BalderError
+    {
+        let loadOp = if resume { VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_LOAD } else { VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR };
 
         let dmut attachments: [VkAttachmentDescription] = [];
         let dmut colorRefs: [VkAttachmentReference]     = [];
@@ -331,29 +426,39 @@ pub class DrawSubpass over VulkanSubpass {
                 let mut depthAttachment = VkAttachmentDescription();
                 depthAttachment.format = tx.format;
                 depthAttachment.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
-                depthAttachment.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
-                depthAttachment.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                depthAttachment.loadOp = loadOp;
+                depthAttachment.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE;
                 depthAttachment.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
                 depthAttachment.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                depthAttachment.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+                depthAttachment.initialLayout = if resume {
+                    VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                } else {
+                    VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED
+                };
                 depthAttachment.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
                 attachments ~= [depthAttachment];
                 depthRef.attachment = cast!u32(i);
                 depthRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-                let mut color = VkClearValue();
-                color.depthStencil.depth = 1.0f;
-                self._clearColor ~= [color];
+                if !resume {
+                    let mut color = VkClearValue();
+                    color.depthStencil.depth = 1.0f;
+                    self._clearColor ~= [color];
+                }
             } else {
                 let mut colorAttachement = VkAttachmentDescription();
                 colorAttachement.format = tx.format;
                 colorAttachement.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT;
-                colorAttachement.loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_CLEAR;
+                colorAttachement.loadOp = loadOp;
                 colorAttachement.storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE;
                 colorAttachement.stencilLoadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
                 colorAttachement.stencilStoreOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                colorAttachement.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+                colorAttachement.initialLayout = if resume {
+                    VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED
+                };
                 colorAttachement.finalLayout = VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
                 attachments ~= [colorAttachement];
@@ -362,9 +467,11 @@ pub class DrawSubpass over VulkanSubpass {
                 colorRef.layout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 colorRefs ~= [colorRef];
 
-                let mut color = VkClearValue();
-                color.color.float32 = [0.0f, 0.0f, 0.0f, 0.0f];
-                self._clearColor ~= [color];
+                if !resume {
+                    let mut color = VkClearValue();
+                    color.color.float32 = [0.0f, 0.0f, 0.0f, 0.0f];
+                    self._clearColor ~= [color];
+                }
             }
         }
 
@@ -377,6 +484,7 @@ pub class DrawSubpass over VulkanSubpass {
         subPass.colorAttachmentCount = cast!u32(colorRefs.len);
         subPass.pColorAttachments = colorRefs.ptr;
 
+        // the same dependencies for both render passes, which have to stay compatible (see resume for the barrier)
         let dependencies = self.createPassDependencies(colorRefs.len != 0, hasDepth);
 
         let mut renderPassInfo = VkRenderPassCreateInfo();
@@ -389,10 +497,13 @@ pub class DrawSubpass over VulkanSubpass {
         renderPassInfo.dependencyCount = cast!u32(dependencies.len);
         renderPassInfo.pDependencies = dependencies.ptr;
 
-        if vkCreateRenderPass(self._device.getDeviceHandle(), &renderPassInfo, null, alias &self._renderPass)
+        let dmut renderPass: VkRenderPass = null;
+        if vkCreateRenderPass(self._device.getDeviceHandle(), &renderPassInfo, null, alias &renderPass)
            != VkResult::VK_SUCCESS {
             throw copy BalderError("Failed to create render pass");
         }
+
+        alias renderPass
     }
 
     /*!
@@ -554,6 +665,11 @@ pub class DrawSubpass over VulkanSubpass {
             vkDestroyRenderPass(self._device.getDeviceHandle(), self._renderPass, null);
             self._renderPass = null;
             self._clearColor = [];
+        }
+
+        if self._resumePass != null {
+            vkDestroyRenderPass(self._device.getDeviceHandle(), self._resumePass, null);
+            self._resumePass = null;
         }
     }
 
