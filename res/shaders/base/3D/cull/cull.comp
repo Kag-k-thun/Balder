@@ -1,11 +1,17 @@
 #version 450 core
 
-// The cull pass of the instances of a batch of the 3D shaders (see InstanceBatch), dispatched twice:
+// The cull pass of the instances of a batch of the 3D shaders (see InstanceBatch), dispatched twice per phase:
 //    - phase 0, one thread per candidate: the instances whose world box the camera sees are written in the range of
-//      their template, counted in the counter of the template
-//    - phase 1, one thread per template: the templates with an instance seen are written as the commands of the draw
-//      indirect count call, counted in the counter of the commands
-// The test is the one of the culling on the CPU (Frustum::classify, ViewVolume::pixelSize), its reference
+//      their template, counted in the counter of the template; when the occluded instances are culled, only those the
+//      last pass found visible are
+//    - phase 1, one thread per template: the templates with an instance seen are written as the commands of the first
+//      draw indirect count call, counted in the counter of the commands
+//    - phase 2, one thread per candidate, once the instances of phase 0 are drawn and their depth reduced into the depth
+//      pyramid: the instances the camera sees that are not hidden behind that depth are visible, kept for the next pass;
+//      those phase 0 did not draw are written after its instances in the range of their template
+//    - phase 3, one thread per template: the instances phase 2 wrote are written as the commands of the second draw
+//      indirect count call, after the commands of phase 1
+// The frustum test is the one of the culling on the CPU (Frustum::classify, ViewVolume::pixelSize), its reference
 
 layout (local_size_x = 64) in;
 
@@ -15,6 +21,12 @@ layout (set = 1, binding = 0) uniform Camera {
     mat4 viewProj;
     vec3 eyePos;
 } camera;
+
+// The levels of the depth pyramid of the frame, each texel the farthest depth of the texels it covers, from the level 1
+// (see balder::scene::utils::pyramid::layout); bound when the occluded instances are culled only
+layout (std430, set = 1, binding = 1) readonly buffer Pyramid {
+    float texels [];
+} pyramid;
 
 // The data of an object, in the slot given by the words of its instances (see the draws of IndexedMesh3D)
 struct Object {
@@ -58,18 +70,30 @@ layout (std430, set = 0, binding = 2) readonly buffer Templates {
     Command templates [];
 };
 
+// The instances seen in the range of a template, and those of them written by phase 0
+struct Range {
+    uint seen;
+    uint early;
+};
+
 // Cleared before the pass
 layout (std430, set = 0, binding = 3) buffer Counters {
-    // The commands written, read by the draw indirect count call
+    // The commands written by phase 1, read by the first draw indirect count call
     uint drawCount;
 
-    // The instances drawn by the commands written
+    // The instances drawn by the commands written by phase 1
     uint instanceCount;
 
-    // The instances seen in the range of each template
-    uint seen [];
+    // The commands written by phase 3, read by the second draw indirect count call
+    uint lateDrawCount;
+
+    // The instances drawn by the commands written by phase 3
+    uint lateInstanceCount;
+
+    Range ranges [];
 } counters;
 
+// The commands of phase 1, then those of phase 3 from the index 'count'
 layout (std430, set = 0, binding = 4) writeonly buffer Commands {
     Command commands [];
 };
@@ -77,6 +101,11 @@ layout (std430, set = 0, binding = 4) writeonly buffer Commands {
 // The words of the instances seen, read by the vertex shaders at their instance index
 layout (std430, set = 0, binding = 5) writeonly buffer Instances {
     uint instances [];
+};
+
+// The visibility of each candidate at the last pass culling the occluded instances, 0 when it was culled
+layout (std430, set = 0, binding = 6) buffer Visibility {
+    uint visible [];
 };
 
 layout (push_constant) uniform Push {
@@ -91,6 +120,15 @@ layout (push_constant) uniform Push {
 
     // The size on screen in pixels under which an instance is culled, 0 to cull the instances outside the view only
     float minPixels;
+
+    // The width of the view, in pixels
+    float width;
+
+    // The number of levels of the depth pyramid, 0 when the occluded instances are not culled
+    uint levels;
+
+    uint pad0;
+    uint pad1;
 } push;
 
 const uint NO_COMMAND = 0xffffffffu;
@@ -128,6 +166,79 @@ bool sees (vec3 center, vec3 extent) {
     return true;
 }
 
+/**
+ * @returns: the farthest depth of the texel (x, y) of the level 'level' of the depth pyramid, (x, y) being clamped to the
+ * level
+ * */
+float farthest (uint level, uint x, uint y) {
+    uint w = uint (push.width);
+    uint h = uint (push.height);
+    uint offset = 0u;
+    for (uint k = 1u; k < level; k++) {
+        w = max ((w + 1u) / 2u, 1u);
+        h = max ((h + 1u) / 2u, 1u);
+        offset += w * h;
+    }
+
+    w = max ((w + 1u) / 2u, 1u);
+    h = max ((h + 1u) / 2u, 1u);
+    return pyramid.texels [offset + min (y, h - 1u) * w + min (x, w - 1u)];
+}
+
+/**
+ * @returns: true iif the box lies behind the depth of the pyramid: its closest depth is farther than the farthest depth
+ * of the texels covering its rect on screen, at the level where they are 2x2 at most
+ * @assume: the camera sees the box
+ * */
+bool occluded (vec3 center, vec3 extent) {
+    vec2 lo = vec2 (1.0);
+    vec2 hi = vec2 (-1.0);
+    float closest = 1.0;
+    for (int i = 0; i < 8; i++) {
+        vec3 corner = center + extent * vec3 ((i & 1) == 0 ? -1.0 : 1.0,
+                                              (i & 2) == 0 ? -1.0 : 1.0,
+                                              (i & 4) == 0 ? -1.0 : 1.0);
+        vec4 clip = camera.viewProj * vec4 (corner, 1.0);
+
+        // a box reaching the plane of the eye is not tested
+        if (clip.w <= 0.0) return false;
+
+        vec3 ndc = clip.xyz / clip.w;
+        lo = min (lo, ndc.xy);
+        hi = max (hi, ndc.xy);
+        closest = min (closest, ndc.z);
+    }
+
+    // a box reaching the near plane is not tested
+    if (closest <= 0.0) return false;
+
+    // the rect of the box in texels of the depth
+    vec2 size = vec2 (push.width, push.height);
+    uvec2 p0 = uvec2 (clamp ((lo * 0.5 + 0.5) * size, vec2 (0.0), size - 1.0));
+    uvec2 p1 = uvec2 (clamp ((hi * 0.5 + 0.5) * size, vec2 (0.0), size - 1.0));
+
+    // the level whose texels covering the rect are 2x2 at most (see layout::levelOf)
+    uint extentTexels = max (p1.x - p0.x, p1.y - p0.y) + 1u;
+    uint level = 1u;
+    while ((1u << level) < extentTexels) level++;
+    level = min (level, push.levels);
+
+    uvec2 t0 = p0 >> level;
+    uvec2 t1 = p1 >> level;
+    float depth = max (max (farthest (level, t0.x, t0.y), farthest (level, t1.x, t0.y)),
+                       max (farthest (level, t0.x, t1.y), farthest (level, t1.x, t1.y)));
+
+    return closest > depth;
+}
+
+/**
+ * Write an instance seen in the range of its template, after those written before
+ * */
+void append (Candidate candidate) {
+    uint slot = atomicAdd (counters.ranges [candidate.command].seen, 1u);
+    instances [templates [candidate.command].firstInstance + slot] = candidate.word;
+}
+
 void main () {
     uint index = gl_GlobalInvocationID.x;
     if (index >= push.count) return;
@@ -136,13 +247,16 @@ void main () {
         Candidate candidate = draws [index];
         if (candidate.command == NO_COMMAND) return;
 
+        // the instances the last pass did not see are tested against the depth pyramid by phase 2
+        if (push.levels != 0u && visible [index] == 0u) return;
+
         Object object = objects [candidate.word >> 2];
         if (!sees (object.boxCenter.xyz, object.boxExtent.xyz)) return;
 
-        uint slot = atomicAdd (counters.seen [candidate.command], 1u);
-        instances [templates [candidate.command].firstInstance + slot] = candidate.word;
-    } else {
-        uint seen = counters.seen [index];
+        append (candidate);
+    } else if (push.phase == 1u) {
+        uint seen = counters.ranges [index].seen;
+        counters.ranges [index].early = seen;
         if (seen == 0u) return;
 
         Command command = templates [index];
@@ -150,5 +264,29 @@ void main () {
 
         commands [atomicAdd (counters.drawCount, 1u)] = command;
         atomicAdd (counters.instanceCount, seen);
+    } else if (push.phase == 2u) {
+        Candidate candidate = draws [index];
+        if (candidate.command == NO_COMMAND) return;
+
+        Object object = objects [candidate.word >> 2];
+        bool seen = sees (object.boxCenter.xyz, object.boxExtent.xyz);
+
+        // the test of phase 0, the candidate being the only one reading and writing its visibility
+        bool early = seen && visible [index] != 0u;
+        bool now = seen && !occluded (object.boxCenter.xyz, object.boxExtent.xyz);
+
+        visible [index] = now ? 1u : 0u;
+        if (now && !early) append (candidate);
+    } else {
+        Range range = counters.ranges [index];
+        uint late = range.seen - range.early;
+        if (late == 0u) return;
+
+        Command command = templates [index];
+        command.firstInstance += range.early;
+        command.instanceCount = late;
+
+        commands [push.count + atomicAdd (counters.lateDrawCount, 1u)] = command;
+        atomicAdd (counters.lateInstanceCount, late);
     }
 }
