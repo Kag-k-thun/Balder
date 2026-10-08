@@ -1,0 +1,228 @@
+in pyramid;
+
+pub mod ::layout;
+
+use balder::core::{_, application::_, shader::_, shader::texture};
+use balder::core::config::shader::_;
+use balder::core::memory::buffer;
+use balder::scene::utils::pyramid::layout;
+
+use ::vulkan::core;
+
+/**
+ * The size of a texel of the pyramid in bytes, a float
+ * */
+def TEXEL_SIZE = 4us;
+
+/**
+ * The push constant of the pyramid shader, the level it reads and the level it writes
+ * */
+@data
+record PyramidPush {
+
+    // The first texel of the level read and of the level written
+    pub let srcOffset: u32;
+    pub let dstOffset: u32;
+
+    // The size of the level read
+    pub let srcWidth: u32;
+    pub let srcHeight: u32;
+
+    // The size of the level written
+    pub let dstWidth: u32;
+    pub let dstHeight: u32;
+
+    // 1 when the level read is the depth
+    pub let fromDepth: u32;
+    pub let pad: u32;
+}
+
+/**
+ * The depth pyramid (the hierarchical depth buffer) of the deferred pass of a scene, each frame in flight reducing its
+ * depth into its own pyramid, read by the cull pass to drop the instances hidden behind what the frame drew
+ * @info: the levels are laid out in a storage buffer (see layout), the texel of a level holding the largest depth of the
+ * texels it covers, the farthest
+ * */
+@final
+pub class DepthPyramid {
+
+    // The pyramid shader
+    let dmut _shader: &RefCount!{&Shader};
+
+    // The descriptor set binding the depth of each frame and its pyramid
+    let dmut _set: &DescriptorSet;
+
+    // The pyramid of each frame
+    let dmut _buffers: [&Buffer] = [];
+
+    // The size of the depth
+    let _width: u32;
+    let _height: u32;
+
+    /**
+     * @params:
+     *    - shader: the pyramid shader, loaded (DefaultShaders::PYRAMID_3D)
+     *    - depth: the depth texture of the deferred pass, one image per frame
+     *    - width: the width of the depth
+     *    - height: the height of the depth
+     * */
+    pub self (dmut shader: &RefCount!{&Shader}, depth: &Texture, width: u32, height: u32)
+        with _shader = alias shader
+        , _set = shader:.get():.allocateDescriptorSet(DescriptorContext::GLOBAL)
+        , _width = width
+        , _height = height
+        throws BalderError
+    {
+        let dmut device = shader:.get():.getDevice();
+        let size = cast!usize(pyramidSize(width, height)) * TEXEL_SIZE;
+        let nbFrames = device:.getSwapchain().nbFrames;
+
+        let dmut buffers: [&Buffer] = [];
+        for _ in 0us .. nbFrames {
+            buffers ~= [device
+                        :.getMemoryAllocator()
+                        :.allocBuffer(size,
+                                      cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
+                                      cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))];
+        }
+
+        self._buffers = alias buffers;
+        self._set:.setTexture(UniformNames::DEPTH, depth);
+        for f, b in self._buffers {
+            self._set:.setBuffer(UniformNames::PYRAMID, b, cast!u32(f));
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the pyramid of the frame 'frame'
+     * */
+    pub fn getBuffer(self, frame: u32)-> &Buffer {
+        self._buffers[frame]
+    }
+
+    /**
+     * @returns: the number of levels of the pyramid
+     * */
+    pub fn getLevelCount(self)-> u32 {
+        levelCount(self._width, self._height)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Record the reduction of the depth of a frame into its pyramid, level by level, the pyramid being readable by the
+     * compute shaders afterwards
+     * @assume: the render pass writing the depth ended, the depth being in its read only layout
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command buffer of the frame, outside of a render pass
+     * */
+    pub fn build(mut self, frame: u32, cmd: VkCommandBuffer)
+        throws BalderError
+    {
+        let dmut shader = if let Ok(dmut c: &ComputeShader) = (alias self._shader:.get())? {
+            alias c
+        } else {
+            throw copy BalderError("The pyramid shader is not a compute shader");
+        };
+
+        let groups = shader.getGroupSizes();
+        if groups[0] == 0u32 || groups[1] == 0u32 { return; }
+
+        // the depth written by the render pass, read by the first level
+        barrier(cmd,
+                VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT);
+
+        shader.select(cmd);
+        self._set.select(frame, cmd);
+
+        let levels = levelCount(self._width, self._height);
+        for level in 1u32 .. levels + 1u32 {
+            let fromDepth = level == 1u32;
+            let srcWidth = if fromDepth { self._width } else { levelWidth(self._width, level - 1u32) };
+            let srcHeight = if fromDepth { self._height } else { levelHeight(self._height, level - 1u32) };
+            let srcOffset = if fromDepth { 0u32 } else { levelOffset(self._width, self._height, level - 1u32) };
+
+            let dstWidth = levelWidth(self._width, level);
+            let dstHeight = levelHeight(self._height, level);
+            let push = PyramidPush(srcOffset,
+                                   levelOffset(self._width, self._height, level),
+                                   srcWidth,
+                                   srcHeight,
+                                   dstWidth,
+                                   dstHeight,
+                                   if fromDepth { 1u32 } else { 0u32 },
+                                   0u32);
+
+            shader:.setPush(cmd, UniformNames::LEVEL, push);
+            vkCmdDispatch(cmd, (dstWidth + groups[0] - 1u32) / groups[0], (dstHeight + groups[1] - 1u32) / groups[1], 1u32);
+
+            // the level written, read by the next one and by the cull pass
+            barrier(cmd,
+                    VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                    VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retire the resources of the pyramid
+     * @params:
+     *    - window: the window retiring the resources, the recordings in use still reading them
+     * */
+    pub fn retire(mut self, dmut window: &Window) {
+        window:.retire(alias self._set);
+        for dmut b in alias self._buffers {
+            window:.retire(alias b);
+        }
+
+        self._buffers = [];
+        self._shader:.dispose();
+    }
+}
+
+/**
+ * Record a memory barrier from a stage to the compute shaders
+ * */
+fn barrier(cmd: VkCommandBuffer, srcStage: u32, srcAccess: u32, dstAccess: u32) {
+    let mut b = VkMemoryBarrier();
+    b.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = dstAccess;
+
+    vkCmdPipelineBarrier(cmd,
+                         srcStage,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0u32,
+                         1u32,
+                         &b,
+                         0u32,
+                         null,
+                         0u32,
+                         null);
+}
