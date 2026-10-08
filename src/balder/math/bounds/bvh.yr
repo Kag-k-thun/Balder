@@ -1,0 +1,503 @@
+in bvh;
+
+mod ::utils;
+
+use std::algorithm::comparison;
+
+/**
+ * The index of no node
+ * */
+def NONE = u32::max;
+
+/**
+ * The ratio of the cost of a hierarchy to the cost it would have without its refits above which it is degraded
+ * */
+def REBUILD_RATIO = 2.0f;
+
+/**
+ * A node of a hierarchy, a leaf holding a box or the parent of two nodes
+ * */
+@data
+record BvhNode {
+
+    // The box of the leaf, the box enclosing the children of a parent
+    pub let mut box: Aabb = Aabb();
+
+    // The parent of the node, NONE for the root
+    pub let mut parent: u32 = NONE;
+
+    // The children of a parent, NONE for a leaf
+    pub let mut left: u32 = NONE;
+    pub let mut right: u32 = NONE;
+
+    // The id of the box of a leaf
+    pub let mut id: usize = 0us;
+
+    // The number of leaves under the node, itself included
+    pub let mut leaves: usize = 0us;
+
+}
+
+/**
+ * A bounding volume hierarchy over boxes, each identified by a uniq id: the leaves hold the boxes, every other node has
+ * two children and the box enclosing them
+ * @info: a box inserted descends to the sibling enlarging the hierarchy the least (the sum of the areas of its nodes); a
+ * box moved is refit, its ancestors enlarged or shrunk without changing the shape of the hierarchy, which degrades as
+ * the boxes move away from where they were inserted, until a rebuild from scratch
+ * */
+@final
+pub class Bvh {
+
+    // The nodes, the free ones included
+    let dmut _nodes: [BvhNode] = copy [];
+
+    // The number of nodes allocated, free ones included, at the start of _nodes
+    let mut _used: usize = 0us;
+
+    // The first free node, the free nodes being chained by their parent, NONE when there is none
+    let mut _free: u32 = NONE;
+
+    // The leaf of each box
+    let dmut _leaves: [usize => u32] = copy [];
+
+    // The root of the hierarchy, NONE when it is empty
+    let mut _root: u32 = NONE;
+
+    // The sum of the areas of the nodes that are not leaves
+    let mut _cost: f32 = 0.0f;
+
+    // The cost the hierarchy would have without the refits since its last rebuild
+    let mut _reference: f32 = 0.0f;
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of boxes in the hierarchy
+     * */
+    @field
+    pub fn len(self)-> usize {
+        self._leaves.len
+    }
+
+    /**
+     * @returns: true iif the hierarchy holds a box of id 'id'
+     * */
+    pub fn contains(self, id: usize)-> bool {
+        id in self._leaves
+    }
+
+    /**
+     * @returns: the box of id 'id', empty when the hierarchy does not hold it
+     * */
+    pub fn getBox(self, id: usize)-> Aabb {
+        if let Ok(leaf) = self._leaves[id] {
+            return self._nodes[leaf].box;
+        }
+
+        Aabb()
+    }
+
+    /**
+     * @returns: the box enclosing every box of the hierarchy, empty when it holds none
+     * */
+    @field
+    pub fn bounds(self)-> Aabb {
+        if self._root == NONE { return Aabb(); }
+
+        self._nodes[self._root].box
+    }
+
+    /**
+     * @returns: the sum of the areas of the nodes that are not leaves, what a culling visits growing with it
+     * */
+    @field
+    pub fn cost(self)-> f32 {
+        self._cost
+    }
+
+    /**
+     * @returns: true iif the refits made the hierarchy REBUILD_RATIO times as costly as it would be without them
+     * */
+    @field
+    pub fn isDegraded(self)-> bool {
+        self._leaves.len > 2us && self._cost > REBUILD_RATIO * self._reference
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          INSERT/REMOVE          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Insert a box in the hierarchy, replacing the box of the same id
+     * @params:
+     *    - id: the uniq id of the box
+     *    - box: the box
+     * */
+    pub fn insert(mut self, id: usize, box: Aabb) {
+        self:.remove(id);
+
+        let before = self._cost;
+        let leaf = self:.allocNode();
+        self._nodes[leaf].box = box;
+        self._nodes[leaf].id = id;
+        self._nodes[leaf].leaves = 1us;
+
+        self._leaves[id] = leaf;
+        self:.insertLeaf(leaf);
+        self._reference += self._cost - before;
+    }
+
+    /**
+     * Remove the box of id 'id' from the hierarchy, if it holds it
+     * */
+    pub fn remove(mut self, id: usize) {
+        if let Ok(leaf) = self._leaves[id] {
+            let before = self._cost;
+            self:.removeLeaf(leaf);
+            self:.freeNode(leaf);
+            self._leaves:.remove(id);
+            self._reference = comparison::max(self._reference + (self._cost - before), 0.0f);
+        }
+    }
+
+    /**
+     * Move the box of id 'id', its ancestors being refit to enclose it
+     * @info: does nothing when the hierarchy does not hold the box
+     * */
+    pub fn update(mut self, id: usize, box: Aabb) {
+        if let Ok(leaf) = self._leaves[id] {
+            self._nodes[leaf].box = box;
+            self:.refit(self._nodes[leaf].parent);
+        }
+    }
+
+    /**
+     * Remove every box
+     * */
+    pub fn clear(mut self) {
+        self._nodes = [];
+        self._used = 0us;
+        self._free = NONE;
+        self._leaves = copy [];
+        self._root = NONE;
+        self._cost = 0.0f;
+        self._reference = 0.0f;
+    }
+
+    /**
+     * Build the hierarchy again from its boxes, each node splitting its boxes in two at the middle of their centers
+     * along the axis where they are the most spread
+     * */
+    pub fn rebuild(mut self) {
+        let nb = self._leaves.len;
+        let dmut ids = copy [0us; nb];
+        let dmut boxes = copy [Aabb(); nb];
+        let mut i = 0us;
+        for id, leaf in self._leaves {
+            ids[i] = id;
+            boxes[i] = self._nodes[leaf].box;
+            i += 1us;
+        }
+
+        self:.clear();
+        if nb == 0us { return; }
+
+        let dmut order = copy [0u32; nb];
+        for j in 0us .. nb {
+            let leaf = self:.allocNode();
+            self._nodes[leaf].box = boxes[j];
+            self._nodes[leaf].id = ids[j];
+            self._nodes[leaf].leaves = 1us;
+            self._leaves[ids[j]] = leaf;
+            order[j] = leaf;
+        }
+
+        self._root = self:.build(alias order, 0us, order.len, NONE);
+        self._reference = self._cost;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CULLING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the boxes seen through a view, a node outside its frustum or too small on screen rejecting all of its boxes
+     * at once, and a node inside its frustum accepting its boxes without testing them against the frustum
+     * @params:
+     *    - view: the view
+     *    - minPixels: the size on screen in pixels under which a box is not seen, 0 to see any box in the frustum
+     * @returns:
+     *    - .0: the ids of the boxes seen
+     *    - .1: the counters of the culling
+     * */
+    pub fn cull(self, view: ViewVolume, minPixels: f32)-> ([usize], CullStats) {
+        let mut stats = CullStats();
+        stats.considered = self._leaves.len;
+
+        let dmut visible = copy [0us; self._leaves.len];
+        if self._root != NONE {
+            self.cullNode(self._root, view, minPixels, false, alias visible, ref stats);
+        }
+
+        (visible[0us .. stats.visible], stats)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Cull the boxes under a node, the boxes seen written in 'visible' from the index stats.visible
+     * @params:
+     *    - inside: true when an ancestor of the node is inside the frustum
+     * */
+    fn cullNode(self, index: u32, view: ViewVolume, minPixels: f32, inside: bool, dmut visible: [usize], ref mut stats: CullStats) {
+        let node = self._nodes[index];
+        stats.visited += 1us;
+
+        let mut isInside = inside;
+        if node.box.isEmpty {
+            stats.outside += node.leaves;
+            return;
+        }
+
+        if !inside {
+            let containment = view.frustum.classify(node.box);
+            if containment == Containment::OUTSIDE {
+                stats.outside += node.leaves;
+                return;
+            }
+
+            isInside = containment == Containment::INSIDE;
+        }
+
+        if minPixels > 0.0f && view.pixelSize(node.box) < minPixels {
+            stats.small += node.leaves;
+            return;
+        }
+
+        if node.left == NONE {
+            visible[stats.visible] = node.id;
+            stats.visible += 1us;
+            return;
+        }
+
+        self.cullNode(node.left, view, minPixels, isInside, alias visible, ref stats);
+        self.cullNode(node.right, view, minPixels, isInside, alias visible, ref stats);
+    }
+
+    /**
+     * Place a leaf in the hierarchy, next to the node whose enlargement enlarges the hierarchy the least
+     * */
+    fn insertLeaf(mut self, leaf: u32) {
+        if self._root == NONE {
+            self._root = leaf;
+            self._nodes[leaf].parent = NONE;
+            return;
+        }
+
+        let box = self._nodes[leaf].box;
+        let mut sibling = self._root;
+        while self._nodes[sibling].left != NONE {
+            let node = self._nodes[sibling];
+            let combined = utils::area(node.box.merged(box));
+
+            // placed here, the node gets a new parent enclosing the box; placed below, the node is enlarged
+            let here = 2.0f * combined;
+            let inherited = 2.0f * (combined - utils::area(node.box));
+            let left = self.descentCost(node.left, box) + inherited;
+            let right = self.descentCost(node.right, box) + inherited;
+
+            if here < left && here < right { break; }
+            sibling = if left < right { node.left } else { node.right };
+        }
+
+        let oldParent = self._nodes[sibling].parent;
+        let parent = self:.allocNode();
+        self._nodes[parent].parent = oldParent;
+        self._nodes[parent].left = sibling;
+        self._nodes[parent].right = leaf;
+        self._nodes[parent].box = self._nodes[sibling].box.merged(box);
+        self._nodes[parent].leaves = self._nodes[sibling].leaves + 1us;
+        self._cost += utils::area(self._nodes[parent].box);
+
+        self._nodes[sibling].parent = parent;
+        self._nodes[leaf].parent = parent;
+
+        if oldParent == NONE {
+            self._root = parent;
+        } else {
+            if self._nodes[oldParent].left == sibling {
+                self._nodes[oldParent].left = parent;
+            } else {
+                self._nodes[oldParent].right = parent;
+            }
+
+            self:.refit(oldParent);
+        }
+    }
+
+    /**
+     * @returns: the enlargement of the hierarchy when a box descends in a node, the node itself excluded
+     * */
+    fn descentCost(self, index: u32, box: Aabb)-> f32 {
+        let node = self._nodes[index];
+        let merged = utils::area(node.box.merged(box));
+        if node.left == NONE {
+            return merged;
+        }
+
+        merged - utils::area(node.box)
+    }
+
+    /**
+     * Take a leaf out of the hierarchy, its sibling replacing its parent
+     * @info: the leaf is not freed
+     * */
+    fn removeLeaf(mut self, leaf: u32) {
+        if leaf == self._root {
+            self._root = NONE;
+            return;
+        }
+
+        let parent = self._nodes[leaf].parent;
+        let grandParent = self._nodes[parent].parent;
+        let sibling = if self._nodes[parent].left == leaf { self._nodes[parent].right } else { self._nodes[parent].left };
+
+        self._cost -= utils::area(self._nodes[parent].box);
+        self:.freeNode(parent);
+
+        self._nodes[sibling].parent = grandParent;
+        if grandParent == NONE {
+            self._root = sibling;
+        } else {
+            if self._nodes[grandParent].left == parent {
+                self._nodes[grandParent].left = sibling;
+            } else {
+                self._nodes[grandParent].right = sibling;
+            }
+
+            self:.refit(grandParent);
+        }
+    }
+
+    /**
+     * Compute again the boxes and the numbers of leaves of a node and of its ancestors from their children
+     * */
+    fn refit(mut self, index: u32) {
+        let mut current = index;
+        while current != NONE {
+            let node = self._nodes[current];
+            let box = self._nodes[node.left].box.merged(self._nodes[node.right].box);
+
+            self._cost += utils::area(box) - utils::area(node.box);
+            self._nodes[current].box = box;
+            self._nodes[current].leaves = self._nodes[node.left].leaves + self._nodes[node.right].leaves;
+            current = node.parent;
+        }
+    }
+
+    /**
+     * Build the hierarchy of the leaves order[start .. end]
+     * @params:
+     *    - order: the leaves, reordered in place
+     *    - parent: the parent of the hierarchy built
+     * @returns: the root of the hierarchy built
+     * */
+    fn build(mut self, dmut order: [u32], start: usize, end: usize, parent: u32)-> u32 {
+        if end - start == 1us {
+            self._nodes[order[start]].parent = parent;
+            return order[start];
+        }
+
+        let mut centers = Aabb();
+        for i in start .. end {
+            let c = self._nodes[order[i]].box.center;
+            centers = centers.merged(Aabb(c, c));
+        }
+
+        let spread = centers.max - centers.min;
+        let axis = if spread.x >= spread.y && spread.x >= spread.z { 0u32 } else if spread.y >= spread.z { 1u32 } else { 2u32 };
+        let middle = utils::component(centers.center, axis);
+
+        let mut split = start;
+        for i in start .. end {
+            if utils::component(self._nodes[order[i]].box.center, axis) < middle {
+                let leaf = order[i];
+                order[i] = order[split];
+                order[split] = leaf;
+                split += 1us;
+            }
+        }
+
+        // the centers are all at the same place, the leaves are split in two halves
+        if split == start || split == end {
+            split = start + (end - start) / 2us;
+        }
+
+        let node = self:.allocNode();
+        self._nodes[node].parent = parent;
+
+        let left = self:.build(alias order, start, split, node);
+        let right = self:.build(alias order, split, end, node);
+
+        self._nodes[node].left = left;
+        self._nodes[node].right = right;
+        self._nodes[node].box = self._nodes[left].box.merged(self._nodes[right].box);
+        self._nodes[node].leaves = self._nodes[left].leaves + self._nodes[right].leaves;
+        self._cost += utils::area(self._nodes[node].box);
+
+        node
+    }
+
+    /**
+     * @returns: the index of a node reset to a leaf of no parent, taken from the free nodes or appended to the nodes
+     * */
+    fn allocNode(mut self)-> u32 {
+        let index = if self._free != NONE {
+            let i = self._free;
+            self._free = self._nodes[i].parent;
+            i
+        } else {
+            if self._used == self._nodes.len {
+                self._nodes = self._nodes ~ copy [BvhNode(); comparison::max(self._nodes.len, 16us)];
+            }
+
+            self._used += 1us;
+            cast!u32(self._used - 1us)
+        };
+
+        self._nodes[index] = BvhNode();
+        index
+    }
+
+    /**
+     * Give a node back to the free nodes
+     * */
+    fn freeNode(mut self, index: u32) {
+        self._nodes[index] = BvhNode();
+        self._nodes[index].parent = self._free;
+        self._free = index;
+    }
+
+}

@@ -1,0 +1,281 @@
+in bvh;
+
+use balder::math::{bounds, utils, vector};
+
+use std::algorithm::sorting;
+
+/**
+ * @returns: true iif two vectors are equal, give or take the rounding errors
+ * */
+fn near(a: vec3, b: vec3)-> bool {
+    (a - b).length() < 0.0001f
+}
+
+/**
+ * @returns: the box of side 2 centered on a point
+ * */
+fn cube(center: vec3)-> Aabb {
+    Aabb(center - 1.0f, center + 1.0f)
+}
+
+/**
+ * @returns: the view of a camera at the origin looking down -z, with a vertical field of view of 90°, a square aspect,
+ * seeing from 1 to 20 units in front of it, on 100 pixels of height
+ * */
+fn perspectiveView()-> ViewVolume {
+    let proj = perspective!{f32}(radian(90.0f), 1.0f, 1.0f, 20.0f);
+    let view = lookAt!{f32}(vec3(), makeVec3(0.0f, 0.0f, -1.0f), makeVec3(0.0f, 1.0f, 0.0f));
+
+    ViewVolume(proj * view, 100.0f)
+}
+
+/**
+ * @returns: a pseudo random number in [-range, range), the state moved to the next one
+ * */
+fn next(ref mut state: u64, range: f32)-> f32 {
+    state = (state * 1103515245u64 + 12345u64) % 2147483648u64;
+    let unit = cast!f32((state >> 15u64) & 0xffffu64) / 65536.0f;
+
+    (unit * 2.0f - 1.0f) * range
+}
+
+/**
+ * @returns: n boxes of sides from 0.1 to 2 scattered around the origin, in [-range, range) along each axis
+ * */
+fn scatter(n: usize, range: f32, seed: u64)-> [Aabb] {
+    let mut state = seed;
+    let dmut boxes = copy [Aabb(); n];
+    for i in 0us .. n {
+        let c = makeVec3(next(ref state, range), next(ref state, range), next(ref state, range));
+        let h = 0.55f + next(ref state, 0.45f);
+        boxes[i] = Aabb(c - h, c + h);
+    }
+
+    boxes
+}
+
+/**
+ * @returns: a hierarchy of boxes, the id of each box being its index
+ * */
+fn hierarchy(boxes: [Aabb])-> dmut &Bvh {
+    let dmut bvh = copy Bvh();
+    for i, b in boxes {
+        bvh:.insert(i, b);
+    }
+
+    alias bvh
+}
+
+/**
+ * @returns: the indexes of the boxes intersecting the frustum of a view, tested one by one, sorted
+ * */
+fn bruteForce(boxes: [Aabb], view: ViewVolume)-> [usize] {
+    let mut res: [usize] = [];
+    for i, b in boxes {
+        if view.frustum.intersects(b) {
+            res = res ~ [i];
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: true iif the id 'id' is among 'ids'
+ * */
+fn has(ids: [usize], id: usize)-> bool {
+    for i in ids {
+        if i == id { return true; }
+    }
+
+    false
+}
+
+/**
+ * @returns: the ids a culling found, sorted
+ * */
+fn sorted(ids: [usize])-> [usize] {
+    let dmut res = copy ids;
+    (alias res).sort()
+}
+
+__test an_empty_hierarchy_holds_nothing_and_sees_nothing {
+    let bvh = copy Bvh();
+    let (ids, stats) = bvh.cull(ViewVolume(), 0.0f);
+
+    assert (bvh.len == 0us);
+    assert (bvh.bounds.isEmpty);
+    assert (ids.len == 0us);
+    assert (stats.considered == 0us && stats.visited == 0us);
+}
+
+__test the_bounds_of_a_hierarchy_enclose_its_boxes {
+    let dmut bvh = copy Bvh();
+    bvh:.insert(1us, cube(makeVec3(-4.0f, 0.0f, 0.0f)));
+    bvh:.insert(2us, cube(makeVec3(4.0f, 2.0f, 0.0f)));
+    bvh:.insert(3us, cube(makeVec3(0.0f, 0.0f, 7.0f)));
+
+    assert (bvh.len == 3us);
+    assert (bvh.contains(2us) && !bvh.contains(4us));
+    assert (near(bvh.getBox(2us).center, makeVec3(4.0f, 2.0f, 0.0f)));
+    assert (near(bvh.bounds.min, makeVec3(-5.0f, -1.0f, -1.0f)));
+    assert (near(bvh.bounds.max, makeVec3(5.0f, 3.0f, 8.0f)));
+}
+
+__test inserting_an_id_again_replaces_its_box {
+    let dmut bvh = copy Bvh();
+    bvh:.insert(1us, cube(makeVec3(-4.0f, 0.0f, 0.0f)));
+    bvh:.insert(2us, cube(vec3()));
+    bvh:.insert(1us, cube(makeVec3(3.0f, 0.0f, 0.0f)));
+
+    assert (bvh.len == 2us);
+    assert (near(bvh.bounds.min, makeVec3(-1.0f, -1.0f, -1.0f)));
+    assert (near(bvh.bounds.max, makeVec3(4.0f, 1.0f, 1.0f)));
+}
+
+__test a_removed_box_leaves_the_hierarchy_and_its_bounds {
+    let dmut bvh = copy Bvh();
+    bvh:.insert(1us, cube(makeVec3(-4.0f, 0.0f, 0.0f)));
+    bvh:.insert(2us, cube(vec3()));
+    bvh:.insert(3us, cube(makeVec3(4.0f, 0.0f, 0.0f)));
+
+    bvh:.remove(3us);
+    bvh:.remove(42us);
+
+    assert (bvh.len == 2us);
+    assert (!bvh.contains(3us));
+    assert (bvh.getBox(3us).isEmpty);
+    assert (near(bvh.bounds.max, makeVec3(1.0f, 1.0f, 1.0f)));
+
+    bvh:.remove(1us);
+    bvh:.remove(2us);
+    assert (bvh.len == 0us && bvh.bounds.isEmpty && bvh.cost == 0.0f);
+}
+
+__test a_moved_box_refits_the_bounds {
+    let dmut bvh = copy Bvh();
+    for i in 0us .. 8us {
+        bvh:.insert(i, cube(makeVec3(cast!f32(cast!u64(i)) * 3.0f, 0.0f, 0.0f)));
+    }
+
+    bvh:.update(7us, cube(makeVec3(0.0f, 10.0f, 0.0f)));
+    assert (near(bvh.bounds.min, makeVec3(-1.0f, -1.0f, -1.0f)));
+    assert (near(bvh.bounds.max, makeVec3(19.0f, 11.0f, 1.0f)));
+
+    bvh:.update(99us, cube(makeVec3(100.0f, 0.0f, 0.0f)));
+    assert (bvh.len == 8us && near(bvh.bounds.max, makeVec3(19.0f, 11.0f, 1.0f)));
+}
+
+__test the_default_view_sees_every_box_but_the_empty_ones {
+    let dmut bvh = hierarchy(scatter(50us, 30.0f, 7u64));
+    bvh:.insert(100us, Aabb());
+
+    let (ids, stats) = bvh.cull(ViewVolume(), 1.0f);
+    assert (ids.len == 50us);
+    assert (!has(ids, 100us));
+    assert (stats.considered == 51us && stats.visible == 50us && stats.outside == 1us);
+}
+
+__test the_culling_sees_the_boxes_intersecting_the_frustum {
+    let boxes = scatter(500us, 40.0f, 1u64);
+    let bvh = hierarchy(boxes);
+    let view = perspectiveView();
+
+    let (ids, stats) = bvh.cull(view, 0.0f);
+    let expected = bruteForce(boxes, view);
+
+    assert (expected.len != 0us && expected.len < boxes.len);
+    assert (sorted(ids) == expected);
+    assert (stats.considered == 500us && stats.visible == expected.len && stats.small == 0us);
+    assert (stats.outside + stats.visible == stats.considered);
+}
+
+__test the_culling_rejects_whole_branches_outside_the_frustum {
+    // a crowd far behind the camera, a few boxes in front of it
+    let dmut bvh = copy Bvh();
+    let behind = scatter(1000us, 20.0f, 3u64);
+    for i, b in behind {
+        bvh:.insert(i, b.transformed(translation(makeVec3(0.0f, 0.0f, 100.0f))));
+    }
+
+    for i in 0us .. 4us {
+        bvh:.insert(1000us + i, cube(makeVec3(cast!f32(cast!u64(i)) * 2.0f - 3.0f, 0.0f, -10.0f)));
+    }
+
+    let (ids, stats) = bvh.cull(perspectiveView(), 0.0f);
+    assert (sorted(ids) == [1000us, 1001us, 1002us, 1003us]);
+    assert (stats.outside == 1000us);
+    assert (stats.visited < 100us);
+}
+
+__test the_culling_rejects_the_boxes_too_small_on_screen {
+    let dmut bvh = copy Bvh();
+    bvh:.insert(1us, cube(makeVec3(0.0f, 0.0f, -5.0f)));
+    bvh:.insert(2us, Aabb(makeVec3(-0.01f, -0.01f, -15.01f), makeVec3(0.01f, 0.01f, -14.99f)));
+    bvh:.insert(3us, cube(makeVec3(0.0f, 0.0f, 50.0f)));
+
+    let (all, _) = bvh.cull(perspectiveView(), 0.0f);
+    assert (sorted(all) == [1us, 2us]);
+
+    let (ids, stats) = bvh.cull(perspectiveView(), 1.0f);
+    assert (ids == [1us]);
+    assert (stats.small == 1us && stats.outside == 1us && stats.visible == 1us);
+}
+
+__test the_refits_degrade_the_hierarchy_until_it_is_rebuilt {
+    // boxes inserted in a line along x, then scattered in the whole space
+    let dmut bvh = copy Bvh();
+    for i in 0us .. 200us {
+        bvh:.insert(i, cube(makeVec3(cast!f32(cast!u64(i)) * 2.0f, 0.0f, 0.0f)));
+    }
+
+    assert (!bvh.isDegraded);
+
+    let boxes = scatter(200us, 40.0f, 11u64);
+    for i, b in boxes {
+        bvh:.update(i, b);
+    }
+
+    assert (bvh.isDegraded);
+    let degraded = bvh.cost;
+
+    bvh:.rebuild();
+    assert (!bvh.isDegraded);
+    assert (bvh.cost < degraded);
+    assert (bvh.len == 200us);
+
+    let view = perspectiveView();
+    let (ids, _) = bvh.cull(view, 0.0f);
+    assert (sorted(ids) == bruteForce(boxes, view));
+}
+
+__test the_hierarchy_stays_consistent_through_insertions_and_removals {
+    let boxes = scatter(300us, 30.0f, 5u64);
+    let dmut bvh = hierarchy(boxes);
+    for i in 0us .. 300us {
+        if i % 2us == 0us { bvh:.remove(i); }
+    }
+
+    // the nodes freed are taken again
+    for i in 0us .. 300us {
+        if i % 4us == 0us { bvh:.insert(i, boxes[i]); }
+    }
+
+    let mut expected: [usize] = [];
+    for i in 0us .. 300us {
+        if i % 2us == 1us || i % 4us == 0us { expected = expected ~ [i]; }
+    }
+
+    let (ids, _) = bvh.cull(ViewVolume(), 0.0f);
+    assert (bvh.len == expected.len);
+    assert (sorted(ids) == expected);
+
+    let view = perspectiveView();
+    let (seen, _) = bvh.cull(view, 0.0f);
+    let mut inView: [usize] = [];
+    for i in bruteForce(boxes, view) {
+        if i % 2us == 1us || i % 4us == 0us { inView = inView ~ [i]; }
+    }
+
+    assert (sorted(seen) == inView);
+}

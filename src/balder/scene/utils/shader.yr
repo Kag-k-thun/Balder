@@ -4,10 +4,11 @@ use balder::utils;
 use balder::core::{_, driver::_};
 use balder::core::application::window;
 use balder::core::shader::{_, buffers::_};
+use balder::math::{bounds, matrix};
 use balder::scene::node::node3D::camera;
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::material;
-use balder::scene::utils::{batch, light, material};
+use balder::scene::utils::{batch, light, material, visibility};
 
 use std::time::dur;
 
@@ -26,6 +27,9 @@ pub record ShaderNodeScene {
 
     // The drawable nodes
     let dmut _nodes : [usize => &VisualInstance3D] = copy [];
+
+    // The drawable nodes in a hierarchy of their world boxes, and those seen by the camera
+    let dmut _visibility : VisibilityScene = VisibilityScene ();
 
     // The list of drawable nodes that casts shadows
     let dmut _shadowMeshes : [usize => &VisualInstance3D] = copy [];    
@@ -123,6 +127,14 @@ pub record ShaderNodeScene {
      * ====================================================================================================
      * ====================================================================================================
      */
+
+    /**
+     * @returns: the counters of the last culling of the drawable nodes by the camera
+     * */
+    @field
+    pub fn cullStats (self)-> CullStats {
+        self._visibility.stats
+    }
 
     /**
      * @returns: the material array of the shader associations
@@ -232,6 +244,7 @@ pub record ShaderNodeScene {
         if let Ok (dmut g) = alias self._groups [shCfg.name] {
             let dmut draws = g:.register (alias material, alias node, vertices, indices);
             self._nodes [node.uid] = alias node;
+            self._visibility:.insert (alias node);
             return alias draws;
         }
 
@@ -244,6 +257,7 @@ pub record ShaderNodeScene {
      * */
     pub fn release (mut self, material : &Material, node : &VisualInstance3D) {
         self._nodes:.remove (node.uid);
+        self._visibility:.remove (node);
 
         let name = material.shaderConfig.name;
         if let Ok (dmut win) = alias self._window {
@@ -257,6 +271,44 @@ pub record ShaderNodeScene {
         }
     }
 
+    /**
+     * Mark a drawable node moved, its box to be refit before the next culling
+     * */
+    pub fn onMoved (mut self, dmut node : &VisualInstance3D) {
+        self._visibility:.moved (alias node);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          VISIBILITY          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Cull the drawable nodes the camera does not see, and draw again those it sees
+     * @params:
+     *    - viewProj: the projection by the view of the camera
+     *    - height: the height of the view, in pixels
+     *    - threshold: the size on screen under which a node is culled, in pixels
+     * @returns: true iif the draws of a node changed and the commands have to be recorded again to draw them
+     * */
+    pub fn cull (mut self, viewProj : mat4, height : f32, threshold : f32)-> bool {
+        self._visibility:.update (viewProj, height, threshold)
+    }
+
+    /**
+     * Find the drawable nodes seen through a view other than the camera's, culling none of them
+     * @params:
+     *    - view: the view (of a light...)
+     *    - threshold: the size on screen under which a node is not seen, in pixels
+     * @returns: the uniq ids of the nodes seen, and the counters of the culling
+     * */
+    pub fn findVisible (mut self, view : ViewVolume, threshold : f32)-> ([usize], CullStats) {
+        self._visibility:.cull (view, threshold)
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -266,7 +318,8 @@ pub record ShaderNodeScene {
      */
 
     /**
-     * Select the levels of detail of the drawable nodes from the camera, and advance their cross-fades
+     * Select the levels of detail of the drawable nodes seen by the camera, and advance their cross-fades
+     * @info: a culled node keeps its level and its cross-fade until it is seen again
      * @params:
      *    - camera: the camera of the scene
      *    - height: the height of the view, in pixels
@@ -276,7 +329,7 @@ pub record ShaderNodeScene {
      * */
     pub fn selectLods (mut self, camera : &Camera, height : f32, threshold : f32, delta : Duration)-> bool {
         let mut changed = false;
-        for _, dmut v in alias self._nodes {
+        for _, dmut v in alias self._visibility:.getVisible () {
             if v:.selectLod (camera, height, threshold, delta) { changed = true; }
         }
 
@@ -317,6 +370,7 @@ pub record ShaderNodeScene {
     impl Disposable {
         pub over dispose (mut self) {
             self._nodes = copy [];
+            self._visibility:.clear ();
 
             if let Ok (dmut win) = alias self._window {
                 for _, dmut g in alias self._groups {
