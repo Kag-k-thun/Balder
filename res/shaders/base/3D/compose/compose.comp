@@ -53,8 +53,44 @@ layout (binding = 4) uniform sampler2D albedo;
 layout (binding = 5) uniform sampler2D depth;
 layout (binding = 6) uniform usampler2D materialID;
 
-layout (binding = 7) uniform texture2D shadowMaps [];
-layout (binding = 8) uniform sampler shadowMapSampler;
+// The cascades of the shadow map of the direction light casting shadows, side by side in a 2x2 atlas, the first one at
+// the top left: a lookup gives the fraction of the four texels around a point whose depth is not closer to the light
+// than the depth it is compared to
+layout (binding = 7) uniform sampler2DShadow shadowMap;
+
+// The number of cascades of the shadow map, the size of the array below
+const uint CASCADES = 4;
+
+// A cascade of the shadow map, seeing a slice of the view of the camera from the light, its block (256 bytes) being the
+// camera the shadow pipelines read
+struct Cascade {
+    // From world space to the clip space of the cascade, its depth in [0, 1] growing away from the light
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+
+    // .x: the size of a texel of the cascade, in world units
+    vec4 info;
+
+    vec4 padding [3];
+};
+
+// The cascades of the shadow map, written at once with the cameras the shadow pipelines drew them with
+layout (binding = 8) uniform Shadow {
+    Cascade cascades [CASCADES];
+
+    // The number of cascades, 0 when no light casts shadows
+    uint count;
+
+    // The index of the direction light casting the shadows
+    uint light;
+
+    // The offset of the point looked up along its normal, in texels of its cascade, so a surface does not shadow itself
+    float normalOffset;
+
+    // The bias of the depth compared to the shadow map, in the depth of the cascades
+    float bias;
+} shadow;
 
 layout (binding = 9) uniform Camera {
     CameraContent camera;
@@ -78,10 +114,6 @@ layout (std430, binding = 13) readonly buffer Points {
     uint nbLights;
     Light lights[];
 } pointLights;
-
-layout(push_constant) uniform PC {
-    float shadowTexLen;
-} pc;
 
 
 /*!
@@ -177,6 +209,61 @@ vec4 shadeDiffuse (Light light, Material mat, vec2 uv) {
 /*!
  * ====================================================================================================
  * ====================================================================================================
+ * =====================================          SHADOW          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the fraction of the light of the direction light casting shadows reaching a point, 1 out of the cascades
+ * @info: the point is looked up in the first cascade holding it, the finest; the cascades are fitted at the ticks of
+ * the scene, so they may hold the view of the camera of an earlier tick, a point out of the finest being found in a
+ * larger one
+ * @info: the point is moved along its normal by a few texels of its cascade, and its depth biased, so the surface it
+ * lies on does not shadow itself (acne); the 3x3 lookups around it, each filtering four texels, soften the edges of the
+ * shadows (percentage closer filtering)
+ * @params:
+ *    - viewPos: the point, in the view space of the camera
+ *    - normal: the normal of the surface at the point
+ */
+float shadowFactor (vec3 viewPos, vec3 normal) {
+    // the view of the camera is a rotation and a translation, inverted without inverting the matrix; the positions were
+    // written with the camera of this frame, the one bound here
+    mat3 rotation = mat3 (camera.view);
+    vec3 world = transpose (rotation) * (viewPos - camera.view [3].xyz);
+    vec3 n = normalize (normal);
+
+    // a cascade covers a quarter of the atlas, the lookups of a point reading the texels around it, inside its tile
+    float texel = 2.0 / float (textureSize (shadowMap, 0).x);
+    float margin = texel * 1.5;
+
+    for (uint c = 0 ; c < shadow.count ; c++) {
+        vec3 p = world + n * shadow.cascades [c].info.x * shadow.normalOffset;
+        vec4 clip = shadow.cascades [c].viewProj * vec4 (p, 1.0);
+        vec2 uv = clip.xy * 0.5 + 0.5;
+        if (any (lessThan (uv, vec2 (margin))) || any (greaterThan (uv, vec2 (1.0 - margin))) || clip.z > 1.0) {
+            continue;
+        }
+
+        vec2 tile = vec2 (float (c & 1u), float (c >> 1u));
+        float depth = clip.z - shadow.bias;
+
+        float lit = 0.0;
+        for (int x = -1 ; x <= 1 ; x++) {
+            for (int y = -1 ; y <= 1 ; y++) {
+                lit += texture (shadowMap, vec3 ((tile + uv + vec2 (x, y) * texel) * 0.5, depth));
+            }
+        }
+
+        return lit / 9.0;
+    }
+
+    return 1.0;
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
  * ======================================          MAIN          ======================================
  * ====================================================================================================
  * ====================================================================================================
@@ -197,8 +284,13 @@ void main () {
             for (uint i = 0 ; i < directionLights.nbLights ; i++) {    
                 vec4 diffuse = shadeDiffuse (directionLights.lights [i], mat, uv);
                 vec4 metalic = shadeMetallic (directionLights.lights [i], mat, uv);
-        
-                color += (diffuse + metalic);
+
+                float lit = 1.0;
+                if (shadow.count != 0 && i == shadow.light) {
+                    lit = shadowFactor (texture (positions, uv).xyz, texture (normals, uv).xyz);
+                }
+
+                color += (diffuse + metalic) * lit;
             }
 
             for (uint i = 0 ; i < spotLights.nbLights ; i++) {    
