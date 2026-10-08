@@ -19,8 +19,12 @@ record PassContent {
     pub let mut sems : [mut [VkSemaphore]] = [];
     pub let dmut stages : [u32] = [];
 
-    pub self (dmut pass : &VulkanSubpass)
+    // True for the frame slots in which the pass alone has to be recorded again
+    pub let dmut dirty : [bool];
+
+    pub self (dmut pass : &VulkanSubpass, nbFrames : u32)
         with pass = alias pass
+        , dirty = copy [false ; nbFrames]
     {}            
 }
 
@@ -39,9 +43,6 @@ pub class VulkanPipeline {
         
         // The frames that have been swapped already
         let dmut _updated : [FrameDrawing] = [];
-
-        // The number of frames to redraw
-        let mut _redrawFrames : u32 = 0;
     }
 
     prot { // deferred disposal
@@ -132,7 +133,12 @@ pub class VulkanPipeline {
             self._generations:.awaited (frame)
         };
 
+        let dmut passes = atomic self { alias self._passGraph };
+
         self._device:.collect (safe);
+        for dmut pass in alias passes {
+            pass.pass:.collectRetired (frame);
+        }
     }
 
     /**
@@ -165,6 +171,13 @@ pub class VulkanPipeline {
             self:.forceRedraw ();
         }
 
+        let dmut passes = atomic self { alias self._passGraph };
+        for dmut pass in alias passes {
+            if pass.pass:.takeRedrawRequest () {
+                self:.redrawPass (pass.pass);
+            }
+        }
+
         atomic self {                        
             if self._updated [frame] == FrameDrawing::REDRAW {                
                 self._updated [frame] = FrameDrawing::DRAWING;
@@ -173,14 +186,22 @@ pub class VulkanPipeline {
                 self._generations:.recorded (frame, self._device.getGeneration ());
                                                         
                 // Redraw all subpasses for the current frame
-                for dmut pass in alias self._passGraph {
-                    pass.pass:.redraw (frame);
+                for i in 0 .. self._passGraph.len {
+                    self._passGraph [i].dirty [frame] = false;
+                    self._passGraph [i].pass:.redraw (frame);
                 }                
                             
                 self._updated [frame] = FrameDrawing::SWAPPED;        
-                self._redrawFrames -= 1;                
-            } else if self._updated [frame] == FrameDrawing::SWAPPED {
-                self._updated [frame] = FrameDrawing::AWAITED;
+            } else {
+                if self._updated [frame] == FrameDrawing::SWAPPED {
+                    self._updated [frame] = FrameDrawing::AWAITED;
+                }
+
+                // The other passes keep their recording, and the generation it was stamped with
+                for i in 0 .. self._passGraph.len if self._passGraph [i].dirty [frame] {
+                    self._passGraph [i].dirty [frame] = false;
+                    self._passGraph [i].pass:.redraw (frame);
+                }
             }
             
             self:.submitNoDraw (frame);                        
@@ -208,8 +229,24 @@ pub class VulkanPipeline {
             for i in 0 .. self._updated.len {
                 self._updated [i] = FrameDrawing::REDRAW;
             }
-            
-            self._redrawFrames = cast!u32 (self._updated.len);
+        }
+
+        self._device:.requestFrame ();
+    }
+
+    /**
+     * Force the subpass 'pass' alone to be redrawn, the other subpasses keeping their recording
+     * @warning: only for a change that the recordings of the other subpasses do not reference, the generation of the
+     * frame slots staying the one of their last full redraw (an object only the subpass references is retired by the
+     * subpass, see VulkanSubpass::retire)
+     * */
+    pub fn redrawPass (mut self, pass : &VulkanSubpass) {
+        atomic self {
+            for i in 0 .. self._passGraph.len if self._passGraph [i].pass is pass {
+                for f in 0 .. self._passGraph [i].dirty.len {
+                    self._passGraph [i].dirty [f] = true;
+                }
+            }
         }
 
         self._device:.requestFrame ();
@@ -226,10 +263,23 @@ pub class VulkanPipeline {
     }
 
     /**
-     * @returns: true iif a frame slot has to be recorded again
+     * @returns: true iif a frame slot, or a subpass in one, has to be recorded again
      * */
     pub fn hasPendingRedraw (self)-> bool {
-        self._redrawFrames > 0u32
+        atomic self {
+            let mut pending = false;
+            for u in self._updated if u == FrameDrawing::REDRAW {
+                pending = true;
+            }
+
+            for pass in self._passGraph {
+                for d in pass.dirty if d {
+                    pending = true;
+                }
+            }
+
+            pending
+        }
     }
 
     /*!
@@ -332,7 +382,7 @@ pub class VulkanPipeline {
      * */
     fn resetToDefault (mut self) {        
         atomic self {            
-            let dmut content = PassContent (alias self._compose);                
+            let dmut content = PassContent (alias self._compose, self._device.getNbFrames ());                
             
             content.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
             content.sems = copy [copy [self._transfer.getSemaphore (i)] for i in 0 .. self._device.getNbFrames ()];        
@@ -384,7 +434,7 @@ pub class VulkanPipeline {
 
             // Adding it on the result graph
             if let Ok (dmut p) = alias self._passes [pname] {
-                let dmut content = PassContent (alias p);
+                let dmut content = PassContent (alias p, nbFrames);
                 content.sems = alias sems;
                 content.stages = alias stages;                
                 
@@ -481,11 +531,11 @@ pub class VulkanPipeline {
                 self:.resetToDefault ();
                 for i in 0 .. self._updated.len {
                     self._updated [i] = FrameDrawing::REDRAW;
-                    self._redrawFrames = cast!u32 (self._updated.len);
                 }                
             }
 
-            // Nothing is recorded nor in flight anymore
+            // Nothing is recorded nor in flight anymore, the other subpasses drained their retires when disposed
+            self._compose:.drainRetired ();
             self._device:.drainRetired ();
         }
     }
