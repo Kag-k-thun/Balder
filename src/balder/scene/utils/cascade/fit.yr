@@ -1,0 +1,239 @@
+in fit;
+
+use balder::math::{bounds, matrix, vector};
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The fitting of the cascades of the shadow map of a direction light to the view of a camera
+ * @info: the view of the camera is split along its depth into slices, each enclosed in a sphere; the sphere of a slice
+ * keeps its size when the camera turns, so its cascade covers the same area of the world whatever the camera looks at
+ * @info: the light looks at the sphere along its direction through an orthographic projection whose center is snapped
+ * to the texels of the cascade, so the texels stand at the same places of the world while the camera moves and the
+ * edges of the shadows do not crawl
+ * @info: a projection writes the depth in [0, 1] (the depth range of Vulkan), growing along the direction of the light;
+ * it starts at the casters closest to the light, which cast their shadows in the slice from outside of its sphere
+ * */
+
+/**
+ * The share of the logarithmic split in the depths splitting the view of a camera, the rest being a uniform split
+ * */
+pub def SPLIT_LAMBDA = 0.75f;
+
+/**
+ * The step the radius of the sphere of a slice is rounded up to, so the rounding errors of the corners of the slice do
+ * not change the size of the cascade, nor the texels it is snapped to
+ * */
+def RADIUS_STEP = 1.0f / 16.0f;
+
+/**
+ * The texels kept on each side of a cascade around the sphere it sees: the snapping of its center moves the sphere by
+ * less than a texel, and the filtering of the shadows reads the texels around the point shaded
+ * */
+pub def CASCADE_MARGIN = 2u32;
+
+/**
+ * A cascade of a shadow map, seeing a slice of the view of a camera from the light
+ * */
+@data
+pub record Cascade {
+
+    // The projection by the view of the light, from world space to the clip space of the cascade
+    pub let viewProj: mat4 = mat4();
+
+    // The depth in the view of the camera of the far end of the slice the cascade covers
+    pub let far: f32 = 0.0f;
+
+    // The size of a texel of the cascade, in world units
+    pub let texel: f32 = 0.0f;
+
+}
+
+/**
+ * @returns: the cascades of the shadow map of a direction light, covering the view of a camera from its near plane to a
+ * distance, the closest first
+ * @params:
+ *    - invViewProj: the inverse of the projection by the view of the camera
+ *    - near: the near plane of the camera
+ *    - far: the far plane of the camera
+ *    - distance: the depth up to which the cascades cover the view, the far plane when farther
+ *    - direction: the direction of the light
+ *    - casters: the box enclosing the casters of shadows, in world space
+ *    - count: the number of cascades
+ *    - resolution: the number of texels on a side of a cascade, larger than twice CASCADE_MARGIN
+ * */
+pub fn fitCascades(invViewProj: mat4,
+                   near: f32,
+                   far: f32,
+                   distance: f32,
+                   direction: vec3,
+                   casters: Aabb,
+                   count: u32,
+                   resolution: u32)-> [Cascade] {
+    let view = lightView(direction);
+    let nearest = nearestDepth(view, casters);
+    let ends = splitDepths(near, comparison::min(far, distance), count, SPLIT_LAMBDA);
+
+    let dmut result = copy [Cascade(); count];
+    let mut start = near;
+    for i, end in ends {
+        let bounds = enclose(sliceCorners(invViewProj, near, far, start, end));
+        let proj = cascadeProjection(view, bounds, nearest, resolution);
+        result[i] = Cascade(viewProj-> proj * view, far-> end, texel-> texelSize(bounds.radius, resolution));
+        start = end;
+    }
+
+    result
+}
+
+/**
+ * @returns: the depth of the far end of each of 'count' slices splitting the depths [near, far], blending a
+ * logarithmic split (the same ratio between the ends of each slice, so the texels of each cascade cover about as many
+ * pixels) with a uniform one, the last slice ending at 'far'
+ * @params:
+ *    - lambda: the share of the logarithmic split, from 0 (uniform only) to 1 (logarithmic only)
+ * */
+pub fn splitDepths(near: f32, far: f32, count: u32, lambda: f32)-> [f32] {
+    let dmut result = copy [far; count];
+    for i in 1u32 .. count {
+        let t = cast!f32(i) / cast!f32(count);
+        let logarithmic = near * math::pow(far / near, t);
+        let uniform = near + (far - near) * t;
+        result[i - 1u32] = lambda * logarithmic + (1.0f - lambda) * uniform;
+    }
+
+    result
+}
+
+/**
+ * @returns: the eight corners of the slice of the view of a camera between two depths, in world space, the four of its
+ * near end first
+ * @info: the corners of the near and the far planes of the camera are found through the inverse of its projection, at
+ * the clip depths -1 and 1 of the projections of balder::math::utils; a corner of the slice lies on the edge joining
+ * two of them, the depth growing linearly along it
+ * @params:
+ *    - invViewProj: the inverse of the projection by the view of the camera
+ *    - near: the near plane of the camera
+ *    - far: the far plane of the camera
+ *    - start: the depth of the near end of the slice
+ *    - end: the depth of the far end of the slice
+ * */
+pub fn sliceCorners(invViewProj: mat4, near: f32, far: f32, start: f32, end: f32)-> [vec3] {
+    let s = (start - near) / (far - near), e = (end - near) / (far - near);
+
+    let dmut result = copy [vec3(); 8us];
+    let mut i = 0us;
+    for corner in [makeVec2(-1.0f, -1.0f), makeVec2(1.0f, -1.0f), makeVec2(-1.0f, 1.0f), makeVec2(1.0f, 1.0f)] {
+        let n = unproject(invViewProj, makeVec3(corner, -1.0f));
+        let f = unproject(invViewProj, makeVec3(corner, 1.0f));
+        result[i] = n + (f - n) * s;
+        result[i + 4us] = n + (f - n) * e;
+        i += 1us;
+    }
+
+    result
+}
+
+/**
+ * @returns: the sphere enclosing points, centered on their mean, its radius rounded up to a step (see RADIUS_STEP)
+ * @info: the points of a slice of a camera move with it as a rigid body, so the radius of their sphere does not change
+ * when the camera moves or turns
+ * */
+pub fn enclose(points: [vec3])-> Sphere {
+    if points.len == 0us { return Sphere(); }
+
+    let mut center = vec3();
+    for p in points {
+        center = center + p;
+    }
+
+    center = center / cast!f32(cast!u64(points.len));
+
+    let mut radius = 0.0f;
+    for p in points {
+        radius = comparison::max(radius, (p - center).length());
+    }
+
+    Sphere(center, math::ceil(radius / RADIUS_STEP) * RADIUS_STEP)
+}
+
+/**
+ * @returns: the view of a light looking along a direction, a rotation keeping the origin of the world: its x and y axes
+ * span the shadow map, its z axis is the direction
+ * */
+pub fn lightView(direction: vec3)-> mat4 {
+    let z = direction.normalized();
+
+    // any axis not along the direction gives a basis, the same one for the same direction
+    let up = if math::abs(z.y) > 0.99f { makeVec3(1.0f, 0.0f, 0.0f) } else { makeVec3(0.0f, 1.0f, 0.0f) };
+    let x = up.cross(z).normalized();
+    let y = z.cross(x);
+
+    mat4(a1-> x.x, a2-> x.y, a3-> x.z,
+         b1-> y.x, b2-> y.y, b3-> y.z,
+         c1-> z.x, c2-> z.y, c3-> z.z)
+}
+
+/**
+ * @returns: the smallest depth of a box in the view of a light, f32::max when the box is empty
+ * @params:
+ *    - view: the view of the light (see lightView)
+ *    - box: the box, in world space
+ * */
+pub fn nearestDepth(view: mat4, box: Aabb)-> f32 {
+    if box.isEmpty { return f32::max; }
+
+    let c = box.center, e = box.extent;
+    let row = makeVec3(view.c1, view.c2, view.c3);
+
+    row.dot(c) + view.c4 - (math::abs(row.x) * e.x + math::abs(row.y) * e.y + math::abs(row.z) * e.z)
+}
+
+/**
+ * @returns: the size of a texel of a cascade seeing a sphere, in world units, the cascade keeping CASCADE_MARGIN texels
+ * on each side of the sphere
+ * @params:
+ *    - radius: the radius of the sphere
+ *    - resolution: the number of texels on a side of the cascade, larger than twice the margin
+ * */
+pub fn texelSize(radius: f32, resolution: u32)-> f32 {
+    2.0f * radius / cast!f32(resolution - 2u32 * CASCADE_MARGIN)
+}
+
+/**
+ * @returns: the orthographic projection of a cascade, seeing a sphere from the view of a light, from the depth of the
+ * casters closest to the light (in front of the sphere) to the back of the sphere, writing depths in [0, 1]
+ * @info: the center of the projection is snapped to the texels of the cascade, a multiple of their size in the view of
+ * the light, so a texel covers the same area of the world while the sphere moves; the sphere stays more than a texel
+ * away from the sides of the cascade (see CASCADE_MARGIN)
+ * @params:
+ *    - view: the view of the light (see lightView)
+ *    - bounds: the sphere, in world space
+ *    - nearest: the smallest depth of the casters in the view of the light (see nearestDepth)
+ *    - resolution: the number of texels on a side of the cascade
+ * */
+pub fn cascadeProjection(view: mat4, bounds: Sphere, nearest: f32, resolution: u32)-> mat4 {
+    let r = bounds.radius;
+    let c = (view * makeVec4(bounds.center, 1.0f)).xyz;
+
+    let texel = texelSize(r, resolution);
+    let half = texel * cast!f32(resolution) / 2.0f;
+    let x = math::floor(c.x / texel) * texel;
+    let y = math::floor(c.y / texel) * texel;
+
+    let zmin = comparison::min(nearest, c.z - r);
+    let depth = (c.z + r) - zmin;
+
+    mat4(a1-> 1.0f / half, a4-> -x / half,
+         b2-> 1.0f / half, b4-> -y / half,
+         c3-> 1.0f / depth, c4-> -zmin / depth)
+}
+
+/**
+ * @returns: the point of world space seen at a point of clip space
+ * */
+fn unproject(invViewProj: mat4, clip: vec3)-> vec3 {
+    let p = invViewProj * makeVec4(clip, 1.0f);
+    p.xyz / p.w
+}

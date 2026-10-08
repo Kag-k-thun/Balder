@@ -1,16 +1,123 @@
 in cascade;
 
+pub mod ::fit;
+
+use balder::utils;
+use balder::core::{_, application::_};
+use balder::core::driver::subpass;
+use balder::core::shader::texture;
+use balder::core::shader::buffers::ubo;
+use balder::math::{bounds, matrix};
+use balder::scene::node::node3D::{camera, light};
+use balder::scene::utils::cascade::fit;
+
+use ::etc::c::memory;
+
+use ::vulkan::core;
 
 /**
- * The record holding the data for a cascade shadow pass
+ * The number of cascades of the shadow map, side by side in a 2x2 atlas, the first one at the top left
+ * */
+pub def CASCADES = 4u32;
+
+/**
+ * The size of the block of a cascade in the uniform buffer of the shadow map, the largest alignment of the offset of a
+ * uniform buffer: the block is the camera of the cascade read by the shadow pipelines of the shaders (its projection, the
+ * view of the light, an identity, and their product), then the size of a texel of the cascade
+ * */
+def CASCADE_STRIDE = 256us;
+
+def CASCADE_PROJ     = 0us;
+def CASCADE_VIEW     = 64us;
+def CASCADE_VIEWPROJ = 128us;
+def CASCADE_TEXEL    = 192us;
+
+/**
+ * The size of the uniform buffer of the shadow map, laid out as std140 aligns it (see the Shadow block of the compose
+ * shader): the block of each cascade, then the number of cascades, the index of the light casting the shadows, the
+ * offset along the normals and the bias of the depth
+ * @info: the buffer is written at once, so the shadow pipelines and the composition of a frame read the same cascades
+ * */
+def SHADOW_SIZE = 1040us;
+
+def SHADOW_COUNT         = 1024us;
+def SHADOW_LIGHT         = 1028us;
+def SHADOW_NORMAL_OFFSET = 1032us;
+def SHADOW_BIAS          = 1036us;
+
+/**
+ * The offset of a point shaded along its normal before it is looked up in its cascade, in texels of the cascade
+ * */
+def NORMAL_OFFSET = 1.5f;
+
+/**
+ * The bias subtracted from the depth of a point shaded before it is compared to its cascade, in the depth of the
+ * cascades ([0, 1] from the casters closest to the light to the back of the cascade)
+ * */
+def DEPTH_BIAS = 0.0002f;
+
+/**
+ * The depth bias of the casters drawn in the shadow map: a constant one, and one growing with the slope of their
+ * triangles seen from the light (see vkCmdSetDepthBias)
+ * */
+def CONSTANT_BIAS = 1.25f;
+def SLOPE_BIAS    = 1.75f;
+
+/**
+ * The size on screen under which a cascade does not draw a caster, in texels of the cascade
+ * */
+def CASTER_THRESHOLD = 1.0f;
+
+/**
+ * The shadow map of the direction light of a scene casting shadows: its cascades, each seeing a slice of the view of
+ * the camera from the light (see fit), drawn by a subpass in a depth atlas the composition reads
+ * @info: the subpass outputs to the deferred, drawn before it, the composition reading the atlas once the deferred is
+ * drawn
+ * @info: the cascades are fitted again at each tick of the scene, their views written in the uniform buffer the
+ * recordings read, so they follow the camera without recording the subpass again; the composition finds the cascade of
+ * a point by its projection, so cascades fitted to the camera of an earlier tick still shadow it right
  * */
 pub record CascadeShadowScene {
 
-    // The depth texture holding the cascaded atlas
-    let dmut _altasTexture : (&RefCount!{&Texture})? = none;
+    // The window of the scene
+    let dmut _window : (&Window)? = none;
 
-    // The subpass of the shadow rendering
-    let dmut _pass : (&DrawSubpass)? = none;
+    // The cascades read by the shadow pipelines and the composition (see SHADOW_SIZE), none of them while no light
+    // casts shadows
+    let dmut _ubo : (&UniformBufferObject)? = none;
+
+    prv { // Shadow map
+
+        // The depth atlas holding the cascades
+        let dmut _atlas : (&RefCount!{&Texture})? = none;
+
+        // The subpass drawing the casters in the atlas
+        let dmut _pass : (&DrawSubpass)? = none;
+
+        // The name of the subpass in the pipeline of the window
+        let mut _passName : [c8] = "";
+
+        // The number of texels on a side of a cascade
+        let mut _resolution : u32 = 0u32;
+
+        // The light casting the shadows
+        let dmut _light : (&Light)? = none;
+    }
+
+    prv { // Culling
+
+        // The projections of the cascades fitted last, from world space to their clip space
+        let mut _views : [mat4] = [];
+
+        // The index of the light written last for the composition
+        let mut _lightIndex : u32 = 0u32;
+
+        // The projections of the cascades when their casters were last culled
+        let mut _culledViews : [mat4] = [];
+
+        // The changes of the instances of the scene when the casters were last culled
+        let mut _culledChanges : usize = 0us;
+    }
 
     /*!
      * ====================================================================================================
@@ -22,7 +129,6 @@ pub record CascadeShadowScene {
 
     pub self () {}
 
-
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -30,28 +136,298 @@ pub record CascadeShadowScene {
      * ====================================================================================================
      * ====================================================================================================
      */
-    
-    pub fn configure (mut self, passName : [c8], dmut win : &Window, scale : u32)
-        throws BalderError
-    {        
-        let dmut device = win:.getVulkanDevice ();
-        let dmut shadowText = copy OutputTexture (alias device, device.getDepthFormat (), width, height, depth-> true);
-        self._altasTexture = (alias shadowText)?;
-        
-        let dmut pass = copy DrawSubpass::toTextures (alias device, passName, width, height, copy [shadowText]);
-        self._pass = (alias pass)?;
 
-        {
-            let dmut pipeline = win:.getVulkanPipeline ();
-            pipeline:.registerSubPass (passName, alias pass);
-        } catch {
-            err => {
-                log::error #("Scene", "Failed to register deferred subpass", err);
+    /**
+     * Allocate the uniform buffer of the cascades, no light casting shadows
+     * */
+    pub fn configure (mut self, dmut win : &Window)
+        throws BalderError
+    {
+        self:.dispose ();
+        self._window = (alias win)?;
+
+        let dmut ubo = copy UniformBufferObject (alias win:.getVulkanDevice (), SHADOW_SIZE);
+        ubo:.setData (SHADOW_COUNT, 0u32);
+        self._ubo = (alias ubo)?;
+    }
+
+    /**
+     * Cast the shadows of a direction light: the atlas of its cascades and the subpass drawing it are created, the
+     * subpass registered in the pipeline of the window
+     * @params:
+     *    - passName: the name of the subpass in the pipeline
+     *    - light: the light
+     *    - size: the number of texels on a side of the atlas, twice the number on a side of a cascade
+     * @returns: the subpass, its output to set and its signals to connect
+     * */
+    pub fn start (mut self, passName : [c8], dmut light : &Light, size : u32)-> dmut &DrawSubpass
+        throws BalderError
+    {
+        self:.stop ();
+
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else {
+            throw copy BalderError ("Shadows not configured");
+        };
+
+        let dmut device = win:.getVulkanDevice ();
+        let dmut atlas = copy OutputTexture (alias device, device.getDepthFormat (), size, size, depth-> true);
+        self._atlas = (alias win:.insertResource (alias atlas))?;
+
+        let dmut pass = copy DrawSubpass::toTextures (alias device, passName, size, size, copy [atlas]);
+        win:.getVulkanPipeline ():.registerSubPass (passName, alias pass);
+
+        self._pass = (alias pass)?;
+        self._passName = passName;
+        self._resolution = size / 2u32;
+        self._light = (alias light)?;
+        self._culledViews = [];
+
+        alias pass
+    }
+
+    /**
+     * Stop casting the shadows of the light, the subpass being removed from the pipeline, and retired with the atlas
+     * */
+    pub fn stop (mut self) {
+        if let Ok (dmut win) = alias self._window {
+            if let Ok (dmut pass) = alias self._pass {
+                {
+                    win:.getVulkanPipeline ():.removeSubPass (self._passName);
+                } catch {
+                    err => {
+                        log::error #("Scene", "Failed to remove the shadow subpass", err);
+                    }
+                }
+
+                win:.retire (alias pass);
+            }
+
+            if let Ok (dmut atlas) = alias self._atlas {
+                win:.retire (alias atlas);
             }
         }
-        
+
+        if let Ok (dmut ubo) = alias self._ubo {
+            ubo:.setData (SHADOW_COUNT, 0u32);
+        }
+
+        self._pass = none;
+        self._atlas = none;
+        self._passName = "";
+        self._light = none;
+        self._views = [];
+        self._culledViews = [];
     }
-    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif a light casts shadows
+     * */
+    @field
+    pub fn isCasting (self)-> bool {
+        self._pass.hasValue
+    }
+
+    /**
+     * @returns: true iif a light casts the shadows
+     * */
+    pub fn isCastBy (self, light : &Light)-> bool {
+        if let Ok (l) = self._light {
+            return l is light;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the depth atlas holding the cascades, none while no light casts shadows
+     * */
+    @field
+    pub fn atlas (self)-> (&RefCount!{&Texture})? {
+        self._atlas
+    }
+
+    /**
+     * @returns: the subpass drawing the shadow map
+     * @assume: a light casts shadows
+     * */
+    @field
+    pub fn subpass (mut self)-> dmut &DrawSubpass {
+        if let Ok (dmut pass) = alias self._pass {
+            return alias pass;
+        }
+
+        log::error #("CascadeShadowScene", "No light casts shadows");
+        panic;
+    }
+
+    /**
+     * @returns: the uniform buffer of the cascades, read by the shadow pipelines and the composition
+     * */
+    @field
+    pub fn ubo (self)-> &UniformBufferObject {
+        if let Ok (u) = self._ubo {
+            return u;
+        }
+
+        log::error #("CascadeShadowScene", "Problem of configuration");
+        panic;
+    }
+
+    /**
+     * @returns: the offset of the camera of each cascade in the uniform buffer (see ubo), the view of the light read by
+     * the shadow pipelines
+     * */
+    pub fn cameraOffsets (self)-> [usize] {
+        copy [cast!usize (c) * CASCADE_STRIDE for c in 0u32 .. CASCADES]
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UPDATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Fit the cascades to the view of the camera, written at once for the next submissions when they changed (a frame
+     * being requested then)
+     * @params:
+     *    - camera: the camera of the scene
+     *    - casters: the box enclosing the casters of shadows, in world space
+     *    - distance: the depth up to which the cascades cover the view of the camera
+     * @returns: the volume each cascade sees, none while no light casts shadows
+     * */
+    pub fn update (mut self, camera : &Camera, casters : Aabb, distance : f32)-> [ViewVolume] {
+        let direction = if let Ok (l) = self._light { l.position } else { return []; };
+
+        let cascades = fitCascades (camera.viewProj.inversed (),
+                                    camera.near,
+                                    camera.far,
+                                    distance,
+                                    direction,
+                                    casters,
+                                    CASCADES,
+                                    self._resolution);
+
+        let views = copy [c.viewProj for c in cascades];
+        let volumes = copy [ViewVolume (v, cast!f32 (self._resolution)) for v in views];
+        if self.sameViews (views) && self.lightIndex () == self._lightIndex {
+            return volumes;
+        }
+
+        self._views = views;
+        self._lightIndex = self.lightIndex ();
+
+        // written at once, a submission never reading the cascades of two fittings
+        let dmut content = copy [0u8; SHADOW_SIZE];
+        for i, c in cascades {
+            // the shadow pipelines project the view of the camera, the view of the light being in the projection
+            let block = i * CASCADE_STRIDE;
+            put (alias content, block + CASCADE_PROJ, c.viewProj);
+            put (alias content, block + CASCADE_VIEW, mat4 ());
+            put (alias content, block + CASCADE_VIEWPROJ, c.viewProj);
+            put (alias content, block + CASCADE_TEXEL, c.texel);
+        }
+
+        put (alias content, SHADOW_COUNT, cast!u32 (cascades.len));
+        put (alias content, SHADOW_LIGHT, self._lightIndex);
+        put (alias content, SHADOW_NORMAL_OFFSET, NORMAL_OFFSET);
+        put (alias content, SHADOW_BIAS, DEPTH_BIAS);
+        if let Ok (dmut ubo) = alias self._ubo {
+            ubo:.setData (0us, content);
+        }
+
+        volumes
+    }
+
+    /**
+     * @returns: true iif the casters seen by the cascades have to be culled again, the cascades fitted last or the
+     * instances of the scene having changed since their last culling, which is marked done
+     * @params:
+     *    - changes: the number of changes of the instances of the scene
+     * */
+    pub fn cullAgain (mut self, changes : usize)-> bool {
+        if changes == self._culledChanges && self.sameViews (self._culledViews) { return false; }
+
+        self._culledViews = self._views;
+        self._culledChanges = changes;
+        true
+    }
+
+    /**
+     * @returns: the size on screen under which a cascade does not draw a caster, in texels of the cascade
+     * */
+    pub fn casterThreshold (self)-> f32 {
+        CASTER_THRESHOLD
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DRAWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw in the tile of a cascade of the atlas from now on, the casters biased by the slope of their triangles
+     * @params:
+     *    - cmd: the command buffer of the subpass, its render pass begun
+     *    - cascade: the index of the cascade
+     * */
+    pub fn selectCascade (self, cmd : VkCommandBuffer, cascade : u32) {
+        let x = (cascade & 1u32) * self._resolution, y = (cascade >> 1u32) * self._resolution;
+
+        let mut viewport = VkViewport ();
+        viewport.x = cast!f32 (x);
+        viewport.y = cast!f32 (y);
+        viewport.width = cast!f32 (self._resolution);
+        viewport.height = cast!f32 (self._resolution);
+        viewport.maxDepth = 1.0f;
+
+        let mut scissor = VkRect2D ();
+        scissor.offset.x = cast!i32 (x);
+        scissor.offset.y = cast!i32 (y);
+        scissor.extent.width = self._resolution;
+        scissor.extent.height = self._resolution;
+
+        vkCmdSetViewport (cmd, 0, 1, &viewport);
+        vkCmdSetScissor (cmd, 0, 1, &scissor);
+        vkCmdSetDepthBias (cmd, CONSTANT_BIAS, 0.0f, SLOPE_BIAS);
+    }
+
+    /**
+     * @returns: true iif projections are those of the cascades fitted last
+     * */
+    fn sameViews (self, views : [mat4])-> bool {
+        if views.len != self._views.len { return false; }
+        for i, v in views {
+            if v != self._views [i] { return false; }
+        }
+
+        true
+    }
+
+    /**
+     * @returns: the index of the light casting the shadows among the direction lights of the composition, 0 when none
+     * */
+    fn lightIndex (self)-> u32 {
+        if let Ok (l) = self._light {
+            return l.getIndex ();
+        }
+
+        0u32
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -62,17 +438,28 @@ pub record CascadeShadowScene {
 
     impl Disposable {
         pub over dispose (mut self) {
-            if let Ok (dmut pass) = alias self._pass {
-                pass:.dispose ();
-                self._pass = none;
+            self:.stop ();
+
+            if let Ok (dmut win) = alias self._window {
+                if let Ok (dmut ubo) = alias self._ubo {
+                    win:.retire (alias ubo);
+                }
             }
 
-            if let Ok (dmut at) = alias self._altasTexture {
-                at:.dispose ();
-                self._altasTexture = none;
-            }
+            self._ubo = none;
+            self._window = none;
         }
     }
-    
-    
+
+}
+
+/**
+ * Write a value in the content of a buffer
+ * @params:
+ *    - content: the content
+ *    - offset: the offset in bytes of the value
+ *    - value: the value
+ * */
+fn put {U} (dmut content : [u8], offset : usize, value : U) {
+    memcpy (cast!{*void} (content.ptr + offset), cast!{*void} (&value), U::size);
 }
