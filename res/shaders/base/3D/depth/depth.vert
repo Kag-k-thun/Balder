@@ -20,6 +20,11 @@ struct Object {
 
     // The index of the material of the object in the composition pass
     uint material;
+
+    // The center and the half size along each axis of the box enclosing the object in world space, read by the cull
+    // pass of the scene (an empty box has a negative extent)
+    vec4 boxCenter;
+    vec4 boxExtent;
 };
 
 layout (std430, set = 0, binding = 0) readonly buffer Objects {

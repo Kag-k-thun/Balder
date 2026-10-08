@@ -25,6 +25,18 @@ def MIN_COMMANDS = 64us;
 def WORD_SIZE = 4us;
 
 /**
+ * The number of words of a candidate of the cull pass: the word of its instance, the index of its command
+ * */
+def CANDIDATE_WORDS = 2us;
+
+/**
+ * The counters at the start of the counter buffer of a frame culled on the GPU: the number of commands written by the
+ * cull pass (read by the draw indirect count call), the number of instances they draw; the instances seen in the range of
+ * each template follow
+ * */
+def COUNTER_HEADER = 2us;
+
+/**
  * The draws of objects laid out by the recordings of a subpass, the draws of the same range of indices being drawn by
  * one instanced command, the closest instances first, drawn by draw indirect calls over runs of the commands
  * @info: the commands of a frame read the words of their instances (the slots of the objects...) in a storage buffer of
@@ -33,6 +45,10 @@ def WORD_SIZE = 4us;
  * @info: each frame in flight has its own objects, laid out by its recording, and its own buffers of commands and of
  * words, built again at its submission when the draws of its objects changed; a frame never draws the objects laid out
  * by the recording of another, nor commands placing geometry the buffers it bound do not hold
+ * @info: when culled on the GPU, the commands built are the templates of a cull pass, each holding the range of its
+ * instances in the words, and the words its candidates, each with the index of its template (see cullCandidates); the
+ * pass writes the instances it sees and the commands drawing them in buffers of the GPU, with their number in a counter
+ * buffer read by a draw indirect count call, the CPU reading the counters back once the submission of the frame is over
  * */
 @final
 pub class InstanceBatch {
@@ -44,6 +60,13 @@ pub class InstanceBatch {
 
     // True when the draws modified are drawn by the next submissions without recording them again (multi-draw)
     let _inPlace: bool;
+
+    // True when the instances are culled on the GPU, the commands and the words built being the templates and the
+    // candidates of a cull pass
+    let mut _culled: bool = false;
+
+    // True when the last recording of each frame laid out its objects to be culled on the GPU
+    let mut _frameCulled: [mut bool] = [];
 
     // The draws of each object, by uniq id
     let dmut _draws: [usize => [InstanceDraw]] = copy [];
@@ -81,6 +104,21 @@ pub class InstanceBatch {
     // The words of each frame to write in its buffer at its submission
     let mut _dirtyWords: FrameRanges;
 
+    prv { // Culling on the GPU
+
+        // The commands written by the cull pass of each frame, drawing the instances it sees
+        let dmut _culledCommands: [(&Buffer)?] = [];
+
+        // The words of the instances seen by the cull pass of each frame, read by the shaders
+        let dmut _culledWords: [(&Buffer)?] = [];
+
+        // The counters of the cull pass of each frame (see COUNTER_HEADER)
+        let dmut _counters: [(&Buffer)?] = [];
+
+        // The header of the counters of each frame, copied for the CPU at the end of its cull pass
+        let dmut _readbacks: [(&Buffer)?] = [];
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -104,12 +142,17 @@ pub class InstanceBatch {
         let nbFrames = device.getNbFrames();
         self._counts = copy [0u32; nbFrames];
         self._stale = copy [false; nbFrames];
+        self._frameCulled = copy [false; nbFrames];
 
         let dmut commands: [[VkDrawIndexedIndirectCommand]] = [];
         let dmut words: [[u32]]                            = [];
         let dmut owners: [[usize => u32]]                  = [];
         let dmut commandCopies: [(&Buffer)?]               = [];
         let dmut wordCopies: [(&Buffer)?]                  = [];
+        let dmut culledCommands: [(&Buffer)?]              = [];
+        let dmut culledWords: [(&Buffer)?]                 = [];
+        let dmut counters: [(&Buffer)?]                    = [];
+        let dmut readbacks: [(&Buffer)?]                   = [];
         for _ in 0u32 .. nbFrames {
             let dmut owner: [usize => u32] = copy [];
             commands ~= [[]];
@@ -117,6 +160,10 @@ pub class InstanceBatch {
             owners ~= [alias owner];
             commandCopies ~= [none];
             wordCopies ~= [none];
+            culledCommands ~= [none];
+            culledWords ~= [none];
+            counters ~= [none];
+            readbacks ~= [none];
         }
 
         self._commands = alias commands;
@@ -124,6 +171,10 @@ pub class InstanceBatch {
         self._owners = alias owners;
         self._commandCopies = alias commandCopies;
         self._wordCopies = alias wordCopies;
+        self._culledCommands = alias culledCommands;
+        self._culledWords = alias culledWords;
+        self._counters = alias counters;
+        self._readbacks = alias readbacks;
 
         device:.getMemoryAllocator():.registerInFlight(self.uid, &self:.flush);
     }
@@ -174,24 +225,49 @@ pub class InstanceBatch {
 
     /**
      * End the layout of the objects of a frame, its commands being built and its buffers enlarged to hold them
-     * @returns: the number of commands laid out, the number of commands to draw
+     * @returns: the number of commands laid out, the number of commands to draw (the largest number the cull pass
+     * writes, when culled on the GPU)
      * */
     pub fn end(mut self, frame: u32)-> u32
         throws BalderError
     {
         atomic self {
-            let count = self._counts[frame];
-            if cast!usize(count) > self._commands[frame].len {
-                let extra = max(cast!usize(count) - self._commands[frame].len, max(self._commands[frame].len, 16us));
+            self._frameCulled[frame] = self._culled;
+
+            let count = cast!usize(self._counts[frame]);
+            let nbWords = if self._culled { count * CANDIDATE_WORDS } else { count };
+            if count > self._commands[frame].len {
+                let extra = max(count - self._commands[frame].len, max(self._commands[frame].len, 16us));
                 self._commands[frame] = self._commands[frame] ~ copy [VkDrawIndexedIndirectCommand(); extra];
+            }
+
+            if nbWords > self._words[frame].len {
+                let extra = max(nbWords - self._words[frame].len, max(self._words[frame].len, 16us));
                 self._words[frame] = self._words[frame] ~ copy [0u32; extra];
             }
 
-            self:.reserve(frame, cast!usize(count) * VkDrawIndexedIndirectCommand::size, true);
-            self:.reserve(frame, cast!usize(count) * WORD_SIZE, false);
+            self:.reserve(frame, count * VkDrawIndexedIndirectCommand::size, true);
+            self:.reserve(frame, nbWords * WORD_SIZE, false);
+            if self._culled {
+                self:.reserveCulled(frame, count);
+            }
+
             self:.build(frame);
 
-            return count;
+            return self._counts[frame];
+        }
+    }
+
+    /**
+     * Cull the instances on the GPU or on the CPU from the next layout of each frame, a frame keeping the way it was laid
+     * out until then
+     * @info: the recordings have to be done again, the buffers they bind and the calls drawing the commands changing
+     * @params:
+     *    - culled: true for a cull pass to write the commands from the templates and the candidates built
+     * */
+    pub fn setCulled(mut self, culled: bool) {
+        atomic self {
+            self._culled = culled;
         }
     }
 
@@ -270,8 +346,17 @@ pub class InstanceBatch {
     }
 
     /**
+     * @returns: true iif the last recording of the frame 'frame' laid out its objects to be culled on the GPU
+     * */
+    pub fn isCulled(self, frame: u32)-> bool {
+        atomic self {
+            self._frameCulled[frame]
+        }
+    }
+
+    /**
      * @returns: the number of commands drawing something and the number of instances they draw, at the last build of a
-     * frame
+     * frame, or at the last cull pass read back when culled on the GPU
      * */
     pub fn getDrawn(self)-> (u32, u32) {
         atomic self {
@@ -293,12 +378,74 @@ pub class InstanceBatch {
     }
 
     /**
-     * @returns: the storage buffer of the words of the instances read by the frame 'frame', none if nothing was laid out
+     * @returns: the storage buffer of the words of the instances read by the shaders drawing the frame 'frame', written by
+     * the cull pass when culled on the GPU, none if nothing was laid out
      * */
     pub fn getWordBuffer(self, frame: u32)-> (&Buffer)? {
         atomic self {
+            if self._frameCulled[frame] {
+                return self._culledWords[frame];
+            }
+
             self._wordCopies[frame]
         }
+    }
+
+    /**
+     * @returns: the templates of the cull pass of the frame 'frame', the commands built, none if nothing was laid out
+     * */
+    pub fn getTemplateBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            self._commandCopies[frame]
+        }
+    }
+
+    /**
+     * @returns: the candidates of the cull pass of the frame 'frame', the words built, none if nothing was laid out
+     * */
+    pub fn getCandidateBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            self._wordCopies[frame]
+        }
+    }
+
+    /**
+     * @returns: the commands written by the cull pass of the frame 'frame', none unless culled on the GPU
+     * */
+    pub fn getCulledCommandBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            if !self._frameCulled[frame] { return none; }
+            self._culledCommands[frame]
+        }
+    }
+
+    /**
+     * @returns: the counters of the cull pass of the frame 'frame', the number of commands it wrote first, none unless
+     * culled on the GPU
+     * */
+    pub fn getCounterBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            if !self._frameCulled[frame] { return none; }
+            self._counters[frame]
+        }
+    }
+
+    /**
+     * @returns: the buffer the header of the counters of the frame 'frame' is copied in for the CPU, none unless culled on
+     * the GPU
+     * */
+    pub fn getReadbackBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            if !self._frameCulled[frame] { return none; }
+            self._readbacks[frame]
+        }
+    }
+
+    /**
+     * @returns: the size in bytes of the header of the counters, copied for the CPU
+     * */
+    pub fn getCounterHeaderSize(self)-> usize {
+        COUNTER_HEADER * WORD_SIZE
     }
 
     /*!
@@ -317,6 +464,10 @@ pub class InstanceBatch {
     pub fn flush(mut self, frame: u32) {
         atomic self {
             if frame >= cast!u32(self._commandCopies.len) { return; }
+            if self._frameCulled[frame] {
+                self:.readBack(frame);
+            }
+
             if self._stale[frame] && self._inPlace {
                 self:.build(frame);
             }
@@ -369,13 +520,114 @@ pub class InstanceBatch {
         for i in 0u32 .. count {
             let c = if cast!usize(i) < commands.len { commands[i] } else { VkDrawIndexedIndirectCommand() };
             self:.writeCommand(frame, i, c);
-
-            let w = if cast!usize(i) < words.len { words[i] } else { 0u32 };
-            self:.writeWord(frame, i, w);
         }
 
-        self._drawn = (cast!u32(commands.len), cast!u32(words.len));
+        if self._frameCulled[frame] {
+            // the counters of the cull pass give the commands and the instances drawn
+            for i, w in cullCandidates(commands, words, cast!usize(count)) {
+                self:.writeWord(frame, cast!u32(i), w);
+            }
+        } else {
+            for i in 0u32 .. count {
+                let w = if cast!usize(i) < words.len { words[i] } else { 0u32 };
+                self:.writeWord(frame, i, w);
+            }
+
+            self._drawn = (cast!u32(commands.len), cast!u32(words.len));
+        }
+
         self._stale[frame] = false;
+    }
+
+    /**
+     * Read the header of the counters of the last cull pass of a frame, the commands and the instances it drew
+     * @atomic
+     * @assume: the previous submission of the frame was awaited
+     * */
+    fn readBack(mut self, frame: u32) {
+        if let Ok(dmut readback) = alias self._readbacks[frame] {
+            let dmut header: [u32] = copy [0u32; COUNTER_HEADER];
+
+            // The memory of the buffer is shared with other buffers, mapped and unmapped under the lock of the device
+            atomic self._device {
+                let ptr = readback:.map();
+                if ptr != null {
+                    memcpy(cast!{*void} (header.ptr), ptr, COUNTER_HEADER * WORD_SIZE);
+                    readback:.unmap();
+                }
+            }
+
+            self._drawn = (header[0], header[1]);
+        }
+    }
+
+    /**
+     * Enlarge the buffers the cull pass of a frame writes to hold the commands and the instances of 'count' draws
+     * @atomic
+     * */
+    fn reserveCulled(mut self, frame: u32, count: usize)
+        throws BalderError
+    {
+        let local = cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        let commandUsage = cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
+                                    | VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        let wordUsage = cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        let counterUsage = cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
+                                    | VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                    | VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                    | VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+        self._culledCommands[frame] = self:.enlarge(alias self._culledCommands[frame],
+                                                    count * VkDrawIndexedIndirectCommand::size,
+                                                    commandUsage,
+                                                    local);
+        self._culledWords[frame] = self:.enlarge(alias self._culledWords[frame], count * WORD_SIZE, wordUsage, local);
+        self._counters[frame] = self:.enlarge(alias self._counters[frame],
+                                              (COUNTER_HEADER + count) * WORD_SIZE,
+                                              counterUsage,
+                                              local);
+
+        if !self._readbacks[frame].hasValue {
+            let dmut readback = self._device
+                :.getMemoryAllocator()
+                :.allocBuffer(COUNTER_HEADER * WORD_SIZE,
+                              cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_DST_BIT),
+                              cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                       | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+
+            // read before the first cull pass of the frame copies its counters
+            let zeros: [u32] = copy [0u32; COUNTER_HEADER];
+            self:.write(alias readback, cast!{*void} (zeros.ptr), COUNTER_HEADER * WORD_SIZE, 0us, COUNTER_HEADER * WORD_SIZE);
+            self._readbacks[frame] = (alias readback)?;
+        }
+    }
+
+    /**
+     * @returns: a buffer of 'size' bytes at least, 'current' when it is large enough, a buffer twice as large otherwise,
+     * 'current' being retired once the frame is over
+     * @atomic
+     * @params:
+     *    - current: the buffer in use, none if there is none
+     *    - usage: the usage of a new buffer
+     *    - memory: the memory properties of a new buffer
+     * */
+    fn enlarge(mut self, dmut current: (&Buffer)?, size: usize, usage: u32, memory: u32)-> dmut (&Buffer)?
+        throws BalderError
+    {
+        if let Ok(c) = current {
+            if size <= c.getSize() { return alias current; }
+        }
+
+        let dmut larger = self._device
+            :.getMemoryAllocator()
+            :.allocBuffer(max(size * 2us, MIN_COMMANDS * VkDrawIndexedIndirectCommand::size), usage, memory);
+
+        // only the replaced recording of the frame, whose submission was awaited, read the buffer
+        if let Ok(dmut old) = alias current {
+            self._device:.retireAfterFrame(&old:.dispose);
+        }
+
+        (alias larger)?
     }
 
     /**
@@ -404,8 +656,10 @@ pub class InstanceBatch {
         if size <= capacity && capacity != 0us { return; }
 
         let elem: usize = if commands { cast!usize(VkDrawIndexedIndirectCommand::size) } else { WORD_SIZE };
+        // the commands are the templates the cull pass reads when culled on the GPU
         let usage = if commands {
             VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
+            | VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         } else {
             VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         };
@@ -517,8 +771,17 @@ pub class InstanceBatch {
                     }
                 }
 
+                disposeAll(alias self._culledCommands);
+                disposeAll(alias self._culledWords);
+                disposeAll(alias self._counters);
+                disposeAll(alias self._readbacks);
+
                 self._commandCopies = [];
                 self._wordCopies = [];
+                self._culledCommands = [];
+                self._culledWords = [];
+                self._counters = [];
+                self._readbacks = [];
                 self._commands = [];
                 self._words = [];
                 self._owners = [];

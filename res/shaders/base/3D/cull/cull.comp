@@ -1,0 +1,154 @@
+#version 450 core
+
+// The cull pass of the instances of a batch of the 3D shaders (see InstanceBatch), dispatched twice:
+//    - phase 0, one thread per candidate: the instances whose world box the camera sees are written in the range of
+//      their template, counted in the counter of the template
+//    - phase 1, one thread per template: the templates with an instance seen are written as the commands of the draw
+//      indirect count call, counted in the counter of the commands
+// The test is the one of the culling on the CPU (Frustum::classify, ViewVolume::pixelSize), its reference
+
+layout (local_size_x = 64) in;
+
+layout (set = 1, binding = 0) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+} camera;
+
+// The data of an object, in the slot given by the words of its instances (see the draws of IndexedMesh3D)
+struct Object {
+    mat4 model;
+    float fade;
+    uint material;
+
+    // The center and the half size along each axis of the box enclosing the object in world space, the extent being
+    // negative when the box is empty
+    vec4 boxCenter;
+    vec4 boxExtent;
+};
+
+layout (std430, set = 0, binding = 0) readonly buffer Objects {
+    Object objects [];
+};
+
+// A candidate: the word of its instance (the slot of its object above the two low bits), the index of its template,
+// NO_COMMAND when it draws nothing
+struct Candidate {
+    uint word;
+    uint command;
+};
+
+layout (std430, set = 0, binding = 1) readonly buffer Draws {
+    Candidate draws [];
+};
+
+// A VkDrawIndexedIndirectCommand
+struct Command {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+// The commands grouping the candidates by range of indices, the candidates of a template following each other from its
+// first instance
+layout (std430, set = 0, binding = 2) readonly buffer Templates {
+    Command templates [];
+};
+
+// Cleared before the pass
+layout (std430, set = 0, binding = 3) buffer Counters {
+    // The commands written, read by the draw indirect count call
+    uint drawCount;
+
+    // The instances drawn by the commands written
+    uint instanceCount;
+
+    // The instances seen in the range of each template
+    uint seen [];
+} counters;
+
+layout (std430, set = 0, binding = 4) writeonly buffer Commands {
+    Command commands [];
+};
+
+// The words of the instances seen, read by the vertex shaders at their instance index
+layout (std430, set = 0, binding = 5) writeonly buffer Instances {
+    uint instances [];
+};
+
+layout (push_constant) uniform Push {
+    // The number of candidates, as many as the templates at most
+    uint count;
+
+    // 0 to cull the candidates, 1 to write the commands
+    uint phase;
+
+    // The height of the view, in pixels
+    float height;
+
+    // The size on screen in pixels under which an instance is culled, 0 to cull the instances outside the view only
+    float minPixels;
+} push;
+
+const uint NO_COMMAND = 0xffffffffu;
+
+/**
+ * @returns: true iif the camera sees the box: a part of it may be in the frustum, and it is not smaller on screen than
+ * the threshold
+ * */
+bool sees (vec3 center, vec3 extent) {
+    if (any (lessThan (extent, vec3 (0.0)))) return false;
+
+    // the rows of the projection by the view, the planes of the frustum facing its inside (Gribb–Hartmann)
+    mat4 rows = transpose (camera.viewProj);
+    vec4 planes [6] = vec4 [6] (rows [3] + rows [0], rows [3] - rows [0],
+                                rows [3] + rows [1], rows [3] - rows [1],
+                                rows [3] + rows [2], rows [3] - rows [2]);
+
+    for (int i = 0; i < 6; i++) {
+        float len = length (planes [i].xyz);
+        float d = (dot (planes [i].xyz, center) + planes [i].w) / len;
+        float r = dot (abs (planes [i].xyz), extent) / len;
+        if (d < -r) return false;
+    }
+
+    if (push.minPixels > 0.0) {
+        // the diameter of the box seen at the depth of its point closest to the eye, the box reaching the plane of the
+        // eye being seen
+        float w = dot (rows [3].xyz, center) + rows [3].w - dot (abs (rows [3].xyz), extent);
+        if (w > 0.0) {
+            float pixelScale = length (rows [1].xyz) * push.height / 2.0;
+            if (2.0 * length (extent) * (pixelScale / w) < push.minPixels) return false;
+        }
+    }
+
+    return true;
+}
+
+void main () {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.count) return;
+
+    if (push.phase == 0u) {
+        Candidate candidate = draws [index];
+        if (candidate.command == NO_COMMAND) return;
+
+        Object object = objects [candidate.word >> 2];
+        if (!sees (object.boxCenter.xyz, object.boxExtent.xyz)) return;
+
+        uint slot = atomicAdd (counters.seen [candidate.command], 1u);
+        instances [templates [candidate.command].firstInstance + slot] = candidate.word;
+    } else {
+        uint seen = counters.seen [index];
+        if (seen == 0u) return;
+
+        Command command = templates [index];
+        command.instanceCount = seen;
+
+        commands [atomicAdd (counters.drawCount, 1u)] = command;
+        atomicAdd (counters.instanceCount, seen);
+    }
+}
