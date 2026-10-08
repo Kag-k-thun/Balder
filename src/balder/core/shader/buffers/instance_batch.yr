@@ -31,10 +31,22 @@ def CANDIDATE_WORDS = 2us;
 
 /**
  * The counters at the start of the counter buffer of a frame culled on the GPU: the number of commands written by the
- * cull pass (read by the draw indirect count call), the number of instances they draw; the instances seen in the range of
- * each template follow
+ * first phase of the cull pass (read by its draw indirect count call), the number of instances they draw, then the same
+ * two counters for the second phase (see cullOccluded); the instances seen in the range of each template follow, with
+ * the number of them drawn by the first phase
  * */
-def COUNTER_HEADER = 2us;
+def COUNTER_HEADER = 4us;
+
+/**
+ * The index in the counters of the number of commands written by the second phase of the cull pass
+ * */
+def LATE_COUNTER = 2us;
+
+/**
+ * The number of counters of each template, after the header: the instances seen in its range, and those of them drawn by
+ * the first phase
+ * */
+def TEMPLATE_COUNTERS = 2us;
 
 /**
  * The draws of objects laid out by the recordings of a subpass, the draws of the same range of indices being drawn by
@@ -49,6 +61,10 @@ def COUNTER_HEADER = 2us;
  * instances in the words, and the words its candidates, each with the index of its template (see cullCandidates); the
  * pass writes the instances it sees and the commands drawing them in buffers of the GPU, with their number in a counter
  * buffer read by a draw indirect count call, the CPU reading the counters back once the submission of the frame is over
+ * @info: the cull pass runs in two phases when the instances hidden behind others are culled (occlusion): the first one
+ * draws the instances seen by the last frame, whose depth gives a depth pyramid the second one tests the others against,
+ * drawing those it finds; the commands of the second phase follow those of the first one, and the visibility of each
+ * candidate is kept for the next frame (see getVisibilityBuffer)
  * */
 @final
 pub class InstanceBatch {
@@ -117,6 +133,10 @@ pub class InstanceBatch {
 
         // The header of the counters of each frame, copied for the CPU at the end of its cull pass
         let dmut _readbacks: [(&Buffer)?] = [];
+
+        // The visibility of each candidate of each frame at its last cull pass, written by the second phase, read by the
+        // first one of the next pass of the frame
+        let dmut _visibilities: [(&Buffer)?] = [];
     }
 
     /*!
@@ -153,6 +173,7 @@ pub class InstanceBatch {
         let dmut culledWords: [(&Buffer)?]                 = [];
         let dmut counters: [(&Buffer)?]                    = [];
         let dmut readbacks: [(&Buffer)?]                   = [];
+        let dmut visibilities: [(&Buffer)?]                = [];
         for _ in 0u32 .. nbFrames {
             let dmut owner: [usize => u32] = copy [];
             commands ~= [[]];
@@ -164,6 +185,7 @@ pub class InstanceBatch {
             culledWords ~= [none];
             counters ~= [none];
             readbacks ~= [none];
+            visibilities ~= [none];
         }
 
         self._commands = alias commands;
@@ -175,6 +197,7 @@ pub class InstanceBatch {
         self._culledWords = alias culledWords;
         self._counters = alias counters;
         self._readbacks = alias readbacks;
+        self._visibilities = alias visibilities;
 
         device:.getMemoryAllocator():.registerInFlight(self.uid, &self:.flush);
     }
@@ -442,6 +465,41 @@ pub class InstanceBatch {
     }
 
     /**
+     * @returns: the visibility of the candidates of the cull pass of the frame 'frame', one word each, none unless culled
+     * on the GPU
+     * @info: the content is undefined until a cull pass of the frame culling the occluded instances wrote it, and when
+     * the candidates of the frame are laid out again; it only decides which instances the first phase draws, the second
+     * phase drawing the others it finds
+     * */
+    pub fn getVisibilityBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            if !self._frameCulled[frame] { return none; }
+            self._visibilities[frame]
+        }
+    }
+
+    /**
+     * @returns: the offset in bytes of the first command of a phase of the cull pass of the frame 'frame', in the buffer
+     * of the commands it writes
+     * @params:
+     *    - late: false for the first phase, true for the second one
+     * */
+    pub fn getCulledCommandOffset(self, frame: u32, late: bool)-> u64 {
+        if !late { return 0u64; }
+        cast!u64(self.getCount(frame)) * cast!u64(VkDrawIndexedIndirectCommand::size)
+    }
+
+    /**
+     * @returns: the offset in bytes of the number of commands written by a phase of the cull pass, in the counters
+     * @params:
+     *    - late: false for the first phase, true for the second one
+     * */
+    pub fn getCountOffset(self, late: bool)-> u64 {
+        if !late { return 0u64; }
+        cast!u64(LATE_COUNTER * WORD_SIZE)
+    }
+
+    /**
      * @returns: the size in bytes of the header of the counters, copied for the CPU
      * */
     pub fn getCounterHeaderSize(self)-> usize {
@@ -557,12 +615,13 @@ pub class InstanceBatch {
                 }
             }
 
-            self._drawn = (header[0], header[1]);
+            self._drawn = (header[0] + header[LATE_COUNTER], header[1] + header[LATE_COUNTER + 1us]);
         }
     }
 
     /**
-     * Enlarge the buffers the cull pass of a frame writes to hold the commands and the instances of 'count' draws
+     * Enlarge the buffers the cull pass of a frame writes to hold the commands and the instances of 'count' draws, the
+     * commands of its two phases
      * @atomic
      * */
     fn reserveCulled(mut self, frame: u32, count: usize)
@@ -578,14 +637,15 @@ pub class InstanceBatch {
                                     | VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
         self._culledCommands[frame] = self:.enlarge(alias self._culledCommands[frame],
-                                                    count * VkDrawIndexedIndirectCommand::size,
+                                                    2us * count * VkDrawIndexedIndirectCommand::size,
                                                     commandUsage,
                                                     local);
         self._culledWords[frame] = self:.enlarge(alias self._culledWords[frame], count * WORD_SIZE, wordUsage, local);
         self._counters[frame] = self:.enlarge(alias self._counters[frame],
-                                              (COUNTER_HEADER + count) * WORD_SIZE,
+                                              (COUNTER_HEADER + TEMPLATE_COUNTERS * count) * WORD_SIZE,
                                               counterUsage,
                                               local);
+        self._visibilities[frame] = self:.enlarge(alias self._visibilities[frame], count * WORD_SIZE, wordUsage, local);
 
         if !self._readbacks[frame].hasValue {
             let dmut readback = self._device
@@ -775,6 +835,7 @@ pub class InstanceBatch {
                 disposeAll(alias self._culledWords);
                 disposeAll(alias self._counters);
                 disposeAll(alias self._readbacks);
+                disposeAll(alias self._visibilities);
 
                 self._commandCopies = [];
                 self._wordCopies = [];
@@ -782,6 +843,7 @@ pub class InstanceBatch {
                 self._culledWords = [];
                 self._counters = [];
                 self._readbacks = [];
+                self._visibilities = [];
                 self._commands = [];
                 self._words = [];
                 self._owners = [];
