@@ -17,7 +17,7 @@ layout (location = 3) out vec4 albedo;
 layout (location = 4) out uint materialID;
 
 
-layout (set = 0, binding = 1) uniform sampler2D diffuse;
+layout (set = 0, binding = 2) uniform sampler2D diffuse;
 
 
 /**
