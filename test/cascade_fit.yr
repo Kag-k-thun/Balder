@@ -1,0 +1,160 @@
+in cascade_fit;
+
+use balder::math::{bounds, matrix, utils, vector};
+use balder::scene::utils::cascade::fit;
+
+use std::math;
+
+/**
+ * @returns: true iif two values are equal, give or take the rounding errors
+ * */
+fn near(a: f32, b: f32)-> bool {
+    math::abs(a - b) < 0.001f
+}
+
+/**
+ * @returns: the inverse of the projection by the view of a camera at 'eye' looking at 'target', with a vertical field
+ * of view of 90°, a square aspect, seeing from 1 to 100 units in front of it
+ * */
+fn invCamera(eye: vec3, target: vec3)-> mat4 {
+    let proj = perspective!{f32}(radian(90.0f), 1.0f, 1.0f, 100.0f);
+    let view = lookAt!{f32}(eye, target, makeVec3(0.0f, 1.0f, 0.0f));
+
+    (proj * view).inversed()
+}
+
+/**
+ * @returns: a point in the clip space of a projection
+ * */
+fn project(viewProj: mat4, p: vec3)-> vec3 {
+    let c = viewProj * makeVec4(p, 1.0f);
+    c.xyz / c.w
+}
+
+__test the_slices_end_at_the_far_plane_growing_away_from_the_camera {
+    let ends = splitDepths(1.0f, 100.0f, 4u32, 0.75f);
+    assert (ends.len == 4us);
+    assert (ends[3] == 100.0f);
+
+    let mut previous = 1.0f;
+    for e in ends {
+        assert (e > previous);
+        previous = e;
+    }
+
+    // the logarithmic split keeps the same ratio between the ends of each slice, the uniform one the same length
+    let logarithmic = splitDepths(1.0f, 81.0f, 4u32, 1.0f);
+    assert (near(logarithmic[0], 3.0f) && near(logarithmic[1], 9.0f) && near(logarithmic[2], 27.0f));
+
+    let uniform = splitDepths(20.0f, 100.0f, 4u32, 0.0f);
+    assert (near(uniform[0], 40.0f) && near(uniform[1], 60.0f) && near(uniform[2], 80.0f));
+}
+
+__test the_corners_of_a_slice_stand_at_its_depths_on_the_edges_of_the_view {
+    let inv = invCamera(vec3(), makeVec3(0.0f, 0.0f, -1.0f));
+    let corners = sliceCorners(inv, 1.0f, 100.0f, 5.0f, 20.0f);
+    assert (corners.len == 8us);
+
+    // the camera looks down -z with a field of view of 90°: a corner at the depth d stands at (±d, ±d, -d)
+    for i, c in corners {
+        let depth = if i < 4us { 5.0f } else { 20.0f };
+        assert (near(c.z, -depth));
+        assert (near(math::abs(c.x), depth) && near(math::abs(c.y), depth));
+    }
+}
+
+__test the_sphere_of_a_slice_encloses_it_and_keeps_its_size_when_the_camera_turns {
+    let eye = makeVec3(3.0f, 2.0f, 1.0f);
+    let first = sliceCorners(invCamera(eye, makeVec3(0.0f, 0.0f, -10.0f)), 1.0f, 100.0f, 5.0f, 20.0f);
+    let turned = sliceCorners(invCamera(eye, makeVec3(10.0f, -4.0f, 3.0f)), 1.0f, 100.0f, 5.0f, 20.0f);
+
+    let a = enclose(first), b = enclose(turned);
+    assert (a.radius == b.radius);
+
+    for c in first {
+        assert ((c - a.center).length() <= a.radius);
+    }
+}
+
+__test the_view_of_a_light_turns_its_direction_to_the_depth_axis {
+    for direction in [makeVec3(-0.3f, -1.0f, -0.2f), makeVec3(0.0f, -1.0f, 0.0f), makeVec3(1.0f, 0.0f, 0.0f)] {
+        let view = lightView(direction);
+        let z = view * makeVec4(direction.normalized(), 0.0f);
+        assert (near(z.x, 0.0f) && near(z.y, 0.0f) && near(z.z, 1.0f));
+
+        // a rotation keeps the lengths
+        let v = view * makeVec4(1.0f, 2.0f, 3.0f, 0.0f);
+        assert (near(v.xyz.length(), makeVec3(1.0f, 2.0f, 3.0f).length()));
+    }
+}
+
+__test the_nearest_depth_of_a_box_is_the_depth_of_its_corner_closest_to_the_light {
+    let view = lightView(makeVec3(0.0f, -1.0f, 0.0f));
+
+    // the light shines downward, the top of the box is closest to it
+    let box = Aabb(makeVec3(-1.0f, -2.0f, -1.0f), makeVec3(1.0f, 3.0f, 1.0f));
+    assert (near(nearestDepth(view, box), -3.0f));
+    assert (nearestDepth(view, Aabb()) == f32::max);
+}
+
+__test a_cascade_sees_its_sphere_inside_its_margins_from_the_nearest_caster {
+    let view = lightView(makeVec3(-0.3f, -1.0f, -0.2f));
+    let sphere = Sphere(makeVec3(4.3f, 1.7f, -8.1f), 6.0f);
+    let resolution = 64u32;
+    let nearest = nearestDepth(view, Aabb(makeVec3(-20.0f, -1.0f, -20.0f), makeVec3(20.0f, 5.0f, 20.0f)));
+
+    let viewProj = cascadeProjection(view, sphere, nearest, resolution) * view;
+    let margin = 2.0f / cast!f32(resolution);
+    for axis in [makeVec3(1.0f, 0.0f, 0.0f), makeVec3(0.0f, 1.0f, 0.0f), makeVec3(0.0f, 0.0f, 1.0f)] {
+        for side in [-1.0f, 1.0f] {
+            let p = project(viewProj, sphere.center + axis * (side * sphere.radius));
+            assert (math::abs(p.x) <= 1.0f - margin && math::abs(p.y) <= 1.0f - margin);
+            assert (p.z >= 0.0f && p.z <= 1.0f);
+        }
+    }
+
+    // the casters closest to the light are at the depth 0
+    let top = project(viewProj, makeVec3(0.0f, 5.0f, 0.0f));
+    assert (top.z >= 0.0f);
+}
+
+__test a_cascade_moves_by_whole_texels {
+    let view = lightView(makeVec3(-0.3f, -1.0f, -0.2f));
+    let resolution = 64u32;
+    let texel = texelSize(6.0f, resolution);
+    let half = texel * cast!f32(resolution) / 2.0f;
+
+    // the translation of the projection in the view of the light is a multiple of the size of a texel
+    for i in 0u32 .. 20u32 {
+        let center = makeVec3(cast!f32(i) * 0.137f, 1.0f, -cast!f32(i) * 0.071f);
+        let proj = cascadeProjection(view, Sphere(center, 6.0f), 0.0f, resolution);
+        let x = -proj.a4 * half / texel, y = -proj.b4 * half / texel;
+        assert (near(x, math::round(x)) && near(y, math::round(y)));
+    }
+}
+
+__test the_cascades_cover_their_slices_of_the_view {
+    let eye = makeVec3(0.0f, 4.0f, 8.0f), target = vec3();
+    let inv = invCamera(eye, target);
+    let casters = Aabb(makeVec3(-15.0f, -1.0f, -15.0f), makeVec3(15.0f, 3.0f, 15.0f));
+    let cascades = fitCascades(inv, 1.0f, 100.0f, 50.0f, makeVec3(-0.3f, -1.0f, -0.2f), casters, 4u32, 1024u32);
+
+    assert (cascades.len == 4us);
+    assert (cascades[3].far == 50.0f);
+
+    let mut start = 1.0f;
+    for c in cascades {
+        for p in sliceCorners(inv, 1.0f, 100.0f, start, c.far) {
+            let clip = project(c.viewProj, p);
+            assert (math::abs(clip.x) <= 1.0f && math::abs(clip.y) <= 1.0f);
+            assert (clip.z >= 0.0f && clip.z <= 1.0f);
+        }
+
+        start = c.far;
+    }
+
+    // the farther cascades cover larger slices with larger texels
+    for i in 1us .. cascades.len {
+        assert (cascades[i].texel > cascades[i - 1us].texel);
+    }
+}

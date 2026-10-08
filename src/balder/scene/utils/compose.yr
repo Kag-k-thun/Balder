@@ -1,14 +1,13 @@
 in compose;
 
-use balder::core::_;
-use balder::core::config::{shader, shader::_};
-
-use balder::core::{application::_, shader::_, driver::subpass};
-use balder::core::shader::buffers::_;
 use balder::utils;
-
-use balder::scene::utils::{deferred, shader};
+use balder::core::{_, application::_};
+use balder::core::config::shader;
+use balder::core::config::shader::_;
+use balder::core::driver::subpass;
+use balder::core::shader::{_, buffers::_};
 use balder::scene::node::node3D::camera;
+use balder::scene::utils::{cascade, deferred, shader};
 
 use ::vulkan::core;
 
@@ -24,6 +23,9 @@ pub record ComposeRenderScene {
     let dmut _pass : (&ComputeSubpass)? = none;
     let dmut _computeShader : (&ComputeShader)? = none;
     let dmut _outputTex : (&OutputTexture)? = none;
+
+    // The depth of the deferred, standing in for the shadow map while no light casts shadows (never read then)
+    let mut _depth : (&RefCount!{&Texture})? = none;
     
     /*!
      * ====================================================================================================
@@ -43,7 +45,18 @@ pub record ComposeRenderScene {
      * =================================i===================================================================
      */
     
-    pub fn configure (mut self, passName : [c8], dmut win : &Window, width : u32, height : u32, defer : DeferredRenderScene)
+    /**
+     * @params:
+     *    - defer: the deferred pass, its textures read by the composition
+     *    - shadow: the cascades of the shadow map, read by the composition
+     * */
+    pub fn configure (mut self,
+                      passName : [c8],
+                      dmut win : &Window,
+                      width : u32,
+                      height : u32,
+                      defer : DeferredRenderScene,
+                      shadow : &UniformBufferObject)
         throws BalderError
     {
         let dmut device = alias win:.getVulkanDevice ();
@@ -71,6 +84,9 @@ pub record ComposeRenderScene {
             set:.setTexture ("albedo", defer.albedo.get ());
             set:.setTexture ("materialID", defer.materialID.get ());
             set:.setTexture ("depth", defer.depth.get ());  
+            set:.setTexture ("shadowMap", defer.depth.get ());
+            set:.setUniform (UniformNames::SHADOW, shadow);
+            self._depth = (defer.depth)?;
             
             set:.setStorageTexture ("output", output);            
         } catch {
@@ -184,8 +200,15 @@ pub record ComposeRenderScene {
 
     /**
      * Select the compute shader, and descriptor set to be used for the next command dispatch
+     * @params:
+     *    - shadow: the shadow map, its atlas read when a light casts shadows
      * */
-    pub fn select (mut self, frame : u32, ref shaderAssoc : ShaderNodeScene, cmd : VkCommandBuffer) {
+    pub fn select (mut self,
+                   frame : u32,
+                   ref shaderAssoc : ShaderNodeScene,
+                   ref shadow : CascadeShadowScene,
+                   cmd : VkCommandBuffer)
+    {
         let dmut set = (if let Ok (dmut s) = alias self._set {
             alias s
         } else {
@@ -197,6 +220,18 @@ pub record ComposeRenderScene {
         self.setStorage (frame, alias set, UniformNames::DIRECTION_LIGHT, shaderAssoc.directionLights.getSBO ());
         self.setStorage (frame, alias set, UniformNames::POINT_LIGHT, shaderAssoc.pointLights.getSBO ());
         self.setStorage (frame, alias set, UniformNames::SPOT_LIGHT, shaderAssoc.spotLights.getSBO ());
+
+        {
+            if let Ok (atlas) = shadow.atlas {
+                set:.setTexture ("shadowMap", atlas.get (), frame-> cast!i32 (frame));
+            } else if let Ok (depth) = self._depth {
+                set:.setTexture ("shadowMap", depth.get (), frame-> cast!i32 (frame));
+            }
+        } catch {
+            err => {
+                log::error #("ComposeRenderScene", "Failed to bind the shadow map", err);
+            }
+        }
         
         set.select (frame, cmd);        
         if let Ok (dmut sh) = alias self._computeShader {
@@ -249,6 +284,8 @@ pub record ComposeRenderScene {
                 s:.dispose ();
                 self._set = none;
             }
+
+            self._depth = none;
         }
     }
 }

@@ -1,0 +1,269 @@
+in casters;
+
+use balder::core::_;
+use balder::core::application::window;
+use balder::core::config::shader::_;
+use balder::core::driver::cmd_alloc;
+use balder::core::shader::{_, buffers::_};
+use balder::utils::log;
+
+/**
+ * The draws of the casters of a shader in a cascade of the shadow map, those the cascade sees drawing their level of
+ * detail, the others nothing
+ * */
+@final
+class CascadeDraws {
+
+    // The descriptor set of the camera of the cascade, the view of the light
+    pub let dmut camera: &DescriptorSet;
+
+    // The descriptor set binding the objects of the shader and the words of the draws
+    pub let dmut set: &DescriptorSet;
+
+    // The draws of the casters
+    pub let dmut draws: &InstanceBatch;
+
+    // The casters the cascade sees, by uniq id
+    pub let dmut seen: [usize => ()] = copy [];
+
+    // The number of draws laid out by the recording of the current frame
+    pub let mut count: u32 = 0u32;
+
+    pub self (dmut camera: &DescriptorSet, dmut set: &DescriptorSet, dmut draws: &InstanceBatch)
+        with camera = alias camera
+        , set = alias set
+        , draws = alias draws
+    {}
+}
+
+/**
+ * The casters of shadows drawn by a shader, and their draws in the cascades of the shadow map of the scene
+ * @info: a caster draws the level of detail the camera selected for it, alone, in the cascades seeing it only (see
+ * see); its draws are laid out in each cascade at each recording of the shadow map, and modified in place when its
+ * level changes or when a cascade starts or stops seeing it
+ * @info: the cascades read the objects of the shader and draw from its geometry pool, with its shadow pipeline
+ * */
+@final
+pub class ShadowCasters {
+
+    // The draws of each caster by uniq id, as many each time it changes them
+    let dmut _draws: [usize => [InstanceDraw]] = copy [];
+
+    // The draws of each cascade, none while no light casts shadows
+    let dmut _cascades: [&CascadeDraws] = [];
+
+    // True when the draws modified are drawn by the next submissions without recording them again (multi-draw)
+    let _inPlace: bool;
+
+    /**
+     * @params:
+     *    - inPlace: true when the device has multi-draw, the draws being modified in place
+     * */
+    pub self (inPlace: bool)
+        with _inPlace = inPlace
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CASTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the casters draw in the cascades of a shadow map
+     * */
+    pub fn isCasting(self)-> bool {
+        self._cascades.len != 0us
+    }
+
+    /**
+     * Set the draws of a caster, drawn by the cascades seeing it, a caster entering the cascades from their next layout
+     * @params:
+     *    - owner: the uniq id of the caster
+     *    - draws: the draws of its level of detail, as many each time
+     * @returns: true iif the recordings have to be done again to draw them (the device has no multi-draw)
+     * */
+    pub fn set(mut self, owner: usize, draws: [InstanceDraw])-> bool {
+        if let Ok(old) = self._draws[owner] {
+            if sameDraws(old, draws) { return false; }
+        }
+
+        self._draws[owner] = copy draws;
+
+        let mut redraw = false;
+        for dmut c in alias self._cascades {
+            if owner in c.seen {
+                c.draws:.update(owner, draws);
+                redraw = !self._inPlace;
+            }
+        }
+
+        redraw
+    }
+
+    /**
+     * Remove a caster, the next submissions drawing it no more
+     * @info: without multi-draw, the caster is drawn until the recordings are done again
+     * */
+    pub fn remove(mut self, owner: usize) {
+        self._draws:.remove(owner);
+        for dmut c in alias self._cascades {
+            c.seen:.remove(owner);
+            c.draws:.remove(owner);
+        }
+    }
+
+    /**
+     * Draw the casters a cascade sees, and none of the others
+     * @params:
+     *    - cascade: the index of the cascade
+     *    - seen: the uniq ids of the instances the cascade sees, casters of the shader or not
+     * @returns: true iif the recordings have to be done again to draw them (the device has no multi-draw)
+     * */
+    pub fn see(mut self, cascade: usize, seen: [usize])-> bool {
+        if cascade >= self._cascades.len { return false; }
+
+        let dmut c = alias self._cascades[cascade];
+        let dmut now: [usize => ()] = copy [];
+        let mut changed = false;
+        for uid in seen {
+            if let Ok(draws) = self._draws[uid] {
+                now[uid] = ();
+                if uid !in c.seen {
+                    c.draws:.update(uid, draws);
+                    changed = true;
+                }
+            }
+        }
+
+        for uid, _ in c.seen {
+            if uid !in now {
+                if let Ok(draws) = self._draws[uid] {
+                    c.draws:.update(uid, copy [InstanceDraw(); draws.len]);
+                    changed = true;
+                }
+            }
+        }
+
+        c.seen = alias now;
+        changed && !self._inPlace
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CASCADES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the casters in the cascades of a shadow map, seeing none of them until the cascades are culled (see see)
+     * @params:
+     *    - shader: the shader of the casters, allocating the descriptor sets
+     *    - cameras: the buffer holding the view of the light of each cascade, read as the camera of the shader
+     *    - offsets: the offset of the camera of each cascade in the buffer
+     * */
+    pub fn start(mut self, dmut window: &Window, dmut shader: &Shader, cameras: &UniformBufferObject, offsets: [usize])
+        throws BalderError
+    {
+        self:.stop(alias window);
+
+        let dmut cascades: [&CascadeDraws] = [];
+        for offset in offsets {
+            let dmut camera = shader:.allocateDescriptorSet(DescriptorContext::CAMERA);
+            camera:.setUniform(UniformNames::CAMERA, cameras, offset-> offset);
+
+            let dmut set = shader:.allocateDescriptorSet(DescriptorContext::OBJECT);
+            cascades ~= [copy CascadeDraws(alias camera, alias set, copy InstanceBatch(alias shader:.getDevice()))];
+        }
+
+        self._cascades = alias cascades;
+    }
+
+    /**
+     * Stop drawing the casters in a shadow map, the resources of the cascades being retired
+     * @params:
+     *    - window: the window retiring the resources, the recordings in use still drawing with them
+     * */
+    pub fn stop(mut self, dmut window: &Window) {
+        for dmut c in alias self._cascades {
+            window:.retire(alias c.camera);
+            window:.retire(alias c.set);
+            window:.retire(alias c.draws);
+        }
+
+        self._cascades = [];
+    }
+
+    /**
+     * Lay out the draws of the casters in each cascade for the recording of a frame, before any of them is recorded
+     * @params:
+     *    - frame: the frame being recorded
+     *    - objects: the objects of the shader
+     * */
+    pub fn layout(mut self, frame: u32, objects: &ObjectStorage) {
+        for i, dmut c in alias self._cascades {
+            {
+                c.draws:.begin(frame);
+                for uid, draws in self._draws {
+                    if uid in c.seen {
+                        c.draws:.add(frame, uid, draws);
+                    } else {
+                        c.draws:.add(frame, uid, copy [InstanceDraw(); draws.len]);
+                    }
+                }
+
+                c.count = c.draws:.end(frame);
+                c.set:.setBuffer(UniformNames::OBJECTS, objects.getBuffer(), frame);
+                if let Ok(words) = c.draws.getWordBuffer(frame) {
+                    c.set:.setBuffer(UniformNames::INSTANCES, words, frame);
+                }
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to lay out the casters of the cascade", i, err);
+                    c.count = 0u32;
+                }
+            }
+        }
+    }
+
+    /**
+     * Record the draws of the casters a cascade sees, one multi-draw
+     * @assume: the draws of the frame are laid out, the shadow pipeline of the shader and its geometry are bound, the
+     * viewport is the one of the cascade
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the recording of the shadow map
+     *    - cascade: the index of the cascade
+     * */
+    pub fn draw(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator, cascade: usize) {
+        if cascade >= self._cascades.len { return; }
+
+        let c = self._cascades[cascade];
+        if c.count == 0u32 { return; }
+
+        c.camera.select(frame, cmd.getCommandBuffer());
+        c.set.select(frame, cmd.getCommandBuffer());
+        cmd:.drawIndexed(c.draws, 0u32, c.count);
+    }
+}
+
+/**
+ * @returns: true iif two lists of draws draw the same ranges with the same words
+ * */
+fn sameDraws(a: [InstanceDraw], b: [InstanceDraw])-> bool {
+    if a.len != b.len { return false; }
+    for i in 0us .. a.len {
+        if a[i].indexCount != b[i].indexCount
+            || a[i].firstIndex != b[i].firstIndex
+            || a[i].vertexOffset != b[i].vertexOffset
+            || a[i].word != b[i].word {
+            return false;
+        }
+    }
+
+    true
+}

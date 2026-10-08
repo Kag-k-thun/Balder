@@ -60,6 +60,9 @@ pub class Scene {
 
     // The compose rendering textures and subpasses
     let dmut _compose : ComposeRenderScene = ComposeRenderScene ();
+
+    // The shadow map of the direction light casting shadows, and the subpass drawing it
+    let dmut _shadow : CascadeShadowScene = CascadeShadowScene ();
     
     prot { // Aspect 
 
@@ -68,9 +71,15 @@ pub class Scene {
         let mut _aspectWidth : u32 = 0;
         
         let mut _aspectHeight : u32 = 0;
+    }
 
-        // The scale of shadow maps
+    prot { // Shadows
+
+        // The number of texels on a side of the shadow map, holding the four cascades of the light casting shadows
         let mut _shadowScale : u32 = 0;
+
+        // The depth in the view of the camera up to which the shadows are drawn, the far plane of the camera when farther
+        let mut _shadowDistance : f32 = 50.0f;
     }
 
     prot { // Levels of detail
@@ -115,8 +124,10 @@ pub class Scene {
 
     /**
      * Configure the scene and load the basic shaders, and subpasses
+     * @info: the size of the shadow map and the distance of the shadows are those of the configuration of the window
+     * (its [shadow] table), the distance changing afterwards through shadowDistance
      * */
-    pub fn configure (mut self, width : u32, height : u32, shadowScale : u32 = 2048)
+    pub fn configure (mut self, width : u32, height : u32)
         throws BalderError
     {
         log::debug #("Scene", "Configure scene :", width, height);        
@@ -126,7 +137,9 @@ pub class Scene {
             {
                 self._width = width;
                 self._height = height;
-                self._shadowScale = shadowScale;
+                let shadow = self._window.getShadowConfig ();
+                self._shadowScale = shadow.scale;
+                self._shadowDistance = shadow.distance;
 
                 let dmut pipeline = self._window:.getVulkanPipeline ();
                 let dname = "deferred_" ~ self._name;
@@ -134,7 +147,13 @@ pub class Scene {
 
                 self._tree:.configure (alias self._window, alias self);
                 self._deferred:.configure (dname, alias self._window, self._width, self._height);
-                self._compose:.configure (cname, alias self._window, self._width, self._height, self._deferred);
+                self._shadow:.configure (alias self._window);
+                self._compose:.configure (cname,
+                                          alias self._window,
+                                          self._width,
+                                          self._height,
+                                          self._deferred,
+                                          self._shadow.ubo);
 
                 let dmut dpass = alias self._deferred.subpass;
                 let dmut cpass = alias self._compose.subpass;
@@ -289,6 +308,35 @@ pub class Scene {
     pub fn drawStats (self)-> DrawStats {
         atomic self {
             self._shaderToNode.drawStats
+        }
+    }
+
+    /**
+     * @returns: the depth in the view of the camera up to which the shadows are drawn
+     * */
+    @field
+    pub fn shadowDistance (self)-> f32 {
+        self._shadowDistance
+    }
+
+    /**
+     * Set the depth in the view of the camera up to which the shadows are drawn, the far plane of the camera when
+     * farther; the cascades of the shadow map share it, a shorter distance giving sharper shadows
+     * */
+    @field
+    pub fn shadowDistance (mut self, distance : f32) {
+        atomic self {
+            self._shadowDistance = distance;
+        }
+    }
+
+    /**
+     * @returns: true iif a direction light casts shadows
+     * */
+    @field
+    pub fn hasShadows (self)-> bool {
+        atomic self {
+            self._shadow.isCasting
         }
     }
 
@@ -490,7 +538,8 @@ pub class Scene {
             
             self._compose:.prepareTexture (cmdV, frame);
             self._compose:.select (frame,
-                                   self._shaderToNode,                                   
+                                   self._shaderToNode,
+                                   self._shadow,
                                    cmdV);
             
             cmd:.dispatchNext ();
@@ -626,7 +675,7 @@ pub class Scene {
             LightType::DIRECTION => {
                 self._shaderToNode.directionLights:.register (alias light);
                 if light.castShadow {
-                    self:.addShadowPass (light);
+                    self:.addShadowPass (alias light);
                 }                    
                 
             }
@@ -688,17 +737,89 @@ pub class Scene {
      */
     
     /**
-     * Add a shadow pass to the rendering pipeline
+     * Cast the shadows of a direction light, drawn in the cascades of a shadow map by a subpass before the composition
+     * @info: one direction light casts shadows at a time, the others lighting the scene without casting any
      * @assume: light is a direction light
      * */
-    fn addShadowPass (mut self, light : &Light) {
-        light;
+    fn addShadowPass (mut self, dmut light : &Light) {
+        if self._shadow.isCasting {
+            log::warn #("Scene", "A direction light already casts shadows, the light", light.name, "casts none");
+            return;
+        }
+
+        let sname = "shadow_" ~ self._name;
+        {
+            let dmut pass = self._shadow:.start (sname, alias light, self._shadowScale);
+            pass:.onPrepare ():.connect (&self:.onShadowPrepare);
+            pass:.onDraw ():.connect (&self:.onShadowDraw);
+
+            atomic self {
+                self._shaderToNode:.castShadows (alias pass, self._shadow.ubo, self._shadow.cameraOffsets ());
+            }
+
+            // the shadow map is drawn before the deferred, the entry of the pipeline waiting for the transfers (a
+            // second entry would wait for them too, and only one pass can wait for a signal of the transfers)
+            self._window:.getVulkanPipeline ():.setPassOutput (sname, "deferred_" ~ self._name);
+        } catch {
+            err => {
+                log::error #("Scene", "Failed to cast the shadows of the light", light.name, err);
+                atomic self {
+                    self._shaderToNode:.stopShadows ();
+                }
+
+                self._shadow:.stop ();
+            }
+        }
+
+        self._window:.redrawPipeline ();
     }
 
+    /**
+     * Stop casting the shadows of a direction light, its shadow map removed from the rendering pipeline
+     * @info: does nothing unless the light casts the shadows of the scene
+     * */
     fn removeShadowPass (mut self, light : &Light) {
-        light;
+        if !self._shadow.isCastBy (light) { return; }
+
+        atomic self {
+            self._shaderToNode:.stopShadows ();
+        }
+
+        self._shadow:.stop ();
+        self._window:.redrawPipeline ();
     }
-    
+
+    /**
+     * Slot called when the shadow map is redrawn, before its render pass begins: the draws of the casters laid out
+     * */
+    fn onShadowPrepare (mut self) {
+        if !self._tree.camera.hasValue { return; }
+
+        let dmut subpass = alias self._shadow.subpass;
+        let frame = subpass.getCurrentFrame ();
+        atomic self {
+            self._shaderToNode:.layoutShadows (frame);
+        }
+    }
+
+    /**
+     * Slot called when the shadow map is redrawn: the casters drawn in each cascade, in its tile of the atlas
+     * */
+    fn onShadowDraw (mut self) {
+        if !self._tree.camera.hasValue { return; }
+
+        let dmut subpass = alias self._shadow.subpass;
+        let dmut cmd = copy IndexedDrawCommandAllocator (alias subpass);
+        let frame = subpass.getCurrentFrame ();
+
+        atomic self {
+            for c in 0u32 .. CASCADES {
+                self._shadow.selectCascade (cmd.getCommandBuffer (), c);
+                self._shaderToNode:.drawShadows (frame, alias cmd, cast!usize (c));
+            }
+        }
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -715,6 +836,7 @@ pub class Scene {
         self:.cull ();
         self:.sortDraws ();
         self:.selectLods (delta);
+        self:.updateShadows ();
     }
 
     /**
@@ -725,6 +847,28 @@ pub class Scene {
         let changed = atomic self {
             if let Ok (cam) = self._tree.camera {
                 self._shaderToNode:.cull (cam.viewProj, cast!f32 (self._height), self._cullThreshold)
+            } else { false }
+        };
+
+        if changed {
+            self._window:.redrawPipeline ();
+        }
+    }
+
+    /**
+     * Fit the cascades of the shadow map to the view of the camera, and cull the casters each of them sees when the
+     * cascades or the instances changed, recording the commands again when the device draws without multi-draw
+     * */
+    fn updateShadows (mut self) {
+        let changed = atomic self {
+            if !self._shadow.isCasting {
+                false
+            } else if let Ok (cam) = self._tree.camera {
+                let bounds = self._shaderToNode:.casterBounds ();
+                let volumes = self._shadow:.update (cam, bounds, self._shadowDistance);
+                if self._shadow:.cullAgain (self._shaderToNode.visibilityChanges ()) {
+                    self._shaderToNode:.cullShadows (volumes, self._shadow.casterThreshold ())
+                } else { false }
             } else { false }
         };
 
@@ -775,6 +919,7 @@ pub class Scene {
                     
             self._tree:.dispose ();                                            
             self._shaderToNode:.dispose ();
+            self._shadow:.dispose ();
             
             self._deferred:.dispose ();
             self._compose:.dispose ();

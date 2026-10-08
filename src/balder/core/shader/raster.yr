@@ -19,6 +19,14 @@ def RGBA_MASK = cast!u32(VkColorComponentFlagBits::VK_COLOR_COMPONENT_R_BIT
                          | VkColorComponentFlagBits::VK_COLOR_COMPONENT_A_BIT);
 
 /**
+ * The pipelines a raster shader builds
+ * */
+enum PipelineKind
+| PASSES  = 1
+| PREPASS = 2
+| SHADOW  = 3;
+
+/**
  * A shader used that includes a rasterization pass (vertex, fragment, etc.)
  * In distinction to compute shaders
  */
@@ -26,6 +34,9 @@ pub class RasterShader over Shader {
 
     // The pipeline of the depth prepass, null when the shader has none
     let mut _prepass: VkPipeline = null;
+
+    // The pipeline drawing the depth of the geometry in a shadow map, null until it is built (see configureShadow)
+    let mut _shadow: VkPipeline = null;
 
     /**
      * ======================================================================================================
@@ -99,12 +110,70 @@ pub class RasterShader over Shader {
             };
 
             let stages = self:.createStages(cfg.passes, alias modules, 0us);
-            self._program = self:.createPipeline(cfg, stages, pass, extent, outTextures-> outTextures, prepass-> false);
+            self._program = self:.createPipeline(cfg,
+                                                 stages,
+                                                 pass,
+                                                 extent,
+                                                 outTextures-> outTextures,
+                                                 kind-> PipelineKind::PASSES);
 
             if cfg.prepass.len != 0 {
                 let depthStages = self:.createStages(cfg.prepass, alias modules, cfg.passes.len);
-                self._prepass = self:.createPipeline(cfg, depthStages, pass, extent, outTextures-> outTextures, prepass-> true);
+                self._prepass = self:.createPipeline(cfg,
+                                                     depthStages,
+                                                     pass,
+                                                     extent,
+                                                     outTextures-> outTextures,
+                                                     kind-> PipelineKind::PREPASS);
             }
+        } exit {
+            for z in modules {
+                if z != null {
+                    vkDestroyShaderModule(self._device.getDeviceHandle(), z, null);
+                }
+            }
+        }
+    }
+
+    /**
+     * Build the pipeline drawing the depth of the geometry in a shadow map, with the stages of the depth prepass, the
+     * pipeline built before being destroyed
+     * @info: the depth is biased by the slope of the triangles, the bias being set by the recording
+     * (vkCmdSetDepthBias); the triangles are drawn whatever side they face, a single sided plane casting its shadow
+     * @params:
+     *    - renderPass: the render pass of the shadow map, holding a depth attachment only
+     *    - w: the width of the shadow map
+     *    - h: the height of the shadow map
+     * @throws: when the shader has no depth prepass, or the pipeline cannot be created
+     * */
+    pub fn configureShadow(mut self, renderPass: VkRenderPass, w: u32, h: u32)
+        throws BalderError
+    {
+        let cfg = if let Ok(c: &RasterShaderConfig) = self._cfg {
+            c
+        } else {
+            throw copy BalderError("Shader not configured");
+        };
+
+        if cfg.prepass.len == 0 {
+            throw copy BalderError("The shader has no depth prepass to draw shadows with");
+        }
+
+        self:.destroyShadow();
+
+        let mut modules: [mut VkShaderModule] = copy [null; cfg.prepass.len];
+        {
+            let mut extent = VkExtent2D();
+            extent.width = w;
+            extent.height = h;
+
+            let stages = self:.createStages(cfg.prepass, alias modules, 0us);
+            self._shadow = self:.createPipeline(cfg,
+                                                stages,
+                                                renderPass,
+                                                extent,
+                                                outTextures-> [],
+                                                kind-> PipelineKind::SHADOW);
         } exit {
             for z in modules {
                 if z != null {
@@ -135,6 +204,21 @@ pub class RasterShader over Shader {
      * */
     pub fn selectPrepass(self, cmd: VkCommandBuffer) {
         vkCmdBindPipeline(cmd, self._bindPoint, self._prepass);
+    }
+
+    /**
+     * @returns: true iif the pipeline drawing the depth in a shadow map is built
+     * */
+    pub fn hasShadow(self)-> bool {
+        self._shadow != null
+    }
+
+    /**
+     * Use the pipeline drawing the depth in a shadow map for the next drawings
+     * @assume: the pipeline is built, see configureShadow
+     * */
+    pub fn selectShadow(self, cmd: VkCommandBuffer) {
+        vkCmdBindPipeline(cmd, self._bindPoint, self._shadow);
     }
 
     /*!
@@ -177,8 +261,8 @@ pub class RasterShader over Shader {
     /**
      * Create the pipeline of the shader
      * @params:
-     *    - prepass: true for the pipeline of the depth prepass, writing the depth only; the pipeline of the passes of a
-     *      shader with a prepass tests the depth it wrote without writing it
+     *    - kind: the passes, the depth prepass writing the depth only (the pipeline of the passes of a shader with a
+     *      prepass tests the depth it wrote without writing it), or the shadow map, writing the depth only, biased
      */
     fn createPipeline(mut self,
                       cfg: &RasterShaderConfig,
@@ -186,9 +270,11 @@ pub class RasterShader over Shader {
                       renderPass: VkRenderPass,
                       extent: VkExtent2D,
                       outTextures: [&OutputTexture],
-                      prepass: bool)-> dmut VkPipeline
+                      kind: PipelineKind)-> dmut VkPipeline
         throws BalderError
     {
+        let prepass = kind != PipelineKind::PASSES;
+        let shadow = kind == PipelineKind::SHADOW;
         let (attrDescr, bindDescr) = self.createAttributeDescription(cfg);
 
         // the prepass reads the positions only, the first entry of the vertices
@@ -217,7 +303,13 @@ pub class RasterShader over Shader {
         let mut scissors = VkRect2D();
         scissors.extent = extent;
 
-        let dynStateList = copy [VkDynamicState::VK_DYNAMIC_STATE_VIEWPORT, VkDynamicState::VK_DYNAMIC_STATE_SCISSOR];
+        let dynStateList = if shadow {
+            copy [VkDynamicState::VK_DYNAMIC_STATE_VIEWPORT,
+                  VkDynamicState::VK_DYNAMIC_STATE_SCISSOR,
+                  VkDynamicState::VK_DYNAMIC_STATE_DEPTH_BIAS]
+        } else {
+            copy [VkDynamicState::VK_DYNAMIC_STATE_VIEWPORT, VkDynamicState::VK_DYNAMIC_STATE_SCISSOR]
+        };
 
         let mut dynState = VkPipelineDynamicStateCreateInfo();
         dynState.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
@@ -236,9 +328,13 @@ pub class RasterShader over Shader {
         rasterizer.depthClampEnable = VK_FALSE;
         rasterizer.rasterizerDiscardEnable = VK_FALSE;
         rasterizer.polygonMode = VkPolygonMode::VK_POLYGON_MODE_FILL;
-        rasterizer.cullMode = cast!u32(VkCullMofnlagBits::VK_CULL_MODE_BACK_BIT);
+        rasterizer.cullMode = if shadow {
+            cast!u32(VkCullMofnlagBits::VK_CULL_MODE_NONE)
+        } else {
+            cast!u32(VkCullMofnlagBits::VK_CULL_MODE_BACK_BIT)
+        };
         rasterizer.frontFace = VkFrontFace::VK_FRONT_FACE_CLOCKWISE;
-        rasterizer.depthBiasEnable = VK_FALSE;
+        rasterizer.depthBiasEnable = if shadow { VK_TRUE } else { VK_FALSE };
         rasterizer.lineWidth = 1.0f;
 
         let mut multisampling = VkPipelineMultisampleStateCreateInfo();
@@ -270,7 +366,9 @@ pub class RasterShader over Shader {
             depthStencil.depthTestEnable = VK_FALSE;
         }
 
-        let color = if outTextures.len == 0 {
+        let color = if shadow {
+            self.createShadowColorAttachment()
+        } else if outTextures.len == 0 {
             self.createDefaultDepthColorAttachment(cfg, write-> !prepass)
         } else {
             self.createDeferredDepthColorAttachment(cfg, outTextures, write-> !prepass)
@@ -361,6 +459,19 @@ pub class RasterShader over Shader {
     }
 
     /**
+     * Create the color blend state of a shadow map, which has no color attachment
+     * */
+    fn createShadowColorAttachment(self)-> VkPipelineColorBlendStateCreateInfo {
+        let mut colorBlending = VkPipelineColorBlendStateCreateInfo();
+        colorBlending.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.logicOpEnable = VK_FALSE;
+        colorBlending.logicOp = VkLogicOp::VK_LOGIC_OP_COPY;
+        colorBlending.attachmentCount = 0u32;
+
+        colorBlending
+    }
+
+    /**
      * Create color and depth attachment for deferred shading
      * @params:
      *    - write: false to write no color (depth prepass)
@@ -425,6 +536,16 @@ pub class RasterShader over Shader {
      * ====================================================================================================
      */
 
+    /**
+     * Destroy the pipeline drawing the depth in a shadow map, if it was built
+     * */
+    fn destroyShadow(mut self) {
+        if self._shadow != null {
+            vkDestroyPipeline(self._device.getDeviceHandle(), self._shadow, null);
+            self._shadow = null;
+        }
+    }
+
     impl Disposable {
         pub over dispose(mut self) {
             self._pipelineLayout:.dispose();
@@ -438,6 +559,7 @@ pub class RasterShader over Shader {
                 self._prepass = null;
             }
 
+            self:.destroyShadow();
             self._cfg = none;
         }
     }
