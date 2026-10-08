@@ -1,13 +1,8 @@
 in shape;
 
-use balder::core::dispose;
-use balder::core::config::shader::uniform;
-use balder::core::driver::cmd_alloc;
-use balder::core::shader::{buffers::_, desc_set};
+use balder::core::{dispose, error};
 use balder::interface::drawer;
 use balder::math::vector;
-
-use std::algorithm::comparison;
 
 use ::vulkan::core;
 
@@ -16,16 +11,55 @@ pub mod ::texture;
 pub mod ::list;
 pub mod ::text;
 
-extern (C) fn printf (c : *c8, ...);
-
-record World {
+/**
+ * The data of a shape read by the shaders, in the slot of the shape in the storage buffer of the drawer (std430)
+ * */
+pub record World {
     pub let mut pos : vec2 = vec2 ();
     pub let mut size : vec2 = vec2 ();
     pub let mut color : vec4 = vec4 ();
-    
+
+    // The rectangle the shape is cut to, its corners in CSS pixels
+    pub let mut scissors : vec4 = vec4 ();
+
     pub let mut level : u32 = 0;
             
     pub self () {}
+}
+
+/**
+ * The size of the slot of a shape in the storage buffer of the drawer, World padded to the alignment of its vec4
+ * */
+pub def WORLD_STRIDE = 64us;
+
+/**
+ * The number of indices of the quad of the drawer, drawn by the color and the texture shapes
+ * */
+pub def QUAD_INDICES = 6u32;
+
+/**
+ * The pipelines drawing the shapes
+ * */
+pub enum ShapeKind
+| COLOR   = 0u32
+| TEXTURE = 1u32
+| TEXT    = 2u32;
+
+/**
+ * A draw of a shape, drawn with the draws before it in the same multi-draw when they share its pipeline and its
+ * descriptor set
+ * */
+@data
+pub record ShapeDraw {
+
+    // The pipeline of the draw
+    pub let kind : ShapeKind;
+
+    // The descriptor set of the draw among those of its pipeline (the page of the atlas of a text...)
+    pub let key : usize;
+
+    // The draw, its first instance being the slot of the shape
+    pub let command : VkDrawIndexedIndirectCommand;
 }
 
 /**
@@ -38,11 +72,11 @@ pub class Shape {
 
     let dmut _context : &ShapeDrawer;
 
-    let _vbo : &VertexBufferObject;
-    let _ibo : &IndexBufferObject;
+    // The slot of the shape in the storage buffer of the drawer
+    let _slot : u32;
 
-    let dmut _ubo : &UniformBufferObject;
-    let dmut _descSet : (&DescriptorSet)?;
+    // True once the slot was given back to the drawer
+    let mut _disposed : bool = false;
 
     let mut _hidden : bool = false;    
     let mut _needRedraw : bool = false;
@@ -51,10 +85,8 @@ pub class Shape {
     let mut _changed : bool = true;
 
     let mut _world : World = World ();
-    let mut _scissors : vec4 = vec4 ();
 
-    // The scissors and the visibility the draws are recorded with, those of the last commit
-    let mut _drawnScissors : vec4 = vec4 ();
+    // The visibility the draws are recorded with, the one of the last commit
     let mut _drawnHidden : bool = false;
     
     /*!
@@ -65,27 +97,12 @@ pub class Shape {
      * ====================================================================================================
      */
 
-    pub self (uid : usize,
-              dmut drawer : &ShapeDrawer,
-              vbo : &VertexBufferObject,
-              ibo : &IndexBufferObject,
-              dmut ubo : &UniformBufferObject,
-              dmut descSet : &DescriptorSet)
-
+    pub self (uid : usize, dmut drawer : &ShapeDrawer)
         with uid = uid
         , _context = alias drawer
-        , _vbo = vbo
-        , _ibo = ibo
-        , _ubo = alias ubo
-        , _descSet = (alias descSet)?
-    
-    {        
-        descSet:.setUniform (UniformNames::WORLD, ubo);
-    }
-
-    __dtor (mut self) {
-        self:.dispose ();
-    }
+        , _slot = drawer:.allocObject ()
+        throws BalderError
+    {}
 
     /*!
      * ====================================================================================================
@@ -141,10 +158,9 @@ pub class Shape {
      */
     pub fn setScissors (mut self, pos : vec2, size : vec2) {
         let scissors = makeVec4 (pos.x, pos.y, pos.x + size.x, pos.y + size.y);
-        if scissors != self._scissors {
-            // the scissors are recorded with the draw commands, not passed in the uniform buffer
-            self._scissors = scissors;
-            self._needRedraw = true;
+        if scissors != self._world.scissors {
+            self._world.scissors = scissors;
+            self._changed = true;
         }
     }
 
@@ -197,12 +213,11 @@ pub class Shape {
      * */
     pub fn commit (mut self) {
         if self._changed {            
-            self._ubo:.setData (0, self._world, commit-> true);
+            self._context:.writeObject (self._slot, self._world);
             self._changed = false;
         }
 
         if self._needRedraw {
-            self._drawnScissors = self._scissors;
             self._drawnHidden = self._hidden;
             self._context:.redraw ();
             self._needRedraw = false;
@@ -233,14 +248,6 @@ pub class Shape {
         !self._drawnHidden
     }
 
-    /**
-     * @returns: the number of points composing the shape
-     * */
-    @final
-    pub fn getNbPoints (self)-> u32 {
-        self._ibo.getNbPoints ()
-    }
-    
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -250,46 +257,23 @@ pub class Shape {
      */
 
     /**
-     * Register the draws of the shape, recorded in the same order by draw
+     * @returns: the draws of the shape, laid out in its drawing order at each recording
      * */
-    pub fn registerDraws (self, dmut cmd : &IndexedDrawCommandAllocator) {
-        cmd:.registerIndexedObject (self.getNbPoints ());
-    }
+    pub fn getDraws (self)-> [ShapeDraw];
 
     /**
-     * Draw the shape
-     * @assume: already registered and at correct index
-     * */
-    pub fn draw (self, frame : u32, dmut cmd : &IndexedDrawCommandAllocator) {
-        if let Ok (ds) = self._descSet {
-            self.selectScissors (cmd.getCommandBuffer ());
-            
-            ds.select (frame, cmd.getCommandBuffer ());
-            self._vbo.select (cmd.getCommandBuffer ());
-            self._ibo.select (cmd.getCommandBuffer ());
-            
-            cmd:.drawNextIndexed ();
-        }
-    }
-
-    /**
-     * Cut the next draws to the scissors of the shape
+     * @returns: a draw of 'nbIndices' indices of the shape
      * */
     @final
-    prot fn selectScissors (self, cmd : VkCommandBuffer) {
-        // the scissors hold the corners of the rectangle in CSS pixels, Vulkan takes its offset and extent in framebuffer pixels
-        let ratio = self._context.getFramebufferRatio ();
-        let x = max (0.0f, self._drawnScissors.x * ratio.x);
-        let y = max (0.0f, self._drawnScissors.y * ratio.y);
+    prot fn makeDraw (self, kind : ShapeKind, key : usize, nbIndices : u32, firstIndex : u32 = 0u32, vertexOffset : i32 = 0)-> ShapeDraw {
+        let mut cmd = VkDrawIndexedIndirectCommand ();
+        cmd.indexCount = nbIndices;
+        cmd.instanceCount = 1u32;
+        cmd.firstIndex = firstIndex;
+        cmd.vertexOffset = vertexOffset;
+        cmd.firstInstance = self._slot;
 
-        let mut scissor = VkRect2D ();
-        scissor.offset.x = cast!i32 (x);
-        scissor.offset.y = cast!i32 (y);
-
-        scissor.extent.width = cast!u32 (max (0.0f, self._drawnScissors.z * ratio.x - x));
-        scissor.extent.height = cast!u32 (max (0.0f, self._drawnScissors.w * ratio.y - y));
-
-        vkCmdSetScissor (cmd, 0, 1, &scissor);
+        ShapeDraw (kind, key, cmd)
     }
 
     /*!
@@ -301,13 +285,16 @@ pub class Shape {
      */
 
     impl Disposable {
-        pub over dispose (mut self) {            
-            if let Ok (dmut ds) = alias self._descSet {
-                ds:.dispose ();                                
-                self._descSet = none;
-            }
-            
-            self._ubo:.dispose ();            
+
+        /**
+         * Give back the slot of the shape
+         * @warning: through a retire, the recordings in use may still draw the shape
+         * */
+        pub over dispose (mut self) {
+            if self._disposed { return; }
+
+            self._disposed = true;
+            self._context:.freeObject (self._slot);
         }
     }
 

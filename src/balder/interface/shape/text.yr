@@ -1,9 +1,7 @@
 in text;
 
-use balder::core::_;
-use balder::core::config::shader::_;
-use balder::core::driver::cmd_alloc;
-use balder::core::shader::{_, buffers::_};
+use balder::core::{dispose, error};
+use balder::core::shader::buffers::pool;
 use balder::interface::drawer;
 use balder::interface::font::{atlas, cache, chain, face, layout, shaper};
 use balder::math::vector;
@@ -20,7 +18,7 @@ record PageBatch {
     // The page sampled by the quads
     pub let page: u32;
 
-    // The first index of the quads in the index buffer
+    // The first index of the quads in the indices of the text
     pub let firstIndex: u32;
 
     // The number of indices of the quads
@@ -29,7 +27,8 @@ record PageBatch {
 
 /**
  * A 2D text of one or several lines, drawn as one quad per glyph sampling the glyph atlas
- * The quads sampling the same page are drawn at once, so a text costs one draw per page it uses
+ * The quads sampling the same page are drawn at once, so a text costs one draw per page it uses, drawn with the draws of
+ * the texts before it sampling the same page; the quads are placed in the text pool of the drawer
  * */
 @final
 pub class TextShape over Shape {
@@ -37,30 +36,20 @@ pub class TextShape over Shape {
     // The atlas the glyphs are taken from
     let dmut _atlas: &GlyphAtlas;
 
-    // The shader the descriptor sets of the pages are allocated from
-    let dmut _shader: &Shader;
-
-    // The corners and texture coordinates of the quads, sorted by page
-    let dmut _quadVBO: &VertexBufferObject;
-
-    // The indices of the quads
-    let dmut _quadIBO: &IndexBufferObject!{u32};
+    // The corners and texture coordinates of the quads, sorted by page, and their indices
+    let dmut _geometry: (&GeometryRange)? = none;
 
     // The quads of each page
     let mut _batches: [PageBatch] = [];
 
-    // The descriptor set of the pages other than 0, page 0 using the one of the shape
-    let dmut _pageSets: [u32 => &DescriptorSet] = copy [];
-
-    // True once the texture of page 0 is bound to the descriptor set of the shape
-    let mut _firstPageBound: bool = false;
-
     // The glyphs the quads are made of, marked used at each recording of the draws
     let mut _keys: [GlyphKey] = [];
 
-    // The buffers of the quads laid out since the last commit, drawn once committed
-    let dmut _nextVBO: (&VertexBufferObject)? = none;
-    let dmut _nextIBO: (&IndexBufferObject!{u32})? = none;
+    // The quads laid out since the last commit, drawn once committed
+    let dmut _nextGeometry: (&GeometryRange)? = none;
+
+    // True when a layout was done since the last commit, it may have no quad
+    let mut _hasNext: bool = false;
 
     // The quads of each page and their glyphs, laid out since the last commit
     let mut _nextBatches: [PageBatch] = [];
@@ -80,19 +69,9 @@ pub class TextShape over Shape {
      * ====================================================================================================
      */
 
-    pub self (uid: usize,
-              dmut drawer: &ShapeDrawer,
-              dmut shader: &Shader,
-              dmut atlas: &GlyphAtlas,
-              dmut vbo: &VertexBufferObject,
-              dmut ibo: &IndexBufferObject!{u32})
-        with super(uid, alias drawer, vbo, ibo,
-                   ubo-> copy UniformBufferObject(alias shader:.getDevice(), shape::World::size),
-                   descSet-> shader:.allocateDescriptorSet(DescriptorContext::OBJECT))
+    pub self (uid: usize, dmut drawer: &ShapeDrawer, dmut atlas: &GlyphAtlas)
+        with super(uid, alias drawer)
         , _atlas = alias atlas
-        , _shader = alias shader
-        , _quadVBO = alias vbo
-        , _quadIBO = alias ibo
         throws BalderError
     {}
 
@@ -160,11 +139,11 @@ pub class TextShape over Shape {
 
                 points ~= v;
                 batches ~= [PageBatch(page, first, cast!u32(indices.len) - first)];
-                self:.selectPage(page);
+                self._context:.selectPage(page);
             }
         }
 
-        self:.replaceNextBuffers(cast!u32(points.len / 4us), points, indices);
+        self:.replaceNextGeometry(points, indices);
 
         self._nextBatches = batches;
         self._nextKeys = keys;
@@ -185,20 +164,17 @@ pub class TextShape over Shape {
      * Draw the glyphs laid out since the last commit from now on, with the other modifications of the shape
      * */
     pub over commit(mut self) {
-        if let Ok(dmut vbo) = alias self._nextVBO {
-            if let Ok(dmut ibo) = alias self._nextIBO {
-                let dmut window = self._context:.getWindow();
-                window:.retire(alias self._quadVBO);
-                window:.retire(alias self._quadIBO);
-
-                self._quadVBO = alias vbo;
-                self._quadIBO = alias ibo;
-                self._batches = self._nextBatches;
-                self._keys = self._nextKeys;
+        if self._hasNext {
+            if let Ok(dmut g) = alias self._geometry {
+                self._context:.getWindow():.retire(alias g);
             }
 
-            self._nextVBO = none;
-            self._nextIBO = none;
+            self._geometry = alias self._nextGeometry;
+            self._batches = self._nextBatches;
+            self._keys = self._nextKeys;
+
+            self._nextGeometry = none;
+            self._hasNext = false;
         }
 
         self.__super__:.commit();
@@ -241,30 +217,20 @@ pub class TextShape over Shape {
         }
     }
 
-    pub over registerDraws(self, dmut cmd: &IndexedDrawCommandAllocator) {
-        for b in self._batches {
-            cmd:.registerIndexedObject(b.nbIndices, firstIndex-> b.firstIndex);
+    /**
+     * @returns: the draws of the quads of each page, with the descriptor set of the page
+     * */
+    pub over getDraws(self)-> [ShapeDraw] {
+        if let Ok(g) = self._geometry {
+            return copy [self.makeDraw(ShapeKind::TEXT,
+                                       cast!usize(b.page),
+                                       b.nbIndices,
+                                       firstIndex-> g.firstIndex + b.firstIndex,
+                                       vertexOffset-> cast!i32(g.vertexOffset))
+                         for b in self._batches];
         }
-    }
 
-    pub over draw(self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator) {
-        if self._batches.len == 0us { return; }
-
-        self.selectScissors(cmd.getCommandBuffer());
-        self._quadVBO.select(cmd.getCommandBuffer());
-        self._quadIBO.select(cmd.getCommandBuffer());
-
-        for b in self._batches {
-            if b.page == 0u32 {
-                if let Ok(ds) = self._descSet {
-                    ds.select(frame, cmd.getCommandBuffer());
-                }
-            } else if let Ok(ds) = self._pageSets[b.page] {
-                ds.select(frame, cmd.getCommandBuffer());
-            }
-
-            cmd:.drawNextIndexed();
-        }
+        []
     }
 
     /*!
@@ -276,51 +242,22 @@ pub class TextShape over Shape {
      */
 
     /**
-     * Bind the texture of a page to its descriptor set, allocating the set the first time the page is used
+     * Place the quads in the text pool of the drawer for the next commit, replacing those of a layout not committed yet
      * */
-    fn selectPage(mut self, page: u32)
+    fn replaceNextGeometry(mut self, points: [f32], indices: [u32])
         throws BalderError
     {
-        if page == 0u32 {
-            if !self._firstPageBound {
-                if let Ok(dmut ds) = alias self._descSet {
-                    ds:.setTexture(TextureKind::ALBEDO, self._atlas:.getPage(0u32));
-                    self._firstPageBound = true;
-                }
-            }
-        } else if page !in self._pageSets {
-            let dmut ds = self._shader:.allocateDescriptorSet(DescriptorContext::OBJECT);
-            ds:.setUniform(UniformNames::WORLD, self._ubo);
-            ds:.setTexture(TextureKind::ALBEDO, self._atlas:.getPage(page));
-            self._pageSets[page] = alias ds;
-        }
-    }
-
-    /**
-     * Upload the quads in the buffers of the next commit, replacing those of a layout not committed yet
-     * */
-    fn replaceNextBuffers(mut self, nbPoints: u32, points: [f32], indices: [u32])
-        throws BalderError
-    {
-        let dmut window = self._context:.getWindow();
-        if let Ok(dmut vbo) = alias self._nextVBO {
-            window:.retire(alias vbo);
+        if let Ok(dmut g) = alias self._nextGeometry {
+            self._context:.getWindow():.retire(alias g);
+            self._nextGeometry = none;
         }
 
-        if let Ok(dmut ibo) = alias self._nextIBO {
-            window:.retire(alias ibo);
-        }
-
-        let dmut vbo = copy VertexBufferObject();
-        let dmut ibo = copy IndexBufferObject!{u32}();
         if indices.len != 0us {
-            let dmut device = self._shader:.getDevice();
-            vbo:.update(alias device, nbPoints, points);
-            ibo:.update(alias device, indices);
+            let dmut g = self._context:.allocText(points, indices);
+            self._nextGeometry = (alias g)?;
         }
 
-        self._nextVBO = (alias vbo)?;
-        self._nextIBO = (alias ibo)?;
+        self._hasNext = true;
     }
 
     /*!
@@ -333,28 +270,24 @@ pub class TextShape over Shape {
 
     impl Disposable {
         pub over dispose(mut self) {
+            if self._disposed { return; }
+
             self.__super__:.dispose();
 
-            for _, dmut ds in alias self._pageSets {
-                ds:.dispose();
+            // disposed through a retire, the recordings in use do not draw the quads anymore
+            if let Ok(dmut g) = alias self._geometry {
+                g:.dispose();
             }
 
-            self._pageSets = copy [];
-            self._quadVBO:.dispose();
-            self._quadIBO:.dispose();
+            if let Ok(dmut g) = alias self._nextGeometry {
+                g:.dispose();
+            }
+
+            self._geometry = none;
+            self._nextGeometry = none;
             self._batches = [];
-
-            if let Ok(dmut vbo) = alias self._nextVBO {
-                vbo:.dispose();
-            }
-
-            if let Ok(dmut ibo) = alias self._nextIBO {
-                ibo:.dispose();
-            }
-
-            self._nextVBO = none;
-            self._nextIBO = none;
             self._nextBatches = [];
+            self._hasNext = false;
         }
     }
 }

@@ -1,0 +1,334 @@
+in in_flight;
+
+use balder::core::{dispose, error, memory, memory::_};
+use balder::core::driver::device;
+use balder::utils::log;
+
+use std::algorithm::comparison;
+
+use ::etc::c::memory;
+
+use ::vulkan::core;
+
+/**
+ * The bytes of each copy of an in flight buffer modified since that copy was last written
+ * @info: one range per copy, covering every modification made since, possibly with bytes that did not change
+ * */
+pub record FrameRanges {
+
+    // The first modified byte of each copy
+    let mut _starts: [mut usize];
+
+    // The end of the modified bytes of each copy, the copy is up to date when it is not past the start
+    let mut _ends: [mut usize];
+
+    /**
+     * @params:
+     *    - nbFrames: the number of copies
+     * */
+    pub self (nbFrames: u32)
+        with _starts = copy [0us; nbFrames]
+        , _ends = copy [0us; nbFrames]
+    {}
+
+    /**
+     * Mark the bytes [start, end) modified in every copy
+     * */
+    pub fn mark(mut self, start: usize, end: usize) {
+        for i in 0u32 .. cast!u32(self._starts.len) {
+            self:.markFrame(i, start, end);
+        }
+    }
+
+    /**
+     * Mark the bytes [start, end) modified in the copy of the frame 'frame' only
+     * */
+    pub fn markFrame(mut self, frame: u32, start: usize, end: usize) {
+        if end <= start { return; }
+
+        if self._ends[frame] <= self._starts[frame] {
+            self._starts[frame] = start;
+            self._ends[frame] = end;
+        } else {
+            self._starts[frame] = min(self._starts[frame], start);
+            self._ends[frame] = max(self._ends[frame], end);
+        }
+    }
+
+    /**
+     * Take the modified bytes of a copy, the copy being up to date afterwards
+     * @returns: the range [start, end) of the bytes to write, none if the copy is up to date
+     * */
+    pub fn take(mut self, frame: u32)-> (usize, usize)? {
+        if self._ends[frame] <= self._starts[frame] { return none; }
+
+        let range = (self._starts[frame], self._ends[frame]);
+        self._starts[frame] = 0us;
+        self._ends[frame] = 0us;
+        range?
+    }
+
+    /**
+     * @returns: true iif the copy of the frame 'frame' is up to date
+     * */
+    pub fn isClean(self, frame: u32)-> bool {
+        self._ends[frame] <= self._starts[frame]
+    }
+}
+
+/**
+ * A host visible buffer read by the GPU, with one copy per frame in flight, written from a local copy
+ * @info: a copy is written at the submission of its frame, once the previous submission of the frame was awaited, with
+ * the bytes modified since it was last written, so a frame in flight never reads bytes being written, nor the bytes of
+ * a later modification
+ * */
+@final
+pub class InFlightBuffer {
+
+    pub let uid: usize;
+
+    // The device the copies are allocated on
+    let dmut _device: &VulkanDevice;
+
+    // The usage of the copies
+    let _usage: VkBufferUsageFlags;
+
+    // The content of the buffer, the copies being written from it
+    let dmut _local: [u8];
+
+    // The copy read by each frame
+    let dmut _copies: [&Buffer] = [];
+
+    // The bytes of each copy to write at the submission of its frame
+    let mut _dirty: FrameRanges;
+
+    // The number of times the copies were replaced by larger ones
+    let mut _generation: u32 = 0u32;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - uid: the uniq id of the buffer
+     *    - device: the device the copies are allocated on
+     *    - size: the size of the buffer in bytes
+     *    - usage: the usage of the copies
+     */
+    pub self (uid: usize, dmut device: &VulkanDevice, size: usize, usage: VkBufferUsageFlags)
+        with uid = uid
+        , _device = alias device
+        , _usage = usage
+        , _local = copy [0u8; size]
+        , _dirty = FrameRanges(device.getNbFrames())
+        throws BalderError
+    {
+        self._copies = self:.allocCopies(size);
+    }
+
+    // Disposing from the collector races with the GPU and with the device teardown, the object has to be retired
+#if DEBUG
+    __dtor(mut self) {
+        if self._copies.len != 0us {
+            log::warn #("Dispose", self.__typeinfo__.name, "collected without being retired");
+        }
+    }
+#end
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the size of the buffer in bytes
+     * */
+    pub fn getSize(self)-> usize {
+        self._local.len
+    }
+
+    /**
+     * @returns: the number of times the copies were replaced by larger ones, the bindings of the buffer having to be
+     * written again when it changes
+     * */
+    pub fn getGeneration(self)-> u32 {
+        atomic self {
+            self._generation
+        }
+    }
+
+    /**
+     * @returns: the vulkan handle of the copy read by the frame 'frame'
+     * */
+    pub fn getVulkanBuffer(self, frame: u32)-> VkBuffer {
+        atomic self {
+            self._copies[frame].getVulkanBuffer()
+        }
+    }
+
+    /**
+     * @returns: data from the local copy
+     * @params:
+     *    - offset: the offset in bytes where the read is done
+     * */
+    pub fn getData {U} (self, offset: usize)-> U {
+        let val: [u8; U::size] = [0; U::size];
+        atomic self {
+            memcpy(cast!{*void} (val.ptr), cast!{*void} (self._local.ptr + offset), U::size);
+        }
+
+        unsafe { *(cast!{*U} (val.ptr)) }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          UPDATING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write a value in the buffer, written in the copy of each frame at its next submission, a frame being requested
+     * @params:
+     *    - offset: the offset in bytes of the value
+     *    - value: the value to write
+     * */
+    pub fn setData {U} (mut self, offset: usize, value: U) {
+        atomic self {
+            memcpy(cast!{*void} (self._local.ptr + offset), cast!{*void} (&value), U::size);
+            self._dirty:.mark(offset, offset + U::size);
+        }
+
+        self._device:.requestFrame();
+    }
+
+    /**
+     * Write values in the buffer, written in the copy of each frame at its next submission, a frame being requested
+     * @params:
+     *    - offset: the offset in bytes of the first value
+     *    - value: the values to write
+     * */
+    pub fn setData {T of [U], U} (mut self, offset: usize, value: T) {
+        atomic self {
+            memcpy(cast!{*void} (self._local.ptr + offset), cast!{*void} (value.ptr), U::size * value.len);
+            self._dirty:.mark(offset, offset + U::size * value.len);
+        }
+
+        self._device:.requestFrame();
+    }
+
+    /**
+     * Enlarge the buffer, its content being kept
+     * @info: the copies are replaced, so the recordings using them have to be done again (requested by their retire)
+     * @params:
+     *    - size: the new size in bytes, nothing is done when it is not larger than the current one
+     * */
+    pub fn grow(mut self, size: usize)
+        throws BalderError
+    {
+        atomic self {
+            if size <= self._local.len { return; }
+
+            let dmut local = copy [0u8; size];
+            memcpy(cast!{*void} (local.ptr), cast!{*void} (self._local.ptr), self._local.len);
+
+            let dmut copies = self:.allocCopies(size);
+            for dmut c in alias self._copies {
+                self._device:.retire(&c:.dispose);
+            }
+
+            self._local = alias local;
+            self._copies = alias copies;
+            self._dirty:.mark(0us, size);
+            self._generation += 1u32;
+        }
+    }
+
+    /**
+     * Write the bytes modified since the last write of the copy of a frame
+     * @assume: the previous submission of the frame was awaited
+     * @params:
+     *    - frame: the frame being submitted
+     * */
+    pub fn flush(mut self, frame: u32) {
+        atomic self {
+            if frame >= cast!u32(self._copies.len) { return; }
+
+            if let Ok((start, end)) = self._dirty:.take(frame) {
+                // The memory of the copy is shared with other buffers, mapped and unmapped under the lock of the device
+                atomic self._device {
+                    let dmut target = alias self._copies[frame];
+                    let dmut ptr    = target:.map();
+                    if ptr != null {
+                        memcpy(ptr + start, cast!{*void} (self._local.ptr + start), end - start);
+                        target:.unmap();
+                    } else {
+                        log::error #("InFlightBuffer", "failed to map the copy of the frame", frame);
+                    }
+                }
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Allocate a copy per frame in flight
+     * */
+    fn allocCopies(mut self, size: usize)-> dmut [&Buffer]
+        throws BalderError
+    {
+        let dmut copies: [&Buffer] = [];
+        for _ in 0u32 .. self._device.getNbFrames() {
+            let dmut c = self._device
+                :.getMemoryAllocator()
+                :.allocBuffer(size,
+                              self._usage,
+                              cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                       | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+            copies ~= [alias c];
+        }
+
+        alias copies
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            atomic self {
+                if self._copies.len == 0us { return; }
+
+                for dmut c in alias self._copies {
+                    c:.dispose();
+                }
+
+                self._copies = [];
+                self._local = [];
+            }
+
+            self._device:.getMemoryAllocator():.forgetInFlight(self.uid);
+        }
+    }
+}

@@ -7,6 +7,9 @@ layout (location = 2) in vec2 inUV;
 // The cross-fade of the draw, see the vertex shader
 layout (location = 3) flat in vec2 inFade;
 
+// The material of the object
+layout (location = 4) flat in uint inMaterial;
+
 layout (location = 0) out vec3 position;
 layout (location = 1) out vec3 normals;
 layout (location = 2) out vec3 binormals;
@@ -14,11 +17,7 @@ layout (location = 3) out vec4 albedo;
 layout (location = 4) out uint materialID;
 
 
-layout(set = 0, binding = 1) uniform Material {    
-    uint materialID;
-} material;
-
-layout (set = 0, binding = 2) uniform sampler2D diffuse;
+layout (set = 0, binding = 1) uniform sampler2D diffuse;
 
 
 /**
@@ -51,5 +50,5 @@ void main() {
     binormals = vec3 (inNormals);
     albedo = vec4 (texture (diffuse, inUV).xyz, 1);
     
-    materialID = material.materialID;            
+    materialID = inMaterial;
 }

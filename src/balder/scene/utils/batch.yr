@@ -1,0 +1,360 @@
+in batch;
+
+use balder::core::{_, application::_};
+use balder::core::config::shader::_;
+use balder::core::driver::cmd_alloc;
+use balder::core::shader::{_, buffers::_};
+use balder::scene::node::node3D::visual;
+use balder::scene::node::node3D::visual::material;
+
+use ::vulkan::core;
+
+/**
+ * The size of the slot of an object in the storage buffer of the 3D shaders: its world (mat4), the progress of its
+ * cross-fade (f32) and its material (u32), padded to the alignment of the mat4 (std430)
+ * */
+pub def OBJECT_STRIDE = 80us;
+
+/**
+ * The offset of the world of an object in its slot
+ * */
+pub def OBJECT_WORLD = 0us;
+
+/**
+ * The offset of the progress of the cross-fade of an object in its slot
+ * */
+pub def OBJECT_FADE = 64us;
+
+/**
+ * The offset of the material of an object in its slot
+ * */
+pub def OBJECT_MATERIAL = 68us;
+
+/**
+ * The place of a visual instance in the draws of the scene: its geometry in the pool of its shader, its slot in the
+ * objects of its shader, and the batch of its material its draws are laid out in
+ * */
+@final
+pub class SceneDraws {
+
+    // The objects of the shader
+    let dmut _objects: &ObjectStorage;
+
+    // The batch the draws are laid out in
+    let dmut _batch: &DrawBatch;
+
+    // The geometry of the instance
+    let dmut _geometry: &GeometryRange;
+
+    // The slot of the instance in the objects of the shader
+    pub let slot: u32;
+
+    // True when the draws modified in place are drawn without recording them again
+    let _inPlace: bool;
+
+    // True once the slot and the geometry were given back
+    let mut _freed: bool = false;
+
+    pub self (dmut objects: &ObjectStorage, dmut batch: &DrawBatch, dmut geometry: &GeometryRange, slot: u32, inPlace: bool)
+        with _objects = alias objects
+        , _batch = alias batch
+        , _geometry = alias geometry
+        , slot = slot
+        , _inPlace = inPlace
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the geometry of the instance in the pool of its shader
+     * */
+    pub fn getGeometry(self)-> &GeometryRange {
+        self._geometry
+    }
+
+    /**
+     * Write a value in the slot of the instance
+     * @params:
+     *    - offset: the offset of the value in the slot (OBJECT_WORLD...)
+     *    - value: the value to write
+     * */
+    pub fn setObject {U} (mut self, offset: usize, value: U) {
+        self._objects:.setData!{U} (self.slot, offset, value);
+    }
+
+    /**
+     * Modify in place the draws of the instance, as many as it has
+     * @params:
+     *    - owner: the uniq id of the instance
+     *    - commands: the draws of the instance
+     * @returns: true iif the recordings have to be done again to draw the modification (the device has no multi-draw)
+     * */
+    pub fn setDraws(mut self, owner: usize, commands: [VkDrawIndexedIndirectCommand])-> bool {
+        self._batch:.update(owner, commands);
+        !self._inPlace
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+
+        /**
+         * Give back the slot and the geometry of the instance
+         * @warning: through a retire, the recordings in use may still draw the instance
+         * */
+        pub over dispose(mut self) {
+            if self._freed { return; }
+
+            self._freed = true;
+            self._objects:.free(self.slot);
+            self._geometry:.dispose();
+        }
+    }
+}
+
+/**
+ * The draws of the instances of a shader whose materials share their resources (see Material::getBatchKey)
+ * */
+@final
+class MaterialBatch {
+
+    // The descriptor set binding the objects of the shader and the resources of the materials
+    pub let dmut set: &DescriptorSet;
+
+    // The draws of the instances
+    pub let dmut draws: &DrawBatch;
+
+    // The instances
+    pub let dmut nodes: [usize => &VisualInstance3D] = copy [];
+
+    // The number of draws laid out by the recording of the current frame
+    pub let mut count: u32 = 0u32;
+
+    pub self (dmut set: &DescriptorSet, dmut draws: &DrawBatch)
+        with set = alias set
+        , draws = alias draws
+    {}
+}
+
+/**
+ * The visual instances drawn by a shader, the draws of the instances whose materials share their resources being drawn
+ * by one multi-draw indirect call
+ * @info: the instances share the vertex and the index buffer of a geometry pool and the storage buffer of their worlds
+ * */
+@final
+pub class ShaderGroup {
+
+    // The shader
+    let dmut _shader: &RefCount!{&Shader};
+
+    // The descriptor set of the camera
+    let dmut _camera: &DescriptorSet;
+
+    // The geometry of the instances
+    let dmut _geometry: &GeometryPool;
+
+    // The worlds, the cross-fades and the materials of the instances
+    let dmut _objects: &ObjectStorage;
+
+    // The draws of the instances by material key
+    let dmut _batches: [[c8] => &MaterialBatch] = copy [];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - shader: the shader, loaded
+     *    - cfg: the configuration of the shader
+     * */
+    pub self (dmut shader: &RefCount!{&Shader}, cfg: &RasterShaderConfig)
+        with _shader = alias shader
+        , _camera = shader:.get():.allocateDescriptorSet(DescriptorContext::CAMERA)
+        , _geometry = copy GeometryPool(alias shader:.get():.getDevice(), vertexStride(cfg))
+        , _objects = copy ObjectStorage(alias shader:.get():.getDevice(), OBJECT_STRIDE)
+        throws BalderError
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          USAGE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif no instance is drawn by the shader
+     * */
+    pub fn isEmpty(self)-> bool {
+        self._batches.len == 0us
+    }
+
+    /**
+     * Set the camera the shader draws with
+     * */
+    pub fn setCamera(mut self, ubo: &UniformBufferObject) {
+        self._camera:.setUniform(UniformNames::CAMERA, ubo);
+    }
+
+    /**
+     * Place a visual instance in the draws of the shader
+     * @params:
+     *    - material: the material of the instance, attached
+     *    - node: the instance
+     *    - vertices: the vertices of the instance, laid out as the shader reads them
+     *    - indices: the indices of the instance
+     * @returns: the place of the instance, to retire once it is not drawn anymore, after release
+     * */
+    pub fn register(mut self,
+                    dmut material: &Material,
+                    dmut node: &VisualInstance3D,
+                    vertices: [f32],
+                    indices: [u32])-> dmut &SceneDraws
+        throws BalderError
+    {
+        let key = material.getBatchKey();
+        let dmut batch = if let Ok(dmut b) = alias self._batches[key] {
+            alias b
+        } else {
+            let dmut set = self._shader:.get():.allocateDescriptorSet(DescriptorContext::OBJECT);
+            material:.bind(alias set);
+
+            let dmut b = copy MaterialBatch(alias set, copy DrawBatch(alias self._shader:.get():.getDevice()));
+            self._batches[key] = alias b;
+            alias b
+        };
+
+        let dmut geometry = self._geometry:.alloc(vertices, indices);
+        let slot = {
+            self._objects:.alloc()
+        } catch {
+            err => {
+                geometry:.dispose();
+                throw err;
+            }
+        };
+
+        batch.nodes[node.uid] = alias node;
+        copy SceneDraws(alias self._objects,
+                        alias batch.draws,
+                        alias geometry,
+                        slot,
+                        self._shader:.get():.getDevice().isMultiDraw())
+    }
+
+    /**
+     * Remove a visual instance from the draws of the shader
+     * @params:
+     *    - window: the window retiring the resources of the material batch, when it has no instance anymore
+     *    - material: the material of the instance
+     *    - node: the instance
+     * */
+    pub fn release(mut self, dmut window: &Window, material: &Material, node: &VisualInstance3D) {
+        let key = material.getBatchKey();
+        if let Ok(dmut b) = alias self._batches[key] {
+            b.nodes:.remove(node.uid);
+            if b.nodes.len == 0us {
+                window:.retire(alias b.set);
+                window:.retire(alias b.draws);
+                self._batches:.remove(key);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DRAWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Record the draws of the instances, one multi-draw per material key
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the recording
+     * */
+    pub fn draw(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator)
+        throws BalderError
+    {
+        // Laid out before the pool is bound, the buffers bound holding the geometry of every draw laid out
+        for _, dmut b in alias self._batches {
+            b.draws:.begin(frame);
+            for uid, n in b.nodes {
+                b.draws:.add(frame, uid, n.getDraws());
+            }
+
+            b.count = b.draws:.end(frame);
+        }
+
+        let dmut sh = self._shader:.get();
+        sh.select(cmd.getCommandBuffer());
+        self._camera.select(frame, cmd.getCommandBuffer());
+        self._geometry.select(cmd.getCommandBuffer());
+
+        for _, dmut b in alias self._batches {
+            if b.count == 0u32 { continue; }
+
+            b.set:.setBuffer(UniformNames::OBJECTS, self._objects.getBuffer(), frame);
+            b.set.select(frame, cmd.getCommandBuffer());
+            cmd:.drawIndexed(b.draws, 0u32, b.count);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retire the resources of the shader
+     * @params:
+     *    - window: the window retiring the resources, the recordings in use still drawing with them
+     * */
+    pub fn retire(mut self, dmut window: &Window) {
+        for _, dmut b in alias self._batches {
+            window:.retire(alias b.set);
+            window:.retire(alias b.draws);
+        }
+
+        self._batches = copy [];
+        window:.retire(alias self._camera);
+        window:.retire(alias self._geometry);
+        window:.retire(alias self._objects);
+        self._shader:.dispose();
+    }
+}
+
+/**
+ * @returns: the number of floats of a vertex read by the shader 'cfg'
+ * */
+fn vertexStride(cfg: &RasterShaderConfig)-> u32 {
+    let mut size = 0u32;
+    for _, e in cfg.entries {
+        size += e._1;
+    }
+
+    size / 4u32
+}

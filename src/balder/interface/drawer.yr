@@ -12,6 +12,8 @@ use balder::math::vector;
 use std::math;
 use std::algorithm::comparison;
 
+use ::vulkan::core;
+
 
 /**
  * Shape drawer that draws 2D elements on the window
@@ -38,6 +40,24 @@ pub class ShapeDrawer {
     let dmut _quadColorVBO   : &VertexBufferObject = copy VertexBufferObject ();
     let dmut _quadTextureVBO : &VertexBufferObject = copy VertexBufferObject ();
     let dmut _quadIBO        : &IndexBufferObject!{u16} = copy IndexBufferObject!{u16} ();        
+
+    // The quads of the text shapes
+    let dmut _textPool : &GeometryPool;
+
+    // The worlds of the shapes, one slot per shape
+    let dmut _objects : (&ObjectStorage)? = none;
+
+    // The draws of the shapes laid out by the recording of each frame
+    let dmut _batch : &DrawBatch;
+
+    // The descriptor set of the color shapes
+    let dmut _colorSet : (&DescriptorSet)? = none;
+
+    // The descriptor set of each texture shape, by uid
+    let dmut _textureSets : [usize => &DescriptorSet] = copy [];
+
+    // The descriptor set of each page of the atlas sampled by the text shapes
+    let dmut _pageSets : [u32 => &DescriptorSet] = copy [];
 
     // The shape sorted by their drawing order
     let dmut _shapeList : &ShapeList = copy ShapeList ();
@@ -68,6 +88,8 @@ pub class ShapeDrawer {
         , _textureShader = win:.emptyResource!{&RasterShader} ()
         , _textShader = win:.emptyResource!{&RasterShader} ()
         , _atlas = copy GlyphAtlas (win:.getVulkanDevice ())
+        , _textPool = copy GeometryPool (win:.getVulkanDevice (), 4u32)
+        , _batch = copy DrawBatch (win:.getVulkanDevice ())
         , _subpass = alias win:.getVulkanDevice ():.getSwapchain ():.getRenderPass ()
     {
         let dim = win.getDimension ();
@@ -98,6 +120,9 @@ pub class ShapeDrawer {
         self._colorShader = self._window:.loadResource!{&RasterShader} (DefaultShaders::COLOR_2D);                        
         self._textureShader = self._window:.loadResource!{&RasterShader} (DefaultShaders::TEXTURE_2D);
         self._textShader = self._window:.loadResource!{&RasterShader} (DefaultShaders::TEXT_2D);
+
+        self._objects = (copy ObjectStorage (alias device, WORLD_STRIDE))?;
+        self._colorSet = (alias self._colorShader:.get ():.allocateDescriptorSet (DescriptorContext::OBJECT))?;
                 
         self._quadIBO:.update (alias device, copy [1u32, 0u32, 2u32,
                                                    2u32, 0u32, 3u32]);
@@ -218,13 +243,8 @@ pub class ShapeDrawer {
     pub fn registerColorQuad (mut self, position : vec2 = vec2 (), color : vec4 = vec4 (), size : vec2 = vec2 (), level : u32 = 1)-> dmut &ColorShape
         throws BalderError
     {        
-        let dmut s = (alias self._colorShader:.get ())?;
-        if let Ok (dmut sh) = alias s {
-            let dmut result = copy ColorShape (self._uid,
-                                               alias self,
-                                               alias sh,
-                                               self._quadColorVBO,
-                                               self._quadIBO);
+        {
+            let dmut result = copy ColorShape (self._uid, alias self);
             self._uid += 1;
             
             result:.setPosition (position);
@@ -242,8 +262,6 @@ pub class ShapeDrawer {
             
             return alias result;            
         }
-
-        throw copy BalderError ("Invalid shape drawer");
     }
 
     /**
@@ -252,14 +270,8 @@ pub class ShapeDrawer {
     pub fn registerTextureQuad (mut self, dmut texture : &RefCount!{&Texture}, position : vec2 = vec2 (), color : vec4 = vec4 (), size : vec2 = vec2 (), level : u32 = 1)-> dmut &TextureShape
         throws BalderError
     {        
-        let dmut s = (alias self._textureShader:.get ())?;
-        if let Ok (dmut sh) = alias s {
-            let dmut result = copy TextureShape (self._uid,
-                                                 alias self,
-                                                 alias sh,
-                                                 self._quadTextureVBO,
-                                                 self._quadIBO,
-                                                 alias texture);
+        {
+            let dmut result = copy TextureShape (self._uid, alias self, alias texture);
 
             self._uid += 1;
             
@@ -276,8 +288,6 @@ pub class ShapeDrawer {
             self:.redraw ();
             return alias result;            
         }
-
-        throw copy BalderError ("Invalid shape drawer");
     }
 
     /**
@@ -289,14 +299,8 @@ pub class ShapeDrawer {
     pub fn registerText (mut self, dmut chain : &FontChain, text : TextLayout, position : vec2 = vec2 (), color : vec4 = vec4 (), level : u32 = 1)-> dmut &TextShape
         throws BalderError
     {
-        let dmut s = (alias self._textShader:.get ())?;
-        if let Ok (dmut sh) = alias s {
-            let dmut result = copy TextShape (self._uid,
-                                              alias self,
-                                              alias sh,
-                                              alias self._atlas,
-                                              copy VertexBufferObject (),
-                                              copy IndexBufferObject!{u32} ());
+        {
+            let dmut result = copy TextShape (self._uid, alias self, alias self._atlas);
 
             self._uid += 1;
 
@@ -313,8 +317,100 @@ pub class ShapeDrawer {
             self:.redraw ();
             return alias result;
         }
+    }
 
-        throw copy BalderError ("Invalid shape drawer");
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SHAPE DATA          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve the slot of a shape in the storage buffer of the worlds
+     * */
+    pub fn allocObject (mut self)-> u32
+        throws BalderError
+    {
+        if let Ok (dmut objects) = alias self._objects {
+            return objects:.alloc ();
+        }
+
+        throw copy BalderError ("Shape drawer not configured");
+    }
+
+    /**
+     * Give back the slot of a shape
+     * */
+    pub fn freeObject (mut self, slot : u32) {
+        if let Ok (dmut objects) = alias self._objects {
+            objects:.free (slot);
+        }
+    }
+
+    /**
+     * Write the world of a shape in its slot, drawn from the next submission
+     * */
+    pub fn writeObject (mut self, slot : u32, world : World) {
+        if let Ok (dmut objects) = alias self._objects {
+            objects:.setData (slot, 0us, world);
+        }
+    }
+
+    /**
+     * Allocate the descriptor set of a texture shape, binding its texture
+     * */
+    pub fn allocTextureSet (mut self, uid : usize, dmut texture : &Texture)
+        throws BalderError
+    {
+        let dmut set = self._textureShader:.get ():.allocateDescriptorSet (DescriptorContext::OBJECT);
+        set:.setTexture (TextureKind::ALBEDO, texture);
+
+        atomic self {
+            self._textureSets [uid] = alias set;
+        }
+    }
+
+    /**
+     * Dispose the descriptor set of a texture shape
+     * @assume: the recordings in use do not draw the shape anymore (it was retired)
+     * */
+    pub fn freeTextureSet (mut self, uid : usize) {
+        atomic self {
+            if let Ok (dmut set) = alias self._textureSets [uid] {
+                set:.dispose ();
+                self._textureSets:.remove (uid);
+            }
+        }
+    }
+
+    /**
+     * Allocate the descriptor set of a page of the atlas, the first time a text samples it
+     * */
+    pub fn selectPage (mut self, page : u32)
+        throws BalderError
+    {
+        atomic self {
+            if page in self._pageSets { return; }
+
+            let dmut set = self._textShader:.get ():.allocateDescriptorSet (DescriptorContext::OBJECT);
+            set:.setTexture (TextureKind::ALBEDO, self._atlas:.getPage (page));
+            self._pageSets [page] = alias set;
+        }
+    }
+
+    /**
+     * Place the quads of a text in the text pool
+     * @params:
+     *    - points: the corners and the texture coordinates of the quads, four floats per corner
+     *    - indices: the indices of the quads, counting from their first corner
+     * @returns: the range of the quads, to retire once they are not drawn anymore
+     * */
+    pub fn allocText (mut self, points : [f32], indices : [u32])-> dmut &GeometryRange
+        throws BalderError
+    {
+        self._textPool:.alloc (points, indices)
     }
 
     /**
@@ -372,62 +468,98 @@ pub class ShapeDrawer {
         let frame = self._subpass.getCurrentFrame ();
         
         atomic self {
-            // The shapes drawn by this recording, the draw loop must follow the registration exactly
-            let mut drawn : [&Shape] = [];
-            { // Register shapes
-                self._atlas:.advance ();
-                for dmut s in alias self._drawn {
-                    if !s.isDrawn () { continue; }
-                    if let dmut t : &TextShape = alias s {
-                        t:.touchGlyphs ();
-                    }
-
-                    s.registerDraws (alias cmd);
-                    drawn ~= [s];
-                }
-            }
-
-            cmd:.finalizeRegister ();
+            let runs = self:.layoutDraws (frame);
 
             {
-                let mut current = 0;
                 let dmut cSh = alias self._colorShader:.get ();
                 let dmut tSh = alias self._textureShader:.get ();
                 let dmut xSh = alias self._textShader:.get ();
 
                 { // pushing the dimension of the framebuffer, the one of the drawing area once the widgets are laid out at its size
                     cSh.select (cmd.getCommandBuffer ());                    
-                    cSh:.setPush (cmd.getCommandBuffer (), UniformNames::WINDOW, self.getFramebufferDimension ());
+                    cSh:.setPush (cmd.getCommandBuffer (), UniformNames::WINDOW, WindowPush (self.getFramebufferDimension (), self.getFramebufferRatio ()));
                 }
-                
-                for s in drawn {
-                    if (s of TextureShape) {
-                        if current != 1 {
-                            current = 1;
-                            tSh.select (cmd.getCommandBuffer ());
-                        }
-                        
-                        s.draw (frame, alias cmd);
-                    }
-                    else if (s of ColorShape) {
-                        if current != 0 {
-                            current = 0;
-                            cSh.select (cmd.getCommandBuffer ());
-                        }
-                        
-                        s.draw (frame, alias cmd);
-                    }
-                    else if (s of TextShape) {
-                        if current != 2 {
-                            current = 2;
-                            xSh.select (cmd.getCommandBuffer ());
-                        }
 
-                        s.draw (frame, alias cmd);
+                let mut current = ShapeKind::COLOR;
+                for i, r in runs {
+                    if i == 0us || r.kind != current {
+                        current = r.kind;
+                        match r.kind {
+                            ShapeKind::COLOR => {
+                                cSh.select (cmd.getCommandBuffer ());
+                                self._quadColorVBO.select (cmd.getCommandBuffer ());
+                                self._quadIBO.select (cmd.getCommandBuffer ());
+                            }
+                            ShapeKind::TEXTURE => {
+                                tSh.select (cmd.getCommandBuffer ());
+                                self._quadTextureVBO.select (cmd.getCommandBuffer ());
+                                self._quadIBO.select (cmd.getCommandBuffer ());
+                            }
+                            ShapeKind::TEXT => {
+                                xSh.select (cmd.getCommandBuffer ());
+                                self._textPool.select (cmd.getCommandBuffer ());
+                            }
+                        }
                     }
+
+                    self:.selectSet (frame, cmd.getCommandBuffer (), r.kind, r.key);
+                    cmd:.drawIndexed (self._batch, r.first, r.count);
                 }
             } catch {
                 err => log::error #("ShapeDrawer", "Failed to draw...", err);                    
+            }
+        }
+    }
+
+    /**
+     * Lay out the draws of the shapes drawn by the recording of a frame, in their drawing order
+     * @atomic
+     * @returns: the runs of draws sharing their pipeline and their descriptor set, each drawn by one multi-draw
+     * */
+    fn layoutDraws (mut self, frame : u32)-> [DrawRun] {
+        self._atlas:.advance ();
+        self._batch:.begin (frame);
+
+        let mut draws : [ShapeDraw] = [];
+        for dmut s in alias self._drawn {
+            if !s.isDrawn () { continue; }
+            if let dmut t : &TextShape = alias s {
+                t:.touchGlyphs ();
+            }
+
+            for d in s.getDraws () {
+                self._batch:.add (frame, s.uid, copy [d.command]);
+                draws ~= [d];
+            }
+        }
+
+        {
+            self._batch:.end (frame);
+        } catch {
+            err => {
+                log::error #("ShapeDrawer", "Failed to lay out the draws", err);
+                return [];
+            }
+        }
+
+        splitRuns (draws)
+    }
+
+    /**
+     * Bind the descriptor set of a run of draws, and the storage buffer of the worlds in it
+     * @atomic
+     * */
+    fn selectSet (mut self, frame : u32, cmd : VkCommandBuffer, kind : ShapeKind, key : usize) {
+        if let Ok (dmut objects) = alias self._objects {
+            let dmut set = match kind {
+                ShapeKind::COLOR => { alias self._colorSet }
+                ShapeKind::TEXTURE => { alias self._textureSets [key] }
+                ShapeKind::TEXT => { alias self._pageSets [cast!u32 (key)] }
+            };
+
+            if let Ok (dmut s) = alias set {
+                s:.setBuffer (UniformNames::OBJECTS, objects.getBuffer (), frame);
+                s.select (frame, cmd);
             }
         }
     }
@@ -552,6 +684,24 @@ pub class ShapeDrawer {
                 self._window:.retire (alias self._quadColorVBO);
                 self._window:.retire (alias self._quadTextureVBO);
                 self._window:.retire (alias self._quadIBO);                
+                self._window:.retire (alias self._textPool);
+                self._window:.retire (alias self._batch);
+
+                if let Ok (dmut objects) = alias self._objects {
+                    self._window:.retire (alias objects);
+                    self._objects = none;
+                }
+
+                if let Ok (dmut set) = alias self._colorSet {
+                    self._window:.retire (alias set);
+                    self._colorSet = none;
+                }
+
+                for _, dmut set in alias self._pageSets {
+                    self._window:.retire (alias set);
+                }
+
+                self._pageSets = copy [];
             }
         }
     }
@@ -563,4 +713,54 @@ pub class ShapeDrawer {
  * */
 fn layoutDimension (w : u32, h : u32, scale : f32)-> uvec2 {
     makeVec2 (max (1u32, cast!u32 (cast!f32 (w) / scale + 0.5f)), max (1u32, cast!u32 (cast!f32 (h) / scale + 0.5f)))
+}
+
+/**
+ * The push constant of the 2D shaders
+ * */
+@data
+record WindowPush {
+
+    // The dimension of the framebuffer, in CSS pixels
+    pub let dimension : uvec2;
+
+    // The number of framebuffer pixels in a CSS pixel
+    pub let ratio : vec2;
+}
+
+/**
+ * A run of consecutive draws of the shapes sharing their pipeline and their descriptor set
+ * */
+@data
+pub record DrawRun {
+
+    // The pipeline of the draws
+    pub let kind : ShapeKind;
+
+    // The descriptor set of the draws among those of the pipeline
+    pub let key : usize;
+
+    // The index of the first draw
+    pub let first : u32;
+
+    // The number of draws
+    pub let count : u32;
+}
+
+/**
+ * Split draws laid out in their drawing order into runs of consecutive draws sharing their pipeline and their descriptor
+ * set, the order being kept as the shapes overlap and blend
+ * @returns: the runs, in the order of the draws
+ * */
+pub fn splitRuns (draws : [ShapeDraw])-> [DrawRun] {
+    let mut runs : [DrawRun] = [];
+    let mut start = 0us;
+    for i in 1us .. draws.len + 1us {
+        if i == draws.len || draws [i].kind != draws [start].kind || draws [i].key != draws [start].key {
+            runs ~= [DrawRun (draws [start].kind, draws [start].key, cast!u32 (start), cast!u32 (i - start))];
+            start = i;
+        }
+    }
+
+    runs
 }

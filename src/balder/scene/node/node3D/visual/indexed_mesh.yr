@@ -1,17 +1,17 @@
 in indexed_mesh;
 
-use balder::core::{_, driver::_};
-use balder::core::config::shader::_;
-use balder::core::shader::{_, buffers::_};
-use balder::math::{matrix, vector};
+use balder::core::shader::buffers::pool;
 use balder::scene::node::node3D::{camera, visual::_, visual::lod};
+use balder::scene::utils::batch;
 use balder::utils::log;
 
 use std::time::dur;
 
+use ::vulkan::core;
+
 /**
- * Mesh with two buffers, one for vertices, and one for indices
- * @info: the index buffer holds the levels of detail of the mesh one after the other, all drawn from the same vertices;
+ * Mesh of vertices and indices, placed in the geometry pool of the shader of its material
+ * @info: the indices hold the levels of detail of the mesh one after the other, all drawn from the same vertices;
  * a change of level cross-fades the two levels with a dithering, during FADE_DURATION
  */
 pub class IndexedMesh3D over VisualInstance3D {
@@ -51,29 +51,13 @@ pub class IndexedMesh3D over VisualInstance3D {
 
     }
 
-    prot { // Remote data
+    prot { // Draws
 
-        // The buffer containing the indices of the mesh
-        let dmut _ibo : (&IndexBufferObject)? = none;
+        // The place of the mesh in the draws of the scene, its world in the storage buffer of its shader
+        let dmut _draws : (&SceneDraws)? = none;
 
-        // The buffer containing simpler version of the vertices of the mesh
-        let dmut _shadowVBO : (&VertexBufferObject)? = none;
-
-        // The buffer containing the vertices of the mesh
-        let dmut _vbo : (&VertexBufferObject)? = none;
-
-    }
-
-    prot { // shader binding
-
-        // The buffer containing the world transformation of the visual instance
-        let dmut _world : (&UniformBufferObject)? = none;
-
-        // The descriptor set used to attach buffers on deferred pass
-        let dmut _descSet : (&DescriptorSet)? = none;
-
-        // The list of descriptor set used to attach buffers on shadow rendering passes
-        let dmut _shadowDescSet : [&DescriptorSet] = [];
+        // The index of the material in the composition pass, once registered in the scene
+        let mut _matID : (u32)? = none;
     }
 
     /*!
@@ -119,24 +103,20 @@ pub class IndexedMesh3D over VisualInstance3D {
 
         {
             if let Ok (array) = self._array && self._lods.indices.len != 0 {
-                let dmut win = scene:.getWindow ();
-            
-                let dmut ibo = copy IndexBufferObject!{u32} (win:.getVulkanDevice (), self._lods.indices);
-                self._ibo = (alias ibo)?;
+                let matID = scene:.registerMaterialRef (self._material.config);
+                self._matID = matID?;
+                self._material:.attach (scene:.getWindow (), matID);
 
-                let dmut vbo = copy VertexBufferObject ();
-                self._vbo = (alias vbo)?;
+                let vertices = array.compactVertices (self._material, forShadow-> false);
+                let dmut draws = scene:.registerDraws (alias self._material, alias self, vertices, self._lods.indices);
+                draws:.setObject (OBJECT_WORLD, self._transformation);
+                draws:.setObject (OBJECT_FADE, self._fade);
+                draws:.setObject (OBJECT_MATERIAL, matID);
+                self._draws = (alias draws)?;
 
-                // the world transformation, then the progress of the cross-fade, padded to a vec4
-                let dmut world = copy UniformBufferObject (win:.getVulkanDevice (), mat4::size + vec4::size);
-                world:.setData (0, self._transformation, commit-> false);
-                world:.setData (mat4::size, self._fade, commit-> true);
-                self._world = (alias world)?;
-
-                self:.configureVertices (win:.getVulkanDevice (), array, self._material, self._castShadow);
-                self:.configureShader ();
+                log::debug #("IndexedMesh3D", "Registered draws of material ", matID);
             } else {
-                log::warn #("IndexBufferObject", "Empty mesh");
+                log::warn #("IndexedMesh3D", "Empty mesh");
             }
         } catch {
             err => {
@@ -161,94 +141,6 @@ pub class IndexedMesh3D over VisualInstance3D {
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * =====================================          SHADOW          =====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-    
-    /**
-     * Configure the shadow descriptor sets
-     * */
-    pub over onShadowUpdate (mut self, dmut scene : &Scene)
-        throws BalderError
-    {
-        let dmut new = copy [{
-            let dmut shader = scene:.getShadowShaderRef (i):.get ();
-            let dmut set = shader:.allocateDescriptorSet (DescriptorContext::OBJECT);
-            
-            if let Ok (dmut w) = alias self._world {                
-                set:.setUniform (UniformNames::WORLD, w);                
-            }
-                                        
-            alias set
-        } for i in 0 .. scene.getNbShadowShaders ()];
-
-        let dmut win = scene:.getWindow ();
-        for i in 0 .. self._shadowDescSet.len {
-            win:.retire (alias self._shadowDescSet [i]);
-        }
-        self._shadowDescSet = alias new;
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * =========================          UPLOAD DATA TO REMOTE BUFFERS          ==========================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Configure the buffers containing the points of the mesh
-     * */
-    fn configureVertices (mut self, dmut device : &VulkanDevice, array : MeshArray, material : &Material, shadow : bool)
-        throws BalderError
-    {
-        let data = array.compactVertices (material, forShadow-> false);
-        if let Ok (dmut vbo) = alias self._vbo {
-            vbo:.update (alias device, cast!{u32} (array.positions.len), data);
-
-            if (shadow && data.len != array.positions.len * 3u32) {
-                let dmut shadowVBO = copy VertexBufferObject ();
-                let shadowData = array.compactVertices (material, forShadow-> true);
-                shadowVBO:.update (alias device, cast!{u32} (array.positions.len), shadowData);
-
-                self._shadowVBO = (alias shadowVBO)?;
-            }
-        }
-    }
-
-    /**
-     * Configure the shader association to the node
-     * @params:
-     *    - scene: the scene containing the node
-     * */
-    fn configureShader (mut self)
-        throws BalderError
-    {
-        if let Ok (dmut scene) = alias self:.getScene () {
-            let dmut shader = scene:.registerShaderRef (self._material.shaderConfig,                                                         
-                                                         alias self):.get ();
-
-            let matID = scene:.registerMaterialRef (self._material.config);
-                        
-            log::debug #("IndexedMesh3D", "Registered shader to draw ", matID);
-
-            let dmut set = shader:.allocateDescriptorSet (DescriptorContext::OBJECT);
-
-            if let Ok (dmut w) = alias self._world {
-                w:.setData (0, self._transformation, commit-> true);
-                set:.setUniform (UniformNames::WORLD, w);
-            }
-
-            self._material:.attach (scene:.getWindow (), alias set, matID);
-            self._descSet = (alias set)?;
-        }
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
      * ===============================          LEVELS OF DETAIL          =================================
      * ====================================================================================================
      * ====================================================================================================
@@ -259,7 +151,7 @@ pub class IndexedMesh3D over VisualInstance3D {
      * under the threshold; a cross-fade in progress finishes before another level is selected
      * */
     pub over selectLod (mut self, camera : &Camera, height : f32, threshold : f32, delta : Duration)-> bool {
-        if self._lods.levels.len < 2us || !self._world.hasValue { return false; }
+        if self._lods.levels.len < 2us || !self._draws.hasValue { return false; }
 
         if self._fadingLevel.hasValue {
             self._fade += cast!f32 (delta.allMillis) / FADE_DURATION;
@@ -268,11 +160,11 @@ pub class IndexedMesh3D over VisualInstance3D {
                 return false;
             }
 
-            // the fade stays at 1, so the commands still recorded with both levels draw the incoming one only
+            // the incoming level is drawn alone from now on
             self._fade = 1.0f;
             self:.writeFade ();
             self._fadingLevel = none;
-            return true;
+            return self:.writeDraws ();
         }
 
         let (center, radius) = self.boundingSphere ();
@@ -296,16 +188,29 @@ pub class IndexedMesh3D over VisualInstance3D {
 
         self._level = level;
         self._selected = true;
-        true
+        self:.writeDraws ()
     }
 
     /**
-     * Write the progress of the cross-fade in the world uniform buffer
+     * Write the progress of the cross-fade in the slot of the mesh
      * */
     fn writeFade (mut self) {
-        if let Ok (dmut world) = alias self._world {
-            world:.setData (mat4::size, self._fade, commit-> true);
+        if let Ok (dmut draws) = alias self._draws {
+            draws:.setObject (OBJECT_FADE, self._fade);
         }
+    }
+
+    /**
+     * Modify in place the draws of the mesh, after a change of its levels
+     * @returns: true iif the recordings have to be done again to draw them
+     * */
+    fn writeDraws (mut self)-> bool {
+        let commands = self.getDraws ();
+        if let Ok (dmut draws) = alias self._draws {
+            return draws:.setDraws (self.uid, commands);
+        }
+
+        false
     }
 
     /*!
@@ -317,84 +222,42 @@ pub class IndexedMesh3D over VisualInstance3D {
      */
 
     /**
-     * Register the mesh using the command allocator, the two levels of a cross-fade, their first instance telling the
-     * shaders which one is which
-     * @assume: the command allocator is in load mode
-     * @params:
-     *    - cmd: the command allocator in which the mesh has to be registered
-     */
-    pub over register (mut self, dmut cmd : &IndexedDrawCommandAllocator) {
-        if !self._ibo.hasValue { return; }
-
-        if let Ok (fading) = self._fadingLevel {
-            let outgoing = self._lods.levels [fading], incoming = self._lods.levels [self._level];
-            cmd:.registerIndexedObject (outgoing.count, firstIndex-> outgoing.firstIndex, firstInstance-> OUTGOING_DRAW);
-            cmd:.registerIndexedObject (incoming.count, firstIndex-> incoming.firstIndex, firstInstance-> INCOMING_DRAW);
-        } else {
-            let level = self._lods.levels [self._level];
-            cmd:.registerIndexedObject (level.count, firstIndex-> level.firstIndex);
-        }
-    }
-
-    /**
-     * @returns: the number of draws registered by the mesh
+     * @returns: the two draws of the mesh, the incoming then the outgoing level of a cross-fade, or the level drawn alone
+     * then an empty draw; their first instance holds the slot of the mesh above its two low bits, and in them the role
+     * of the draw read by the shaders
      * */
-    fn getNbDraws (self)-> u32 {
-        if !self._ibo.hasValue { 0u32 }
-        else if self._fadingLevel.hasValue { 2u32 }
-        else { 1u32 }
+    pub over getDraws (self)-> [VkDrawIndexedIndirectCommand] {
+        if let Ok (draws) = self._draws {
+            let geometry = draws.getGeometry ();
+            if let Ok (fading) = self._fadingLevel {
+                return copy [self.levelDraw (geometry, draws.slot, self._level, INCOMING_DRAW),
+                             self.levelDraw (geometry, draws.slot, fading, OUTGOING_DRAW)];
+            }
+
+            return copy [self.levelDraw (geometry, draws.slot, self._level, ALONE_DRAW), VkDrawIndexedIndirectCommand ()];
+        }
+
+        []
     }
 
     /**
-     * Draw the mesh using the command allocator
-     * @assume:
-     *    - the command allocator is in draw mode
-     *    - the shader is already selected
+     * @returns: the draw of a level of the mesh
      * @params:
-     *    - shader: the shader used to draw
-     *    - cmd: the command allocator in which the mesh has to be drawn
-     */
-    pub over draw (self,  frame : u32, dmut _ : &Shader, dmut cmd : &IndexedDrawCommandAllocator) {
-        if let Ok (s) = self._descSet {
-            s.select (frame, cmd.getCommandBuffer ());
-        }
-
-        if let Ok (v) = self._vbo {
-            v.select (cmd.getCommandBuffer ());
-        }
-
-        if let Ok (i) = self._ibo {
-            i.select (cmd.getCommandBuffer ());
-        }
-
-        for _ in 0u32 .. self.getNbDraws () {
-            cmd:.drawNextIndexed ();
-        }
-    }
-
-    /**
-     * Draw the shadow of the mesh using the command allocator
-     * @assume:
-     *    - the command allocator is in draw mode
-     *    - the shader is already selected
-     * @params:
-     *    - index: the index of the shadow map being drawn
-     *    - shader: the shader used to draw (basically only a vertex shader)
-     *    - cmd: the command allocator in which the mesh has to be drawn
+     *    - geometry: the geometry of the mesh in the pool of its shader
+     *    - slot: the slot of the mesh in the objects of its shader
+     *    - level: the level to draw
+     *    - role: the role of the draw in a cross-fade
      * */
-    pub over drawShadow (self, frame : u32, index : u32, dmut _ : &Shader, dmut cmd : &IndexedDrawCommandAllocator) {        
-        self._shadowDescSet [index].select (frame, cmd.getCommandBuffer ());
-        if let Ok (v) = self._shadowVBO {
-            v.select (cmd.getCommandBuffer ());
-        }
+    fn levelDraw (self, geometry : &GeometryRange, slot : u32, level : usize, role : u32)-> VkDrawIndexedIndirectCommand {
+        let lod = self._lods.levels [level];
 
-        if let Ok (i) = self._ibo {
-            i.select (cmd.getCommandBuffer ());
-        }
-
-        for _ in 0u32 .. self.getNbDraws () {
-            cmd:.drawNextIndexed ();
-        }
+        let mut cmd = VkDrawIndexedIndirectCommand ();
+        cmd.indexCount = lod.count;
+        cmd.instanceCount = 1u32;
+        cmd.firstIndex = geometry.firstIndex + lod.firstIndex;
+        cmd.vertexOffset = cast!i32 (geometry.vertexOffset);
+        cmd.firstInstance = (slot << 2u32) | role;
+        cmd
     }
 
     /*!
@@ -442,9 +305,9 @@ pub class IndexedMesh3D over VisualInstance3D {
     over updateTransformation (mut self) {
         self._super_:.updateTransformation ();
         
-        if let Ok (dmut world) = alias self._world {
-            world:.setData (0, self._transformation, commit-> true);
-        }        
+        if let Ok (dmut draws) = alias self._draws {
+            draws:.setObject (OBJECT_WORLD, self._transformation);
+        }
     }
 
     /*!
@@ -456,43 +319,21 @@ pub class IndexedMesh3D over VisualInstance3D {
      */
 
     /**
-     * Destroy all allocated buffers on device
+     * Remove the mesh from the draws of the scene, its geometry and its slot being retired
      * */
     fn destroyBuffers (mut self, dmut scene : &Scene) {
-        let dmut win = scene:.getWindow ();
-        if let Ok (dmut ibo) = alias self._ibo {
-            win:.retire (alias ibo);
-            self._ibo = none;
+        if let Ok (dmut draws) = alias self._draws {
+            scene:.releaseDraws (self._material, self);
+            scene:.getWindow ():.retire (alias draws);
+            self._draws = none;
         }
 
-        if let Ok (dmut vbo) = alias self._vbo {
-            win:.retire (alias vbo);
-            self._vbo = none;
+        if let Ok (matID) = self._matID {
+            scene:.freeMaterialRef (matID);
+            self._matID = none;
         }
 
-        if let Ok (dmut vbo) = alias self._shadowVBO {
-            win:.retire (alias vbo);
-            self._shadowVBO = none;
-        }
-
-        if let Ok (dmut world) = alias self._world {
-            win:.retire (alias world);
-            self._world = none;
-        }
-
-        if let Ok (dmut s) = alias self._descSet {
-            win:.retire (alias s);
-            self._descSet = none;
-            scene:.freeShaderRef (self._material.shaderConfig, alias self);
-            scene:.freeMaterialRef (self._material.matID);
-        }
-                
-        for i in 0 .. self._shadowDescSet.len {
-            win:.retire (alias self._shadowDescSet [i]);            
-        }
-        self._shadowDescSet = [];
-        
-        self._material:.detach ();        
+        self._material:.detach ();
     }
 
 }
@@ -503,11 +344,16 @@ pub class IndexedMesh3D over VisualInstance3D {
 def FADE_DURATION = 250.0f;
 
 /**
- * The first instance of the draw of the outgoing level of a cross-fade, read by the shaders (0 draws a level alone)
+ * The role of the draw of a level drawn alone, in the low bits of its first instance, read by the shaders
+ * */
+def ALONE_DRAW = 0u32;
+
+/**
+ * The role of the draw of the outgoing level of a cross-fade
  * */
 def OUTGOING_DRAW = 1u32;
 
 /**
- * The first instance of the draw of the incoming level of a cross-fade
+ * The role of the draw of the incoming level of a cross-fade
  * */
 def INCOMING_DRAW = 2u32;

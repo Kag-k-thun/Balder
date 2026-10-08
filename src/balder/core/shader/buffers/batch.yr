@@ -1,0 +1,325 @@
+in batch;
+
+use balder::core::{dispose, error, memory::_};
+use balder::core::driver::device;
+use balder::utils::log;
+
+use std::algorithm::comparison;
+
+use ::etc::c::memory;
+
+use ::vulkan::core;
+
+/**
+ * The indexed draws laid out by the recordings of a subpass, drawn by draw indirect calls over runs of them
+ * @info: each frame in flight has its own draws, laid out by its recording, and its own buffer of indirect commands,
+ * written at its submission with the commands modified since; the commands of an object are modified in place in the
+ * frames whose recording laid it out, so a frame never draws commands laid out by the recording of another, nor
+ * commands placing geometry the buffers it bound do not hold
+ * */
+@final
+pub class DrawBatch {
+
+    pub let uid: usize;
+
+    // The device the buffers are allocated on
+    let dmut _device: &VulkanDevice;
+
+    // The commands laid out by the last recording of each frame
+    let dmut _commands: [[VkDrawIndexedIndirectCommand]] = [];
+
+    // The number of commands laid out by the last recording of each frame
+    let mut _counts: [mut u32] = [];
+
+    // The commands of each object laid out by the last recording of each frame: its first command and their number
+    let dmut _owners: [[usize => (u32, u32)]] = [];
+
+    // The buffer of indirect commands read by each frame
+    let dmut _copies: [(&Buffer)?] = [];
+
+    // The commands of each frame to write in its buffer at its submission
+    let mut _dirty: FrameRanges;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create an empty batch, written at the submission of each frame until it is disposed
+     * @params:
+     *    - device: the device the buffers are allocated on
+     * */
+    pub self (dmut device: &VulkanDevice)
+        with uid = device:.getMemoryAllocator():.nextBufferId()
+        , _device = alias device
+        , _dirty = FrameRanges(device.getNbFrames())
+    {
+        let nbFrames = device.getNbFrames();
+        self._counts = copy [0u32; nbFrames];
+
+        let dmut commands: [[VkDrawIndexedIndirectCommand]] = [];
+        let dmut owners: [[usize => (u32, u32)]]            = [];
+        let dmut copies: [(&Buffer)?]                       = [];
+        for _ in 0u32 .. nbFrames {
+            let dmut owner: [usize => (u32, u32)] = copy [];
+            commands ~= [[]];
+            owners ~= [alias owner];
+            copies ~= [none];
+        }
+
+        self._commands = alias commands;
+        self._owners = alias owners;
+        self._copies = alias copies;
+
+        device:.getMemoryAllocator():.registerInFlight(self.uid, &self:.flush);
+    }
+
+    // Disposing from the collector races with the GPU and with the device teardown, the object has to be retired
+#if DEBUG
+    __dtor(mut self) {
+        if self._commands.len != 0us {
+            log::warn #("Dispose", self.__typeinfo__.name, "collected without being retired");
+        }
+    }
+#end
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          LAYOUT          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start the layout of the draws of a frame, those of its previous recording being dropped
+     * @assume: the previous submission of the frame was awaited
+     * */
+    pub fn begin(mut self, frame: u32) {
+        atomic self {
+            let dmut owner: [usize => (u32, u32)] = copy [];
+            self._counts[frame] = 0u32;
+            self._owners[frame] = alias owner;
+        }
+    }
+
+    /**
+     * Lay out the commands of an object after the ones laid out since begin
+     * @params:
+     *    - frame: the frame being recorded
+     *    - owner: the uniq id of the object, to modify its commands in place, see update
+     *    - commands: the commands of the object
+     * @returns: the index of its first command
+     * */
+    pub fn add(mut self, frame: u32, owner: usize, commands: [VkDrawIndexedIndirectCommand])-> u32 {
+        atomic self {
+            let first = self._counts[frame];
+            let end   = first + cast!u32(commands.len);
+            if cast!usize(end) > self._commands[frame].len {
+                let extra = max(cast!usize(end) - self._commands[frame].len, max(self._commands[frame].len, 16us));
+                self._commands[frame] = self._commands[frame] ~ copy [VkDrawIndexedIndirectCommand(); extra];
+            }
+
+            for i, c in commands {
+                self:.write(frame, first + cast!u32(i), c);
+            }
+
+            self._counts[frame] = end;
+            self._owners[frame][owner] = (first, cast!u32(commands.len));
+            return first;
+        }
+    }
+
+    /**
+     * End the layout of the draws of a frame, its buffer being enlarged to hold them
+     * @returns: the number of commands laid out
+     * */
+    pub fn end(mut self, frame: u32)-> u32
+        throws BalderError
+    {
+        atomic self {
+            let count = self._counts[frame];
+            let size  = cast!usize(count) * VkDrawIndexedIndirectCommand::size;
+
+            let capacity = if let Ok(c) = self._copies[frame] { c.getSize() } else { 0us };
+            if size > capacity {
+                let dmut larger = self._device
+                    :.getMemoryAllocator()
+                    :.allocBuffer(max(size * 2us, MIN_COMMANDS * VkDrawIndexedIndirectCommand::size),
+                                  cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT),
+                                  cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                           | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+
+                // only the replaced recording of the frame, whose submission was awaited, read the buffer
+                if let Ok(dmut old) = alias self._copies[frame] {
+                    self._device:.retireAfterFrame(&old:.dispose);
+                }
+
+                self._copies[frame] = (alias larger)?;
+                self._dirty:.markFrame(frame, 0us, size);
+            }
+
+            return count;
+        }
+    }
+
+    /**
+     * Modify in place the commands of an object, in the frames whose last recording laid it out, a frame being requested
+     * @params:
+     *    - owner: the uniq id the object was laid out with
+     *    - commands: the commands of the object, as many as laid out
+     * */
+    pub fn update(mut self, owner: usize, commands: [VkDrawIndexedIndirectCommand]) {
+        atomic self {
+            for f in 0u32 .. cast!u32(self._owners.len) {
+                if let Ok((first, nb)) = self._owners[f][owner] {
+                    for i in 0u32 .. min(nb, cast!u32(commands.len)) {
+                        self:.write(f, first + i, commands[i]);
+                    }
+                }
+            }
+        }
+
+        self._device:.requestFrame();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the command 'index' laid out by the last recording of the frame 'frame'
+     * */
+    pub fn getCommand(self, frame: u32, index: u32)-> VkDrawIndexedIndirectCommand {
+        atomic self {
+            self._commands[frame][index]
+        }
+    }
+
+    /**
+     * @returns: the number of commands laid out by the last recording of the frame 'frame'
+     * */
+    pub fn getCount(self, frame: u32)-> u32 {
+        atomic self {
+            self._counts[frame]
+        }
+    }
+
+    /**
+     * @returns: the buffer of indirect commands read by the frame 'frame', null if nothing was laid out
+     * */
+    pub fn getVulkanBuffer(self, frame: u32)-> VkBuffer {
+        atomic self {
+            if let Ok(c) = self._copies[frame] {
+                return c.getVulkanBuffer();
+            }
+
+            return null;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FLUSH          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write the commands modified since the last write of the buffer of a frame
+     * @assume: the previous submission of the frame was awaited
+     * */
+    pub fn flush(mut self, frame: u32) {
+        atomic self {
+            if frame >= cast!u32(self._copies.len) { return; }
+
+            if let Ok((start, end)) = self._dirty:.take(frame) {
+                if let Ok(dmut target) = alias self._copies[frame] {
+                    let last = min(end, min(target.getSize(), self._commands[frame].len * VkDrawIndexedIndirectCommand::size));
+                    if last <= start { return; }
+
+                    // The memory of the buffer is shared with other buffers, mapped and unmapped under the lock of the device
+                    atomic self._device {
+                        let dmut ptr = target:.map();
+                        if ptr != null {
+                            memcpy(ptr + start, cast!{*void} (self._commands[frame].ptr) + start, last - start);
+                            target:.unmap();
+                        } else {
+                            log::error #("DrawBatch", "failed to map the commands of the frame", frame);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write a command of a frame, marked for the next write of its buffer if it changed
+     * @atomic
+     * */
+    fn write(mut self, frame: u32, index: u32, command: VkDrawIndexedIndirectCommand) {
+        let old = self._commands[frame][index];
+        if old.indexCount == command.indexCount
+            && old.instanceCount == command.instanceCount
+            && old.firstIndex == command.firstIndex
+            && old.vertexOffset == command.vertexOffset
+            && old.firstInstance == command.firstInstance {
+            return;
+        }
+
+        self._commands[frame][index] = command;
+
+        let start = cast!usize(index) * VkDrawIndexedIndirectCommand::size;
+        self._dirty:.markFrame(frame, start, start + VkDrawIndexedIndirectCommand::size);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            atomic self {
+                if self._commands.len == 0us { return; }
+
+                for dmut c in alias self._copies {
+                    if let Ok(dmut b) = alias c {
+                        b:.dispose();
+                    }
+                }
+
+                self._copies = [];
+                self._commands = [];
+                self._owners = [];
+            }
+
+            self._device:.getMemoryAllocator():.forgetInFlight(self.uid);
+        }
+    }
+}
+
+/**
+ * The smallest number of commands the buffer of a frame holds
+ * */
+def MIN_COMMANDS = 64us;

@@ -1,78 +1,26 @@
 in indexed;
 
-use balder::core::dispose;
 use balder::core::driver::subpass;
+use balder::core::shader::buffers::batch;
+
+use std::algorithm::comparison;
 
 use ::vulkan::core;
 
-enum CommandAllocatorPhase
-| LOADING = 0u32
-| DRAWING = 1u32;
-
 /**
- * The indexed command allocator registers the indexed objects a recording draws, then draws them in the same order
+ * The indexed command allocator draws the runs of commands a recording laid out in draw batches
  */
 @final
 pub class IndexedDrawCommandAllocator over CommandAllocator {
 
-    // The phase of the command allocator
-    let mut _phase: CommandAllocatorPhase = CommandAllocatorPhase::LOADING;
-
-    // The draws of the registered objects, in the order of their registration
-    let mut _indexedCmds: [mut VkDrawIndexedIndirectCommand] = [];
-
-    // The id of the current index being drawn
-    let mut _currentIndexed: u32 = 0;
-
     /**
-     * Create an empty indexed command allocator
+     * Create an indexed command allocator drawing in the current recording of a subpass
      * @params:
-     *    - device: the device used to allocate and draw
+     *    - pass: the subpass being recorded
      */
     pub self (dmut pass: &DrawSubpass)
         with super(alias pass)
     {}
-
-    /**
-     * ======================================================================================================
-     * ======================================================================================================
-     * ==========================================   LOADING PHASE   =========================================
-     * ======================================================================================================
-     * ======================================================================================================
-     */
-
-    /**
-     * Register an indexed mesh that will be drawn during the draw phase
-     * @params:
-     *    - nbPoints: the number of points to draw
-     *    - nbInstance: the number of instance to draw
-     *    - firstIndex: the offset of the first index in the ibo buffer
-     *    - vertexOffset: the offset of the first vertex in the vbo buffer
-     *    - firstInstance: the offset of the first instance in the instance buffer
-     */
-    pub fn registerIndexedObject(mut self,
-                                 nbPoints: u32,
-                                 nbInstance: u32 = 1u32,
-                                 firstIndex: u32 = 0u32,
-                                 vertexOffset: i32 = 0,
-                                 firstInstance: u32 = 0u32) {
-        let mut cmd = VkDrawIndexedIndirectCommand();
-        cmd.indexCount = nbPoints;
-        cmd.instanceCount = nbInstance;
-        cmd.firstIndex = firstIndex;
-        cmd.vertexOffset = vertexOffset;
-        cmd.firstInstance = firstInstance;
-
-        self._indexedCmds ~= [cmd];
-    }
-
-    /**
-     * Finalize the loading phase of the command buffer allocator. So it enter the drawing phase.
-     */
-    pub fn finalizeRegister(mut self) {
-        self._phase = CommandAllocatorPhase::DRAWING;
-        self._currentIndexed = 0;
-    }
 
     /**
      * ======================================================================================================
@@ -83,39 +31,48 @@ pub class IndexedDrawCommandAllocator over CommandAllocator {
      */
 
     /**
-     * Draw the next registered object
-     * @info: drawn directly, a buffer of indirect commands would have to be allocated and uploaded at each recording
-     * @assume: associated buffers, shaders and descriptor set are correctly bound
+     * Draw a run of the commands laid out in a batch by the recording of the current frame, with one draw indirect call
+     * when the device has multi-draw (more when the run is longer than the device allows), one draw per command
+     * otherwise
+     * @info: without multi-draw the commands are read at the recording, a command modified in place is drawn once the
+     * recording is done again
+     * @assume: the buffers, the shader and the descriptor sets of the run are bound, the batch layout of the frame ended
+     * @params:
+     *    - batch: the batch holding the commands
+     *    - first: the index of the first command of the run
+     *    - count: the number of commands of the run
      */
-    pub fn drawNextIndexed(mut self) {
-        if self._currentIndexed < cast!u32(self._indexedCmds.len) {
-            let cmd = self._indexedCmds[self._currentIndexed];
-            vkCmdDrawIndexed(commandBuffer-> self.getCommandBuffer(),
-                             indexCount-> cmd.indexCount,
-                             instanceCount-> cmd.instanceCount,
-                             firstIndex-> cmd.firstIndex,
-                             vertexOffset-> cmd.vertexOffset,
-                             firstInstance-> cmd.firstInstance);
+    pub fn drawIndexed(mut self, batch: &DrawBatch, first: u32, count: u32) {
+        let frame = self._pass.getCurrentFrame();
+        let cmd   = self.getCommandBuffer();
 
-            self._currentIndexed += 1;
-        }
-    }
+        if self._device.isMultiDraw() {
+            let buffer = batch.getVulkanBuffer(frame);
+            if buffer == null { return; }
 
-    /**
-     * ======================================================================================================
-     * ======================================================================================================
-     * ============================================   DISPOSING   ===========================================
-     * ======================================================================================================
-     * ======================================================================================================
-     */
+            let maxCount = self._device.getMaxDrawCount();
+            let mut done = 0u32;
+            while done < count {
+                let nb = min(count - done, maxCount);
+                vkCmdDrawIndexedIndirect(cmd,
+                                         buffer,
+                                         cast!u64(first + done) * cast!u64(VkDrawIndexedIndirectCommand::size),
+                                         nb,
+                                         cast!u32(VkDrawIndexedIndirectCommand::size));
+                done += nb;
+            }
+        } else {
+            for i in first .. first + count {
+                let c = batch.getCommand(frame, i);
+                if c.indexCount == 0u32 || c.instanceCount == 0u32 { continue; }
 
-    impl Disposable {
-        pub over dispose(mut self) {
-            self._indexedCmds = [];
-            self._currentIndexed = 0;
-            self._phase = CommandAllocatorPhase::LOADING;
-
-            self.__super__:.dispose();
+                vkCmdDrawIndexed(commandBuffer-> cmd,
+                                 indexCount-> c.indexCount,
+                                 instanceCount-> c.instanceCount,
+                                 firstIndex-> c.firstIndex,
+                                 vertexOffset-> c.vertexOffset,
+                                 firstInstance-> c.firstInstance);
+            }
         }
     }
 }
