@@ -51,6 +51,19 @@ pub class VulkanSubpass {
     }
 
     let dmut _clocks : [&VulkanClock] = [];    
+
+    prot { // deferred disposal
+
+        // The disposals waiting for every frame slot to record the subpass again, stamped with the redraw generation of
+        // the subpass
+        let dmut _retired : &RetireQueue = copy RetireQueue ();
+
+        // The redraw generations the subpass was recorded with in the frame slots
+        let dmut _generations : &SlotGenerations = copy SlotGenerations (0u32);
+
+        // True when a retire is waiting for the subpass to be recorded again
+        let mut _redrawRequested : bool = false;
+    }
     
     /*!
      * ====================================================================================================
@@ -224,6 +237,7 @@ pub class VulkanSubpass {
         let nbFrames = self._device:.getSwapchain ().nbFrames;
 
         self._allocators = copy [[] ; nbFrames];
+        self._generations = copy SlotGenerations (nbFrames);
         self._commandBuffers = copy [null ; nbFrames];
         self._nextCommandBuffer = copy [null ; nbFrames];
 
@@ -295,6 +309,9 @@ pub class VulkanSubpass {
             }
             self._allocators [frame] = [];
 
+            // Read before recording, so an object retired while recording is never counted as unused by it
+            self._generations:.recorded (frame, self._retired.getStamp ());
+
             self:.startRecording ();
             self._onRedraw:.emit ();
             self:.stopRecording ();
@@ -307,6 +324,72 @@ pub class VulkanSubpass {
         }
     }
     
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          DEFERRED DISPOSAL          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Dispose an object that only the recordings of the subpass reference, once they no longer can: every frame slot
+     * recorded the subpass again after the retire, and the submission of its previous recording was awaited
+     * @info: requests the redraw of the subpass itself (see takeRedrawRequest), the other subpasses keeping their
+     * recording
+     * @warning: an object the recordings of other subpasses may reference is retired by the device (VulkanDevice::retire)
+     * @params:
+     *    - clean: the disposal of the object
+     * */
+    pub fn retire (mut self, clean : dg ()-> void) {
+        atomic self._retired {
+            self._retired:.push (clean);
+            self._redrawRequested = true;
+        }
+
+        self._device:.requestFrame ();
+    }
+
+    /**
+     * @returns: true if a retire is waiting for the subpass to be recorded again in every frame slot, the request being
+     * cleared and a new redraw generation started, the objects retired before it not referenced by the recordings made
+     * in it
+     * */
+    pub fn takeRedrawRequest (mut self)-> bool {
+        atomic self._retired {
+            let requested = self._redrawRequested;
+            if requested {
+                self._redrawRequested = false;
+                self._retired:.advance ();
+            }
+
+            requested
+        }
+    }
+
+    /**
+     * Dispose the retired objects the recordings of the subpass no longer reference, the previous submission of the frame
+     * slot 'frame' being awaited
+     * @returns: the number of objects disposed
+     * */
+    pub fn collectRetired (mut self, frame : u32)-> usize {
+        let bound = atomic self {
+            self._generations:.awaited (frame)
+        };
+
+        self._retired:.collect (bound)
+    }
+
+    /**
+     * Dispose every retired object
+     * @warning: only safe once nothing can use the retired objects anymore (the device is idle and the subpass recorded
+     * nothing)
+     * @returns: the number of objects disposed
+     * */
+    pub fn drainRetired (mut self)-> usize {
+        self._retired:.drain ()
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -377,6 +460,7 @@ pub class VulkanSubpass {
             
             self:.resetCommands ();
             self:.resetDrawSignal ();
+            self:.drainRetired ();
             
             self._allocators = [];
             self._finishSemaphore = [];
