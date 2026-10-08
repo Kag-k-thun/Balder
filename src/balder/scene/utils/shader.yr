@@ -4,11 +4,11 @@ use balder::utils;
 use balder::core::{_, driver::_};
 use balder::core::application::window;
 use balder::core::shader::{_, buffers::_};
-use balder::math::{bounds, matrix};
+use balder::math::{bounds, matrix, vector};
 use balder::scene::node::node3D::camera;
 use balder::scene::node::node3D::visual;
-use balder::scene::node::node3D::visual::material;
-use balder::scene::utils::{batch, light, material, visibility};
+use balder::scene::node::node3D::visual::{material, mesh};
+use balder::scene::utils::{batch, draw_stats, light, material, visibility};
 
 use std::time::dur;
 
@@ -41,6 +41,16 @@ pub record ShaderNodeScene {
 
         let mut _cam : (&UniformBufferObject)? = none;
         
+    }
+
+    prv { // Sorting
+
+        // The eye the draws were last sorted from
+        let mut _sortedEye : vec3 = vec3 ();
+
+        // The culling of the visibility the draws were last sorted after
+        let mut _sortedUpdate : usize = 0us;
+
     }
     
     prv { // lights
@@ -137,6 +147,22 @@ pub record ShaderNodeScene {
     }
 
     /**
+     * @returns: the counters of the draws of the drawable nodes, at the last build of their commands
+     * */
+    @field
+    pub fn drawStats (self)-> DrawStats {
+        let mut stats = DrawStats ();
+        for _, g in self._groups {
+            let s = g.drawStats ();
+            stats.multiDraws += s.multiDraws;
+            stats.commands += s.commands;
+            stats.instances += s.instances;
+        }
+
+        stats
+    }
+
+    /**
      * @returns: the material array of the shader associations
      * */
     @field
@@ -213,11 +239,10 @@ pub record ShaderNodeScene {
      * @params:
      *    - material: the material of the node, attached
      *    - node: the node
-     *    - vertices: the vertices of the node, laid out as the shader of the material reads them
-     *    - indices: the indices of the node
+     *    - mesh: the geometry of the node, placed once in the pool of the shader for the nodes drawing it
      * @returns: the place of the node in the draws, to retire after release
      * */
-    pub fn register (mut self, dmut material : &Material, dmut node : &VisualInstance3D, vertices : [f32], indices : [u32])-> dmut &SceneDraws
+    pub fn register (mut self, dmut material : &Material, dmut node : &VisualInstance3D, mesh : &MeshGeometry)-> dmut &SceneDraws
         throws BalderError
     {
         let shCfg = material.shaderConfig;
@@ -242,7 +267,7 @@ pub record ShaderNodeScene {
         }
 
         if let Ok (dmut g) = alias self._groups [shCfg.name] {
-            let dmut draws = g:.register (alias material, alias node, vertices, indices);
+            let dmut draws = g:.register (alias material, alias node, mesh);
             self._nodes [node.uid] = alias node;
             self._visibility:.insert (alias node);
             return alias draws;
@@ -309,6 +334,23 @@ pub record ShaderNodeScene {
         self._visibility:.cull (view, threshold)
     }
 
+    /**
+     * Sort the draws of the drawable nodes seen front to back, from their distance to the eye, when the eye moved or the
+     * nodes seen changed since the last sort, so the closest occluders write their depth first
+     * @params:
+     *    - eye: the position of the camera
+     * */
+    pub fn sort (mut self, eye : vec3) {
+        let update = self._visibility.updates;
+        if eye == self._sortedEye && update == self._sortedUpdate { return; }
+
+        self._sortedEye = eye;
+        self._sortedUpdate = update;
+        for _, dmut g in alias self._groups {
+            g:.sort (eye);
+        }
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -345,9 +387,24 @@ pub record ShaderNodeScene {
      */
 
     /**
-     * Record the draws of the nodes, one multi-draw per shader and material key
+     * Record the draws of the nodes, one multi-draw per shader and material key: the depth of every node first, written
+     * by the depth prepass of the shaders having one, then the nodes, each pixel being shaded by its closest fragment
      * */
     pub fn draw (mut self, frame : u32, dmut cmd : &IndexedDrawCommandAllocator) {
+        for _, dmut g in alias self._groups {
+            g:.layout (frame);
+        }
+
+        for name, dmut g in alias self._groups {
+            {
+                g:.drawDepth (frame, alias cmd);
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to draw the depth of the nodes of the shader", name, err);
+                }
+            }
+        }
+
         for name, dmut g in alias self._groups {
             {
                 g:.draw (frame, alias cmd);

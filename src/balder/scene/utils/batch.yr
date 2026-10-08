@@ -4,8 +4,11 @@ use balder::core::{_, application::_};
 use balder::core::config::shader::_;
 use balder::core::driver::cmd_alloc;
 use balder::core::shader::{_, buffers::_};
+use balder::math::vector;
 use balder::scene::node::node3D::visual;
-use balder::scene::node::node3D::visual::material;
+use balder::scene::node::node3D::visual::{material, mesh};
+use balder::scene::utils::draw_stats;
+use balder::utils::log;
 
 use ::vulkan::core;
 
@@ -31,6 +34,64 @@ pub def OBJECT_FADE = 64us;
 pub def OBJECT_MATERIAL = 68us;
 
 /**
+ * The geometry of a mesh placed in the pool of a shader, shared by the instances drawing it
+ * */
+@final
+class SharedGeometry {
+
+    // The range of the geometry in the pool
+    pub let dmut range: &GeometryRange;
+
+    // The number of instances drawing the geometry, the range being given back to the pool with the last one
+    let mut _users: usize = 1us;
+
+    /**
+     * @params:
+     *    - range: the range placed for a first instance
+     * */
+    pub self (dmut range: &GeometryRange)
+        with range = alias range
+    {}
+
+    /**
+     * @returns: true iif the range was given back to the pool
+     * */
+    pub fn isFreed(self)-> bool {
+        atomic self {
+            self._users == 0us
+        }
+    }
+
+    /**
+     * Count one more instance drawing the geometry
+     * @returns: false when the range was already given back to the pool, the instance having to place the geometry again
+     * */
+    pub fn acquire(mut self)-> bool {
+        atomic self {
+            if self._users == 0us { return false; }
+
+            self._users += 1us;
+            return true;
+        }
+    }
+
+    /**
+     * Count one instance less drawing the geometry, the range being given back to the pool with the last one
+     * @warning: through a retire, the recordings in use may still draw the geometry
+     * */
+    pub fn release(mut self) {
+        atomic self {
+            if self._users == 0us { return; }
+
+            self._users -= 1us;
+            if self._users == 0us {
+                self.range:.dispose();
+            }
+        }
+    }
+}
+
+/**
  * The place of a visual instance in the draws of the scene: its geometry in the pool of its shader, its slot in the
  * objects of its shader, and the batch of its material its draws are laid out in
  * */
@@ -41,10 +102,10 @@ pub class SceneDraws {
     let dmut _objects: &ObjectStorage;
 
     // The batch the draws are laid out in
-    let dmut _batch: &DrawBatch;
+    let dmut _batch: &InstanceBatch;
 
-    // The geometry of the instance
-    let dmut _geometry: &GeometryRange;
+    // The geometry of the instance, shared with the instances of the same mesh
+    let dmut _geometry: &SharedGeometry;
 
     // The slot of the instance in the objects of the shader
     pub let slot: u32;
@@ -55,7 +116,7 @@ pub class SceneDraws {
     // True once the slot and the geometry were given back
     let mut _freed: bool = false;
 
-    pub self (dmut objects: &ObjectStorage, dmut batch: &DrawBatch, dmut geometry: &GeometryRange, slot: u32, inPlace: bool)
+    pub self (dmut objects: &ObjectStorage, dmut batch: &InstanceBatch, dmut geometry: &SharedGeometry, slot: u32, inPlace: bool)
         with _objects = alias objects
         , _batch = alias batch
         , _geometry = alias geometry
@@ -75,7 +136,7 @@ pub class SceneDraws {
      * @returns: the geometry of the instance in the pool of its shader
      * */
     pub fn getGeometry(self)-> &GeometryRange {
-        self._geometry
+        self._geometry.range
     }
 
     /**
@@ -89,14 +150,14 @@ pub class SceneDraws {
     }
 
     /**
-     * Modify in place the draws of the instance, as many as it has
+     * Modify the draws of the instance, as many as it has
      * @params:
      *    - owner: the uniq id of the instance
-     *    - commands: the draws of the instance
+     *    - draws: the draws of the instance
      * @returns: true iif the recordings have to be done again to draw the modification (the device has no multi-draw)
      * */
-    pub fn setDraws(mut self, owner: usize, commands: [VkDrawIndexedIndirectCommand])-> bool {
-        self._batch:.update(owner, commands);
+    pub fn setDraws(mut self, owner: usize, draws: [InstanceDraw])-> bool {
+        self._batch:.update(owner, draws);
         !self._inPlace
     }
 
@@ -111,7 +172,7 @@ pub class SceneDraws {
     impl Disposable {
 
         /**
-         * Give back the slot and the geometry of the instance
+         * Give back the slot of the instance, and its geometry when no other instance draws it
          * @warning: through a retire, the recordings in use may still draw the instance
          * */
         pub over dispose(mut self) {
@@ -119,7 +180,7 @@ pub class SceneDraws {
 
             self._freed = true;
             self._objects:.free(self.slot);
-            self._geometry:.dispose();
+            self._geometry:.release();
         }
     }
 }
@@ -134,7 +195,7 @@ class MaterialBatch {
     pub let dmut set: &DescriptorSet;
 
     // The draws of the instances
-    pub let dmut draws: &DrawBatch;
+    pub let dmut draws: &InstanceBatch;
 
     // The instances
     pub let dmut nodes: [usize => &VisualInstance3D] = copy [];
@@ -142,7 +203,7 @@ class MaterialBatch {
     // The number of draws laid out by the recording of the current frame
     pub let mut count: u32 = 0u32;
 
-    pub self (dmut set: &DescriptorSet, dmut draws: &DrawBatch)
+    pub self (dmut set: &DescriptorSet, dmut draws: &InstanceBatch)
         with set = alias set
         , draws = alias draws
     {}
@@ -150,7 +211,7 @@ class MaterialBatch {
 
 /**
  * The visual instances drawn by a shader, the draws of the instances whose materials share their resources being drawn
- * by one multi-draw indirect call
+ * by one multi-draw indirect call, the draws of the same range of their geometry by one instanced command
  * @info: the instances share the vertex and the index buffer of a geometry pool and the storage buffer of their worlds
  * */
 @final
@@ -164,6 +225,9 @@ pub class ShaderGroup {
 
     // The geometry of the instances
     let dmut _geometry: &GeometryPool;
+
+    // The geometry of the meshes placed in the pool, by uniq id of their mesh
+    let dmut _meshes: [usize => &SharedGeometry] = copy [];
 
     // The worlds, the cross-fades and the materials of the instances
     let dmut _objects: &ObjectStorage;
@@ -219,15 +283,13 @@ pub class ShaderGroup {
      * @params:
      *    - material: the material of the instance, attached
      *    - node: the instance
-     *    - vertices: the vertices of the instance, laid out as the shader reads them
-     *    - indices: the indices of the instance
+     *    - mesh: the geometry of the instance, placed in the pool unless another instance placed it already
      * @returns: the place of the instance, to retire once it is not drawn anymore, after release
      * */
     pub fn register(mut self,
                     dmut material: &Material,
                     dmut node: &VisualInstance3D,
-                    vertices: [f32],
-                    indices: [u32])-> dmut &SceneDraws
+                    mesh: &MeshGeometry)-> dmut &SceneDraws
         throws BalderError
     {
         let key = material.getBatchKey();
@@ -237,17 +299,17 @@ pub class ShaderGroup {
             let dmut set = self._shader:.get():.allocateDescriptorSet(DescriptorContext::OBJECT);
             material:.bind(alias set);
 
-            let dmut b = copy MaterialBatch(alias set, copy DrawBatch(alias self._shader:.get():.getDevice()));
+            let dmut b = copy MaterialBatch(alias set, copy InstanceBatch(alias self._shader:.get():.getDevice()));
             self._batches[key] = alias b;
             alias b
         };
 
-        let dmut geometry = self._geometry:.alloc(vertices, indices);
+        let dmut geometry = self:.place(mesh, material);
         let slot = {
             self._objects:.alloc()
         } catch {
             err => {
-                geometry:.dispose();
+                geometry:.release();
                 throw err;
             }
         };
@@ -261,6 +323,65 @@ pub class ShaderGroup {
     }
 
     /**
+     * @returns: the geometry of a mesh in the pool, placed unless an instance drawing it placed it already
+     * @params:
+     *    - mesh: the mesh
+     *    - material: the material of the instance, giving the layout of the vertices
+     * */
+    fn place(mut self, mesh: &MeshGeometry, material: &Material)-> dmut &SharedGeometry
+        throws BalderError
+    {
+        if let Ok(dmut g) = alias self._meshes[mesh.uid] {
+            if g:.acquire() { return alias g; }
+        }
+
+        // the geometries given back are forgotten
+        let dmut alive: [usize => &SharedGeometry] = copy [];
+        for uid, dmut g in alias self._meshes {
+            if !g.isFreed() { alive[uid] = alias g; }
+        }
+
+        let (vertices, indices) = mesh.compact(material);
+        let dmut g = copy SharedGeometry(alias self._geometry:.alloc(vertices, indices));
+        alive[mesh.uid] = alias g;
+        self._meshes = alias alive;
+
+        alias g
+    }
+
+    /**
+     * @returns: the counters of the draws of the instances, at the last build of their commands
+     * */
+    pub fn drawStats(self)-> DrawStats {
+        let mut stats = DrawStats();
+        for _, b in self._batches {
+            let (commands, instances) = b.draws.getDrawn();
+            if commands != 0u32 { stats.multiDraws += 1us; }
+
+            stats.commands += cast!usize(commands);
+            stats.instances += cast!usize(instances);
+        }
+
+        stats
+    }
+
+    /**
+     * Set the distance of the instances seen to the eye, their draws being drawn closest first
+     * @params:
+     *    - eye: the position of the camera
+     * */
+    pub fn sort(mut self, eye: vec3) {
+        for _, dmut b in alias self._batches {
+            for uid, dmut n in alias b.nodes {
+                if n.culled { continue; }
+
+                let sphere = n:.boundingSphere();
+                b.draws:.setDistance(uid, (sphere.center - eye).length() - sphere.radius);
+            }
+        }
+    }
+
+    /**
      * Remove a visual instance from the draws of the shader
      * @params:
      *    - window: the window retiring the resources of the material batch, when it has no instance anymore
@@ -271,6 +392,7 @@ pub class ShaderGroup {
         let key = material.getBatchKey();
         if let Ok(dmut b) = alias self._batches[key] {
             b.nodes:.remove(node.uid);
+            b.draws:.remove(node.uid);
             if b.nodes.len == 0us {
                 window:.retire(alias b.set);
                 window:.retire(alias b.draws);
@@ -288,7 +410,54 @@ pub class ShaderGroup {
      */
 
     /**
+     * Lay out the draws of the instances for the recording of a frame, before any of them is recorded
+     * @info: laid out before the pool is bound, the buffers bound holding the geometry of every draw laid out
+     * @params:
+     *    - frame: the frame being recorded
+     * */
+    pub fn layout(mut self, frame: u32) {
+        for key, dmut b in alias self._batches {
+            {
+                b.draws:.begin(frame);
+                for uid, n in b.nodes {
+                    b.draws:.add(frame, uid, n.getDraws());
+                }
+
+                b.count = b.draws:.end(frame);
+                b.set:.setBuffer(UniformNames::OBJECTS, self._objects.getBuffer(), frame);
+                if let Ok(words) = b.draws.getWordBuffer(frame) {
+                    b.set:.setBuffer(UniformNames::INSTANCES, words, frame);
+                }
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to lay out the draws of the material", key, err);
+                    b.count = 0u32;
+                }
+            }
+        }
+    }
+
+    /**
+     * Record the depth prepass of the instances, one multi-draw per material key, nothing when the shader has no prepass
+     * @assume: the draws of the frame are laid out
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the recording
+     * */
+    pub fn drawDepth(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator)
+        throws BalderError
+    {
+        if let sh: &RasterShader = self._shader:.get() {
+            if !sh.hasPrepass() { return; }
+
+            sh.selectPrepass(cmd.getCommandBuffer());
+            self:.drawBatches(frame, alias cmd);
+        }
+    }
+
+    /**
      * Record the draws of the instances, one multi-draw per material key
+     * @assume: the draws of the frame are laid out, and their depth drawn when the shader has a prepass
      * @params:
      *    - frame: the frame being recorded
      *    - cmd: the command allocator of the recording
@@ -296,25 +465,20 @@ pub class ShaderGroup {
     pub fn draw(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator)
         throws BalderError
     {
-        // Laid out before the pool is bound, the buffers bound holding the geometry of every draw laid out
-        for _, dmut b in alias self._batches {
-            b.draws:.begin(frame);
-            for uid, n in b.nodes {
-                b.draws:.add(frame, uid, n.getDraws());
-            }
+        self._shader:.get().select(cmd.getCommandBuffer());
+        self:.drawBatches(frame, alias cmd);
+    }
 
-            b.count = b.draws:.end(frame);
-        }
-
-        let dmut sh = self._shader:.get();
-        sh.select(cmd.getCommandBuffer());
+    /**
+     * Record the multi-draws of the material keys with the pipeline selected
+     * */
+    fn drawBatches(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator) {
         self._camera.select(frame, cmd.getCommandBuffer());
         self._geometry.select(cmd.getCommandBuffer());
 
         for _, dmut b in alias self._batches {
             if b.count == 0u32 { continue; }
 
-            b.set:.setBuffer(UniformNames::OBJECTS, self._objects.getBuffer(), frame);
             b.set.select(frame, cmd.getCommandBuffer());
             cmd:.drawIndexed(b.draws, 0u32, b.count);
         }
@@ -340,6 +504,7 @@ pub class ShaderGroup {
         }
 
         self._batches = copy [];
+        self._meshes = copy [];
         window:.retire(alias self._camera);
         window:.retire(alias self._geometry);
         window:.retire(alias self._objects);

@@ -1,17 +1,31 @@
 in raster;
 
-use balder::core::{_, config::shader::_, shader::texture, driver::device};
-
 use balder::utils;
+use balder::core::_;
+use balder::core::config::shader::_;
+use balder::core::driver::device;
+use balder::core::shader::texture;
+
+use std::{conv, fs};
 
 use ::vulkan::core;
-use std::{conv, fs};
+
+/**
+ * The write mask of the four components of a color attachment
+ * */
+def RGBA_MASK = cast!u32(VkColorComponentFlagBits::VK_COLOR_COMPONENT_R_BIT
+                         | VkColorComponentFlagBits::VK_COLOR_COMPONENT_G_BIT
+                         | VkColorComponentFlagBits::VK_COLOR_COMPONENT_B_BIT
+                         | VkColorComponentFlagBits::VK_COLOR_COMPONENT_A_BIT);
 
 /**
  * A shader used that includes a rasterization pass (vertex, fragment, etc.)
  * In distinction to compute shaders
  */
 pub class RasterShader over Shader {
+
+    // The pipeline of the depth prepass, null when the shader has none
+    let mut _prepass: VkPipeline = null;
 
     /**
      * ======================================================================================================
@@ -62,25 +76,10 @@ pub class RasterShader over Shader {
 
         self._pipelineLayout:.configure(cfg);
 
-        let dmut stages                       = copy [VkPipelineShaderStageCreateInfo(); cfg.passes.len];
-        let mut modules: [mut VkShaderModule] = copy [null; cfg.passes.len];
+        let mut modules: [mut VkShaderModule] = copy [null; cfg.passes.len + cfg.prepass.len];
 
         {
-            for i, p in cfg.passes {
-                let stageContent = self.readFile(balder::utils::path::projectPath(p.shaderFile));
-                modules[i] = self:.createShaderModule(stageContent);
-
-                let mut info = VkPipelineShaderStageCreateInfo();
-                info.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-                info.stage = p.stage;
-                info.module = modules[i];
-                info.pName = std::conv::toStringZ(p.mainFunc);
-                stages[i] = info;
-
-                self._activateStages = self._activateStages | p.stage;
-            }
-
-            if stages.len == 0 {
+            if cfg.passes.len == 0 {
                 throw copy BalderError("Cannot create shader with no stages");
             }
 
@@ -99,7 +98,13 @@ pub class RasterShader over Shader {
                 ext
             };
 
-            self._program = self:.createPipeline(cfg, stages, pass, extent, outTextures-> outTextures);
+            let stages = self:.createStages(cfg.passes, alias modules, 0us);
+            self._program = self:.createPipeline(cfg, stages, pass, extent, outTextures-> outTextures, prepass-> false);
+
+            if cfg.prepass.len != 0 {
+                let depthStages = self:.createStages(cfg.prepass, alias modules, cfg.passes.len);
+                self._prepass = self:.createPipeline(cfg, depthStages, pass, extent, outTextures-> outTextures, prepass-> true);
+            }
         } exit {
             for z in modules {
                 if z != null {
@@ -112,29 +117,88 @@ pub class RasterShader over Shader {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ===================================          SELECTION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the shader has a depth prepass, its passes testing the depth the prepass wrote without writing it
+     * */
+    pub fn hasPrepass(self)-> bool {
+        self._prepass != null
+    }
+
+    /**
+     * Use the pipeline of the depth prepass for the next drawings
+     * @assume: the shader has a depth prepass
+     * */
+    pub fn selectPrepass(self, cmd: VkCommandBuffer) {
+        vkCmdBindPipeline(cmd, self._bindPoint, self._prepass);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * =================================          CONFIGURATION          ==================================
      * ====================================================================================================
      * ====================================================================================================
      */
 
     /**
+     * Create the stages of passes
+     * @params:
+     *    - passes: the passes
+     *    - modules: the modules of the shader, destroyed once the pipelines are created
+     *    - first: the index in modules of the module of the first pass
+     * @returns: the stages
+     */
+    fn createStages(mut self, passes: [ShaderPass], mut modules: [mut VkShaderModule], first: usize)-> [VkPipelineShaderStageCreateInfo]
+        throws BalderError
+    {
+        let dmut stages = copy [VkPipelineShaderStageCreateInfo(); passes.len];
+        for i, p in passes {
+            let stageContent = self.readFile(balder::utils::path::projectPath(p.shaderFile));
+            modules[first + i] = self:.createShaderModule(stageContent);
+
+            let mut info = VkPipelineShaderStageCreateInfo();
+            info.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            info.stage = p.stage;
+            info.module = modules[first + i];
+            info.pName = std::conv::toStringZ(p.mainFunc);
+            stages[i] = info;
+
+            self._activateStages = self._activateStages | p.stage;
+        }
+
+        stages
+    }
+
+    /**
      * Create the pipeline of the shader
+     * @params:
+     *    - prepass: true for the pipeline of the depth prepass, writing the depth only; the pipeline of the passes of a
+     *      shader with a prepass tests the depth it wrote without writing it
      */
     fn createPipeline(mut self,
                       cfg: &RasterShaderConfig,
                       stages: [VkPipelineShaderStageCreateInfo],
                       renderPass: VkRenderPass,
                       extent: VkExtent2D,
-                      outTextures: [&OutputTexture])-> dmut VkPipeline
+                      outTextures: [&OutputTexture],
+                      prepass: bool)-> dmut VkPipeline
         throws BalderError
     {
         let (attrDescr, bindDescr) = self.createAttributeDescription(cfg);
+
+        // the prepass reads the positions only, the first entry of the vertices
+        let nbAttributes = if prepass && attrDescr.len != 0us { 1us } else { attrDescr.len };
 
         let mut vertexInputInfo = VkPipelineVertexInputStateCreateInfo();
         vertexInputInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         vertexInputInfo.vertexBindingDescriptionCount = 1u32;
         vertexInputInfo.pVertexBindingDescriptions = &bindDescr;
-        vertexInputInfo.vertexAttributeDescriptionCount = cast!u32(attrDescr.len);
+        vertexInputInfo.vertexAttributeDescriptionCount = cast!u32(nbAttributes);
         vertexInputInfo.pVertexAttributeDescriptions = attrDescr.ptr;
 
         let mut inputAssembly = VkPipelineInputAssemblyStateCreateInfo();
@@ -187,11 +251,19 @@ pub class RasterShader over Shader {
 
         let mut depthStencil = VkPipelineDepthStencilStateCreateInfo();
         depthStencil.sType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        if cfg.depth {
-            depthStencil.depthTestEnable = VK_TRUE;
-            depthStencil.depthWriteEnable = if cfg.depthWrite { VK_TRUE } else { VK_FALSE };
+        if cfg.depth || prepass {
+            // the passes after a prepass draw the fragments it found closest, at the depth it wrote
+            let afterPrepass = !prepass && cfg.prepass.len != 0;
 
-            depthStencil.depthCompareOp = VkCompareOp::VK_COMPARE_OP_LESS;
+            depthStencil.depthTestEnable = VK_TRUE;
+            depthStencil.depthWriteEnable = if (cfg.depthWrite || prepass) && !afterPrepass { VK_TRUE } else { VK_FALSE };
+
+            depthStencil.depthCompareOp = if afterPrepass {
+                VkCompareOp::VK_COMPARE_OP_LESS_OR_EQUAL
+            } else {
+                VkCompareOp::VK_COMPARE_OP_LESS
+            };
+
             depthStencil.depthBoundsTestEnable = VK_FALSE;
             depthStencil.stencilTestEnable = VK_FALSE;
         } else {
@@ -199,9 +271,9 @@ pub class RasterShader over Shader {
         }
 
         let color = if outTextures.len == 0 {
-            self.createDefaultDepthColorAttachment(cfg)
+            self.createDefaultDepthColorAttachment(cfg, write-> !prepass)
         } else {
-            self.createDeferredDepthColorAttachment(cfg, outTextures)
+            self.createDeferredDepthColorAttachment(cfg, outTextures, write-> !prepass)
         };
 
         let mut pipelineInfo = VkGraphicsPipelineCreateInfo();
@@ -258,13 +330,12 @@ pub class RasterShader over Shader {
 
     /**
      * Create the default color attachment (supposing we just return one color texture)
+     * @params:
+     *    - write: false to write no color (depth prepass)
      * */
-    fn createDefaultDepthColorAttachment(self, cfg: &RasterShaderConfig)-> VkPipelineColorBlendStateCreateInfo {
+    fn createDefaultDepthColorAttachment(self, cfg: &RasterShaderConfig, write: bool)-> VkPipelineColorBlendStateCreateInfo {
         let mut colorBlendAttachment = VkPipelineColorBlendAttachmentState();
-        colorBlendAttachment.colorWriteMask = cast!u32(VkColorComponentFlagBits::VK_COLOR_COMPONENT_R_BIT
-                                                       | VkColorComponentFlagBits::VK_COLOR_COMPONENT_G_BIT
-                                                       | VkColorComponentFlagBits::VK_COLOR_COMPONENT_B_BIT
-                                                       | VkColorComponentFlagBits::VK_COLOR_COMPONENT_A_BIT);
+        colorBlendAttachment.colorWriteMask = if write { RGBA_MASK } else { 0u32 };
         if cfg.blend.enabled {
             colorBlendAttachment.blendEnable = VK_TRUE;
         } else {
@@ -291,18 +362,18 @@ pub class RasterShader over Shader {
 
     /**
      * Create color and depth attachment for deferred shading
+     * @params:
+     *    - write: false to write no color (depth prepass)
      * */
     fn createDeferredDepthColorAttachment(self,
                                           cfg: &RasterShaderConfig,
-                                          outTextures: [&OutputTexture])-> VkPipelineColorBlendStateCreateInfo {
+                                          outTextures: [&OutputTexture],
+                                          write: bool)-> VkPipelineColorBlendStateCreateInfo {
         let dmut attachment: [VkPipelineColorBlendAttachmentState] = [];
 
         for t in outTextures if !t.isDepth() {
             let mut colorBlendAttachment = VkPipelineColorBlendAttachmentState();
-            colorBlendAttachment.colorWriteMask = cast!u32(VkColorComponentFlagBits::VK_COLOR_COMPONENT_R_BIT
-                                                           | VkColorComponentFlagBits::VK_COLOR_COMPONENT_G_BIT
-                                                           | VkColorComponentFlagBits::VK_COLOR_COMPONENT_B_BIT
-                                                           | VkColorComponentFlagBits::VK_COLOR_COMPONENT_A_BIT);
+            colorBlendAttachment.colorWriteMask = if write { RGBA_MASK } else { 0u32 };
 
             colorBlendAttachment.blendEnable = VK_FALSE;
             colorBlendAttachment.srcColorBlendFactor = cfg.blend.srcColorBlendFactor;
@@ -360,6 +431,11 @@ pub class RasterShader over Shader {
             if (self._program != null) {
                 vkDestroyPipeline(self._device.getDeviceHandle(), self._program, null);
                 self._program = null;
+            }
+
+            if self._prepass != null {
+                vkDestroyPipeline(self._device.getDeviceHandle(), self._prepass, null);
+                self._prepass = null;
             }
 
             self._cfg = none;

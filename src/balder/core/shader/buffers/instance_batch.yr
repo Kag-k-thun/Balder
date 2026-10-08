@@ -1,0 +1,532 @@
+in instance_batch;
+
+pub mod ::utils;
+
+use balder::core::{dispose, error, memory::_};
+use balder::core::driver::device;
+use balder::core::shader::buffers::instance_draw;
+use balder::core::shader::buffers::instance_batch::utils;
+use balder::utils::log;
+
+use std::algorithm::comparison;
+
+use ::etc::c::memory;
+
+use ::vulkan::core;
+
+/**
+ * The smallest number of commands the buffers of a frame hold
+ * */
+def MIN_COMMANDS = 64us;
+
+/**
+ * The size of the word of an instance in bytes
+ * */
+def WORD_SIZE = 4us;
+
+/**
+ * The draws of objects laid out by the recordings of a subpass, the draws of the same range of indices being drawn by
+ * one instanced command, the closest instances first, drawn by draw indirect calls over runs of the commands
+ * @info: the commands of a frame read the words of their instances (the slots of the objects...) in a storage buffer of
+ * the frame, each command from its first instance; a recording lays out as many commands as draws, the commands not
+ * needed drawing nothing
+ * @info: each frame in flight has its own objects, laid out by its recording, and its own buffers of commands and of
+ * words, built again at its submission when the draws of its objects changed; a frame never draws the objects laid out
+ * by the recording of another, nor commands placing geometry the buffers it bound do not hold
+ * */
+@final
+pub class InstanceBatch {
+
+    pub let uid: usize;
+
+    // The device the buffers are allocated on
+    let dmut _device: &VulkanDevice;
+
+    // True when the draws modified are drawn by the next submissions without recording them again (multi-draw)
+    let _inPlace: bool;
+
+    // The draws of each object, by uniq id
+    let dmut _draws: [usize => [InstanceDraw]] = copy [];
+
+    // The distance of each object to the camera, the closest instances being drawn first
+    let dmut _distances: [usize => f32] = copy [];
+
+    // The objects laid out by the last recording of each frame, with the number of their draws laid out
+    let dmut _owners: [[usize => u32]] = [];
+
+    // The number of commands laid out by the last recording of each frame, as many as the draws of its objects
+    let mut _counts: [mut u32] = [];
+
+    // The commands of each frame
+    let dmut _commands: [[VkDrawIndexedIndirectCommand]] = [];
+
+    // The words of the instances of each frame
+    let dmut _words: [[u32]] = [];
+
+    // The number of commands drawing something and of instances, at the last build of a frame
+    let mut _drawn: (u32, u32) = (0u32, 0u32);
+
+    // True when the draws of an object of a frame changed since its commands were last built
+    let mut _stale: [mut bool] = [];
+
+    // The buffer of indirect commands read by each frame
+    let dmut _commandCopies: [(&Buffer)?] = [];
+
+    // The storage buffer of the words read by each frame
+    let dmut _wordCopies: [(&Buffer)?] = [];
+
+    // The commands of each frame to write in its buffer at its submission
+    let mut _dirtyCommands: FrameRanges;
+
+    // The words of each frame to write in its buffer at its submission
+    let mut _dirtyWords: FrameRanges;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create an empty batch, written at the submission of each frame until it is disposed
+     * @params:
+     *    - device: the device the buffers are allocated on
+     * */
+    pub self (dmut device: &VulkanDevice)
+        with uid = device:.getMemoryAllocator():.nextBufferId()
+        , _device = alias device
+        , _inPlace = device.isMultiDraw()
+        , _dirtyCommands = FrameRanges(device.getNbFrames())
+        , _dirtyWords = FrameRanges(device.getNbFrames())
+    {
+        let nbFrames = device.getNbFrames();
+        self._counts = copy [0u32; nbFrames];
+        self._stale = copy [false; nbFrames];
+
+        let dmut commands: [[VkDrawIndexedIndirectCommand]] = [];
+        let dmut words: [[u32]]                            = [];
+        let dmut owners: [[usize => u32]]                  = [];
+        let dmut commandCopies: [(&Buffer)?]               = [];
+        let dmut wordCopies: [(&Buffer)?]                  = [];
+        for _ in 0u32 .. nbFrames {
+            let dmut owner: [usize => u32] = copy [];
+            commands ~= [[]];
+            words ~= [[]];
+            owners ~= [alias owner];
+            commandCopies ~= [none];
+            wordCopies ~= [none];
+        }
+
+        self._commands = alias commands;
+        self._words = alias words;
+        self._owners = alias owners;
+        self._commandCopies = alias commandCopies;
+        self._wordCopies = alias wordCopies;
+
+        device:.getMemoryAllocator():.registerInFlight(self.uid, &self:.flush);
+    }
+
+    // Disposing from the collector races with the GPU and with the device teardown, the object has to be retired
+#if DEBUG
+    __dtor(mut self) {
+        if self._commands.len != 0us {
+            log::warn #("Dispose", self.__typeinfo__.name, "collected without being retired");
+        }
+    }
+#end
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          LAYOUT          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start the layout of the objects of a frame, those of its previous recording being dropped
+     * @assume: the previous submission of the frame was awaited
+     * */
+    pub fn begin(mut self, frame: u32) {
+        atomic self {
+            let dmut owner: [usize => u32] = copy [];
+            self._counts[frame] = 0u32;
+            self._owners[frame] = alias owner;
+        }
+    }
+
+    /**
+     * Lay out the draws of an object with the ones laid out since begin
+     * @params:
+     *    - frame: the frame being recorded
+     *    - owner: the uniq id of the object, to modify its draws, see update
+     *    - draws: the draws of the object, the object keeping as many until its next layout
+     * */
+    pub fn add(mut self, frame: u32, owner: usize, draws: [InstanceDraw]) {
+        atomic self {
+            self._draws[owner] = copy draws;
+            self._owners[frame][owner] = cast!u32(draws.len);
+            self._counts[frame] = self._counts[frame] + cast!u32(draws.len);
+        }
+    }
+
+    /**
+     * End the layout of the objects of a frame, its commands being built and its buffers enlarged to hold them
+     * @returns: the number of commands laid out, the number of commands to draw
+     * */
+    pub fn end(mut self, frame: u32)-> u32
+        throws BalderError
+    {
+        atomic self {
+            let count = self._counts[frame];
+            if cast!usize(count) > self._commands[frame].len {
+                let extra = max(cast!usize(count) - self._commands[frame].len, max(self._commands[frame].len, 16us));
+                self._commands[frame] = self._commands[frame] ~ copy [VkDrawIndexedIndirectCommand(); extra];
+                self._words[frame] = self._words[frame] ~ copy [0u32; extra];
+            }
+
+            self:.reserve(frame, cast!usize(count) * VkDrawIndexedIndirectCommand::size, true);
+            self:.reserve(frame, cast!usize(count) * WORD_SIZE, false);
+            self:.build(frame);
+
+            return count;
+        }
+    }
+
+    /**
+     * Modify the draws of an object, drawn by the next submission of the frames laying it out, a frame being requested
+     * @info: without multi-draw, the modification is drawn once the recordings are done again
+     * @params:
+     *    - owner: the uniq id the object was laid out with
+     *    - draws: the draws of the object, as many as laid out
+     * */
+    pub fn update(mut self, owner: usize, draws: [InstanceDraw]) {
+        atomic self {
+            if owner !in self._draws { return; }
+
+            self._draws[owner] = copy draws;
+            self:.markStale(owner);
+        }
+
+        self._device:.requestFrame();
+    }
+
+    /**
+     * Set the distance of an object to the camera, its instances being drawn before those of the farther objects
+     * @info: without multi-draw, the order is changed once the recordings are done again
+     * */
+    pub fn setDistance(mut self, owner: usize, distance: f32) {
+        atomic self {
+            if owner !in self._draws { return; }
+            if let Ok(d) = self._distances[owner] {
+                if d == distance { return; }
+            }
+
+            self._distances[owner] = distance;
+            self:.markStale(owner);
+        }
+    }
+
+    /**
+     * Remove an object, the next submissions of the frames laying it out drawing it no more
+     * @info: without multi-draw, the object is drawn until the recordings are done again
+     * */
+    pub fn remove(mut self, owner: usize) {
+        atomic self {
+            if owner !in self._draws { return; }
+
+            self:.markStale(owner);
+            self._draws:.remove(owner);
+            self._distances:.remove(owner);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the command 'index' of the frame 'frame'
+     * */
+    pub fn getCommand(self, frame: u32, index: u32)-> VkDrawIndexedIndirectCommand {
+        atomic self {
+            self._commands[frame][index]
+        }
+    }
+
+    /**
+     * @returns: the number of commands laid out by the last recording of the frame 'frame'
+     * */
+    pub fn getCount(self, frame: u32)-> u32 {
+        atomic self {
+            self._counts[frame]
+        }
+    }
+
+    /**
+     * @returns: the number of commands drawing something and the number of instances they draw, at the last build of a
+     * frame
+     * */
+    pub fn getDrawn(self)-> (u32, u32) {
+        atomic self {
+            self._drawn
+        }
+    }
+
+    /**
+     * @returns: the buffer of indirect commands read by the frame 'frame', null if nothing was laid out
+     * */
+    pub fn getVulkanBuffer(self, frame: u32)-> VkBuffer {
+        atomic self {
+            if let Ok(c) = self._commandCopies[frame] {
+                return c.getVulkanBuffer();
+            }
+
+            return null;
+        }
+    }
+
+    /**
+     * @returns: the storage buffer of the words of the instances read by the frame 'frame', none if nothing was laid out
+     * */
+    pub fn getWordBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            self._wordCopies[frame]
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FLUSH          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Build the commands of a frame again when the draws of its objects changed, and write the commands and the words
+     * modified since the last write of its buffers
+     * @assume: the previous submission of the frame was awaited
+     * */
+    pub fn flush(mut self, frame: u32) {
+        atomic self {
+            if frame >= cast!u32(self._commandCopies.len) { return; }
+            if self._stale[frame] && self._inPlace {
+                self:.build(frame);
+            }
+
+            if let Ok((start, end)) = self._dirtyCommands:.take(frame) {
+                if let Ok(dmut target) = alias self._commandCopies[frame] {
+                    let source = cast!{*void} (self._commands[frame].ptr);
+                    let size   = self._commands[frame].len * VkDrawIndexedIndirectCommand::size;
+                    self:.write(alias target, source, size, start, end);
+                }
+            }
+
+            if let Ok((start, end)) = self._dirtyWords:.take(frame) {
+                if let Ok(dmut target) = alias self._wordCopies[frame] {
+                    let source = cast!{*void} (self._words[frame].ptr);
+                    let size   = self._words[frame].len * WORD_SIZE;
+                    self:.write(alias target, source, size, start, end);
+                }
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Build the commands and the words of a frame from the draws of its objects
+     * @atomic
+     * */
+    fn build(mut self, frame: u32) {
+        let count = self._counts[frame];
+        let dmut draws: [(f32, InstanceDraw)] = copy [(0.0f, InstanceDraw()); count];
+        let mut nb = 0us;
+        for owner, laid in self._owners[frame] {
+            if let Ok(ds) = self._draws[owner] {
+                let distance = if let Ok(d) = self._distances[owner] { d } else { 0.0f };
+                for i in 0us .. min(cast!usize(laid), ds.len) {
+                    draws[nb] = (distance, ds[i]);
+                    nb += 1us;
+                }
+            }
+        }
+
+        let (commands, words) = groupInstances(draws[0us .. nb]);
+        for i in 0u32 .. count {
+            let c = if cast!usize(i) < commands.len { commands[i] } else { VkDrawIndexedIndirectCommand() };
+            self:.writeCommand(frame, i, c);
+
+            let w = if cast!usize(i) < words.len { words[i] } else { 0u32 };
+            self:.writeWord(frame, i, w);
+        }
+
+        self._drawn = (cast!u32(commands.len), cast!u32(words.len));
+        self._stale[frame] = false;
+    }
+
+    /**
+     * Mark stale the frames laying out an object, their commands to build again at their submission
+     * @atomic
+     * */
+    fn markStale(mut self, owner: usize) {
+        for f in 0us .. self._owners.len {
+            if owner in self._owners[f] {
+                self._stale[f] = true;
+            }
+        }
+    }
+
+    /**
+     * Enlarge the buffer of commands or of words of a frame to hold 'size' bytes, written whole at its submission
+     * @atomic
+     * @params:
+     *    - commands: true for the buffer of commands, false for the buffer of words
+     * */
+    fn reserve(mut self, frame: u32, size: usize, commands: bool)
+        throws BalderError
+    {
+        let current = if commands { self._commandCopies[frame] } else { self._wordCopies[frame] };
+        let capacity = if let Ok(c) = current { c.getSize() } else { 0us };
+        if size <= capacity && capacity != 0us { return; }
+
+        let elem: usize = if commands { cast!usize(VkDrawIndexedIndirectCommand::size) } else { WORD_SIZE };
+        let usage = if commands {
+            VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
+        } else {
+            VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+        };
+
+        let dmut larger = self._device
+            :.getMemoryAllocator()
+            :.allocBuffer(max(size * 2us, MIN_COMMANDS * elem),
+                          cast!u32(usage),
+                          cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                   | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+
+        // only the replaced recording of the frame, whose submission was awaited, read the buffer
+        if commands {
+            if let Ok(dmut old) = alias self._commandCopies[frame] {
+                self._device:.retireAfterFrame(&old:.dispose);
+            }
+
+            self._commandCopies[frame] = (alias larger)?;
+            self._dirtyCommands:.markFrame(frame, 0us, larger.getSize());
+        } else {
+            if let Ok(dmut old) = alias self._wordCopies[frame] {
+                self._device:.retireAfterFrame(&old:.dispose);
+            }
+
+            self._wordCopies[frame] = (alias larger)?;
+            self._dirtyWords:.markFrame(frame, 0us, larger.getSize());
+        }
+    }
+
+    /**
+     * Write a command of a frame, marked for the next write of its buffer if it changed
+     * @atomic
+     * */
+    fn writeCommand(mut self, frame: u32, index: u32, command: VkDrawIndexedIndirectCommand) {
+        let old = self._commands[frame][index];
+        if old.indexCount == command.indexCount
+            && old.instanceCount == command.instanceCount
+            && old.firstIndex == command.firstIndex
+            && old.vertexOffset == command.vertexOffset
+            && old.firstInstance == command.firstInstance {
+            return;
+        }
+
+        self._commands[frame][index] = command;
+
+        let start = cast!usize(index) * VkDrawIndexedIndirectCommand::size;
+        self._dirtyCommands:.markFrame(frame, start, start + VkDrawIndexedIndirectCommand::size);
+    }
+
+    /**
+     * Write the word of an instance of a frame, marked for the next write of its buffer if it changed
+     * @atomic
+     * */
+    fn writeWord(mut self, frame: u32, index: u32, word: u32) {
+        if self._words[frame][index] == word { return; }
+
+        self._words[frame][index] = word;
+
+        let start = cast!usize(index) * WORD_SIZE;
+        self._dirtyWords:.markFrame(frame, start, start + WORD_SIZE);
+    }
+
+    /**
+     * Write the bytes [start, end) of a local array in a buffer
+     * @atomic
+     * @params:
+     *    - target: the buffer
+     *    - source: the local array
+     *    - size: the size of the local array in bytes
+     * */
+    fn write(mut self, dmut target: &Buffer, source: *void, size: usize, start: usize, end: usize) {
+        let last = min(end, min(target.getSize(), size));
+        if last <= start { return; }
+
+        // The memory of the buffer is shared with other buffers, mapped and unmapped under the lock of the device
+        atomic self._device {
+            let dmut ptr = target:.map();
+            if ptr != null {
+                memcpy(ptr + start, source + start, last - start);
+                target:.unmap();
+            } else {
+                log::error #("InstanceBatch", "failed to map a buffer of the batch");
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            atomic self {
+                if self._commands.len == 0us { return; }
+
+                for dmut c in alias self._commandCopies {
+                    if let Ok(dmut b) = alias c {
+                        b:.dispose();
+                    }
+                }
+
+                for dmut c in alias self._wordCopies {
+                    if let Ok(dmut b) = alias c {
+                        b:.dispose();
+                    }
+                }
+
+                self._commandCopies = [];
+                self._wordCopies = [];
+                self._commands = [];
+                self._words = [];
+                self._owners = [];
+                self._draws = copy [];
+                self._distances = copy [];
+            }
+
+            self._device:.getMemoryAllocator():.forgetInFlight(self.uid);
+        }
+    }
+}

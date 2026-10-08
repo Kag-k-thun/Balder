@@ -18,6 +18,11 @@ use std::{config::_, io, math, rand, time::_};
 use std::fs;
 use std::fs::path;
 
+/**
+ * The number of Raymans on a side of the crowd standing behind the three in front, set by '--crowd'
+ * */
+lazy dmut __CROWD__ = copy [0us];
+
 class MyActivity over Activity {
 
     let dmut _scene: (&Scene)?   = none;
@@ -108,8 +113,10 @@ class MyActivity over Activity {
         if let Ok(dmut lbl) = alias self._culling {
             if let Ok(s) = self._scene {
                 let stats = s.cullStats;
-                lbl:.setText(std::format::format("{} nodes, {} visited: {} outside, {} small, {} drawn",
-                                                 stats.considered, stats.visited, stats.outside, stats.small, stats.visible));
+                let draws = s.drawStats;
+                lbl:.setText(std::format::format("{} nodes, {} visited: {} outside, {} small, {} drawn by {} multi-draws, {} commands, {} instances",
+                                                 stats.considered, stats.visited, stats.outside, stats.small, stats.visible,
+                                                 draws.multiDraws, draws.commands, draws.instances));
             }
         }
 
@@ -232,21 +239,24 @@ class MyActivity over Activity {
     fn createBoxMesh(mut self, dmut scene: &Scene)
         throws BalderError
     {
-        // three Raymans side by side, drawn at the levels of detail 0, 2 and 4 from left to right
-        let dmut __subject__ = self:.createRayman(alias scene, "subject", -3.0f, 0us);
-        self:.createRayman(alias scene, "subject_lod_2", 0.0f, 2us);
-        self:.createRayman(alias scene, "subject_lod_4", 3.0f, 4us);
+        // three Raymans side by side, drawn at the levels of detail 0, 2 and 4 from left to right, the last two sharing
+        // the geometry of the first
+        let dmut __subject__ = copy SolidObjectModel::fromFile("subject", scene:.getRootNode(), "res:/models/rayman/rayman.obj");
+        self:.placeRayman(alias __subject__, -3.0f, 0.0f, (0us)?);
+
+        let dmut lod2 = copy SolidObjectModel::copyOf("subject_lod_2", scene:.getRootNode(), alias __subject__);
+        self:.placeRayman(alias lod2, 0.0f, 0.0f, (2us)?);
+
+        let dmut lod4 = copy SolidObjectModel::copyOf("subject_lod_4", scene:.getRootNode(), alias __subject__);
+        self:.placeRayman(alias lod4, 3.0f, 0.0f, (4us)?);
+
+        self:.createCrowd(alias scene, alias __subject__);
         self._subject = (alias __subject__)?;
 
+        // the walls are copies of the ground, the three cubes drawn by one instanced command
         let dmut ground = copy SolidObjectModel::fromFile("ground", scene:.getRootNode(), "res:/models/cube/cube.obj");
-
-        let dmut _wall_1_ = copy SolidObjectModel::fromFile("wall_1",
-                                                            scene:.getRootNode(),
-                                                            "res:/models/cube/cube.obj");
-
-        let dmut _wall_2_ = copy SolidObjectModel::fromFile("wall_2",
-                                                            scene:.getRootNode(),
-                                                            "res:/models/cube/cube.obj");
+        let dmut _wall_1_ = copy SolidObjectModel::copyOf("wall_1", scene:.getRootNode(), alias ground);
+        let dmut _wall_2_ = copy SolidObjectModel::copyOf("wall_2", scene:.getRootNode(), alias ground);
 
         // a position is scaled with its node: the ground spans [-15, 15] and the walls stand at x = -15 and z = -15
         ground.position = makeVec3(0.0f, -1.0f, 0.0f);
@@ -260,17 +270,29 @@ class MyActivity over Activity {
     }
 
     /**
-     * Load a Rayman three units tall, at x along the x axis, drawn at a level of detail
+     * Make a Rayman three units tall and place it at (x, 0, z), drawn at a level of detail, or at the level selected from
+     * the camera when none
      * */
-    fn createRayman(mut self, dmut scene: &Scene, name: [c8], x: f32, lod: usize)-> dmut &SolidObjectModel
-        throws BalderError
-    {
-        let dmut rayman = copy SolidObjectModel::fromFile(name, scene:.getRootNode(), "res:/models/rayman/rayman.obj");
+    fn placeRayman(mut self, dmut rayman: &SolidObjectModel, x: f32, z: f32, lod: (usize)?) {
         rayman.scale *= 3.0f;
-        rayman.position = makeVec3(x / 3.0f, 0.0f, 0.0f);
-        rayman:.forceLod((lod)?);
+        rayman.position = makeVec3(x / 3.0f, 0.0f, z / 3.0f);
+        rayman:.forceLod(lod);
+    }
 
-        alias rayman
+    /**
+     * Place the crowd of copies of a Rayman behind the three in front, its levels of detail selected from the camera
+     * */
+    fn createCrowd(mut self, dmut scene: &Scene, dmut model: &SolidObjectModel) {
+        let side = __CROWD__[0];
+        for i in 0us .. side * side {
+            let x = (cast!f32(cast!u64(i % side)) - cast!f32(cast!u64(side)) / 2.0f) * 2.5f;
+            let z = -3.0f - cast!f32(cast!u64(i / side)) * 2.5f;
+
+            let dmut copied = copy SolidObjectModel::copyOf("crowd_" ~ std::conv::to!{[c8]} (i),
+                                                            scene:.getRootNode(),
+                                                            alias model);
+            self:.placeRayman(alias copied, x, z, none);
+        }
     }
 
     fn createCamera(mut self, dmut scene: &Scene) {
@@ -323,7 +345,8 @@ class MyActivity over Activity {
 fn readArguments(args: [[c8]])-> bool {
     let dmut parser = (copy ArgumentParser)
         :.help("help", short-> "h", comments-> "print this help and exit")
-        :.option!{[c8]} ("work-dir", comments-> "the directory holding res/ (the current directory by default)");
+        :.option!{[c8]} ("work-dir", comments-> "the directory holding res/ (the current directory by default)")
+        :.option!{[c8]} ("crowd", comments-> "the number of Raymans on a side of a crowd behind the three in front (none by default)");
 
     {
         let cfg = parser.parse(args);
@@ -331,10 +354,18 @@ fn readArguments(args: [[c8]])-> bool {
             setProjectPath(Path(dir));
         }
 
+        if let Ok(Str(value-> side)) = cfg["crowd"]? {
+            __CROWD__[0] = std::conv::to!{usize} (side);
+        }
+
         true
     } catch {
         err: &std::config::args::errors::CommandLineError => {
             eprintln(parser.explain(err, usage-> "demo"));
+            false
+        }
+        _: &std::conv::errors::CastFailure => {
+            eprintln("demo: --crowd expects a number of Raymans");
             false
         }
     }

@@ -10,7 +10,7 @@ layout(set = 1, binding = 0) uniform Camera {
     vec3 eyePos;
 } camera;
 
-// The data of an object, in the slot its draws give as their instance (see the draws of IndexedMesh3D)
+// The data of an object, in the slot given by the words of its instances (see the draws of IndexedMesh3D)
 struct Object {
     mat4 model;
 
@@ -25,30 +25,36 @@ layout (std430, set = 0, binding = 0) readonly buffer Objects {
     Object objects [];
 };
 
+// The word of each instance drawn: the slot of its object above the two low bits, and in them the role of the draw
+layout (std430, set = 0, binding = 1) readonly buffer Instances {
+    uint instances [];
+};
+
 layout (location = 0) out vec4 outPosition;
 layout (location = 1) out vec3 outNormals;
 layout (location = 2) out vec3 outColor;
 
-// The cross-fade of the draw: .x its progress, .y the role of the draw, the two low bits of its instance (0 for a level
+// The cross-fade of the draw: .x its progress, .y the role of the draw, the two low bits of its word (0 for a level
 // drawn alone, 1 for the outgoing level of a cross-fade, 2 for the incoming one)
 layout (location = 3) flat out vec2 outFade;
 
 // The material of the object
 layout (location = 4) flat out uint outMaterial;
 
+// Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
 out gl_PerVertex {
-    vec4 gl_Position;
+    invariant vec4 gl_Position;
 };
 
 void main () {
-    uint instance = uint (gl_InstanceIndex);
-    Object object = objects [instance >> 2];
+    uint word = instances [gl_InstanceIndex];
+    Object object = objects [word >> 2];
 
     vec4 viewPos = camera.view * object.model * vec4 (inPosition, 1.0);
     gl_Position = camera.proj * viewPos;  
     
     outPosition = viewPos;    
     outNormals = inNormals;
-    outFade = vec2 (object.fade, float (instance & 3u));
+    outFade = vec2 (object.fade, float (word & 3u));
     outMaterial = object.material;
 }

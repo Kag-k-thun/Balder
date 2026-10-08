@@ -1,13 +1,11 @@
 in indexed_mesh;
 
-use balder::core::shader::buffers::pool;
+use balder::core::shader::buffers::{instance_draw, pool};
 use balder::scene::node::node3D::{camera, visual::_, visual::lod};
 use balder::scene::utils::batch;
 use balder::utils::log;
 
 use std::time::dur;
-
-use ::vulkan::core;
 
 /**
  * Mesh of vertices and indices, placed in the geometry pool of the shader of its material
@@ -21,13 +19,11 @@ pub class IndexedMesh3D over VisualInstance3D {
 
     prot { // Local data
 
-        // The data of the mesh to upload on device
-        let mut _array : (MeshArray)? = none;
+        // The vertices and the levels of detail of the mesh, possibly shared with other meshes
+        let dmut _mesh : &MeshGeometry;
 
-        // The levels of detail of the mesh, the indices dropped after the upload
-        let mut _lods : LodChain;
-
-        // Destroy the array after uploading (meaning it can be detached and reattached to the scene)
+        // Release the vertices after uploading them, unless other meshes share them (meaning the mesh cannot be
+        // detached and reattached to the scene)
         let mut _destroyOnUpload : bool = false;
 
     }
@@ -84,11 +80,33 @@ pub class IndexedMesh3D over VisualInstance3D {
 
         with super (name, alias parent, array.aabb (), shadow)
         , _material = alias material
-        , _array = (array?)
-        , _lods = lods
+        , _mesh = copy MeshGeometry (array, lods)
         , _destroyOnUpload = destroyOnUpload
 
-    {}
+    {
+        self._mesh:.share ();
+    }
+
+    /**
+     * Create a mesh drawing the geometry of another, placed once in the geometry pool of the shader of its material
+     * @info: the meshes of the same geometry and of materials of the same shader and the same key are drawn by one
+     * instanced command
+     * @params:
+     *    - mesh: the geometry, its vertices kept until every mesh drawing it is uploaded
+     */
+    pub self sharing (name : [c8],
+                      dmut parent : &Node,
+                      dmut mesh : &MeshGeometry,
+                      dmut material : &Material,
+                      shadow : bool = true)
+
+        with super (name, alias parent, mesh.aabb, shadow)
+        , _material = alias material
+        , _mesh = alias mesh
+
+    {
+        self._mesh:.share ();
+    }
 
     /*!
      * ====================================================================================================
@@ -102,13 +120,12 @@ pub class IndexedMesh3D over VisualInstance3D {
         self:.destroyBuffers (alias scene);
 
         {
-            if let Ok (array) = self._array && self._lods.indices.len != 0 {
+            if !self._mesh.isEmpty {
                 let matID = scene:.registerMaterialRef (self._material.config);
                 self._matID = matID?;
                 self._material:.attach (scene:.getWindow (), matID);
 
-                let vertices = array.compactVertices (self._material, forShadow-> false);
-                let dmut draws = scene:.registerDraws (alias self._material, alias self, vertices, self._lods.indices);
+                let dmut draws = scene:.registerDraws (alias self._material, alias self, self._mesh);
                 draws:.setObject (OBJECT_WORLD, self._transformation);
                 draws:.setObject (OBJECT_FADE, self._fade);
                 draws:.setObject (OBJECT_MATERIAL, matID);
@@ -126,8 +143,7 @@ pub class IndexedMesh3D over VisualInstance3D {
         }
 
         if self._destroyOnUpload {
-            self._array = none;
-            self._lods.indices = [];
+            self._mesh:.releaseUnshared ();
         }
 
         self._selected = false;
@@ -151,7 +167,7 @@ pub class IndexedMesh3D over VisualInstance3D {
      * under the threshold; a cross-fade in progress finishes before another level is selected
      * */
     pub over selectLod (mut self, camera : &Camera, height : f32, threshold : f32, delta : Duration)-> bool {
-        if self._lods.levels.len < 2us || !self._draws.hasValue { return false; }
+        if self._mesh.lods.levels.len < 2us || !self._draws.hasValue { return false; }
 
         if self._fadingLevel.hasValue {
             self._fade += cast!f32 (delta.allMillis) / FADE_DURATION;
@@ -175,9 +191,9 @@ pub class IndexedMesh3D over VisualInstance3D {
 
         let unitSize = camera.screenSize (closest, self.worldScale ()) * height;
         let level = if let Ok (forced) = self._forcedLod {
-            if forced < self._lods.levels.len { forced } else { self._lods.levels.len - 1us }
+            if forced < self._mesh.lods.levels.len { forced } else { self._mesh.lods.levels.len - 1us }
         } else {
-            self._lods.select (self._level, unitSize, threshold)
+            self._mesh.lods.select (self._level, unitSize, threshold)
         };
         if level == self._level && self._selected { return false; }
 
@@ -234,13 +250,13 @@ pub class IndexedMesh3D over VisualInstance3D {
 
     /**
      * @returns: the two draws of the mesh, the incoming then the outgoing level of a cross-fade, or the level drawn alone
-     * then an empty draw, two empty draws when the mesh is culled; their first instance holds the slot of the mesh above
-     * its two low bits, and in them the role of the draw read by the shaders
+     * then an empty draw, two empty draws when the mesh is culled; their word holds the slot of the mesh above its two
+     * low bits, and in them the role of the draw read by the shaders
      * */
-    pub over getDraws (self)-> [VkDrawIndexedIndirectCommand] {
+    pub over getDraws (self)-> [InstanceDraw] {
         if let Ok (draws) = self._draws {
             if self.culled {
-                return copy [VkDrawIndexedIndirectCommand (), VkDrawIndexedIndirectCommand ()];
+                return copy [InstanceDraw (), InstanceDraw ()];
             }
 
             let geometry = draws.getGeometry ();
@@ -249,7 +265,7 @@ pub class IndexedMesh3D over VisualInstance3D {
                              self.levelDraw (geometry, draws.slot, fading, OUTGOING_DRAW)];
             }
 
-            return copy [self.levelDraw (geometry, draws.slot, self._level, ALONE_DRAW), VkDrawIndexedIndirectCommand ()];
+            return copy [self.levelDraw (geometry, draws.slot, self._level, ALONE_DRAW), InstanceDraw ()];
         }
 
         []
@@ -263,16 +279,15 @@ pub class IndexedMesh3D over VisualInstance3D {
      *    - level: the level to draw
      *    - role: the role of the draw in a cross-fade
      * */
-    fn levelDraw (self, geometry : &GeometryRange, slot : u32, level : usize, role : u32)-> VkDrawIndexedIndirectCommand {
-        let lod = self._lods.levels [level];
+    fn levelDraw (self, geometry : &GeometryRange, slot : u32, level : usize, role : u32)-> InstanceDraw {
+        let lod = self._mesh.lods.levels [level];
 
-        let mut cmd = VkDrawIndexedIndirectCommand ();
-        cmd.indexCount = lod.count;
-        cmd.instanceCount = 1u32;
-        cmd.firstIndex = geometry.firstIndex + lod.firstIndex;
-        cmd.vertexOffset = cast!i32 (geometry.vertexOffset);
-        cmd.firstInstance = (slot << 2u32) | role;
-        cmd
+        let mut draw = InstanceDraw ();
+        draw.indexCount = lod.count;
+        draw.firstIndex = geometry.firstIndex + lod.firstIndex;
+        draw.vertexOffset = cast!i32 (geometry.vertexOffset);
+        draw.word = (slot << 2u32) | role;
+        draw
     }
 
     /*!
@@ -283,6 +298,14 @@ pub class IndexedMesh3D over VisualInstance3D {
      * ====================================================================================================
      * ====================================================================================================
      */
+
+    /**
+     * @returns: the vertices and the levels of detail of the mesh, possibly shared with other meshes
+     * */
+    @field
+    pub fn mesh (mut self)-> dmut &MeshGeometry {
+        alias self._mesh
+    }
 
     /**
      * The material used to draw the object

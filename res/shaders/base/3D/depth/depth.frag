@@ -1,24 +1,10 @@
 #version 450
 
-layout (location = 0) in vec4 inPosition;
-layout (location = 1) in vec3 inNormals;
-layout (location = 2) in vec2 inUV;
+// The fragment shader of the depth prepass of the 3D shaders, writing no color: it discards the pixels a cross-fade gives
+// to the other level, as the passes do, so the depth written is the one of the level they draw
 
 // The cross-fade of the draw, see the vertex shader
-layout (location = 3) flat in vec2 inFade;
-
-// The material of the object
-layout (location = 4) flat in uint inMaterial;
-
-layout (location = 0) out vec3 position;
-layout (location = 1) out vec3 normals;
-layout (location = 2) out vec3 binormals;
-layout (location = 3) out vec4 albedo;
-layout (location = 4) out uint materialID;
-
-
-layout (set = 0, binding = 2) uniform sampler2D diffuse;
-
+layout (location = 0) flat in vec2 inFade;
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -44,11 +30,4 @@ void crossFade () {
 
 void main() {
     crossFade ();
-
-    position = inPosition.xyz;
-    normals = vec3 (inNormals);
-    binormals = vec3 (inNormals);
-    albedo = vec4 (texture (diffuse, inUV).xyz, 1);
-    
-    materialID = inMaterial;
 }

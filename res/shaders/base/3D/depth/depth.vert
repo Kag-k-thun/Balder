@@ -1,8 +1,8 @@
 #version 450 core
 
+// The vertex shader of the depth prepass of the 3D shaders, reading the positions only, the first entry of their vertices
+
 layout (location = 0) in vec3 inPosition;
-layout (location = 1) in vec3 inNormals;
-layout (location = 2) in vec2 inUV;
 
 layout(set = 1, binding = 0) uniform Camera {
     mat4 proj;
@@ -31,32 +31,21 @@ layout (std430, set = 0, binding = 1) readonly buffer Instances {
     uint instances [];
 };
 
-layout (location = 0) out vec4 outPosition;
-layout (location = 1) out vec3 outNormals;
-layout (location = 2) out vec2 outUV;
-
 // The cross-fade of the draw: .x its progress, .y the role of the draw, the two low bits of its word (0 for a level
 // drawn alone, 1 for the outgoing level of a cross-fade, 2 for the incoming one)
-layout (location = 3) flat out vec2 outFade;
+layout (location = 0) flat out vec2 outFade;
 
-// The material of the object
-layout (location = 4) flat out uint outMaterial;
-
-// Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
+// Computed as the vertex shaders of the passes compute it, so the passes find the depth written by the prepass
 out gl_PerVertex {
     invariant vec4 gl_Position;
 };
 
-void main () {    
+void main () {
     uint word = instances [gl_InstanceIndex];
     Object object = objects [word >> 2];
 
     vec4 viewPos = camera.view * object.model * vec4 (inPosition, 1.0);
     gl_Position = camera.proj * viewPos;
-    
-    outPosition = viewPos;    
-    outNormals = inNormals;
-    outUV = inUV;
+
     outFade = vec2 (object.fade, float (word & 3u));
-    outMaterial = object.material;
 }
