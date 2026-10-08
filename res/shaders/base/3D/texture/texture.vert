@@ -37,8 +37,9 @@ layout (location = 3) flat out vec2 outFade;
 // The material of the object
 layout (location = 4) flat out uint outMaterial;
 
+// Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
 out gl_PerVertex {
-    vec4 gl_Position;
+    invariant vec4 gl_Position;
 };
 
 void main () {    
