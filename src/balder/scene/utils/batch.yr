@@ -5,7 +5,7 @@ use balder::core::config::shader::_;
 use balder::core::driver::cmd_alloc;
 use balder::core::shader::{_, buffers::_};
 use balder::scene::node::node3D::visual;
-use balder::scene::node::node3D::visual::material;
+use balder::scene::node::node3D::visual::{material, mesh};
 use balder::utils::log;
 
 use ::vulkan::core;
@@ -32,6 +32,64 @@ pub def OBJECT_FADE = 64us;
 pub def OBJECT_MATERIAL = 68us;
 
 /**
+ * The geometry of a mesh placed in the pool of a shader, shared by the instances drawing it
+ * */
+@final
+class SharedGeometry {
+
+    // The range of the geometry in the pool
+    pub let dmut range: &GeometryRange;
+
+    // The number of instances drawing the geometry, the range being given back to the pool with the last one
+    let mut _users: usize = 1us;
+
+    /**
+     * @params:
+     *    - range: the range placed for a first instance
+     * */
+    pub self (dmut range: &GeometryRange)
+        with range = alias range
+    {}
+
+    /**
+     * @returns: true iif the range was given back to the pool
+     * */
+    pub fn isFreed(self)-> bool {
+        atomic self {
+            self._users == 0us
+        }
+    }
+
+    /**
+     * Count one more instance drawing the geometry
+     * @returns: false when the range was already given back to the pool, the instance having to place the geometry again
+     * */
+    pub fn acquire(mut self)-> bool {
+        atomic self {
+            if self._users == 0us { return false; }
+
+            self._users += 1us;
+            return true;
+        }
+    }
+
+    /**
+     * Count one instance less drawing the geometry, the range being given back to the pool with the last one
+     * @warning: through a retire, the recordings in use may still draw the geometry
+     * */
+    pub fn release(mut self) {
+        atomic self {
+            if self._users == 0us { return; }
+
+            self._users -= 1us;
+            if self._users == 0us {
+                self.range:.dispose();
+            }
+        }
+    }
+}
+
+/**
  * The place of a visual instance in the draws of the scene: its geometry in the pool of its shader, its slot in the
  * objects of its shader, and the batch of its material its draws are laid out in
  * */
@@ -44,8 +102,8 @@ pub class SceneDraws {
     // The batch the draws are laid out in
     let dmut _batch: &InstanceBatch;
 
-    // The geometry of the instance
-    let dmut _geometry: &GeometryRange;
+    // The geometry of the instance, shared with the instances of the same mesh
+    let dmut _geometry: &SharedGeometry;
 
     // The slot of the instance in the objects of the shader
     pub let slot: u32;
@@ -56,7 +114,7 @@ pub class SceneDraws {
     // True once the slot and the geometry were given back
     let mut _freed: bool = false;
 
-    pub self (dmut objects: &ObjectStorage, dmut batch: &InstanceBatch, dmut geometry: &GeometryRange, slot: u32, inPlace: bool)
+    pub self (dmut objects: &ObjectStorage, dmut batch: &InstanceBatch, dmut geometry: &SharedGeometry, slot: u32, inPlace: bool)
         with _objects = alias objects
         , _batch = alias batch
         , _geometry = alias geometry
@@ -76,7 +134,7 @@ pub class SceneDraws {
      * @returns: the geometry of the instance in the pool of its shader
      * */
     pub fn getGeometry(self)-> &GeometryRange {
-        self._geometry
+        self._geometry.range
     }
 
     /**
@@ -112,7 +170,7 @@ pub class SceneDraws {
     impl Disposable {
 
         /**
-         * Give back the slot and the geometry of the instance
+         * Give back the slot of the instance, and its geometry when no other instance draws it
          * @warning: through a retire, the recordings in use may still draw the instance
          * */
         pub over dispose(mut self) {
@@ -120,7 +178,7 @@ pub class SceneDraws {
 
             self._freed = true;
             self._objects:.free(self.slot);
-            self._geometry:.dispose();
+            self._geometry:.release();
         }
     }
 }
@@ -165,6 +223,9 @@ pub class ShaderGroup {
 
     // The geometry of the instances
     let dmut _geometry: &GeometryPool;
+
+    // The geometry of the meshes placed in the pool, by uniq id of their mesh
+    let dmut _meshes: [usize => &SharedGeometry] = copy [];
 
     // The worlds, the cross-fades and the materials of the instances
     let dmut _objects: &ObjectStorage;
@@ -220,15 +281,13 @@ pub class ShaderGroup {
      * @params:
      *    - material: the material of the instance, attached
      *    - node: the instance
-     *    - vertices: the vertices of the instance, laid out as the shader reads them
-     *    - indices: the indices of the instance
+     *    - mesh: the geometry of the instance, placed in the pool unless another instance placed it already
      * @returns: the place of the instance, to retire once it is not drawn anymore, after release
      * */
     pub fn register(mut self,
                     dmut material: &Material,
                     dmut node: &VisualInstance3D,
-                    vertices: [f32],
-                    indices: [u32])-> dmut &SceneDraws
+                    mesh: &MeshGeometry)-> dmut &SceneDraws
         throws BalderError
     {
         let key = material.getBatchKey();
@@ -243,12 +302,12 @@ pub class ShaderGroup {
             alias b
         };
 
-        let dmut geometry = self._geometry:.alloc(vertices, indices);
+        let dmut geometry = self:.place(mesh, material);
         let slot = {
             self._objects:.alloc()
         } catch {
             err => {
-                geometry:.dispose();
+                geometry:.release();
                 throw err;
             }
         };
@@ -259,6 +318,33 @@ pub class ShaderGroup {
                         alias geometry,
                         slot,
                         self._shader:.get():.getDevice().isMultiDraw())
+    }
+
+    /**
+     * @returns: the geometry of a mesh in the pool, placed unless an instance drawing it placed it already
+     * @params:
+     *    - mesh: the mesh
+     *    - material: the material of the instance, giving the layout of the vertices
+     * */
+    fn place(mut self, mesh: &MeshGeometry, material: &Material)-> dmut &SharedGeometry
+        throws BalderError
+    {
+        if let Ok(dmut g) = alias self._meshes[mesh.uid] {
+            if g:.acquire() { return alias g; }
+        }
+
+        // the geometries given back are forgotten
+        let dmut alive: [usize => &SharedGeometry] = copy [];
+        for uid, dmut g in alias self._meshes {
+            if !g.isFreed() { alive[uid] = alias g; }
+        }
+
+        let (vertices, indices) = mesh.compact(material);
+        let dmut g = copy SharedGeometry(alias self._geometry:.alloc(vertices, indices));
+        alive[mesh.uid] = alias g;
+        self._meshes = alias alive;
+
+        alias g
     }
 
     /**
@@ -384,6 +470,7 @@ pub class ShaderGroup {
         }
 
         self._batches = copy [];
+        self._meshes = copy [];
         window:.retire(alias self._camera);
         window:.retire(alias self._geometry);
         window:.retire(alias self._objects);
