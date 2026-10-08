@@ -6,6 +6,7 @@ use balder::core::driver::cmd_alloc;
 use balder::core::shader::{_, buffers::_};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::material;
+use balder::utils::log;
 
 use ::vulkan::core;
 
@@ -288,7 +289,51 @@ pub class ShaderGroup {
      */
 
     /**
+     * Lay out the draws of the instances for the recording of a frame, before any of them is recorded
+     * @info: laid out before the pool is bound, the buffers bound holding the geometry of every draw laid out
+     * @params:
+     *    - frame: the frame being recorded
+     * */
+    pub fn layout(mut self, frame: u32) {
+        for key, dmut b in alias self._batches {
+            {
+                b.draws:.begin(frame);
+                for uid, n in b.nodes {
+                    b.draws:.add(frame, uid, n.getDraws());
+                }
+
+                b.count = b.draws:.end(frame);
+                b.set:.setBuffer(UniformNames::OBJECTS, self._objects.getBuffer(), frame);
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to lay out the draws of the material", key, err);
+                    b.count = 0u32;
+                }
+            }
+        }
+    }
+
+    /**
+     * Record the depth prepass of the instances, one multi-draw per material key, nothing when the shader has no prepass
+     * @assume: the draws of the frame are laid out
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the recording
+     * */
+    pub fn drawDepth(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator)
+        throws BalderError
+    {
+        if let sh: &RasterShader = self._shader:.get() {
+            if !sh.hasPrepass() { return; }
+
+            sh.selectPrepass(cmd.getCommandBuffer());
+            self:.drawBatches(frame, alias cmd);
+        }
+    }
+
+    /**
      * Record the draws of the instances, one multi-draw per material key
+     * @assume: the draws of the frame are laid out, and their depth drawn when the shader has a prepass
      * @params:
      *    - frame: the frame being recorded
      *    - cmd: the command allocator of the recording
@@ -296,25 +341,20 @@ pub class ShaderGroup {
     pub fn draw(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator)
         throws BalderError
     {
-        // Laid out before the pool is bound, the buffers bound holding the geometry of every draw laid out
-        for _, dmut b in alias self._batches {
-            b.draws:.begin(frame);
-            for uid, n in b.nodes {
-                b.draws:.add(frame, uid, n.getDraws());
-            }
+        self._shader:.get().select(cmd.getCommandBuffer());
+        self:.drawBatches(frame, alias cmd);
+    }
 
-            b.count = b.draws:.end(frame);
-        }
-
-        let dmut sh = self._shader:.get();
-        sh.select(cmd.getCommandBuffer());
+    /**
+     * Record the multi-draws of the material keys with the pipeline selected
+     * */
+    fn drawBatches(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator) {
         self._camera.select(frame, cmd.getCommandBuffer());
         self._geometry.select(cmd.getCommandBuffer());
 
         for _, dmut b in alias self._batches {
             if b.count == 0u32 { continue; }
 
-            b.set:.setBuffer(UniformNames::OBJECTS, self._objects.getBuffer(), frame);
             b.set.select(frame, cmd.getCommandBuffer());
             cmd:.drawIndexed(b.draws, 0u32, b.count);
         }
