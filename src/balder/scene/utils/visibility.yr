@@ -1,0 +1,215 @@
+in visibility;
+
+use balder::math::{bounds, matrix};
+use balder::scene::node::node3D::visual;
+
+/**
+ * The visual instances of a scene in a bounding volume hierarchy of their world boxes, and those seen by the camera
+ * @info: an instance the camera does not see is culled, its draws drawing nothing; the instances seen are found again
+ * only when the view of the camera changed or an instance moved, entered or left the scene
+ * */
+pub record VisibilityScene {
+
+    // The world boxes of the instances, by uniq id
+    let dmut _index : &Bvh = copy Bvh ();
+
+    // The instances
+    let dmut _nodes : [usize => &VisualInstance3D] = copy [];
+
+    // The instances moved since their boxes were last refit
+    let dmut _moved : [usize => &VisualInstance3D] = copy [];
+
+    // The instances seen by the camera, the other ones being culled
+    let dmut _visible : [usize => &VisualInstance3D] = copy [];
+
+    prv { // View of the last culling
+
+        // The projection by the view of the camera
+        let mut _viewProj : mat4 = mat4 ();
+
+        // The height of the view, in pixels
+        let mut _height : f32 = 0.0f;
+
+        // The size on screen under which an instance is culled, in pixels
+        let mut _minPixels : f32 = 0.0f;
+
+        // True when the instances changed since the last culling
+        let mut _dirty : bool = true;
+
+        // The counters of the last culling
+        let mut _stats : CullStats = CullStats ();
+    }
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of instances
+     * */
+    @field
+    pub fn len (self)-> usize {
+        self._nodes.len
+    }
+
+    /**
+     * @returns: the counters of the last culling of the instances by the camera
+     * */
+    @field
+    pub fn stats (self)-> CullStats {
+        self._stats
+    }
+
+    /**
+     * @returns: the instances seen by the camera at the last culling
+     * */
+    pub fn getVisible (mut self)-> dmut [usize => &VisualInstance3D] {
+        alias self._visible
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          INSERT/REMOVE          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Insert an instance, seen until a culling finds it is not unless it is already culled
+     * */
+    pub fn insert (mut self, dmut node : &VisualInstance3D) {
+        self._index:.insert (node.uid, node:.ownBounds ());
+        self._nodes [node.uid] = alias node;
+        self._moved:.remove (node.uid);
+
+        if node.culled {
+            self._visible:.remove (node.uid);
+        } else {
+            self._visible [node.uid] = alias node;
+        }
+
+        self._dirty = true;
+    }
+
+    /**
+     * Remove an instance
+     * */
+    pub fn remove (mut self, node : &VisualInstance3D) {
+        if node.uid !in self._nodes { return; }
+
+        self._index:.remove (node.uid);
+        self._nodes:.remove (node.uid);
+        self._moved:.remove (node.uid);
+        self._visible:.remove (node.uid);
+        self._dirty = true;
+    }
+
+    /**
+     * Mark the box of an instance to be refit before the next culling
+     * @info: does nothing when the instance was not inserted
+     * */
+    pub fn moved (mut self, dmut node : &VisualInstance3D) {
+        if node.uid !in self._nodes { return; }
+
+        self._moved [node.uid] = alias node;
+        self._dirty = true;
+    }
+
+    /**
+     * Remove every instance, without drawing the culled ones again
+     * */
+    pub fn clear (mut self) {
+        self._index:.clear ();
+        self._nodes = copy [];
+        self._moved = copy [];
+        self._visible = copy [];
+        self._stats = CullStats ();
+        self._dirty = true;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CULLING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Refit the boxes of the instances moved, the hierarchy being rebuilt when the refits degraded it
+     * */
+    pub fn refit (mut self) {
+        for uid, dmut n in alias self._moved {
+            self._index:.update (uid, n:.ownBounds ());
+        }
+
+        self._moved = copy [];
+        if self._index.isDegraded {
+            self._index:.rebuild ();
+        }
+    }
+
+    /**
+     * Find the instances seen through a view, culling none of them (the view of a light...)
+     * @params:
+     *    - view: the view
+     *    - minPixels: the size on screen in pixels under which an instance is not seen
+     * @returns:
+     *    - .0: the uniq ids of the instances seen
+     *    - .1: the counters of the culling
+     * */
+    pub fn cull (mut self, view : ViewVolume, minPixels : f32)-> ([usize], CullStats) {
+        self:.refit ();
+        self._index.cull (view, minPixels)
+    }
+
+    /**
+     * Cull the instances the camera does not see and draw again the ones it sees, when its view or the instances
+     * changed since the last update
+     * @params:
+     *    - viewProj: the projection by the view of the camera
+     *    - height: the height of the view, in pixels
+     *    - minPixels: the size on screen in pixels under which an instance is culled
+     * @returns: true iif the draws of an instance changed and the commands have to be recorded again to draw them
+     * */
+    pub fn update (mut self, viewProj : mat4, height : f32, minPixels : f32)-> bool {
+        if !self._dirty && viewProj == self._viewProj && height == self._height && minPixels == self._minPixels {
+            return false;
+        }
+
+        let (ids, stats) = self:.cull (ViewVolume (viewProj, height), minPixels);
+        self._viewProj = viewProj;
+        self._height = height;
+        self._minPixels = minPixels;
+        self._stats = stats;
+        self._dirty = false;
+
+        let mut redraw = false;
+        let dmut visible : [usize => &VisualInstance3D] = copy [];
+        for uid in ids {
+            if let Ok (dmut n) = alias self._nodes [uid] {
+                visible [uid] = alias n;
+                if uid !in self._visible {
+                    if n:.setCulled (false) { redraw = true; }
+                }
+            }
+        }
+
+        for uid, dmut n in alias self._visible {
+            if uid !in visible {
+                if n:.setCulled (true) { redraw = true; }
+            }
+        }
+
+        self._visible = alias visible;
+        redraw
+    }
+
+}
