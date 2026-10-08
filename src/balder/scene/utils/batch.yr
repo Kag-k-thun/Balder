@@ -214,6 +214,9 @@ class MaterialBatch {
     // The number of draws laid out by the recording of the current frame
     pub let mut count: u32 = 0u32;
 
+    // The descriptor set of the cull pass of the draws, when they are culled on the GPU
+    pub let dmut cullSet: (&DescriptorSet)? = none;
+
     pub self (dmut set: &DescriptorSet, dmut draws: &InstanceBatch)
         with set = alias set
         , draws = alias draws
@@ -224,6 +227,8 @@ class MaterialBatch {
  * The visual instances drawn by a shader, the draws of the instances whose materials share their resources being drawn
  * by one multi-draw indirect call, the draws of the same range of their geometry by one instanced command
  * @info: the instances share the vertex and the index buffer of a geometry pool and the storage buffer of their worlds
+ * @info: when culled on the GPU, a cull pass writes the commands of each material key before the render pass, drawn by
+ * one draw indirect count call
  * */
 @final
 pub class ShaderGroup {
@@ -245,6 +250,9 @@ pub class ShaderGroup {
 
     // The draws of the instances by material key
     let dmut _batches: [[c8] => &MaterialBatch] = copy [];
+
+    // The cull shader of the scene when the instances are culled on the GPU, none when they are culled on the CPU
+    let dmut _cull: (&ComputeShader)? = none;
 
     /*!
      * ====================================================================================================
@@ -311,6 +319,7 @@ pub class ShaderGroup {
             material:.bind(alias set);
 
             let dmut b = copy MaterialBatch(alias set, copy InstanceBatch(alias self._shader:.get():.getDevice()));
+            self:.cullOnGpu(alias b);
             self._batches[key] = alias b;
             alias b
         };
@@ -393,6 +402,34 @@ pub class ShaderGroup {
     }
 
     /**
+     * Cull the instances on the GPU with a cull shader, or on the CPU, from the next recordings
+     * @params:
+     *    - window: the window retiring the descriptor sets of the cull pass, when culled on the CPU
+     *    - cull: the cull shader of the scene, none to cull on the CPU
+     * */
+    pub fn setCulling(mut self, dmut window: &Window, dmut cull: (&ComputeShader)?) {
+        self._cull = alias cull;
+        for key, dmut b in alias self._batches {
+            if self._cull.hasValue {
+                {
+                    self:.cullOnGpu(alias b);
+                } catch {
+                    err => {
+                        log::error #("Scene", "Failed to cull the draws of the material on the GPU", key, err);
+                    }
+                }
+            } else {
+                if let Ok(dmut set) = alias b.cullSet {
+                    window:.retire(alias set);
+                }
+
+                b.cullSet = none;
+                b.draws:.setCulled(false);
+            }
+        }
+    }
+
+    /**
      * Remove a visual instance from the draws of the shader
      * @params:
      *    - window: the window retiring the resources of the material batch, when it has no instance anymore
@@ -407,6 +444,10 @@ pub class ShaderGroup {
             if b.nodes.len == 0us {
                 window:.retire(alias b.set);
                 window:.retire(alias b.draws);
+                if let Ok(dmut set) = alias b.cullSet {
+                    window:.retire(alias set);
+                }
+
                 self._batches:.remove(key);
             }
         }
@@ -439,12 +480,71 @@ pub class ShaderGroup {
                 if let Ok(words) = b.draws.getWordBuffer(frame) {
                     b.set:.setBuffer(UniformNames::INSTANCES, words, frame);
                 }
+
+                if let Ok(dmut set) = alias b.cullSet {
+                    self.bindCull(frame, alias set, b.draws);
+                }
             } catch {
                 err => {
                     log::error #("Scene", "Failed to lay out the draws of the material", key, err);
                     b.count = 0u32;
                 }
             }
+        }
+    }
+
+    /**
+     * Record the clear of the counters of the cull passes of the material keys culled on the GPU
+     * @assume: the draws of the frame are laid out
+     * */
+    pub fn clearCounters(mut self, dmut cmd: &CullCommandAllocator) {
+        for _, b in self._batches {
+            cmd:.clear(b.draws);
+        }
+    }
+
+    /**
+     * Record the cull of the candidates of the material keys culled on the GPU
+     * @assume: the counters are cleared, the cull pass of the scene is bound (see CullPass::select)
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the cull passes
+     *    - height: the height of the view, in pixels
+     *    - minPixels: the size on screen in pixels under which an instance is culled
+     * */
+    pub fn cull(mut self, frame: u32, dmut cmd: &CullCommandAllocator, height: f32, minPixels: f32) {
+        if let Ok(dmut shader) = alias self._cull {
+            for _, b in self._batches {
+                if let Ok(set) = b.cullSet {
+                    set.select(frame, cmd.getCommandBuffer());
+                    cmd:.cull(alias shader, b.draws, height, minPixels);
+                }
+            }
+        }
+    }
+
+    /**
+     * Record the writing of the commands of the material keys culled on the GPU
+     * @assume: the candidates are culled, the cull pass of the scene is bound
+     * */
+    pub fn writeCommands(mut self, frame: u32, dmut cmd: &CullCommandAllocator) {
+        if let Ok(dmut shader) = alias self._cull {
+            for _, b in self._batches {
+                if let Ok(set) = b.cullSet {
+                    set.select(frame, cmd.getCommandBuffer());
+                    cmd:.writeCommands(alias shader, b.draws);
+                }
+            }
+        }
+    }
+
+    /**
+     * Record the copy of the counters of the material keys culled on the GPU, read back by the CPU (see drawStats)
+     * @assume: the commands are written
+     * */
+    pub fn readBack(mut self, dmut cmd: &CullCommandAllocator) {
+        for _, b in self._batches {
+            cmd:.readBack(b.draws);
         }
     }
 
@@ -491,7 +591,54 @@ pub class ShaderGroup {
             if b.count == 0u32 { continue; }
 
             b.set.select(frame, cmd.getCommandBuffer());
-            cmd:.drawIndexed(b.draws, 0u32, b.count);
+            if b.draws.isCulled(frame) {
+                cmd:.drawIndexedCount(b.draws);
+            } else {
+                cmd:.drawIndexed(b.draws, 0u32, b.count);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CULLING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Cull the draws of a material key on the GPU when the cull shader is set, its descriptor set being allocated
+     * */
+    fn cullOnGpu(mut self, dmut b: &MaterialBatch)
+        throws BalderError
+    {
+        if let Ok(dmut cull) = alias self._cull {
+            if !b.cullSet.hasValue {
+                let dmut set = cull:.allocateDescriptorSet(DescriptorContext::OBJECT);
+                b.cullSet = (alias set)?;
+            }
+
+            b.draws:.setCulled(true);
+        }
+    }
+
+    /**
+     * Bind the buffers the cull pass of a material key reads and writes for a frame
+     * @assume: the draws of the frame are laid out
+     * */
+    fn bindCull(self, frame: u32, dmut set: &DescriptorSet, draws: &InstanceBatch) {
+        if !draws.isCulled(frame) { return; }
+
+        set:.setBuffer(UniformNames::OBJECTS, self._objects.getBuffer(), frame);
+        for name, buffer in copy [UniformNames::DRAWS => draws.getCandidateBuffer(frame),
+                                  UniformNames::TEMPLATES => draws.getTemplateBuffer(frame),
+                                  UniformNames::COUNTERS => draws.getCounterBuffer(frame),
+                                  UniformNames::COMMANDS => draws.getCulledCommandBuffer(frame),
+                                  UniformNames::INSTANCES => draws.getWordBuffer(frame)] {
+            if let Ok(b) = buffer {
+                set:.setBuffer(name, b, frame);
+            }
         }
     }
 
@@ -512,6 +659,9 @@ pub class ShaderGroup {
         for _, dmut b in alias self._batches {
             window:.retire(alias b.set);
             window:.retire(alias b.draws);
+            if let Ok(dmut set) = alias b.cullSet {
+                window:.retire(alias set);
+            }
         }
 
         self._batches = copy [];

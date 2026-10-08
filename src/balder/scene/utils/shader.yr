@@ -3,12 +3,13 @@ in shader;
 use balder::utils;
 use balder::core::{_, driver::_};
 use balder::core::application::window;
+use balder::core::config::shader;
 use balder::core::shader::{_, buffers::_};
 use balder::math::{bounds, matrix, vector};
 use balder::scene::node::node3D::camera;
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
-use balder::scene::utils::{batch, draw_stats, light, material, visibility};
+use balder::scene::utils::{batch, cull, draw_stats, light, material, visibility};
 
 use std::time::dur;
 
@@ -41,6 +42,16 @@ pub record ShaderNodeScene {
 
         let mut _cam : (&UniformBufferObject)? = none;
         
+    }
+
+    prv { // Culling on the GPU
+
+        // True when the drawable nodes are culled on the GPU, by a cull pass before the render pass of the deferred
+        let mut _gpuCulling : bool = false;
+
+        // The cull pass, loaded when the nodes are first culled on the GPU
+        let dmut _cull : (&CullPass)? = none;
+
     }
 
     prv { // Sorting
@@ -126,6 +137,10 @@ pub record ShaderNodeScene {
                 g:.setCamera (ubo);
             }
 
+            if let Ok (dmut c) = alias self._cull {
+                c:.setCamera (ubo);
+            }
+
             self._cam = (ubo)?;
         }
     }    
@@ -139,11 +154,26 @@ pub record ShaderNodeScene {
      */
 
     /**
-     * @returns: the counters of the last culling of the drawable nodes by the camera
+     * @returns: the counters of the last culling of the drawable nodes by the camera, the number of nodes only when they
+     * are culled on the GPU (see drawStats for what it draws)
      * */
     @field
     pub fn cullStats (self)-> CullStats {
+        if self._gpuCulling {
+            let mut stats = CullStats ();
+            stats.considered = self._nodes.len;
+            return stats;
+        }
+
         self._visibility.stats
+    }
+
+    /**
+     * @returns: true iif the drawable nodes are culled on the GPU
+     * */
+    @field
+    pub fn gpuCulling (self)-> bool {
+        self._gpuCulling
     }
 
     /**
@@ -261,6 +291,13 @@ pub record ShaderNodeScene {
                         g:.setCamera (cam);
                     }
 
+                    if self._gpuCulling {
+                        if let Ok (dmut c) = alias self._cull {
+                            let dmut cullShader = alias c:.getShader ();
+                            g:.setCulling (alias win, (alias cullShader)?);
+                        }
+                    }
+
                     self._groups [shCfg.name] = alias g;
                 }
             }
@@ -312,7 +349,7 @@ pub record ShaderNodeScene {
      */
 
     /**
-     * Cull the drawable nodes the camera does not see, and draw again those it sees
+     * Cull the drawable nodes the camera does not see, and draw again those it sees, unless they are culled on the GPU
      * @params:
      *    - viewProj: the projection by the view of the camera
      *    - height: the height of the view, in pixels
@@ -320,7 +357,72 @@ pub record ShaderNodeScene {
      * @returns: true iif the draws of a node changed and the commands have to be recorded again to draw them
      * */
     pub fn cull (mut self, viewProj : mat4, height : f32, threshold : f32)-> bool {
+        if self._gpuCulling { return false; }
+
         self._visibility:.update (viewProj, height, threshold)
+    }
+
+    /**
+     * Cull the drawable nodes on the GPU, by a cull pass recorded before the render pass of the deferred, or on the CPU,
+     * through the hierarchy of their boxes (the reference of the GPU, and its fallback)
+     * @info: the GPU culls the nodes when the device has multi-draw and the drawIndirectCount feature only, the CPU
+     * culling them otherwise; the CPU selects the levels of detail of every node while the GPU culls them
+     * @params:
+     *    - culling: true to cull the nodes on the GPU
+     * @returns: true iif the culling changed and the commands have to be recorded again
+     * */
+    pub fn setGpuCulling (mut self, culling : bool)-> bool {
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else { return false; };
+
+        let device = win:.getVulkanDevice ();
+        let supported = device.isMultiDraw () && device.isDrawIndirectCount ();
+        if culling && !supported {
+            log::warn #("Scene", "The device cannot cull on the GPU (multi-draw and drawIndirectCount), culling on the CPU");
+        }
+
+        let enabled = culling && supported;
+        if enabled == self._gpuCulling { return false; }
+
+        if enabled && !self._cull.hasValue {
+            {
+                let dmut shader = win:.loadResource!{&ComputeShader} (DefaultShaders::CULL_3D);
+                let dmut c = copy CullPass (alias shader);
+                if let Ok (cam) = self._cam {
+                    c:.setCamera (cam);
+                }
+
+                self._cull = (alias c)?;
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to load the cull pass, culling on the CPU", err);
+                    return false;
+                }
+            }
+        }
+
+        let dmut cullShader : (&ComputeShader)? = none;
+        if enabled {
+            if let Ok (dmut c) = alias self._cull {
+                {
+                    let dmut sh = c:.getShader ();
+                    cullShader = (alias sh)?;
+                } catch {
+                    err => {
+                        log::error #("Scene", "Failed to load the cull pass, culling on the CPU", err);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        self._gpuCulling = enabled;
+        for _, dmut g in alias self._groups {
+            g:.setCulling (alias win, alias cullShader);
+        }
+
+        // the culled nodes are drawn again, the CPU culling them again from the next update when the GPU stops
+        self._visibility:.showAll ();
+        true
     }
 
     /**
@@ -341,6 +443,9 @@ pub record ShaderNodeScene {
      *    - eye: the position of the camera
      * */
     pub fn sort (mut self, eye : vec3) {
+        // the cull pass writes the commands in no particular order
+        if self._gpuCulling { return; }
+
         let update = self._visibility.updates;
         if eye == self._sortedEye && update == self._sortedUpdate { return; }
 
@@ -387,14 +492,59 @@ pub record ShaderNodeScene {
      */
 
     /**
-     * Record the draws of the nodes, one multi-draw per shader and material key: the depth of every node first, written
-     * by the depth prepass of the shaders having one, then the nodes, each pixel being shaded by its closest fragment
+     * Lay out the draws of the nodes for the recording of a frame, and record the cull passes of the nodes culled on the
+     * GPU, before the render pass of the deferred begins
+     * @params:
+     *    - frame: the frame being recorded
+     *    - pass: the subpass of the deferred, being prepared
+     *    - height: the height of the view, in pixels
+     *    - threshold: the size on screen under which a node is culled, in pixels
      * */
-    pub fn draw (mut self, frame : u32, dmut cmd : &IndexedDrawCommandAllocator) {
+    pub fn prepare (mut self, frame : u32, dmut pass : &DrawSubpass, height : f32, threshold : f32) {
         for _, dmut g in alias self._groups {
             g:.layout (frame);
         }
 
+        if !self._gpuCulling { return; }
+
+        if let Ok (dmut cull) = alias self._cull {
+            let dmut cmd = copy CullCommandAllocator (alias pass);
+            {
+                for _, dmut g in alias self._groups {
+                    g:.clearCounters (alias cmd);
+                }
+
+                cmd:.afterClear ();
+                cull.select (frame, cmd.getCommandBuffer ());
+                for _, dmut g in alias self._groups {
+                    g:.cull (frame, alias cmd, height, threshold);
+                }
+
+                cmd:.afterCull ();
+                for _, dmut g in alias self._groups {
+                    g:.writeCommands (frame, alias cmd);
+                }
+
+                cmd:.afterCommands ();
+                for _, dmut g in alias self._groups {
+                    g:.readBack (alias cmd);
+                }
+
+                cmd:.afterReadBack ();
+            } catch {
+                err => {
+                    log::error #("Scene", "Failed to record the cull passes", err);
+                }
+            }
+        }
+    }
+
+    /**
+     * Record the draws of the nodes, one multi-draw per shader and material key: the depth of every node first, written
+     * by the depth prepass of the shaders having one, then the nodes, each pixel being shaded by its closest fragment
+     * @assume: the draws of the frame are laid out, see prepare
+     * */
+    pub fn draw (mut self, frame : u32, dmut cmd : &IndexedDrawCommandAllocator) {
         for name, dmut g in alias self._groups {
             {
                 g:.drawDepth (frame, alias cmd);
@@ -433,9 +583,15 @@ pub record ShaderNodeScene {
                 for _, dmut g in alias self._groups {
                     g:.retire (alias win);
                 }
+
+                if let Ok (dmut c) = alias self._cull {
+                    c:.retire (alias win);
+                }
             }
 
             self._groups = copy [];
+            self._cull = none;
+            self._gpuCulling = false;
             self._materials:.dispose ();
             self._directionLights:.dispose ();
             self._spotLights:.dispose ();
