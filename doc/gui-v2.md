@@ -663,7 +663,9 @@ next popup opened.
 
 - **A layout scrolls itself.** `overflow: scroll` keeps the bases of the children instead of shrinking them, and the
   layout scrolls over them with the wheel or by dragging its scrollbar, styled as its part `LinearLayout::scrollbar`.
-  The `ScrollLayout` wrapper is gone, so restyling `overflow` changes no widget of the tree.
+  The `ScrollLayout` wrapper is gone, so restyling `overflow` changes no widget of the tree. Its min-content along its
+  axis is 0 (BAL-74): it shrinks to the space its parent gives it, and adds nothing to the minimum of its ancestors,
+  where CSS would need a `min-height: 0` on each of them.
 - **Tracks are sized as in CSS**: lengths, percentages and content sizes first, then the `auto` tracks grow from their
   min-content to their max-content sharing the free space, then the shares in `fr` take what is left, the `auto`
   tracks stretching to it when there is none. A share may be smaller than its content (`minmax(0, 1fr)`), and a track
