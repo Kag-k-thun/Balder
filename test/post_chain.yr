@@ -1,0 +1,273 @@
+in post_chain;
+
+use balder::core::error;
+use balder::core::driver::graph;
+use balder::scene::utils::post::_;
+
+use ::vulkan::core;
+
+def COMPUTE      = 0x00000800u32; // VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+def SHADER_WRITE = 0x00000040u32; // VK_ACCESS_SHADER_WRITE_BIT
+
+/**
+ * An effect in HDR space reading the depth of the g-buffer, as a fog would
+ * */
+class FogEffect over PostEffect {
+    pub self (name : [c8] = "fog")
+        with super (name, PostSpace::HDR, "shaders:/fog.toml", reads-> copy [PostInput::DEPTH])
+    {}
+}
+
+/**
+ * @returns: the names around the chain of a scene named "scene"
+ * */
+fn sources ()-> PostSources {
+    PostSources (scene-> "scene",
+                 submission-> "compose",
+                 radiance-> "radiance",
+                 output-> "output",
+                 depth-> "depth",
+                 normals-> "normals")
+}
+
+/**
+ * @returns: the names of the effects of the stages of a plan, in their order
+ * */
+fn effectsOf (plan : PostPlan)-> [[c8]] {
+    let mut result : [[c8]] = [];
+    for s in plan.stages {
+        result = result ~ [s.effect];
+    }
+
+    result
+}
+
+/**
+ * @returns: the stage of an effect in a plan, an empty stage if there is none
+ * */
+fn stageOf (plan : PostPlan, effect : [c8])-> PostStage {
+    for s in plan.stages if s.effect == effect {
+        return s;
+    }
+
+    PostStage ()
+}
+
+/**
+ * @returns: the graph of a scene, its g-buffer writing the depth and its composition the light, the passes of a plan
+ * declared after them in the subpass of the composition, and the screen reading the output
+ * */
+fn graphOf (plan : PostPlan)-> dmut &RenderGraph
+    throws BalderError
+{
+    let dmut g = copy RenderGraph ("screen");
+    g:.addSubmission ("screen");
+    g:.addSubmission ("deferred");
+    g:.addSubmission ("compose");
+
+    g:.createImage ("depth", ImageDesc (width-> 32u32, height-> 32u32, depth-> true));
+    g:.createImage ("radiance", ImageDesc (format-> VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT, width-> 32u32, height-> 32u32, storage-> true));
+    g:.importImage ("output");
+
+    g:.declarePass (GraphPass (name-> "screen",
+                               submission-> "screen",
+                               uses-> copy [ResourceUse (resource-> "output", usage-> Usage::SAMPLED_FRAGMENT)]));
+    g:.declarePass (GraphPass (name-> "gbuffer",
+                               submission-> "deferred",
+                               uses-> copy [ResourceUse (resource-> "depth", usage-> Usage::DEPTH_ATTACHMENT)]));
+    g:.declarePass (GraphPass (name-> "compose",
+                               submission-> "compose",
+                               kind-> PassKind::COMPUTE,
+                               uses-> copy [ResourceUse (resource-> "depth", usage-> Usage::SAMPLED_COMPUTE),
+                                            ResourceUse (resource-> "radiance", usage-> Usage::STORAGE_WRITE)]));
+
+    for s in plan.stages {
+        if !s.last {
+            g:.createImage (s.output, s.image (32u32, 32u32));
+        }
+
+        g:.declarePass (s.toPass ("compose", none));
+    }
+
+    alias g
+}
+
+/**
+ * @returns: the barrier of a resource before a pass, a barrier of no stage if there is none
+ * */
+fn barrierOf (s : RenderSchedule, pass : [c8], resource : [c8])-> GraphBarrier {
+    for sub in s.submissions {
+        for p in sub.passes if p.name == pass {
+            for b in p.barriers if b.resource == resource {
+                return b;
+            }
+        }
+    }
+
+    GraphBarrier ()
+}
+
+/**
+ * @returns: the names of the passes of a subpass of a schedule, in their order
+ * */
+fn passNames (s : RenderSchedule, submission : [c8])-> [[c8]] {
+    let mut result : [[c8]] = [];
+    for sub in s.submissions if sub.name == submission {
+        for p in sub.passes {
+            result = result ~ [p.name];
+        }
+    }
+
+    result
+}
+
+/**
+ * A chain without effects tone maps the light the composition wrote straight into the output
+ * */
+__test the_tone_mapping_alone_writes_the_output {
+    let chain = PostChain ();
+    let plan = chain.plan (sources ());
+
+    assert (plan.passes () == ["post_tonemap_scene"]);
+    let s = plan.stages [0];
+    assert (s.input == "radiance" && s.output == "output" && s.last);
+    assert (s.space == PostSpace::DISPLAY);
+}
+
+/**
+ * The effects in HDR space run before the tone mapping and those in display space after it, whatever the order they
+ * were added in, each reading the image the stage before it wrote
+ * */
+__test the_spaces_place_the_effects_around_the_tone_mapping {
+    let dmut chain = PostChain ();
+    chain:.add (copy InvertEffect ());
+    chain:.add (copy VignetteEffect ());
+    chain:.add (copy FogEffect ());
+
+    let plan = chain.plan (sources ());
+    assert (effectsOf (plan) == ["vignette", "fog", "tonemap", "invert"]);
+    assert (plan.passes () == ["post_vignette_scene", "post_fog_scene", "post_tonemap_scene", "post_invert_scene"]);
+
+    let vignette = stageOf (plan, "vignette");
+    assert (vignette.input == "radiance" && vignette.output == "post_vignette_out_scene" && !vignette.last);
+    assert (vignette.space == PostSpace::HDR);
+    assert (vignette.image (32u32, 32u32).format == VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT);
+
+    let fog = stageOf (plan, "fog");
+    assert (fog.input == "post_vignette_out_scene" && fog.reads == ["depth"]);
+    let uses = fog.uses ();
+    assert (uses.len == 3us);
+    assert (uses [0].resource == "post_vignette_out_scene" && uses [0].usage == Usage::SAMPLED_COMPUTE);
+    assert (uses [1].resource == "depth" && uses [1].usage == Usage::SAMPLED_COMPUTE);
+    assert (uses [2].resource == "post_fog_out_scene" && uses [2].usage == Usage::STORAGE_WRITE);
+
+    let tonemap = stageOf (plan, "tonemap");
+    assert (tonemap.input == "post_fog_out_scene" && tonemap.output == "post_tonemap_out_scene");
+    assert (tonemap.space == PostSpace::DISPLAY);
+    assert (tonemap.image (32u32, 32u32).format == VkFormat::VK_FORMAT_R8G8B8A8_UNORM);
+
+    let invert = stageOf (plan, "invert");
+    assert (invert.input == "post_tonemap_out_scene" && invert.output == "output" && invert.last);
+}
+
+/**
+ * A disabled effect is skipped, the stage after it reading what the stage before it wrote, until it is enabled again
+ * */
+__test disabled_effects_are_skipped {
+    let dmut chain = PostChain ();
+    chain:.add (copy VignetteEffect ());
+    chain:.add (copy InvertEffect (), enabled-> false);
+
+    assert (!chain.isEnabled ("invert") && chain.isEnabled ("vignette"));
+    assert (effectsOf (chain.plan (sources ())) == ["vignette", "tonemap"]);
+    assert (stageOf (chain.plan (sources ()), "tonemap").output == "output");
+
+    assert (chain:.enable ("vignette", false));
+    assert (chain:.enable ("invert", true));
+    assert (effectsOf (chain.plan (sources ())) == ["tonemap", "invert"]);
+    assert (stageOf (chain.plan (sources ()), "tonemap").input == "radiance");
+
+    assert (!chain:.enable ("bloom", true));
+}
+
+/**
+ * Effects are reordered within their space and removed, their names unique in the chain, the tone mapping's included
+ * */
+__test effects_are_reordered_and_removed {
+    let dmut chain = PostChain ();
+    chain:.add (copy VignetteEffect ());
+    chain:.add (copy FogEffect ());
+    chain:.add (copy FogEffect (name-> "mist"));
+
+    assert (chain:.reorder ("mist", 0us));
+    assert (effectsOf (chain.plan (sources ())) == ["mist", "vignette", "fog", "tonemap"]);
+
+    assert (chain:.reorder ("mist", 10us));
+    assert (effectsOf (chain.plan (sources ())) == ["vignette", "fog", "mist", "tonemap"]);
+
+    assert (chain:.remove ("fog"));
+    assert (!chain:.remove ("fog"));
+    assert (effectsOf (chain.plan (sources ())) == ["vignette", "mist", "tonemap"]);
+    assert (chain:.get ("mist").hasValue && !chain:.get ("fog").hasValue);
+
+    let mut refused = 0;
+    for name in ["vignette", "tonemap"] {
+        {
+            chain:.add (copy VignetteEffect (name-> name));
+        } catch {
+            _ : &BalderError => { refused += 1; }
+        }
+    }
+
+    assert (refused == 2);
+    assert (chain.effects.len == 2us);
+}
+
+/**
+ * The passes of a chain are compute passes of the subpass of the composition, the render graph ordering them by the
+ * images they read and write: each pass samples what the one before it stored, and the screen reads the output
+ * */
+__test the_render_graph_chains_the_passes {
+    let dmut chain = PostChain ();
+    chain:.add (copy InvertEffect ());
+    chain:.add (copy FogEffect ());
+
+    let g = graphOf (chain.plan (sources ()));
+    let s = g.compile ();
+    assert (passNames (s, "compose") == ["compose", "post_fog_scene", "post_tonemap_scene", "post_invert_scene"]);
+
+    for link in [("post_fog_scene", "radiance"),
+                 ("post_tonemap_scene", "post_fog_out_scene"),
+                 ("post_invert_scene", "post_tonemap_out_scene")] {
+        let read = barrierOf (s, link._0, link._1);
+        assert (read.srcStage == COMPUTE && read.srcAccess == SHADER_WRITE && read.dstStage == COMPUTE);
+        assert (read.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+        assert (read.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    // the last pass stores the output
+    assert (barrierOf (s, "post_invert_scene", "output").newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+}
+
+/**
+ * The registry creates the effects a scene description names, with their parameters, those missing taking their default
+ * */
+__test the_registry_creates_the_described_effects {
+    let dmut registry = PostRegistry ();
+
+    if let Ok (v : &VignetteEffect) = registry.create (PostDescription (kind-> "vignette", params-> copy [0.8f, 0.2f])) {
+        assert (v.name == "vignette" && v.intensity == 0.8f && v.radius == 0.2f && v.softness == 0.6f);
+    } else {
+        assert (false);
+    }
+
+    if let Ok (i) = registry.create (PostDescription (kind-> "invert")) {
+        assert (i.space == PostSpace::DISPLAY);
+    } else {
+        assert (false);
+    }
+
+    assert (!registry.create (PostDescription (kind-> "fog")).hasValue);
+    registry:.register ("fog", |_|-> dmut &PostEffect => copy FogEffect ());
+    assert (registry.has ("fog") && registry.create (PostDescription (kind-> "fog")).hasValue);
+}
