@@ -8,6 +8,8 @@ use ::vulkan::core;
 
 mod ::draw;
 mod ::compute;
+mod ::step;
+mod ::transition;
 
 @abstract
 pub class VulkanSubpass {
@@ -37,6 +39,9 @@ pub class VulkanSubpass {
                 
         // The signal emitted by the subpass when it is redrawn
         let dmut _onRedraw : &DirectSignal!{()} = copy DirectSignal!{()} ();
+
+        // The passes of a render graph recorded in the subpass, in their order, none to emit onRedraw alone
+        let dmut _steps : [PassStep] = [];
 
     }
     
@@ -216,9 +221,102 @@ pub class VulkanSubpass {
      * @params:
      *    - currentFrame: the current frame to submit
      *    - previousPass: the list of semaphores to wait emited by previous passes
-     *    - previousPassStages: the flags of the pass considered finished when reaching the stage (example: VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
+     *    - previousPassStages: the stages of the subpass waiting for each semaphore (example: VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+     *    - signals: the semaphores signaled once the subpass is finished, awaited by the next passes
      * */
-    pub fn submit (mut self, frame : u32, previousPassStages : [u32], previousPass : [VkSemaphore])-> VkResult;
+    pub fn submit (mut self, frame : u32, previousPassStages : [u32], previousPass : [VkSemaphore], signals : [VkSemaphore])-> VkResult;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          GRAPH STEPS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the passes of a render graph the subpass records, in their order, the next recordings recording them instead
+     * of emitting the onDraw signal
+     * */
+    pub fn setSteps (mut self, dmut steps : [PassStep]) {
+        atomic self {
+            self._steps = alias steps;
+        }
+    }
+
+    /**
+     * @returns: the passes the subpass records
+     * */
+    pub fn getSteps (self)-> [PassStep] {
+        atomic self {
+            self._steps
+        }
+    }
+
+    /**
+     * Record a pass of the subpass: its barrier, then its recording
+     * @params:
+     *    - index: the index of the pass in the steps of the subpass
+     * */
+    prot fn recordStep (mut self, index : usize) {
+        self:.recordBarrier (index);
+        self:.runStep (self._steps [index]);
+    }
+
+    /**
+     * Record the barrier a pass needs, if it needs one
+     * @params:
+     *    - index: the index of the pass in the steps of the subpass
+     * */
+    prot fn recordBarrier (mut self, index : usize) {
+        let step = self._steps [index];
+        if step.srcStage == 0u32 { return; }
+
+        let mut memory = VkMemoryBarrier ();
+        memory.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        memory.srcAccessMask = step.srcAccess;
+        memory.dstAccessMask = step.dstAccess;
+
+        let dmut images : [VkImageMemoryBarrier] = [];
+        for j, t in step.transitions {
+            let mut b = VkImageMemoryBarrier ();
+            b.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout = t.oldLayout;
+            b.newLayout = t.newLayout;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = alias self._steps [index].transitions [j].images [self._currentFrame];
+            b.subresourceRange.aspectMask = t.aspect;
+            b.subresourceRange.levelCount = 1;
+            b.subresourceRange.layerCount = 1;
+            b.srcAccessMask = t.srcAccess;
+            b.dstAccessMask = t.dstAccess;
+            images ~= [b];
+        }
+
+        let memoryCount = if step.srcAccess != 0u32 || step.dstAccess != 0u32 { 1u32 } else { 0u32 };
+        vkCmdPipelineBarrier (self._nextCommandBuffer [self._currentFrame],
+                              step.srcStage,
+                              step.dstStage,
+                              0u32,
+                              memoryCount,
+                              &memory,
+                              0u32,
+                              null,
+                              cast!u32 (images.len),
+                              images.ptr);
+    }
+
+    /**
+     * Record a pass, without its barrier
+     * */
+    prot fn runStep (mut self, step : PassStep) {
+        if let Ok (r) = step.recording {
+            r ();
+        } else {
+            self._onRedraw:.emit ();
+        }
+    }
 
     /*!
      * ====================================================================================================
@@ -313,7 +411,14 @@ pub class VulkanSubpass {
             self._generations:.recorded (frame, self._retired.getStamp ());
 
             self:.startRecording ();
-            self._onRedraw:.emit ();
+            if self._steps.len == 0us {
+                self._onRedraw:.emit ();
+            } else {
+                for i in 0us .. self._steps.len {
+                    self:.recordStep (i);
+                }
+            }
+
             self:.stopRecording ();
 
             let dmut aux = alias self._commandBuffers [frame];
@@ -461,6 +566,7 @@ pub class VulkanSubpass {
             self:.resetCommands ();
             self:.resetDrawSignal ();
             self:.drainRetired ();
+            self._steps = [];
             
             self._allocators = [];
             self._finishSemaphore = [];
@@ -475,3 +581,6 @@ pub class VulkanSubpass {
 
 pub def DrawSubpass : draw::DrawSubpass;
 pub def ComputeSubpass : compute::ComputeSubpass;
+pub def PassStep : step::PassStep;
+pub def ImageTransition : transition::ImageTransition;
+
