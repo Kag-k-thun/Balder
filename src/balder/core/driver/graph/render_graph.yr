@@ -1,0 +1,824 @@
+in render_graph;
+
+mod ::utils;
+
+use balder::core::error;
+use balder::core::driver::graph::{barrier, edge, lifetime, pass, resource, schedule, scheduled_pass, submission, usage};
+
+use ::vulkan::core;
+
+/**
+ * The stages awaiting the semaphores that only order two subpasses (the transfers before the first subpasses, the
+ * subpasses nothing reads before the screen)
+ * */
+def ORDER_STAGE = 0x00010000u32; // VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+
+/**
+ * No pass
+ * */
+def NONE = usize::max;
+
+/**
+ * A dependency between two passes, from the use of a resource by the first one to its use by the second one
+ * */
+record Dependency {
+    pub let from: usize;
+    pub let to: usize;
+    pub let resource: [c8];
+
+    pub self (from: usize, to: usize, resource: [c8])
+        with from = from
+        , to = to
+        , resource = resource
+    {}
+}
+
+/**
+ * The state of a resource while the passes of a frame are walked in the order they are recorded
+ * */
+record ResourceState {
+
+    // The layout of the image
+    pub let mut layout: VkImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+
+    // True once a pass of the frame used the resource
+    pub let mut used: bool = false;
+
+    // The subpass of the last pass writing the resource, NONE if none did
+    pub let mut writer: usize = NONE;
+
+    // The stages and the accesses of that write
+    pub let mut writeStage: u32 = 0u32;
+    pub let mut writeAccess: u32 = 0u32;
+
+    // The subpasses of the passes reading the resource since it was written, and their stages
+    pub let mut readers: [usize] = [];
+    pub let mut readStages: [u32] = [];
+
+    pub self () {}
+}
+
+/**
+ * A render graph: the passes of a frame declared with the resources they use, the graph deriving the order they are
+ * recorded and submitted in, the barriers between them, and the semaphores between their subpasses
+ * @info: a resource written by several passes is written in the order the passes are declared, a pass reading it reading
+ * what the last of them declared before it wrote (the pass of the screen being the last one); the passes are recorded in
+ * the order of their declaration, each subpass submitted once those it depends on are, so a pass declared later may run
+ * earlier when nothing orders them
+ * @info: a disabled pass is not recorded, and its uses do not exist; an optional use of a resource no pass wrote before
+ * it in the frame, or of a resource not declared, is dropped
+ * */
+@final
+pub class RenderGraph {
+
+    // The pass reading what the frame shows, recorded last, in the subpass of the screen
+    let _sink: [c8];
+
+    // The resources, by name
+    let dmut _resources: [[c8] => GraphResource] = copy [];
+
+    // The subpasses, in the order of their registration
+    let mut _submissions: [[c8]] = [];
+
+    // The passes, in the order of their declaration
+    let mut _passes: [GraphPass] = [];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - sink: the name of the pass recording the screen, declared afterwards
+     * */
+    pub self (sink: [c8])
+        with _sink = sink
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the name of the pass recording the screen
+     * */
+    pub fn getSink(self)-> [c8] {
+        self._sink
+    }
+
+    /**
+     * @returns: the passes, in the order of their declaration
+     * */
+    pub fn getPasses(self)-> [GraphPass] {
+        self._passes
+    }
+
+    /**
+     * @returns: the resource named 'name', none if it is not declared
+     * */
+    pub fn getResource(self, name: [c8])-> (GraphResource)? {
+        if let Ok(r) = self._resources[name] {
+            return r?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the resources, sorted by name
+     * */
+    pub fn getResources(self)-> [GraphResource] {
+        let mut result: [GraphResource] = [];
+        for _, r in self._resources {
+            result = result ~ [r];
+        }
+
+        utils::sortByName(result)
+    }
+
+    /**
+     * @returns: the names of the subpasses, in the order of their registration
+     * */
+    pub fn getSubmissions(self)-> [[c8]] {
+        self._submissions
+    }
+
+    /**
+     * @returns: true iif the pass 'name' is declared and enabled
+     * */
+    pub fn isEnabled(self, name: [c8])-> bool {
+        for p in self._passes if p.name == name {
+            return p.enabled;
+        }
+
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          RESOURCES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Declare an image the code declaring it owns, a frame using the one of its frame slot
+     * @params:
+     *    - depth: true for a depth image
+     * */
+    pub fn importImage(mut self, name: [c8], depth: bool = false)
+        throws BalderError
+    {
+        self:.declare(GraphResource(name-> name, image-> true, depth-> depth));
+    }
+
+    /**
+     * Declare a buffer the code declaring it owns, or the buffers a pass reads and another one writes, named as one
+     * @info: the barriers of buffers are memory barriers, they do not need the buffer itself
+     * */
+    pub fn importBuffer(mut self, name: [c8])
+        throws BalderError
+    {
+        self:.declare(GraphResource(name-> name));
+    }
+
+    /**
+     * Declare an image the graph owns, its content lasting one frame
+     * */
+    pub fn createImage(mut self, name: [c8], desc: ImageDesc)
+        throws BalderError
+    {
+        self:.declare(GraphResource(name-> name, image-> true, depth-> desc.depth, transient-> true, desc-> desc));
+    }
+
+    /**
+     * Forget a resource, the passes using it having to be removed first
+     * */
+    pub fn removeResource(mut self, name: [c8]) {
+        self._resources:.remove(name);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PASSES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Register a subpass, the passes recorded in it being declared afterwards
+     * */
+    pub fn addSubmission(mut self, name: [c8])
+        throws BalderError
+    {
+        if name == "" { throw copy BalderError("Empty subpass name"); }
+        for s in self._submissions if s == name {
+            throw copy BalderError("A subpass is already named " ~ name);
+        }
+
+        self._submissions = self._submissions ~ [name];
+    }
+
+    /**
+     * Forget a subpass, and the passes recorded in it
+     * */
+    pub fn removeSubmission(mut self, name: [c8]) {
+        let mut submissions: [[c8]] = [];
+        for s in self._submissions if s != name {
+            submissions = submissions ~ [s];
+        }
+
+        let mut passes: [GraphPass] = [];
+        for p in self._passes if p.submission != name {
+            passes = passes ~ [p];
+        }
+
+        self._submissions = submissions;
+        self._passes = passes;
+    }
+
+    /**
+     * Declare a pass, after the passes already declared, or before one of them
+     * @params:
+     *    - before: the pass the pass is declared before, the resources it writes being read by that pass and the passes
+     *              after it; empty to declare it after every pass
+     * @throws: if a pass has the same name, or its subpass is not registered
+     * */
+    pub fn declarePass(mut self, pass: GraphPass, before: [c8] = "")
+        throws BalderError
+    {
+        if pass.name == "" { throw copy BalderError("Empty pass name"); }
+        for p in self._passes if p.name == pass.name {
+            throw copy BalderError("A pass is already named " ~ pass.name);
+        }
+
+        let mut registered = false;
+        for s in self._submissions if s == pass.submission {
+            registered = true;
+        }
+
+        if !registered {
+            throw copy BalderError("The pass " ~ pass.name ~ " is recorded in no subpass named " ~ pass.submission);
+        }
+
+        for i, p in self._passes if p.name == before {
+            self._passes = self._passes[0us .. i] ~ [pass] ~ self._passes[i .. $];
+            return;
+        }
+
+        self._passes = self._passes ~ [pass];
+    }
+
+    /**
+     * Forget a pass
+     * */
+    pub fn removePass(mut self, name: [c8]) {
+        let mut passes: [GraphPass] = [];
+        for p in self._passes if p.name != name {
+            passes = passes ~ [p];
+        }
+
+        self._passes = passes;
+    }
+
+    /**
+     * Enable or disable a pass
+     * @returns: true iif the pass changed
+     * */
+    pub fn enablePass(mut self, name: [c8], enabled: bool)-> bool {
+        for i in 0us .. self._passes.len if self._passes[i].name == name && self._passes[i].enabled != enabled {
+            let p = self._passes[i];
+            self._passes = self._passes[0us .. i] ~ [GraphPass(name-> p.name,
+                                        submission-> p.submission,
+                                        kind-> p.kind,
+                                        uses-> p.uses,
+                                        recording-> p.recording,
+                                        enabled-> enabled)] ~ self._passes[i + 1us .. $];
+            return true;
+        }
+
+        false
+    }
+
+    /**
+     * Add a use to a pass (the image of a scene sampled by the screen)
+     * @throws: if no pass is named 'name'
+     * */
+    pub fn addUse(mut self, name: [c8], added: ResourceUse)
+        throws BalderError
+    {
+        for i in 0us .. self._passes.len if self._passes[i].name == name {
+            let p = self._passes[i];
+            self._passes = self._passes[0us .. i] ~ [GraphPass(name-> p.name,
+                                        submission-> p.submission,
+                                        kind-> p.kind,
+                                        uses-> p.uses ~ [added],
+                                        recording-> p.recording,
+                                        enabled-> p.enabled)] ~ self._passes[i + 1us .. $];
+            return;
+        }
+
+        throw copy BalderError("No pass named " ~ name);
+    }
+
+    /**
+     * Remove the uses of a resource by a pass
+     * */
+    pub fn removeUses(mut self, name: [c8], resource: [c8]) {
+        for i in 0us .. self._passes.len if self._passes[i].name == name {
+            let p = self._passes[i];
+            let mut uses: [ResourceUse] = [];
+            for u in p.uses if u.resource != resource {
+                uses = uses ~ [u];
+            }
+
+            self._passes = self._passes[0us .. i] ~ [GraphPass(name-> p.name,
+                                        submission-> p.submission,
+                                        kind-> p.kind,
+                                        uses-> uses,
+                                        recording-> p.recording,
+                                        enabled-> p.enabled)] ~ self._passes[i + 1us .. $];
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          COMPILATION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compile the enabled passes into the schedule of a frame
+     * @throws:
+     *    - if a pass uses a resource that is not declared, or uses it in a way its kind or the resource cannot
+     *    - if a pass reads a transient image no pass wrote before it, and the use is not optional
+     *    - if two subpasses depend on each other
+     *    - if the pass of the screen is not declared
+     * */
+    pub fn compile(self)-> RenderSchedule
+        throws BalderError
+    {
+        let passes = self.activePasses();
+        let deps = self.dependencies(passes);
+        let (order, submissions) = self.orderSubmissions(passes, deps);
+        let edges = self.edges(passes, deps, order, submissions);
+
+        self.schedule(passes, order, submissions, edges)
+    }
+
+    /**
+     * @returns: the enabled passes, the sink last, each use of a resource merged into one, the optional uses of a
+     * resource no pass wrote before them dropped
+     * */
+    fn activePasses(self)-> [GraphPass]
+        throws BalderError
+    {
+        let mut ordered: [GraphPass] = [];
+        let mut sink: (GraphPass)? = none;
+        for p in self._passes if p.enabled {
+            if p.name == self._sink {
+                sink = p?;
+            } else {
+                ordered = ordered ~ [p];
+            }
+        }
+
+        if let Ok(s) = sink {
+            ordered = ordered ~ [s];
+        } else {
+            throw copy BalderError("The pass of the screen " ~ self._sink ~ " is not declared");
+        }
+
+        let dmut written: [[c8] => ()] = copy [];
+        let mut result: [GraphPass] = [];
+        for p in ordered {
+            let mut uses: [ResourceUse] = [];
+            for u in p.uses {
+                // the resource of an optional use may not exist (the shadow map while no light casts shadows)
+                if u.optional && u.resource !in self._resources { continue; }
+
+                let res = if let Ok(r) = self._resources[u.resource] { r } else {
+                    throw copy BalderError("The pass " ~ p.name ~ " uses " ~ u.resource ~ ", which is not declared");
+                };
+
+                self.validate(p, res, u);
+                if u.optional && u.resource !in written { continue; }
+
+                uses = uses ~ [u];
+            }
+
+            for u in uses if describe(u.usage).writes {
+                written[u.resource] = ();
+            }
+
+            let merged = GraphPass(name-> p.name, kind-> p.kind, uses-> uses);
+            if let Ok(res) = utils::layoutConflict(merged, &self.isDepth) {
+                throw copy BalderError("The pass " ~ p.name ~ " uses " ~ res ~ " in two layouts");
+            }
+
+            result = result ~ [GraphPass(name-> p.name,
+                                 submission-> p.submission,
+                                 kind-> p.kind,
+                                 uses-> uses,
+                                 recording-> p.recording,
+                                 enabled-> true)];
+        }
+
+        result
+    }
+
+    /**
+     * Check that a pass can use a resource the way it does
+     * */
+    fn validate(self, pass: GraphPass, res: GraphResource, u: ResourceUse)
+        throws BalderError
+    {
+        if res.image && isBufferOnly(u.usage) {
+            throw copy BalderError("The pass " ~ pass.name ~ " uses the image " ~ res.name ~ " as a buffer");
+        }
+
+        if !res.image && isImageOnly(u.usage) {
+            throw copy BalderError("The pass " ~ pass.name ~ " uses the buffer " ~ res.name ~ " as an image");
+        }
+
+        let raster = pass.kind == PassKind::RASTER;
+        if isRaster(u.usage) != raster {
+            throw copy BalderError("The pass " ~ pass.name ~ " uses " ~ res.name ~ " the way another kind of pass does");
+        }
+
+        if u.usage == Usage::DEPTH_ATTACHMENT && !res.depth {
+            throw copy BalderError("The pass " ~ pass.name ~ " uses the color image " ~ res.name ~ " as its depth");
+        }
+
+        if u.usage == Usage::COLOR_ATTACHMENT && res.depth {
+            throw copy BalderError("The pass " ~ pass.name ~ " uses the depth image " ~ res.name ~ " as a color");
+        }
+    }
+
+    /**
+     * @returns: the dependencies between the passes, each read depending on the last write before it, each write on the
+     * last write and the reads since
+     * @throws: if a pass reads a transient image no pass wrote before it
+     * */
+    fn dependencies(self, passes: [GraphPass])-> [Dependency]
+        throws BalderError
+    {
+        let dmut writers: [[c8] => usize] = copy [];
+        let dmut readers: [[c8] => [usize]] = copy [];
+        let mut result: [Dependency] = [];
+
+        for i, p in passes {
+            for res in utils::resourcesOf(p) {
+                let acc = utils::accessOf(p, res);
+                let writer = if let Ok(w) = writers[res] { w } else { NONE };
+
+                if acc.reads && writer == NONE {
+                    if let Ok(r) = self._resources[res] {
+                        if r.transient {
+                            throw copy BalderError("The pass " ~ p.name ~ " reads " ~ res ~ " before any pass writes it");
+                        }
+                    }
+                }
+
+                if writer != NONE {
+                    result = result ~ [Dependency(writer, i, res)];
+                }
+
+                if acc.writes {
+                    if let Ok(lst) = readers[res] {
+                        for r in lst if r != i {
+                            result = result ~ [Dependency(r, i, res)];
+                        }
+                    }
+
+                    writers[res] = i;
+                    readers[res] = [];
+                } else {
+                    let previous = if let Ok(lst) = readers[res] { lst } else { [] };
+                    readers[res] = previous ~ [i];
+                }
+            }
+        }
+
+        result
+    }
+
+    /**
+     * Order the subpasses of the passes by their dependencies, a subpass coming before another one when it is declared
+     * before it and nothing orders them
+     * @returns:
+     *    - .0: the subpasses, in the order of their submission
+     *    - .1: the index of the subpass of each pass in .0
+     * @throws: if two subpasses depend on each other
+     * */
+    fn orderSubmissions(self, passes: [GraphPass], deps: [Dependency])-> ([[c8]], [usize])
+        throws BalderError
+    {
+        // the subpasses, in the order of their first pass
+        let mut names: [[c8]] = [];
+        let dmut owner: [usize] = [];
+        for p in passes {
+            let mut index = NONE;
+            for j, n in names if n == p.submission {
+                index = j;
+            }
+
+            if index == NONE {
+                index = names.len;
+                names = names ~ [p.submission];
+            }
+
+            owner ~= [index];
+        }
+
+        let n = names.len;
+        let dmut preds: [[usize]] = copy [[] ; n];
+        for d in deps {
+            let a = owner[d.from];
+            let b = owner[d.to];
+            if a != b && !utils::contains(preds[b], a) {
+                preds[b] = preds[b] ~ [a];
+            }
+        }
+
+        // the subpass of the screen comes last
+        let sink = owner[$ - 1];
+        for j in 0us .. n if j != sink && !utils::contains(preds[sink], j) {
+            preds[sink] = preds[sink] ~ [j];
+        }
+
+        let dmut placed = copy [false ; n];
+        let dmut position = copy [0us ; n];
+        let mut order: [[c8]] = [];
+        for step in 0us .. n {
+            let mut next = NONE;
+            for j in 0us .. n if !placed[j] && next == NONE {
+                let mut ready = true;
+                for p in preds[j] if !placed[p] {
+                    ready = false;
+                }
+
+                if ready { next = j; }
+            }
+
+            if next == NONE {
+                let mut cycle: [c8] = "";
+                for j in 0us .. n if !placed[j] {
+                    cycle = if cycle.len == 0us { names[j] } else { cycle ~ ", " ~ names[j] };
+                }
+
+                throw copy BalderError("The subpasses " ~ cycle ~ " depend on each other");
+            }
+
+            placed[next] = true;
+            position[next] = step;
+            order = order ~ [names[next]];
+        }
+
+        let dmut result: [usize] = [];
+        for o in owner {
+            result = result ~ [position[o]];
+        }
+
+        (order, result)
+    }
+
+    /**
+     * @returns: the semaphores between the subpasses, an edge per pair of subpasses, the transfers waited for by the
+     * subpasses depending on none, the screen waiting for the subpasses nothing depends on
+     * */
+    fn edges(self, passes: [GraphPass], deps: [Dependency], order: [[c8]], owner: [usize])-> [GraphEdge] {
+        let mut result: [GraphEdge] = [];
+        for d in deps {
+            let a = owner[d.from];
+            let b = owner[d.to];
+            if a == b { continue; }
+
+            let stage = utils::accessOf(passes[d.to], d.resource).stage;
+            let mut found = false;
+            for i in 0us .. result.len if result[i].from == a && result[i].to == b {
+                found = true;
+                let e = result[i];
+                let resources = if utils::contains(e.resources, d.resource) { e.resources } else { e.resources ~ [d.resource] };
+                result = result[0us .. i] ~ [GraphEdge(from-> a, to-> b, stage-> e.stage | stage, resources-> resources)] ~ result[i + 1us .. $];
+            }
+
+            if !found {
+                result = result ~ [GraphEdge(from-> a, to-> b, stage-> stage, resources-> copy [d.resource])];
+            }
+        }
+
+        let sink = order.len - 1us;
+        for j in 0us .. sink {
+            let mut leaf = true;
+            for e in result if e.from == j {
+                leaf = false;
+            }
+
+            if leaf {
+                result = result ~ [GraphEdge(from-> j, to-> sink, stage-> ORDER_STAGE)];
+            }
+        }
+
+        for j in 0us .. order.len {
+            let mut entry = true;
+            for e in result if e.to == j {
+                entry = false;
+            }
+
+            if entry {
+                result = result ~ [GraphEdge(from-> TRANSFER, to-> j, stage-> ORDER_STAGE)];
+            }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the schedule of the passes, their barriers derived by walking them in the order they are recorded
+     * */
+    fn schedule(self, passes: [GraphPass], order: [[c8]], owner: [usize], edges: [GraphEdge])-> RenderSchedule {
+        // the passes in the order they are recorded
+        let dmut recorded: [usize] = [];
+        for s in 0us .. order.len {
+            for i in 0us .. passes.len if owner[i] == s {
+                recorded ~= [i];
+            }
+        }
+
+        // an image read before it is written in the frame is in the layout the frame leaves it in
+        let dmut states: [[c8] => ResourceState] = copy [];
+        for i in recorded {
+            for res in utils::resourcesOf(passes[i]) {
+                if let Ok(r) = self._resources[res] {
+                    let acc = utils::accessOf(passes[i], res);
+                    let dmut state = ResourceState();
+                    state.layout = if r.depth { acc.depthLayout } else { acc.colorLayout };
+                    states[res] = state;
+                }
+            }
+        }
+
+        let dmut firsts: [[c8] => usize] = copy [];
+        let dmut lasts: [[c8] => usize] = copy [];
+        let mut names: [[c8]] = [];
+
+        let mut scheduled: [[ScheduledPass]] = copy [[] ; order.len];
+        for position, i in recorded {
+            let p = passes[i];
+            let s = owner[i];
+            let mut barriers: [GraphBarrier] = [];
+
+            for res in utils::resourcesOf(p) {
+                if res !in firsts {
+                    firsts[res] = position;
+                    names = names ~ [res];
+                }
+
+                lasts[res] = position;
+
+                let decl = if let Ok(r) = self._resources[res] { r } else { GraphResource(name-> res) };
+                let acc = utils::accessOf(p, res);
+                let dmut state = if let Ok(st) = states[res] { st } else { ResourceState() };
+
+                if let Ok(b) = self.barrierOf(decl, acc, state, s) {
+                    barriers = barriers ~ [b];
+                }
+
+                if decl.image {
+                    state.layout = if decl.depth { acc.depthLayout } else { acc.colorLayout };
+                }
+
+                state.used = true;
+                if acc.writes {
+                    state.writer = s;
+                    state.writeStage = acc.stage;
+                    state.writeAccess = acc.access;
+                    state.readers = [];
+                    state.readStages = [];
+                } else {
+                    state.readers = state.readers ~ [s];
+                    state.readStages = state.readStages ~ [acc.stage];
+                }
+
+                states[res] = state;
+            }
+
+            let added = scheduled[s] ~ [ScheduledPass(name-> p.name, kind-> p.kind, barriers-> barriers, recording-> p.recording)];
+            scheduled = scheduled[0us .. s] ~ [added] ~ scheduled[s + 1us .. $];
+        }
+
+        let mut submissions: [ScheduledSubmission] = [];
+        for s, name in order {
+            let dmut waits: [usize] = [];
+            let dmut signals: [usize] = [];
+            for k, e in edges {
+                if e.to == s { waits ~= [k]; }
+                if e.from == s { signals ~= [k]; }
+            }
+
+            submissions = submissions ~ [ScheduledSubmission(name-> name, passes-> scheduled[s], waits-> waits, signals-> signals)];
+        }
+
+        let mut lifetimes: [ResourceLifetime] = [];
+        for n in names {
+            let first = if let Ok(f) = firsts[n] { f } else { 0us };
+            let last = if let Ok(l) = lasts[n] { l } else { 0us };
+            lifetimes = lifetimes ~ [ResourceLifetime(name-> n, first-> first, last-> last)];
+        }
+
+        RenderSchedule(submissions-> submissions, edges-> edges, lifetimes-> lifetimes)
+    }
+
+    /**
+     * @returns: the barrier a use of a resource needs, none when the semaphores of the subpass are enough
+     * @params:
+     *    - res: the resource
+     *    - acc: the use, all the uses of the pass merged
+     *    - state: the state of the resource before the use
+     *    - submission: the subpass of the pass
+     * */
+    fn barrierOf(self, res: GraphResource, acc: UsageAccess, state: ResourceState, submission: usize)-> (GraphBarrier)? {
+        let mut srcStage = 0u32;
+        let mut srcAccess = 0u32;
+
+        // the write before it, read or written again (a write in another subpass is awaited through a semaphore)
+        if state.writer == submission {
+            srcStage = srcStage | state.writeStage;
+            srcAccess = srcAccess | utils::writesOf(state.writeAccess);
+        }
+
+        // the reads before a write
+        if acc.writes {
+            for j, r in state.readers if r == submission {
+                srcStage = srcStage | state.readStages[j];
+            }
+        }
+
+        // a transient image starts each frame undefined, its memory being shared with other images
+        let first = !state.used;
+        let layout = if res.depth { acc.depthLayout } else { acc.colorLayout };
+        let transition = res.image && !acc.attachment && (state.layout != layout || (first && res.transient));
+
+        // nothing is kept of a content written over
+        let discard = !acc.reads || (first && res.transient);
+        let oldLayout = if !transition { layout } else if discard { VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED } else { state.layout };
+
+        if srcStage == 0u32 && !transition {
+            return none;
+        }
+
+        // a transition after accesses of other subpasses waits for the stages the semaphores are awaited at
+        if srcStage == 0u32 {
+            srcStage = acc.stage;
+        }
+
+        GraphBarrier(resource-> res.name,
+                     image-> res.image,
+                     depth-> res.depth,
+                     srcStage-> srcStage,
+                     srcAccess-> srcAccess,
+                     dstStage-> acc.stage,
+                     dstAccess-> acc.access,
+                     oldLayout-> oldLayout,
+                     newLayout-> layout)?
+    }
+
+    /**
+     * @returns: true iif the resource 'name' is a depth image
+     * */
+    fn isDepth(self, name: [c8])-> bool {
+        if let Ok(r) = self._resources[name] {
+            return r.depth;
+        }
+
+        false
+    }
+
+    /**
+     * Declare a resource
+     * */
+    fn declare(mut self, res: GraphResource)
+        throws BalderError
+    {
+        if res.name == "" { throw copy BalderError("Empty resource name"); }
+        if res.name in self._resources {
+            throw copy BalderError("A resource is already named " ~ res.name);
+        }
+
+        self._resources[res.name] = res;
+    }
+
+}
