@@ -1,0 +1,338 @@
+in transient_pool;
+
+use balder::core::_;
+use balder::core::driver::device;
+use balder::core::driver::graph::aliasing;
+use balder::core::memory::segment;
+use balder::core::shader::texture;
+use balder::utils::log;
+
+use ::vulkan::core;
+
+/**
+ * A memory shared by transient images, reserved once per frame in flight
+ * */
+@final
+class TransientSlot {
+
+    // The device the memory is reserved on
+    let dmut _device: &VulkanDevice;
+
+    // The images sharing the memory, in the order of their first use
+    pub let members: [[c8]];
+
+    // The memory of each frame in flight
+    let mut _memory: [MemoryAllocation] = [];
+
+    pub self (dmut device: &VulkanDevice, members: [[c8]], memory: [MemoryAllocation])
+        with _device = alias device
+        , members = members
+        , _memory = memory
+    {}
+
+    /**
+     * @returns: the memory of each frame in flight
+     * */
+    pub fn getMemory(self)-> [MemoryAllocation] {
+        self._memory
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            for m in self._memory {
+                self._device:.getMemoryAllocator():.freeImageMemory(m);
+            }
+
+            self._memory = [];
+        }
+    }
+}
+
+/**
+ * The transient images of a render graph: allocated while a pass of a frame uses them, the images no pass uses at the
+ * same time sharing their memory
+ * @info: a slot of memory whose images and descriptions do not change keeps its images when the graph is compiled again,
+ * the other images being created again in a new memory (an image cannot be bound twice)
+ * */
+@final
+pub class TransientPool {
+
+    // The device the images are allocated on
+    let dmut _device: &VulkanDevice;
+
+    // The textures of the images, by name
+    let dmut _textures: [[c8] => &OutputTexture] = copy [];
+
+    // The description each texture was created with
+    let dmut _descs: [[c8] => ImageDesc] = copy [];
+
+    // The slots of memory the textures are bound into
+    let dmut _slots: [&TransientSlot] = [];
+
+    pub self (dmut device: &VulkanDevice)
+        with _device = alias device
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the texture of the transient image 'name', none if no pass of the schedule realized last uses it
+     * */
+    pub fn getTexture(mut self, name: [c8])-> dmut (&OutputTexture)? {
+        if let Ok(dmut t) = alias self._textures[name] {
+            return (alias t)?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the texture of the transient image 'name', none if no pass of the schedule realized last uses it
+     * */
+    pub fn getTextureOf(self, name: [c8])-> (&OutputTexture)? {
+        if let Ok(t) = self._textures[name] {
+            return t?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the images sharing each slot of memory, in the order of their first use
+     * */
+    pub fn getSlots(self)-> [[[c8]]] {
+        let mut result: [[[c8]]] = [];
+        for s in self._slots {
+            result = result ~ [s.members];
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          ALLOCATION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Allocate the transient images a schedule uses, the images it no longer uses retired
+     * @params:
+     *    - schedule: the compiled render graph
+     *    - graph: the render graph, declaring the images
+     * @returns: the names of the images whose texture changed
+     * */
+    pub fn realize(mut self, schedule: RenderSchedule, graph: &RenderGraph)-> [[c8]]
+        throws BalderError
+    {
+        let mut used: [GraphResource] = [];
+        let mut spans: [AliasSpan] = [];
+        let dmut fresh: [[c8] => &OutputTexture] = copy [];
+
+        for l in schedule.lifetimes {
+            if let Ok(r) = graph.getResource(l.name) {
+                if !r.transient { continue; }
+
+                let dmut tex = self:.create(r.desc);
+                let req = tex.getRequirements();
+                fresh[r.name] = alias tex;
+                used = used ~ [r];
+                spans = spans ~ [AliasSpan(name-> r.name,
+                                           first-> l.first,
+                                           last-> l.last,
+                                           size-> cast!usize(req.size),
+                                           alignment-> cast!usize(req.alignment),
+                                           typeBits-> req.memoryTypeBits)];
+            }
+        }
+
+        let plan = planSlots(spans);
+        let mut changed: [[c8]] = [];
+        let dmut kept: [&TransientSlot] = [];
+        let dmut textures: [[c8] => &OutputTexture] = copy [];
+        let dmut descs: [[c8] => ImageDesc] = copy [];
+
+        for slot in plan {
+            let names = copy [m.name for m in slot.members];
+            if let Ok(dmut old) = alias self:.findSlot(names, used) {
+                for n in names {
+                    if let Ok(dmut t) = alias self._textures[n] {
+                        textures[n] = alias t;
+                    }
+
+                    if let Ok(d) = self._descs[n] {
+                        descs[n] = d;
+                    }
+                }
+
+                kept ~= [alias old];
+                continue;
+            }
+
+            let mut req = VkMemoryRequirements();
+            req.size = cast!u64(slot.size);
+            req.alignment = cast!u64(slot.alignment);
+            req.memoryTypeBits = slot.typeBits;
+
+            let nbFrames = self._device.getNbFrames();
+            let dmut memory: [MemoryAllocation] = [];
+            for _ in 0u32 .. nbFrames {
+                memory ~= [self._device:.getMemoryAllocator():.allocImageMemory(req, VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)];
+            }
+
+            for n in names {
+                if let Ok(dmut t) = alias fresh[n] {
+                    t:.bind(memory);
+                    textures[n] = alias t;
+                    fresh:.remove(n);
+                }
+
+                for r in used if r.name == n {
+                    descs[n] = r.desc;
+                }
+
+                changed = changed ~ [n];
+            }
+
+            log::debug #("TransientPool", "Allocate a slot of", slot.size, "bytes for", names);
+            kept ~= [copy TransientSlot(alias self._device, names, memory)];
+        }
+
+        // the textures created to measure the images whose slot is kept
+        for _, dmut t in alias fresh {
+            t:.dispose();
+        }
+
+        self:.retireReplaced(kept, textures);
+        self._slots = alias kept;
+        self._textures = alias textures;
+        self._descs = alias descs;
+
+        changed
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retire every image and every slot, the recordings in flight still reading them
+     * */
+    pub fn retire(mut self) {
+        let nothing: [[c8] => &OutputTexture] = copy [];
+        self:.retireReplaced([], nothing);
+        self._slots = [];
+        self._textures = copy [];
+        self._descs = copy [];
+    }
+
+    /**
+     * Dispose every image and every slot
+     * @assume: nothing uses them anymore (the device is idle)
+     * */
+    pub fn dispose(mut self) {
+        for _, dmut t in alias self._textures {
+            t:.dispose();
+        }
+
+        for dmut s in alias self._slots {
+            s:.dispose();
+        }
+
+        self._slots = [];
+        self._textures = copy [];
+        self._descs = copy [];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: a texture of a transient image, created unbound
+     * */
+    fn create(mut self, desc: ImageDesc)-> dmut &OutputTexture
+        throws BalderError
+    {
+        copy OutputTexture::unbound(alias self._device,
+                                    desc.format,
+                                    desc.width,
+                                    desc.height,
+                                    forStorage-> desc.storage,
+                                    depth-> desc.depth)
+    }
+
+    /**
+     * @returns: the slot holding exactly the images 'names', none if there is none or the description of one of them
+     * changed
+     * */
+    fn findSlot(mut self, names: [[c8]], used: [GraphResource])-> dmut (&TransientSlot)? {
+        for dmut s in alias self._slots {
+            if s.members != names { continue; }
+
+            let mut same = true;
+            for r in used {
+                for n in names if n == r.name {
+                    if let Ok(d) = self._descs[n] {
+                        if !sameDesc(d, r.desc) { same = false; }
+                    } else {
+                        same = false;
+                    }
+                }
+            }
+
+            if same {
+                return (alias s)?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Retire the slots that are not kept and the textures bound into them, the textures first
+     * */
+    fn retireReplaced(mut self, kept: [&TransientSlot], textures: [[c8] => &OutputTexture]) {
+        for n, dmut t in alias self._textures {
+            if let Ok(k) = textures[n] {
+                if k is t { continue; }
+            }
+
+            self._device:.retire(&t:.dispose);
+        }
+
+        for dmut s in alias self._slots {
+            let mut keep = false;
+            for k in kept if k is s {
+                keep = true;
+            }
+
+            if !keep {
+                self._device:.retire(&s:.dispose);
+            }
+        }
+    }
+}
+
+/**
+ * @returns: true iif two descriptions describe the same image
+ * */
+fn sameDesc(a: ImageDesc, b: ImageDesc)-> bool {
+    a.format == b.format && a.width == b.width && a.height == b.height && a.depth == b.depth && a.storage == b.storage
+}
