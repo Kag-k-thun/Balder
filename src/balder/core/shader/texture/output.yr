@@ -1,8 +1,9 @@
 in output;
 
-use balder::core::{_, driver::device, memory::image2D};
+use balder::core::_;
+use balder::core::driver::device;
+use balder::core::memory::{image2D, segment};
 use balder::utils::log;
-
 
 use ::vulkan::core;
 
@@ -19,6 +20,9 @@ pub class IOutputTexture over Texture {
     let dmut _imageViews: [VkImageView] = [];
 
     let _depth: bool;
+
+    // The images created without memory, until they are bound (see unbound)
+    let dmut _unbound: [VkImage] = [];
 
     /**
      * Create a color texture of a given dimension
@@ -38,6 +42,27 @@ pub class IOutputTexture over Texture {
         throws BalderError
     {
         self:.configure(numSamples, depth, forSubpass, forStorage, nbImages);
+    }
+
+    /**
+     * Create a texture whose images are bound afterwards into memory shared with other images (see bind), the images
+     * of the textures of a render graph not used at the same time sharing it
+     * */
+    pub self unbound(dmut device: &VulkanDevice,
+                     format: VkFormat,
+                     width: u32,
+                     height: u32,
+                     forSubpass: bool = true,
+                     forStorage: bool = false,
+                     depth: bool = false)
+        with super(alias device, width, height)
+        , _format = format
+        , _depth = depth
+        throws BalderError
+    {
+        let usage = usageOf(depth, forSubpass, forStorage);
+        let nbImage = cast!u32(self._device:.getSwapchain().nbFrames);
+        self._unbound = copy [self._device:.getMemoryAllocator():.createImage2D(width, height, format, VkImageTiling::VK_IMAGE_TILING_OPTIMAL, usage) for _ in 0 .. nbImage];
     }
 
     /*!
@@ -74,20 +99,7 @@ pub class IOutputTexture over Texture {
                    nbImages: u32?)
         throws BalderError
     {
-        let mut usage: u32 = if depth {
-            VkImageUsageFlagBits::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-        } else {
-            VkImageUsageFlagBits::VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-        };
-
-        if forSubpass {
-            usage = usage | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT;
-        }
-
-        if forStorage {
-            usage = usage | VkImageUsageFlagBits::VK_IMAGE_USAGE_STORAGE_BIT;
-        }
-
+        let usage = usageOf(depth, forSubpass, forStorage);
         let nbImage = if let Ok(i) = nbImages { i } else { cast!u32(self._device:.getSwapchain().nbFrames) };
 
         self._images = copy [self._device:.getMemoryAllocator():.allocImage2D(self._width, self._height, self._format, VkImageTiling::VK_IMAGE_TILING_OPTIMAL, usage, numSamples-> numSamples, VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) for _ in 0 .. nbImage];
@@ -125,6 +137,40 @@ pub class IOutputTexture over Texture {
                 throw copy BalderError("Failed to create image view");
             }
         }
+    }
+
+    /**
+     * Bind the images of a texture created unbound into memory reserved for them, one reservation per image
+     * @params:
+     *    - memory: the memory of each image, reserved with the requirements of the texture at least
+     * */
+    pub fn bind(mut self, memory: [MemoryAllocation])
+        throws BalderError
+    {
+        if memory.len != self._unbound.len {
+            throw copy BalderError("Binding the images of a texture into a wrong number of allocations");
+        }
+
+        let dmut images: [&Image2D] = [];
+        for i, dmut img in alias self._unbound {
+            images ~= [self._device:.getMemoryAllocator():.bindImage2D(self._width, self._height, self._format, alias img, memory[i])];
+        }
+
+        self._images = alias images;
+        self._unbound = [];
+        self:.createImageViews(self._depth);
+    }
+
+    /**
+     * @returns: the memory requirements of an image of a texture created unbound
+     * */
+    pub fn getRequirements(self)-> VkMemoryRequirements {
+        let dmut memReq = VkMemoryRequirements();
+        if self._unbound.len != 0 {
+            vkGetImageMemoryRequirements(self._device.getDeviceHandle(), self._unbound[0], alias &memReq);
+        }
+
+        memReq
     }
 
     /*!
@@ -196,10 +242,40 @@ pub class IOutputTexture over Texture {
                 self._images[i]:.dispose();
             }
 
+            for dmut img in alias self._unbound {
+                self._device:.getMemoryAllocator():.destroyImage(alias img);
+            }
+
             self._images = [];
             self._imageViews = [];
+            self._unbound = [];
             self._width = 0;
             self._height = 0;
         }
     }
+}
+
+/**
+ * @returns: the usage of the images of an output texture
+ * @params:
+ *    - depth: true for a depth attachment, false for a color attachment
+ *    - forSubpass: true when the images are sampled
+ *    - forStorage: true when compute shaders write them as storage images
+ * */
+fn usageOf(depth: bool, forSubpass: bool, forStorage: bool)-> u32 {
+    let mut usage: u32 = if depth {
+        VkImageUsageFlagBits::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+    } else {
+        VkImageUsageFlagBits::VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+    };
+
+    if forSubpass {
+        usage = usage | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+
+    if forStorage {
+        usage = usage | VkImageUsageFlagBits::VK_IMAGE_USAGE_STORAGE_BIT;
+    }
+
+    usage
 }
