@@ -1,18 +1,16 @@
 #version 450
 
-layout (location = 0) in vec4 inPosition;
-layout (location = 1) in vec3 inNormals;
+layout (location = 0) in vec3 inNormals;
 
 // The cross-fade of the draw, see the vertex shader
-layout (location = 3) flat in vec2 inFade;
+layout (location = 2) flat in vec2 inFade;
 
 // The material of the object
-layout (location = 4) flat in uint inMaterial;
+layout (location = 3) flat in uint inMaterial;
 
-layout (location = 0) out vec3 position;
-layout (location = 1) out vec3 normals;
-layout (location = 2) out vec4 albedo;
-layout (location = 3) out uint materialID;
+layout (location = 0) out vec3 normals;
+layout (location = 1) out vec4 albedo;
+layout (location = 2) out uint materialID;
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -39,7 +37,6 @@ void crossFade () {
 void main() {
     crossFade ();
 
-    position = vec3 (inPosition.xyz);
     normals = vec3 (inNormals);
     albedo = vec4 (1, 1, 1, 1); 
     materialID = inMaterial;

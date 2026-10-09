@@ -35,16 +35,15 @@ layout (std430, set = 0, binding = 1) readonly buffer Instances {
     uint instances [];
 };
 
-layout (location = 0) out vec4 outPosition;
-layout (location = 1) out vec3 outNormals;
-layout (location = 2) out vec3 outColor;
+layout (location = 0) out vec3 outNormals;
+layout (location = 1) out vec3 outColor;
 
 // The cross-fade of the draw: .x its progress, .y the role of the draw, the two low bits of its word (0 for a level
 // drawn alone, 1 for the outgoing level of a cross-fade, 2 for the incoming one)
-layout (location = 3) flat out vec2 outFade;
+layout (location = 2) flat out vec2 outFade;
 
 // The material of the object
-layout (location = 4) flat out uint outMaterial;
+layout (location = 3) flat out uint outMaterial;
 
 // Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
 out gl_PerVertex {
@@ -58,7 +57,6 @@ void main () {
     vec4 viewPos = camera.view * object.model * vec4 (inPosition, 1.0);
     gl_Position = camera.proj * viewPos;  
     
-    outPosition = viewPos;    
     outNormals = inNormals;
     outFade = vec2 (object.fade, float (word & 3u));
     outMaterial = object.material;
