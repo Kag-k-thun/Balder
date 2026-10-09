@@ -26,9 +26,49 @@ struct Material {
     float refraction;    
 };
 
-struct Light {    
+// A direction light, shining along its direction from infinitely far (DirectionLightContent)
+struct DirectionLight {
+    // The unit direction the light shines along, in world space
+    vec3 direction;
+
+    // The illuminance of a surface facing the light, scaling its colour
+    float intensity;
+
+    vec3 color;
+    float padd;
+};
+
+// A point light, shining all around its position up to its range (PointLightContent)
+struct PointLight {
     vec3 position;
-    vec3 color;    
+
+    // The distance from the light at which its light fades out
+    float range;
+
+    vec3 color;
+
+    // The intensity of the light, scaling its colour, the illuminance of a surface facing it at a distance d being
+    // divided by d²
+    float intensity;
+};
+
+// A spot light, shining from its position along its direction up to its range, in a cone (SpotLightContent)
+struct SpotLight {
+    vec3 position;
+    float range;
+
+    vec3 direction;
+    float intensity;
+
+    vec3 color;
+
+    // The cosines of the angles between the axis of the cone and the edges of its full light and of its light
+    float cosInner;
+    float cosOuter;
+
+    float padd1;
+    float padd2;
+    float padd3;
 };
 
 struct CameraContent {
@@ -100,18 +140,24 @@ layout(std430, binding = 8) readonly buffer Materials {
 
 layout (std430, binding = 9) readonly buffer Directions {
     uint nbLights;
-    Light lights[];
+    DirectionLight lights[];
 } directionLights;
 
-layout (std430, binding = 10) readonly buffer Spots {
+layout (std430, binding = 10) readonly buffer Points {
     uint nbLights;
-    Light lights[];
+    PointLight lights[];
+} pointLights;
+
+layout (std430, binding = 11) readonly buffer Spots {
+    uint nbLights;
+    SpotLight lights[];
 } spotLights;
 
-layout (std430, binding = 11) readonly buffer Points {
-    uint nbLights;
-    Light lights[];
-} pointLights;
+// The light reaching every point of the scene from all around, whatever its lights, added once to each pixel: it stands
+// in for the indirect light
+layout (binding = 12) uniform Ambient {
+    vec3 color;
+} ambient;
 
 
 /*!
@@ -212,35 +258,55 @@ vec3 shadeMetallic (vec3 N, vec3 V, vec3 L, vec3 albedo, float roughness) {
 }
 
 
-vec4 shadeMetallic (Light light, Material mat, vec3 normal, vec3 baseColor, vec3 position) {    
-    vec3 view = normalize (camera.eyePos - position);
-        
-    vec3 color = shadeMetallic (normal, view, light.position, baseColor * mat.specular, mat.shininess);
-        
-    return vec4 (color * light.color, 1);
-}
-
-
 /*!
  * ====================================================================================================
  * ====================================================================================================
- * ====================================          DIFFUSE          =====================================
+ * =====================================          LIGHTS          =====================================
  * ====================================================================================================
  * ====================================================================================================
  */
 
-vec3 directionalLight (vec3 baseColor, vec3 normal, vec3 lightDir, vec3 lightColor) {    
-    vec3 N = normalize(normal);    
-    vec3 L = normalize(-lightDir);    
-    float NdotL = max(dot(N, L), 0.0);
+/**
+ * @returns: the light a point reflects toward the eye, lit from a direction, its diffuse and its specular reflections
+ * @params:
+ *    - N: the unit normal of the surface at the point
+ *    - V: the unit direction from the point to the eye
+ *    - L: the unit direction from the point to the light
+ *    - radiance: the light reaching the point, the colour of the light times its intensity and its attenuation
+ *    - mat: the material of the surface
+ *    - baseColor: the colour of the surface at the point
+ */
+vec3 shade (vec3 N, vec3 V, vec3 L, vec3 radiance, Material mat, vec3 baseColor) {
+    vec3 diffuse = baseColor * mat.diffuse * max (dot (N, L), 0.0);
+    vec3 specular = shadeMetallic (N, V, L, baseColor * mat.specular, mat.shininess);
 
-    return baseColor * lightColor * NdotL;
+    return (diffuse + specular) * radiance;
 }
 
-vec4 shadeDiffuse (Light light, Material mat, vec3 normal, vec3 baseColor) {        
-    vec3 diffuse = directionalLight (baseColor * mat.diffuse, normal, light.position, vec3 (1));
-        
-    return vec4 (diffuse, 1);
+/**
+ * @returns: the share of the intensity of a point or a spot light reaching a point at a distance, its inverse square
+ * windowed to fade out smoothly to 0 at the range of the light
+ * @info: the inverse square is 1 / (d² + 1), bounded close to the light (the falloff of Real Shading in Unreal Engine 4)
+ * @params:
+ *    - d: the distance from the light to the point
+ *    - range: the range of the light
+ */
+float attenuation (float d, float range) {
+    float r = d / range;
+    float window = clamp (1.0 - r * r * r * r, 0.0, 1.0);
+
+    return window * window / (d * d + 1.0);
+}
+
+/**
+ * @returns: the share of the light of a spot light reaching a point in the direction of its cone, 1 inside its full
+ * light, 0 outside its light, fading out smoothly between them
+ * @params:
+ *    - light: the spot light
+ *    - L: the unit direction from the point to the light
+ */
+float cone (SpotLight light, vec3 L) {
+    return smoothstep (light.cosOuter, light.cosInner, dot (-L, light.direction));
 }
 
 /*!
@@ -308,7 +374,7 @@ void main () {
 
     if(texelCoord.x < size.x && texelCoord.y < size.y)
         {                
-            vec4 color = vec4(0, 0, 0, 1.0);    
+            vec3 color = vec3 (0);
 
             // the g-buffer has the size of the output, its texels read as they were written, never filtered; the depth
             // was written with the camera of this frame, the one bound here
@@ -320,32 +386,47 @@ void main () {
             uint matID = texelFetch (materialID, texelCoord, 0).x;
             Material mat = materials [matID];
 
-            for (uint i = 0 ; i < directionLights.nbLights ; i++) {    
-                vec4 diffuse = shadeDiffuse (directionLights.lights [i], mat, normal, baseColor);
-                vec4 metalic = shadeMetallic (directionLights.lights [i], mat, normal, baseColor, position);
+            vec3 view = normalize (camera.eyePos - position);
+            color += ambient.color * baseColor * mat.diffuse;
+
+            for (uint i = 0 ; i < directionLights.nbLights ; i++) {
+                DirectionLight light = directionLights.lights [i];
 
                 float lit = 1.0;
                 if (shadow.count != 0 && i == shadow.light) {
                     lit = shadowFactor (position, normal);
                 }
 
-                color += (diffuse + metalic) * lit;
+                color += shade (normal, view, -light.direction, light.color * light.intensity * lit, mat, baseColor);
             }
 
-            for (uint i = 0 ; i < spotLights.nbLights ; i++) {    
-                vec4 diffuse = shadeDiffuse (spotLights.lights [i], mat, normal, baseColor);
-                vec4 metalic = shadeMetallic (spotLights.lights [i], mat, normal, baseColor, position);
-        
-                color += (diffuse + metalic);
+            for (uint i = 0 ; i < pointLights.nbLights ; i++) {
+                PointLight light = pointLights.lights [i];
+
+                vec3 toLight = light.position - position;
+                float d = length (toLight);
+                if (d >= light.range) {
+                    continue;
+                }
+
+                vec3 L = toLight / max (d, 1e-4);
+                color += shade (normal, view, L, light.color * light.intensity * attenuation (d, light.range), mat, baseColor);
             }
 
-            for (uint i = 0 ; i < pointLights.nbLights ; i++) {    
-                vec4 diffuse = shadeDiffuse (pointLights.lights [i], mat, normal, baseColor);
-                vec4 metalic = shadeMetallic (pointLights.lights [i], mat, normal, baseColor, position);
-        
-                color += (diffuse + metalic + vec4 (mat.ambient, 0));
+            for (uint i = 0 ; i < spotLights.nbLights ; i++) {
+                SpotLight light = spotLights.lights [i];
+
+                vec3 toLight = light.position - position;
+                float d = length (toLight);
+                if (d >= light.range) {
+                    continue;
+                }
+
+                vec3 L = toLight / max (d, 1e-4);
+                float share = attenuation (d, light.range) * cone (light, L);
+                color += shade (normal, view, L, light.color * light.intensity * share, mat, baseColor);
             }
-        
-            imageStore(outTex, texelCoord, color);
+
+            imageStore (outTex, texelCoord, vec4 (color, 1.0));
         }    
 }
