@@ -1,0 +1,291 @@
+in bloom;
+
+use balder::core::config::shader;
+use balder::core::driver::graph;
+use balder::core::shader::buffers::ubo;
+use balder::scene::utils::post::{effect, pass, space, stage};
+
+use ::vulkan::core;
+
+/**
+ * The size of the parameters of the bloom, its threshold, its knee, its intensity and its radius (the params block of
+ * its shaders)
+ * */
+def BLOOM_SIZE = 16us;
+
+/**
+ * The shaders of the bloom, by their place among its shaders
+ * */
+def DOWN = 0us; // the downsampling of a level into the next one, half its size
+def UP   = 1us; // the upsampling of the blurred levels below a level, added to it
+
+/**
+ * The texture of the upsampling shader reading the blurred levels below the level it writes
+ * */
+def LOW = "low";
+
+/**
+ * A bloom, in HDR space: the light brighter than a threshold spreading around it, as through the glass of a lens
+ * @info:
+ * =====
+ * The bright light is downsampled into a chain of levels, each half the size of the one before it, then upsampled back,
+ * each level adding the blurred levels below it, and the bloom is added to the light with an intensity:
+ *   - the first downsampling reads the light the stage before it wrote, and keeps what is brighter than the threshold,
+ *     exposed by the camera, through a soft knee; its boxes are weighed by the average of Karis against fireflies
+ *   - each downsampling is the filter of 13 taps of Jorge Jimenez (Call of Duty: Advanced Warfare)
+ *   - each upsampling is a tent of 3x3 bilinear taps
+ * Each level is a transient image of the render graph, written by a pass of its own: a bloom of n levels runs 2n passes.
+ * ====
+ * */
+@final
+pub class BloomEffect over PostEffect {
+
+    // The brightness of the light, exposed, from which it blooms
+    let mut _threshold : f32;
+
+    // The softness of the threshold, the share of the threshold below it over which the light starts to bloom
+    let mut _knee : f32;
+
+    // The share of the bloom added to the light
+    let mut _intensity : f32;
+
+    // The radius of the tent upsampling the levels, in texels of the level read
+    let mut _radius : f32;
+
+    // The number of levels of the chain, at most
+    let _levels : u32;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - name: the name of the effect in its chain
+     *    - threshold: the brightness of the light from which it blooms, exposed by the camera, 1 being white
+     *    - knee: the softness of the threshold, from 0 (a hard cut) to 1 (the light blooming from black)
+     *    - intensity: the share of the bloom added to the light
+     *    - radius: the radius of the tent upsampling the levels, in texels, the larger the wider the bloom
+     *    - levels: the number of levels of the chain, at most, fewer when the images would get under a texel
+     * */
+    pub self (name : [c8] = "bloom",
+              threshold : f32 = 1.0f,
+              knee : f32 = 0.5f,
+              intensity : f32 = 0.05f,
+              radius : f32 = 1.0f,
+              levels : u32 = 6u32)
+        with super (name, PostSpace::HDR, shaders (), paramsSize-> BLOOM_SIZE, readsCamera-> true)
+        , _threshold = threshold
+        , _knee = knee
+        , _intensity = intensity
+        , _radius = radius
+        , _levels = max1 (levels)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          PARAMETERS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the brightness of the light, exposed, from which it blooms
+     * */
+    @field
+    pub fn threshold (self)-> f32 {
+        self._threshold
+    }
+
+    /**
+     * Set the brightness of the light from which it blooms, exposed by the camera, 1 being white
+     * */
+    @field
+    pub fn threshold (mut self, threshold : f32) {
+        self._threshold = threshold;
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the softness of the threshold
+     * */
+    @field
+    pub fn knee (self)-> f32 {
+        self._knee
+    }
+
+    /**
+     * Set the softness of the threshold, from 0 (a hard cut) to 1 (the light blooming from black)
+     * */
+    @field
+    pub fn knee (mut self, knee : f32) {
+        self._knee = knee;
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the share of the bloom added to the light
+     * */
+    @field
+    pub fn intensity (self)-> f32 {
+        self._intensity
+    }
+
+    /**
+     * Set the share of the bloom added to the light
+     * */
+    @field
+    pub fn intensity (mut self, intensity : f32) {
+        self._intensity = intensity;
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the radius of the tent upsampling the levels, in texels
+     * */
+    @field
+    pub fn radius (self)-> f32 {
+        self._radius
+    }
+
+    /**
+     * Set the radius of the tent upsampling the levels, in texels, the larger the wider the bloom
+     * */
+    @field
+    pub fn radius (mut self, radius : f32) {
+        self._radius = radius;
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the number of levels of the chain, at most
+     * */
+    @field
+    pub fn levels (self)-> u32 {
+        self._levels
+    }
+
+    /**
+     * @returns: the number of levels of the chain over images of a size, a level being at least a texel wide and tall
+     * */
+    pub fn levelsOf (self, width : u32, height : u32)-> u32 {
+        let mut n = 1u32;
+        while n < self._levels && (width >> (n + 1u32)) != 0u32 && (height >> (n + 1u32)) != 0u32 {
+            n += 1u32;
+        }
+
+        n
+    }
+
+    prot over writeParams (self, dmut ubo : &UniformBufferObject) {
+        ubo:.setData (0us, self._threshold);
+        ubo:.setData (4us, self._knee);
+        ubo:.setData (8us, self._intensity);
+        ubo:.setData (12us, self._radius);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PASSES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the passes of the bloom, for n levels: the n downsamplings, `<pass>_down<k>` writing the level
+     * `<pass>_mip<k+1>` from the level k (the light of the stage before it for k = 0), then the n - 1 upsamplings,
+     * `<pass>_up<k>` writing `<pass>_up<k>` from the level k and the blurred levels below it, from the smallest, and last
+     * the pass of the stage adding the bloom to the light of the stage before it
+     * */
+    pub over passes (self, stage : PostStage, width : u32, height : u32)-> [PostPass] {
+        let n = self.levelsOf (width, height);
+        let input : [c8] = PostBindings::INPUT;
+        let mut result : [PostPass] = [];
+
+        for k in 0u32 .. n {
+            let source = if k == 0u32 { stage.input } else { mipName (stage, k) };
+            result = result ~ [PostPass (effect-> self.name,
+                                         name-> stage.pass ~ "_down" ~ std::conv::to!{[c8]} (k),
+                                         index-> result.len,
+                                         shader-> DOWN,
+                                         level-> k,
+                                         textures-> copy [input],
+                                         images-> copy [source],
+                                         output-> mipName (stage, k + 1u32),
+                                         image-> levelImage (width, height, k + 1u32))];
+        }
+
+        for i in 1u32 .. n {
+            let k = n - i;
+            let below = if k + 1u32 == n { mipName (stage, n) } else { upName (stage, k + 1u32) };
+            result = result ~ [PostPass (effect-> self.name,
+                                         name-> upName (stage, k),
+                                         index-> result.len,
+                                         shader-> UP,
+                                         level-> k,
+                                         textures-> copy [input, LOW],
+                                         images-> copy [mipName (stage, k), below],
+                                         output-> upName (stage, k),
+                                         image-> levelImage (width, height, k))];
+        }
+
+        let below = if n == 1u32 { mipName (stage, 1u32) } else { upName (stage, 1u32) };
+        result ~ [PostPass (effect-> self.name,
+                            name-> stage.pass,
+                            index-> result.len,
+                            shader-> UP,
+                            level-> 0u32,
+                            textures-> copy [input, LOW],
+                            images-> copy [stage.input, below],
+                            output-> stage.output,
+                            image-> stage.image (width, height),
+                            imported-> stage.last)]
+    }
+}
+
+/**
+ * @returns: the configurations of the shaders of the bloom, in the order of their places
+ * */
+fn shaders ()-> [[c8]] {
+    let down : [c8] = DefaultShaders::BLOOM_DOWN_3D;
+    let up : [c8] = DefaultShaders::BLOOM_UP_3D;
+    copy [down, up]
+}
+
+/**
+ * @returns: the name of the level k of the downsampling of a stage, the level 1 being half the size of the light
+ * */
+fn mipName (stage : PostStage, k : u32)-> [c8] {
+    stage.pass ~ "_mip" ~ std::conv::to!{[c8]} (k)
+}
+
+/**
+ * @returns: the name of the level k of the upsampling of a stage, the level k of the downsampling with the blurred levels
+ * below it added
+ * */
+fn upName (stage : PostStage, k : u32)-> [c8] {
+    stage.pass ~ "_up" ~ std::conv::to!{[c8]} (k)
+}
+
+/**
+ * @returns: the description of the level k of a chain over images of a size, a float image 2^k times smaller
+ * */
+fn levelImage (width : u32, height : u32, k : u32)-> ImageDesc {
+    ImageDesc (format-> VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT,
+               width-> max1 (width >> k),
+               height-> max1 (height >> k),
+               storage-> true)
+}
+
+/**
+ * @returns: a size, at least 1
+ * */
+fn max1 (x : u32)-> u32 {
+    if x == 0u32 { 1u32 } else { x }
+}

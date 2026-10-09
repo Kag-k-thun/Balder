@@ -1,0 +1,170 @@
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The level read, twice the size of the level written: the light the stage before it wrote for the first level
+layout (binding = 1) uniform sampler2D inputTex;
+
+// The bloom (balder::scene::utils::post::bloom::BloomEffect)
+layout (binding = 2) uniform Params {
+    // The brightness of the light, exposed, from which it blooms
+    float threshold;
+
+    // The softness of the threshold, the share of the threshold below it over which the light starts to bloom
+    float knee;
+
+    // The share of the bloom added to the light
+    float intensity;
+
+    // The radius of the tent upsampling the levels, in texels of the level read
+    float radius;
+} params;
+
+// The camera of the scene, its exposure after its matrices and its position
+layout (binding = 3) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+
+    // The exposure, in stops
+    float exposure;
+} camera;
+
+// The level read, 0 for the light the stage before it wrote, filtered by the threshold
+layout (push_constant) uniform Level {
+    uint level;
+} pc;
+
+// The level written, linear light
+layout (set = 0, binding = 0, rgba16f) uniform writeonly image2D outTex;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          FILTER          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The largest value of a half float, the brightest light kept
+const float HALF_MAX = 65504.0;
+
+/**
+ * @returns: the luminance of a linear colour (Rec. 709)
+ */
+float luminance (vec3 c) {
+    return dot (c, vec3 (0.2126, 0.7152, 0.0722));
+}
+
+/**
+ * @returns: the light of the level read at an offset from a position, in texels of the level read
+ */
+vec3 tap (vec2 uv, vec2 texel, vec2 off) {
+    return textureLod (inputTex, uv + off * texel, 0.0).rgb;
+}
+
+/**
+ * @returns: the light of a box of four taps, averaged
+ */
+vec3 box (vec3 a, vec3 b, vec3 c, vec3 d) {
+    return (a + b + c + d) * 0.25;
+}
+
+/**
+ * @returns: the weight of a box in the average of Karis, the brightest boxes weighing less so a lone bright texel (a
+ * firefly) does not flicker into a large blob
+ * @params:
+ *    - exposure: the scale of the light into the brightness of the screen
+ */
+float karis (vec3 c, float exposure) {
+    return 1.0 / (1.0 + luminance (c) * exposure);
+}
+
+/**
+ * @returns: the share of a light that blooms, by its brightest channel exposed: none below the knee, a quadratic curve
+ * in the knee, all the light above the threshold beyond it
+ */
+vec3 threshold (vec3 c, float exposure) {
+    float bright = max (c.r, max (c.g, c.b)) * exposure;
+    float knee = params.threshold * params.knee + 1e-5;
+    float soft = clamp (bright - params.threshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+
+    return c * (max (soft, bright - params.threshold) / max (bright, 1e-5));
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * The 13 taps of the downsampling of Jorge Jimenez (Call of Duty: Advanced Warfare), five overlapping boxes of four
+ * taps: the inner one weighing a half, the four corner ones an eighth each
+ */
+void main () {
+    ivec2 texelCoord = ivec2 (gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize (outTex);
+    if (texelCoord.x >= size.x || texelCoord.y >= size.y) {
+        return;
+    }
+
+    vec2 uv = (vec2 (texelCoord) + 0.5) / vec2 (size);
+    vec2 texel = 1.0 / vec2 (textureSize (inputTex, 0));
+
+    vec3 a = tap (uv, texel, vec2 (-2.0, -2.0));
+    vec3 b = tap (uv, texel, vec2 ( 0.0, -2.0));
+    vec3 c = tap (uv, texel, vec2 ( 2.0, -2.0));
+    vec3 d = tap (uv, texel, vec2 (-1.0, -1.0));
+    vec3 e = tap (uv, texel, vec2 ( 1.0, -1.0));
+    vec3 f = tap (uv, texel, vec2 (-2.0,  0.0));
+    vec3 g = tap (uv, texel, vec2 ( 0.0,  0.0));
+    vec3 h = tap (uv, texel, vec2 ( 2.0,  0.0));
+    vec3 i = tap (uv, texel, vec2 (-1.0,  1.0));
+    vec3 j = tap (uv, texel, vec2 ( 1.0,  1.0));
+    vec3 k = tap (uv, texel, vec2 (-2.0,  2.0));
+    vec3 l = tap (uv, texel, vec2 ( 0.0,  2.0));
+    vec3 m = tap (uv, texel, vec2 ( 2.0,  2.0));
+
+    vec3 inner = box (d, e, i, j);
+    vec3 topLeft = box (a, b, f, g);
+    vec3 topRight = box (b, c, g, h);
+    vec3 bottomLeft = box (f, g, k, l);
+    vec3 bottomRight = box (g, h, l, m);
+
+    vec3 color;
+    if (pc.level == 0u) {
+        float exposure = exp2 (camera.exposure);
+        float wInner = 0.5 * karis (inner, exposure);
+        float wTopLeft = 0.125 * karis (topLeft, exposure);
+        float wTopRight = 0.125 * karis (topRight, exposure);
+        float wBottomLeft = 0.125 * karis (bottomLeft, exposure);
+        float wBottomRight = 0.125 * karis (bottomRight, exposure);
+
+        color = (inner * wInner + topLeft * wTopLeft + topRight * wTopRight + bottomLeft * wBottomLeft
+                 + bottomRight * wBottomRight)
+              / (wInner + wTopLeft + wTopRight + wBottomLeft + wBottomRight);
+        color = threshold (color, exposure);
+    } else {
+        color = inner * 0.5 + (topLeft + topRight + bottomLeft + bottomRight) * 0.125;
+    }
+
+    // a light out of range (a NaN, an infinity) would spread over the whole image
+    if (any (isnan (color)) || any (isinf (color))) {
+        color = vec3 (0.0);
+    }
+
+    imageStore (outTex, texelCoord, vec4 (min (color, vec3 (HALF_MAX)), 1.0));
+}
