@@ -9,7 +9,8 @@ layout (location = 2) flat in vec2 inFade;
 // The material of the object
 layout (location = 3) flat in uint inMaterial;
 
-layout (location = 0) out vec3 normals;
+// The normal, folded by octEncode
+layout (location = 0) out vec2 normals;
 layout (location = 1) out vec4 albedo;
 layout (location = 2) out uint materialID;
 
@@ -39,10 +40,23 @@ void crossFade () {
     }
 }
 
+/**
+ * @returns: a direction folded onto the octahedron |x| + |y| + |z| = 1, its lower half unfolded over the corners of the
+ * square [-1, 1]², so it fits in two channels (the composition unfolds it back)
+ */
+vec2 octEncode (vec3 n) {
+    n /= max (abs (n.x) + abs (n.y) + abs (n.z), 1e-8);
+    if (n.z < 0.0) {
+        return (1.0 - abs (n.yx)) * vec2 (n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    }
+
+    return n.xy;
+}
+
 void main() {
     crossFade ();
 
-    normals = vec3 (inNormals);
+    normals = octEncode (inNormals);
     albedo = vec4 (texture (diffuse, inUV).xyz, 1);
     
     materialID = inMaterial;
