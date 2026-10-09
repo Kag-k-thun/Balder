@@ -8,10 +8,11 @@ use balder::core::{_, application::_};
 use balder::core::driver::{cmd_alloc, graph};
 use balder::core::shader::texture;
 use balder::math::{bounds, vector};
-use balder::scene::utils::_;
 use balder::scene::node::node3D::{camera, light};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
+use balder::scene::utils::_;
+use balder::scene::utils::tonemap::operator;
 
 use ::std::time::dur;
 
@@ -24,6 +25,7 @@ use ::std::time::dur;
  * */
 def DEFERRED     = "deferred";
 def COMPOSE      = "compose";
+def TONEMAP      = "tonemap";
 def SHADOW       = "shadow";
 def CULL         = "cull";
 def GBUFFER      = "gbuffer";
@@ -31,6 +33,7 @@ def PYRAMID      = "pyramid";
 def LATE_CULL    = "late_cull";
 def LATE_GBUFFER = "late_gbuffer";
 def OUTPUT       = "output";
+def RADIANCE     = "radiance";
 def ATLAS        = "shadow_atlas";
 def DRAWS        = "draws";
 def LATE_DRAWS   = "late_draws";
@@ -80,6 +83,9 @@ pub class Scene {
     // The compose rendering textures and subpasses
     let dmut _compose : ComposeRenderScene = ComposeRenderScene ();
 
+    // The tone mapping of the light the composition writes into the output of the scene
+    let dmut _tonemap : ToneMapRenderScene = ToneMapRenderScene ();
+
     // The shadow map of the direction light casting shadows, and the subpass drawing it
     let dmut _shadow : CascadeShadowScene = CascadeShadowScene ();
     
@@ -105,6 +111,9 @@ pub class Scene {
 
         // The light reaching every point of the scene from all around, whatever its lights
         let mut _ambient : vec3 = makeVec3 (0.1f, 0.1f, 0.1f);
+
+        // The operator mapping the light the camera sees into the colours of the screen
+        let mut _toneMap : ToneMap = ToneMap::AGX;
     }
 
     prot { // Levels of detail
@@ -173,13 +182,20 @@ pub class Scene {
                 self._deferred:.configure (self.named (DEFERRED), self._name, alias self._window, self._width, self._height);
                 self._shadow:.configure (alias self._window);
                 self._compose:.configure (self.named (COMPOSE),
-                                          self.named (OUTPUT),
+                                          self.named (RADIANCE),
                                           alias self._window,
                                           self._width,
                                           self._height,
                                           self._deferred,
                                           self._shadow.ubo,
                                           self._ambient);
+
+                self._tonemap:.configure (self.named (OUTPUT),
+                                          self.named (RADIANCE),
+                                          alias self._window,
+                                          self._width,
+                                          self._height,
+                                          self._toneMap);
 
                 let dmut dpass = alias self._deferred.subpass;
                 self._shaderToNode:.configure (alias self._window, self._deferred.depth, alias dpass);
@@ -203,7 +219,8 @@ pub class Scene {
      * Declare the buffers and the passes of the scene in the render graph of the window, in the order a frame runs them:
      * the cull pass and the g-buffer drawing the instances it finds, the depth pyramid, the late cull pass and the
      * g-buffer drawing the occluded instances it finds again, then the composition (the shadow map is declared before it
-     * when a light casts shadows)
+     * when a light casts shadows), and the tone mapping of the light it writes into the output of the scene, recorded in
+     * the subpass of the composition
      * */
     fn declarePasses (mut self)
         throws BalderError
@@ -259,8 +276,15 @@ pub class Scene {
                                           submission-> self.named (COMPOSE),
                                           kind-> PassKind::COMPUTE,
                                           uses-> reads ~ [ResourceUse (resource-> self.named (ATLAS), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
-                                                          ResourceUse (resource-> self.named (OUTPUT), usage-> Usage::STORAGE_WRITE)],
+                                                          ResourceUse (resource-> self.named (RADIANCE), usage-> Usage::STORAGE_WRITE)],
                                           recording-> (&self:.recordCompose)?));
+
+        pipeline:.declarePass (GraphPass (name-> self.named (TONEMAP),
+                                          submission-> self.named (COMPOSE),
+                                          kind-> PassKind::COMPUTE,
+                                          uses-> copy [ResourceUse (resource-> self.named (RADIANCE), usage-> Usage::SAMPLED_COMPUTE),
+                                                       ResourceUse (resource-> self.named (OUTPUT), usage-> Usage::STORAGE_WRITE)],
+                                          recording-> (&self:.recordToneMap)?));
     }
 
     /**
@@ -476,6 +500,26 @@ pub class Scene {
     }
 
     /**
+     * @returns: the operator mapping the light the camera sees into the colours of the screen
+     * */
+    @field
+    pub fn toneMap (self)-> ToneMap {
+        self._toneMap
+    }
+
+    /**
+     * Set the operator mapping the light the camera sees, exposed by the camera (see Camera::exposure), into the colours
+     * of the screen; AgX by default, NONE clipping the light to 1
+     * */
+    @field
+    pub fn toneMap (mut self, op : ToneMap) {
+        atomic self {
+            self._toneMap = op;
+            self._tonemap:.setOperator (op);
+        }
+    }
+
+    /**
      * @returns: true iif a direction light casts shadows
      * */
     @field
@@ -561,10 +605,10 @@ pub class Scene {
      */
 
     /**
-     * @returns: the generated output texture (composition) of the scene
+     * @returns: the generated output texture of the scene, its composition tone mapped, sampled in sRGB
      * */
     pub fn getOutputTexture (mut self)-> dmut &RefCount!{&Texture} {
-        alias self._compose.output
+        alias self._tonemap.output
     }
 
     /*!
@@ -664,7 +708,7 @@ pub class Scene {
      */
 
     /**
-     * Record the composition of the g-buffer, lit and shadowed, into the output of the scene
+     * Record the composition of the g-buffer, lit and shadowed, into the light the tonemap pass reads
      * */
     fn recordCompose (mut self) {        
         let dmut pass = alias self._compose.subpass;            
@@ -691,6 +735,31 @@ pub class Scene {
         } catch {
             err => {
                 log::error #("Scene", "Failed to call compose shader", err);                
+            }
+        }
+    }
+
+    /**
+     * Record the tone mapping of the light the composition wrote into the output of the scene, in the subpass of the
+     * composition
+     * */
+    fn recordToneMap (mut self) {
+        let dmut pass = alias self._compose.subpass;
+        let frame = pass.getCurrentFrame ();
+        let cmdV = pass.getDrawingCommandBuffer ();
+
+        let dmut cmd = copy ComputeDispatchCommandAllocator (alias pass);
+        let sizes = self._tonemap.groupSizes;
+
+        {
+            cmd:.registerDispatch (groupX-> sizes [0], groupY-> sizes [1], groupZ-> sizes [2]);
+            cmd:.finalizeRegister ();
+
+            self._tonemap:.select (frame, cmdV);
+            cmd:.dispatchNext ();
+        } catch {
+            err => {
+                log::error #("Scene", "Failed to call tonemap shader", err);
             }
         }
     }
@@ -727,6 +796,7 @@ pub class Scene {
     pub fn onCameraUpdate (mut self, dmut cam : &Camera) {
         atomic self {
             self._compose:.setCamera (alias cam);
+            self._tonemap:.setCamera (alias cam);
             self._shaderToNode:.setCamera (alias cam);
         }
     }
@@ -1065,6 +1135,7 @@ pub class Scene {
      * if a frame compiles it in the middle
      * */
     fn disposeGraph (mut self) {
+        self._tonemap:.dispose ();
         self._compose:.dispose ();
         self._shadow:.dispose ();
         self._tree:.dispose ();

@@ -4,7 +4,7 @@ use balder::utils;
 use balder::core::{_, application::_};
 use balder::core::config::shader;
 use balder::core::config::shader::_;
-use balder::core::driver::{pipeline, subpass};
+use balder::core::driver::{graph, pipeline, subpass};
 use balder::core::shader::{_, buffers::_};
 use balder::math::vector;
 use balder::scene::node::node3D::camera;
@@ -30,17 +30,20 @@ enum GBufferBindings : [c8]
 | DEPTH       = "depth";
 
 /**
+ * The format of the light the composition writes, linear and unbounded, exposed and tone mapped by the tonemap pass
+ * */
+def RADIANCE_FORMAT = VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT;
+
+/**
  * The record holding the data needed for the compose pass of the scene
  * */
 pub record ComposeRenderScene {
     
-    let dmut _output : (&RefCount!{&Texture})? = none;
     let dmut _shader : (&RefCount!{&Shader})? = none;    
     let dmut _set : (&DescriptorSet)? = none;
 
     let dmut _pass : (&ComputeSubpass)? = none;
     let dmut _computeShader : (&ComputeShader)? = none;
-    let dmut _outputTex : (&OutputTexture)? = none;
 
     // The ambient light of the scene, read by the composition
     let dmut _ambient : (&UniformBufferObject)? = none;
@@ -48,9 +51,9 @@ pub record ComposeRenderScene {
     // The window of the scene
     let dmut _window : (&Window)? = none;
 
-    // The name of the subpass in the render graph, and of the output
+    // The name of the subpass in the render graph, and of the light the composition writes
     let mut _passName : [c8] = "";
-    let mut _outputName : [c8] = "";
+    let mut _radiance : [c8] = "";
 
     // The images of the g-buffer the composition reads, by their name in the render graph, in the order of the
     // attachments of the deferred
@@ -75,17 +78,18 @@ pub record ComposeRenderScene {
      */
     
     /**
-     * Create the output of the composition, read by the screen, and register the subpass computing it
+     * Declare the light the composition writes in the render graph, a float image read by the tonemap pass, and register
+     * the subpass computing it
      * @params:
      *    - passName: the name of the subpass in the render graph
-     *    - outputName: the name of the output in the render graph
+     *    - radiance: the name of the light the composition writes in the render graph
      *    - defer: the g-buffer, its images read by the composition
      *    - shadow: the cascades of the shadow map, read by the composition
      *    - ambient: the ambient light of the scene (see setAmbient)
      * */
     pub fn configure (mut self,
                       passName : [c8],
-                      outputName : [c8],
+                      radiance : [c8],
                       dmut win : &Window,
                       width : u32,
                       height : u32,
@@ -99,10 +103,6 @@ pub record ComposeRenderScene {
         let dmut ambientUbo = copy UniformBufferObject (alias device, AMBIENT_SIZE);
         ambientUbo:.setData (0us, ambient);
         self._ambient = (alias ambientUbo)?;
-                
-        let dmut output = copy OutputTexture (alias device, VkFormat::VK_FORMAT_R8G8B8A8_UNORM, width, height, forStorage-> true);
-        self._output = (alias win:.insertResource (alias output))?;
-        self._outputTex = (alias output)?;
 
         let dmut pass = copy ComputeSubpass (alias device, passName, width, height, 1);
         self._pass = (alias pass)?;
@@ -119,7 +119,6 @@ pub record ComposeRenderScene {
             self._set = (alias set)?;            
             set:.setUniform (UniformNames::SHADOW, shadow);
             set:.setUniform (UniformNames::AMBIENT, ambientUbo);
-            set:.setStorageTexture ("output", output);            
         } catch {
             err => {
                 log::error #("Scene", "Malformed deferred textures", err);
@@ -128,13 +127,12 @@ pub record ComposeRenderScene {
         }
 
         let dmut pipeline = win:.getVulkanPipeline ();
-        pipeline:.importImage (outputName, alias output);
-        pipeline:.readOnScreen (outputName);
+        pipeline:.createImage (radiance, ImageDesc (format-> RADIANCE_FORMAT, width-> width, height-> height, storage-> true));
         pipeline:.registerSubPass (passName, alias pass);
 
         self._window = (alias win)?;
         self._passName = passName;
-        self._outputName = outputName;
+        self._radiance = radiance;
         self._gbuffer = defer.attachments;
     }
 
@@ -165,20 +163,7 @@ pub record ComposeRenderScene {
      */
 
     /**
-     * @returns: the texture holding the result of the composition pass
-     * */
-    @field
-    pub fn output (mut self)-> dmut &RefCount!{&Texture} {
-        if let Ok (dmut out) = alias self._output {
-            return alias out;
-        }
-
-        log::error #("ComposeRenderScene", "Problem of configuration");
-        panic;
-    }
-
-    /**
-     * @returns: the texture holding the result of the composition pass
+     * @returns: the subpass of the composition, recording the tonemap pass after it
      * */
     @field
     pub fn subpass (mut self)-> dmut &ComputeSubpass {
@@ -244,6 +229,12 @@ pub record ComposeRenderScene {
             // the depth stands in for the shadow map while no light casts shadows (it is never read then)
             let shadowMap = if shadow.atlas != "" { shadow.atlas } else { self._gbuffer [$ - 1] };
             self.bindImage (alias set, alias pipeline, frame, "shadowMap", shadowMap);
+
+            if let Ok (t) = pipeline:.getTexture (self._radiance) {
+                set:.setStorageTexture ("output", t, frame-> cast!i32 (frame));
+            } else {
+                log::error #("ComposeRenderScene", "The image", self._radiance, "is not allocated");
+            }
         }
         
         set.select (frame, cmd);        
@@ -291,15 +282,14 @@ pub record ComposeRenderScene {
     impl Disposable {
 
         /**
-         * Remove the subpass and the output from the render graph, the subpass and the descriptor set being retired with
-         * the frames using them
+         * Remove the subpass and the light it writes from the render graph, the subpass and the descriptor set being
+         * retired with the frames using them
          * */
         pub over dispose (mut self) {            
             if let Ok (dmut win) = alias self._window {
                 let dmut pipeline = win:.getVulkanPipeline ();
                 pipeline:.removeSubPass (self._passName);
-                pipeline:.stopReadingOnScreen (self._outputName);
-                pipeline:.removeResource (self._outputName);
+                pipeline:.removeResource (self._radiance);
 
                 if let Ok (dmut pass) = alias self._pass {
                     win:.retire (alias pass);
@@ -314,17 +304,11 @@ pub record ComposeRenderScene {
                 }
             }
 
-            if let Ok (dmut output) = alias self._output {
-                output:.dispose ();
-            }
-
             if let Ok (dmut shader) = alias self._shader {
                 shader:.dispose ();
             }
 
             self._pass = none;
-            self._output = none;
-            self._outputTex = none;
             self._shader = none;
             self._computeShader = none;
             self._set = none;
