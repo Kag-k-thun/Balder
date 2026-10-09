@@ -62,10 +62,10 @@ attribute = ident ":" values ";" ;
   takes the next free cell, row by row.
 - **Every length is in the style.** Sizes, margins, directions, tracks and positions are style properties; the only
   size in a `.gui` file is the `resolution` a `Scene3D` renders at before being scaled to the widget.
-- **The post-process chain of a `Scene3D`** is described by `post: vignette(0.6, 0.35), invert(off);`: each effect is
-  a kind registered in the post registry of the manager (`WidgetManager::getPostRegistry`, `vignette` and `invert` in
-  Balder, an application registering its own before loading the file), followed by its parameters, `off` adding it
-  disabled. The effects are added to the chain of the scene when the widget is attached (see `doc/render-graph.md`).
+- **The post-process chain of a `Scene3D`** is described by `post: bloom, lut("res:/lut/film.png"), fxaa, invert(off);`:
+  each effect is a kind registered in the post registry of the manager (`WidgetManager::getPostRegistry`, `vignette`,
+  `bloom`, `invert`, `lut` and `fxaa` in Balder, an application registering its own before loading the file), followed
+  by its parameters, numbers and texts (the path of a LUT), `off` adding it disabled. The effects are added to the chain of the scene when the widget is attached (see `doc/render-graph.md`).
 - `@import`, `@style` and `@component` are read but refused at load: components are not implemented yet.
 
 ## The style file
@@ -362,7 +362,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Scene3D`
 
-- **Attributes:** `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, `off` adding it disabled: `vignette(0.5), invert(off)`
+- **Attributes:** `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
