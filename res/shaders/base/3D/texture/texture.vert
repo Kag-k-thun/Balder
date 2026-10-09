@@ -58,7 +58,9 @@ void main () {
     vec4 viewPos = camera.view * object.model * vec4 (inPosition, 1.0);
     gl_Position = camera.proj * viewPos;
     
-    outNormals = inNormals;
+    // the normals of the object turned into world space, by the inverse transpose of its world so a non uniform scale
+    // keeps them perpendicular to its surface
+    outNormals = transpose (inverse (mat3 (object.model))) * inNormals;
     outUV = inUV;
     outFade = vec2 (object.fade, float (word & 3u));
     outMaterial = object.material;
