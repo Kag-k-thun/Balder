@@ -27,7 +27,8 @@ fn uses(resource: [c8], usage: Usage, optional: bool = false)-> ResourceUse {
 
 /**
  * @returns: the graph of a scene drawn in a window: the shadow map, the cull pass, the g-buffer, the depth pyramid, the
- * late cull pass and the late g-buffer in the deferred, the composition, then the screen reading it
+ * late cull pass and the late g-buffer in the deferred, the composition and the tone mapping of the light it writes,
+ * then the screen reading the output
  * */
 fn sceneGraph()-> dmut &RenderGraph
     throws BalderError
@@ -41,6 +42,7 @@ fn sceneGraph()-> dmut &RenderGraph
     g:.createImage("atlas", ImageDesc(width-> 64u32, height-> 64u32, depth-> true));
     g:.createImage("albedo", ImageDesc(width-> 32u32, height-> 32u32));
     g:.createImage("depth", ImageDesc(width-> 32u32, height-> 32u32, depth-> true));
+    g:.createImage("radiance", ImageDesc(width-> 32u32, height-> 32u32, storage-> true));
     g:.importImage("output");
     g:.importBuffer("draws");
     g:.importBuffer("lateDraws");
@@ -79,7 +81,11 @@ fn sceneGraph()-> dmut &RenderGraph
                              uses-> copy [uses("albedo", Usage::SAMPLED_COMPUTE),
                                           uses("depth", Usage::SAMPLED_COMPUTE),
                                           uses("atlas", Usage::SAMPLED_COMPUTE, optional-> true),
-                                          uses("output", Usage::STORAGE_WRITE)]));
+                                          uses("radiance", Usage::STORAGE_WRITE)]));
+    g:.declarePass(GraphPass(name-> "tonemap",
+                             submission-> "compose",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("radiance", Usage::SAMPLED_COMPUTE), uses("output", Usage::STORAGE_WRITE)]));
 
     alias g
 }
@@ -172,6 +178,7 @@ __test subpasses_follow_their_dependencies {
 
     assert (submissionNames(s) == ["deferred", "shadow", "compose", "screen"]);
     assert (passNames(s, "deferred") == ["cull", "gbuffer", "pyramid", "lateCull", "lateGbuffer"]);
+    assert (passNames(s, "compose") == ["compose", "tonemap"]);
     assert (passNames(s, "screen") == ["screen"]);
 }
 
@@ -249,7 +256,7 @@ __test images_are_transitioned_to_the_layout_of_their_use {
     let g = sceneGraph();
     let s = g.compile();
 
-    let write = barrierOf(s, "compose", "output");
+    let write = barrierOf(s, "tonemap", "output");
     assert (write.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
     assert (write.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
     assert (write.srcStage == COMPUTE);
@@ -262,6 +269,28 @@ __test images_are_transitioned_to_the_layout_of_their_use {
 
     // the attachments are left by the render pass in the layout of their readers
     assert (barrierOf(s, "compose", "depth").srcStage == 0u32);
+}
+
+/**
+ * The tone mapping samples the light the composition wrote in the same subpass, once its writes are done and the image
+ * is out of the layout of the storage images
+ * */
+__test the_tone_mapping_samples_the_composition {
+    let g = sceneGraph();
+    let s = g.compile();
+
+    let write = barrierOf(s, "compose", "radiance");
+    assert (write.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
+    assert (write.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+
+    let read = barrierOf(s, "tonemap", "radiance");
+    assert (read.srcStage == COMPUTE && read.srcAccess == SHADER_WRITE);
+    assert (read.dstStage == COMPUTE);
+    assert (read.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+    assert (read.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // the screen reads the output only
+    assert (edgeOf(s, indexOf(s, "compose"), indexOf(s, "screen")).resources == ["output"]);
 }
 
 /**
@@ -297,7 +326,7 @@ __test optional_uses_of_undeclared_resources_are_dropped {
 
     let s = g.compile();
     assert (submissionNames(s) == ["deferred", "compose", "screen"]);
-    assert (barrierOf(s, "compose", "output").newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+    assert (barrierOf(s, "tonemap", "output").newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
 }
 
 /**
@@ -312,8 +341,10 @@ __test lifetimes_span_the_uses_of_a_frame {
             assert (l.first == 1us && l.last == 6us);
         } else if l.name == "atlas" {
             assert (l.first == 5us && l.last == 6us);
-        } else if l.name == "output" {
+        } else if l.name == "radiance" {
             assert (l.first == 6us && l.last == 7us);
+        } else if l.name == "output" {
+            assert (l.first == 7us && l.last == 8us);
         }
     }
 }
@@ -440,17 +471,18 @@ __test the_exported_graph_holds_passes_barriers_and_memory {
     let dmut g = sceneGraph();
     g:.enablePass("lateCull", false);
     let s = g.compile();
-    let cfg = toConfig(g, s, copy [copy ["atlas"], copy ["albedo"], copy ["depth"]]);
+    let cfg = toConfig(g, s, copy [copy ["atlas"], copy ["albedo"], copy ["depth"], copy ["radiance"]]);
 
     assert (cfg.str("subpasses", 0, "name") == ("deferred")?);
     assert (cfg.str("subpasses", 3, "name") == ("screen")?);
     assert (cfg.str("subpasses", 0, "passes", 1) == ("gbuffer")?);
+    assert (cfg.str("subpasses", 2, "passes", 1) == ("tonemap")?);
 
     // the passes in the order they are recorded, the disabled one last
     assert (cfg.str("passes", 0, "name") == ("cull")?);
     assert (cfg.int("passes", 0, "order") == (1i64)?);
-    assert (cfg.str("passes", 7, "name") == ("lateCull")?);
-    assert (cfg.boolean("passes", 7, "enabled") == (false)?);
+    assert (cfg.str("passes", 8, "name") == ("lateCull")?);
+    assert (cfg.boolean("passes", 8, "enabled") == (false)?);
 
     // the transition of the output for the screen
     if let Ok(screen) = named(cfg, "passes", "screen") {
