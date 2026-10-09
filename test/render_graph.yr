@@ -1,0 +1,542 @@
+in render_graph;
+
+use balder::core::error;
+use balder::core::driver::graph;
+use balder::core::driver::graph::{aliasing, edge, export};
+
+use std::config::{access, data, json};
+
+use ::vulkan::core;
+
+def COMPUTE  = 0x00000800u32; // VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+def FRAGMENT = 0x00000080u32; // VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+def INDIRECT = 0x00000002u32; // VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT
+def VERTEX   = 0x00000008u32; // VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+def TESTS    = 0x00000300u32; // VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+def ALL      = 0x00010000u32; // VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+
+def SHADER_WRITE = 0x00000040u32; // VK_ACCESS_SHADER_WRITE_BIT
+def DEPTH_WRITE  = 0x00000400u32; // VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+
+/**
+ * @returns: a use of a resource
+ * */
+fn uses(resource: [c8], usage: Usage, optional: bool = false)-> ResourceUse {
+    ResourceUse(resource-> resource, usage-> usage, optional-> optional)
+}
+
+/**
+ * @returns: the graph of a scene drawn in a window: the shadow map, the cull pass, the g-buffer, the depth pyramid, the
+ * late cull pass and the late g-buffer in the deferred, the composition, then the screen reading it
+ * */
+fn sceneGraph()-> dmut &RenderGraph
+    throws BalderError
+{
+    let dmut g = copy RenderGraph("screen");
+    g:.addSubmission("screen");
+    g:.addSubmission("shadow");
+    g:.addSubmission("deferred");
+    g:.addSubmission("compose");
+
+    g:.createImage("atlas", ImageDesc(width-> 64u32, height-> 64u32, depth-> true));
+    g:.createImage("albedo", ImageDesc(width-> 32u32, height-> 32u32));
+    g:.createImage("depth", ImageDesc(width-> 32u32, height-> 32u32, depth-> true));
+    g:.importImage("output");
+    g:.importBuffer("draws");
+    g:.importBuffer("lateDraws");
+    g:.importBuffer("hzb");
+
+    g:.declarePass(GraphPass(name-> "screen", submission-> "screen", uses-> copy [uses("output", Usage::SAMPLED_FRAGMENT)]));
+    g:.declarePass(GraphPass(name-> "cull",
+                             submission-> "deferred",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("draws", Usage::STORAGE_WRITE)]));
+    g:.declarePass(GraphPass(name-> "gbuffer",
+                             submission-> "deferred",
+                             uses-> copy [uses("draws", Usage::INDIRECT),
+                                          uses("draws", Usage::VERTEX_READ),
+                                          uses("albedo", Usage::COLOR_ATTACHMENT),
+                                          uses("depth", Usage::DEPTH_ATTACHMENT)]));
+    g:.declarePass(GraphPass(name-> "pyramid",
+                             submission-> "deferred",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("depth", Usage::SAMPLED_COMPUTE), uses("hzb", Usage::STORAGE_WRITE)]));
+    g:.declarePass(GraphPass(name-> "lateCull",
+                             submission-> "deferred",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("hzb", Usage::STORAGE_READ), uses("lateDraws", Usage::STORAGE_WRITE)]));
+    g:.declarePass(GraphPass(name-> "lateGbuffer",
+                             submission-> "deferred",
+                             uses-> copy [uses("lateDraws", Usage::INDIRECT),
+                                          uses("albedo", Usage::COLOR_ATTACHMENT),
+                                          uses("depth", Usage::DEPTH_ATTACHMENT)]));
+    g:.declarePass(GraphPass(name-> "shadow",
+                             submission-> "shadow",
+                             uses-> copy [uses("atlas", Usage::DEPTH_ATTACHMENT)]));
+    g:.declarePass(GraphPass(name-> "compose",
+                             submission-> "compose",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("albedo", Usage::SAMPLED_COMPUTE),
+                                          uses("depth", Usage::SAMPLED_COMPUTE),
+                                          uses("atlas", Usage::SAMPLED_COMPUTE, optional-> true),
+                                          uses("output", Usage::STORAGE_WRITE)]));
+
+    alias g
+}
+
+/**
+ * @returns: the names of the subpasses of a schedule, in their order
+ * */
+fn submissionNames(s: RenderSchedule)-> [[c8]] {
+    let mut result: [[c8]] = [];
+    for sub in s.submissions {
+        result = result ~ [sub.name];
+    }
+
+    result
+}
+
+/**
+ * @returns: the names of the passes of a subpass of a schedule, in their order
+ * */
+fn passNames(s: RenderSchedule, submission: [c8])-> [[c8]] {
+    let mut result: [[c8]] = [];
+    for sub in s.submissions if sub.name == submission {
+        for p in sub.passes {
+            result = result ~ [p.name];
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the index of a subpass in a schedule
+ * */
+fn indexOf(s: RenderSchedule, submission: [c8])-> usize {
+    for i, sub in s.submissions if sub.name == submission {
+        return i;
+    }
+
+    usize::max
+}
+
+/**
+ * @returns: the edge from a subpass to another one, the stage of an edge of no stage if there is none
+ * */
+fn edgeOf(s: RenderSchedule, from: usize, to: usize)-> GraphEdge {
+    for e in s.edges if e.from == from && e.to == to {
+        return e;
+    }
+
+    GraphEdge(from-> from, to-> to)
+}
+
+/**
+ * @returns: the barrier of a resource before a pass, a barrier of no stage if there is none
+ * */
+fn barrierOf(s: RenderSchedule, pass: [c8], resource: [c8])-> GraphBarrier {
+    for sub in s.submissions {
+        for p in sub.passes if p.name == pass {
+            for b in p.barriers if b.resource == resource {
+                return b;
+            }
+        }
+    }
+
+    GraphBarrier()
+}
+
+/**
+ * @returns: true iif compiling a graph fails
+ * */
+fn fails(g: &RenderGraph)-> bool {
+    {
+        let _ = g.compile();
+    } catch {
+        _: &BalderError => {
+            return true;
+        }
+    }
+
+    false
+}
+
+/**
+ * The subpasses are submitted in the order of their dependencies, those nothing orders in the order of their first pass,
+ * the screen last; the passes of a subpass in the order of their declaration
+ * */
+__test subpasses_follow_their_dependencies {
+    let g = sceneGraph();
+    let s = g.compile();
+
+    assert (submissionNames(s) == ["deferred", "shadow", "compose", "screen"]);
+    assert (passNames(s, "deferred") == ["cull", "gbuffer", "pyramid", "lateCull", "lateGbuffer"]);
+    assert (passNames(s, "screen") == ["screen"]);
+}
+
+/**
+ * A subpass waits for those it reads from at the stages reading, the subpasses depending on none wait for the transfers,
+ * the screen for every other subpass
+ * */
+__test semaphores_wait_at_the_stages_of_the_reads {
+    let g = sceneGraph();
+    let s = g.compile();
+
+    let deferred = indexOf(s, "deferred");
+    let shadow = indexOf(s, "shadow");
+    let compose = indexOf(s, "compose");
+    let screen = indexOf(s, "screen");
+
+    assert (edgeOf(s, deferred, compose).stage == COMPUTE);
+    assert (edgeOf(s, deferred, compose).resources == ["albedo", "depth"]);
+    assert (edgeOf(s, shadow, compose).stage == COMPUTE);
+    assert (edgeOf(s, compose, screen).stage == FRAGMENT);
+
+    assert (edgeOf(s, TRANSFER, deferred).stage == ALL);
+    assert (edgeOf(s, TRANSFER, shadow).stage == ALL);
+    assert (edgeOf(s, TRANSFER, compose).stage == 0u32);
+    assert (edgeOf(s, deferred, screen).stage == 0u32);
+
+    // the subpasses signal and wait for the edges reaching them
+    for k, e in s.edges {
+        if e.from != TRANSFER {
+            let mut signaled = false;
+            for j in s.submissions[e.from].signals if j == k { signaled = true; }
+            assert (signaled);
+        }
+
+        let mut awaited = false;
+        for j in s.submissions[e.to].waits if j == k { awaited = true; }
+        assert (awaited);
+    }
+}
+
+/**
+ * The passes of a subpass are separated by barriers from the accesses before them: the commands written before they are
+ * drawn, the depth drawn before it is reduced, and the depth reduced before it is drawn again
+ * */
+__test barriers_separate_the_passes_of_a_subpass {
+    let g = sceneGraph();
+    let s = g.compile();
+
+    let draws = barrierOf(s, "gbuffer", "draws");
+    assert (draws.srcStage == COMPUTE);
+    assert (draws.srcAccess == SHADER_WRITE);
+    assert (draws.dstStage == INDIRECT | VERTEX);
+
+    let depth = barrierOf(s, "pyramid", "depth");
+    assert (depth.srcStage == TESTS);
+    assert (depth.srcAccess == DEPTH_WRITE);
+    assert (depth.dstStage == COMPUTE);
+    assert (depth.oldLayout == depth.newLayout);
+
+    // written again after it was read and written
+    let late = barrierOf(s, "lateGbuffer", "depth");
+    assert (late.srcStage == TESTS | COMPUTE);
+    assert (late.srcAccess == DEPTH_WRITE);
+    assert (late.dstStage == TESTS);
+
+    // the first pass waits for the semaphores only
+    assert (barrierOf(s, "cull", "draws").srcStage == 0u32);
+    assert (barrierOf(s, "compose", "albedo").srcStage == 0u32);
+}
+
+/**
+ * An image written by compute shaders is transitioned from undefined, then to the layout its readers sample it in
+ * */
+__test images_are_transitioned_to_the_layout_of_their_use {
+    let g = sceneGraph();
+    let s = g.compile();
+
+    let write = barrierOf(s, "compose", "output");
+    assert (write.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
+    assert (write.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+    assert (write.srcStage == COMPUTE);
+
+    let read = barrierOf(s, "screen", "output");
+    assert (read.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+    assert (read.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    assert (read.srcStage == FRAGMENT);
+    assert (read.dstStage == FRAGMENT);
+
+    // the attachments are left by the render pass in the layout of their readers
+    assert (barrierOf(s, "compose", "depth").srcStage == 0u32);
+}
+
+/**
+ * A disabled pass is not recorded, the optional reads of what it wrote are dropped with it
+ * */
+__test disabled_passes_are_not_present {
+    let dmut g = sceneGraph();
+    assert (g:.enablePass("shadow", false));
+    assert (!g:.enablePass("shadow", false));
+    g:.enablePass("pyramid", false);
+    g:.enablePass("lateCull", false);
+    g:.enablePass("lateGbuffer", false);
+
+    let s = g.compile();
+    assert (submissionNames(s) == ["deferred", "compose", "screen"]);
+    assert (passNames(s, "deferred") == ["cull", "gbuffer"]);
+    assert (edgeOf(s, indexOf(s, "deferred"), indexOf(s, "compose")).resources == ["albedo", "depth"]);
+
+    for l in s.lifetimes {
+        assert (l.name != "atlas");
+        assert (l.name != "hzb");
+    }
+}
+
+/**
+ * An optional use of a resource that is not declared is dropped, as the shadow map of a scene while no light casts
+ * shadows
+ * */
+__test optional_uses_of_undeclared_resources_are_dropped {
+    let dmut g = sceneGraph();
+    g:.removeSubmission("shadow");
+    g:.removeResource("atlas");
+
+    let s = g.compile();
+    assert (submissionNames(s) == ["deferred", "compose", "screen"]);
+    assert (barrierOf(s, "compose", "output").newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+}
+
+/**
+ * The lifetimes of the resources span from their first to their last use, in the order the passes are recorded
+ * */
+__test lifetimes_span_the_uses_of_a_frame {
+    let g = sceneGraph();
+    let s = g.compile();
+
+    for l in s.lifetimes {
+        if l.name == "albedo" {
+            assert (l.first == 1us && l.last == 6us);
+        } else if l.name == "atlas" {
+            assert (l.first == 5us && l.last == 6us);
+        } else if l.name == "output" {
+            assert (l.first == 6us && l.last == 7us);
+        }
+    }
+}
+
+/**
+ * A transient image written first by a compute pass is transitioned from undefined, its memory being shared,
+ * even when the frame leaves it in the layout of the write
+ * */
+__test transient_images_start_undefined {
+    let dmut g = copy RenderGraph("screen");
+    g:.addSubmission("screen");
+    g:.addSubmission("compute");
+    g:.createImage("scratch", ImageDesc(width-> 8u32, height-> 8u32, storage-> true));
+    g:.declarePass(GraphPass(name-> "screen", submission-> "screen"));
+    g:.declarePass(GraphPass(name-> "write",
+                             submission-> "compute",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("scratch", Usage::STORAGE_WRITE)]));
+    g:.declarePass(GraphPass(name-> "read",
+                             submission-> "compute",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("scratch", Usage::STORAGE_READ)]));
+
+    let s = g.compile();
+    let b = barrierOf(s, "write", "scratch");
+    assert (b.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
+    assert (b.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+
+    // read in the layout it was written in
+    let r = barrierOf(s, "read", "scratch");
+    assert (r.oldLayout == r.newLayout);
+    assert (r.srcStage == COMPUTE && r.srcAccess == SHADER_WRITE);
+}
+
+/**
+ * The declarations a frame cannot run are refused
+ * */
+__test invalid_graphs_are_refused {
+    // a transient image read before it is written
+    let dmut g = sceneGraph();
+    g:.enablePass("gbuffer", false);
+    g:.enablePass("lateGbuffer", false);
+    assert (fails(g));
+
+    // two subpasses depending on each other
+    let dmut c = sceneGraph();
+    c:.declarePass(GraphPass(name-> "afterCompose",
+                             submission-> "deferred",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("output", Usage::STORAGE_READ)]));
+    c:.declarePass(GraphPass(name-> "composeAgain",
+                             submission-> "compose",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("lateDraws", Usage::STORAGE_READ)]));
+    c:.declarePass(GraphPass(name-> "drawAgain",
+                             submission-> "deferred",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("lateDraws", Usage::STORAGE_WRITE)]));
+    assert (fails(c));
+
+    // a buffer used as an image, an attachment in a compute pass
+    let dmut b = sceneGraph();
+    b:.declarePass(GraphPass(name-> "sampleBuffer",
+                             submission-> "compose",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("hzb", Usage::SAMPLED_COMPUTE)]));
+    assert (fails(b));
+
+    let dmut a = sceneGraph();
+    a:.declarePass(GraphPass(name-> "attach",
+                             submission-> "compose",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("albedo", Usage::COLOR_ATTACHMENT)]));
+    assert (fails(a));
+
+    // the screen not declared
+    let dmut e = copy RenderGraph("screen");
+    e:.addSubmission("screen");
+    assert (fails(e));
+
+    // a pass in no subpass
+    let dmut p = copy RenderGraph("screen");
+    let mut refused = false;
+    {
+        p:.declarePass(GraphPass(name-> "lost", submission-> "nowhere"));
+    } catch {
+        _: &BalderError => { refused = true; }
+    }
+
+    assert (refused);
+}
+
+/**
+ * Removing a subpass removes its passes
+ * */
+__test removed_subpasses_take_their_passes {
+    let dmut g = sceneGraph();
+    g:.removeSubmission("shadow");
+
+    let s = g.compile();
+    assert (submissionNames(s) == ["deferred", "compose", "screen"]);
+
+    for p in g.getPasses() {
+        assert (p.name != "shadow");
+    }
+}
+
+/**
+ * @returns: the entry of an array of a configuration whose name is 'name', none if there is none
+ * */
+fn named(cfg: &Config, array: [c8], name: [c8])-> (&Config)? {
+    for e in cfg.elements(array) {
+        if e.str("name") == (name)? { return e?; }
+    }
+
+    none
+}
+
+/**
+ * The exported graph lists the subpasses in their order, the passes with their uses and barriers, the semaphores and
+ * the memory of the transient images
+ * */
+__test the_exported_graph_holds_passes_barriers_and_memory {
+    let dmut g = sceneGraph();
+    g:.enablePass("lateCull", false);
+    let s = g.compile();
+    let cfg = toConfig(g, s, copy [copy ["atlas"], copy ["albedo"], copy ["depth"]]);
+
+    assert (cfg.str("subpasses", 0, "name") == ("deferred")?);
+    assert (cfg.str("subpasses", 3, "name") == ("screen")?);
+    assert (cfg.str("subpasses", 0, "passes", 1) == ("gbuffer")?);
+
+    // the passes in the order they are recorded, the disabled one last
+    assert (cfg.str("passes", 0, "name") == ("cull")?);
+    assert (cfg.int("passes", 0, "order") == (1i64)?);
+    assert (cfg.str("passes", 7, "name") == ("lateCull")?);
+    assert (cfg.boolean("passes", 7, "enabled") == (false)?);
+
+    // the transition of the output for the screen
+    if let Ok(screen) = named(cfg, "passes", "screen") {
+        assert (screen.str("barriers", 0, "resource") == ("output")?);
+        assert (screen.str("barriers", 0, "oldLayout") == ("general")?);
+        assert (screen.str("barriers", 0, "newLayout") == ("shader read only")?);
+        assert (screen.str("barriers", 0, "srcStages", "names", 0) == ("fragment shader")?);
+        assert (screen.int("barriers", 0, "dstStages", "value") == (cast!i64(FRAGMENT))?);
+    } else { assert (false); }
+
+    // the semaphores, from the transfers too
+    assert (cfg.str("edges", 0, "from") == ("deferred")?);
+    let mut fromTransfers = false;
+    for e in cfg.elements("edges") if e.str("from") == ("transfers")? && e.str("to") == ("deferred")? {
+        fromTransfers = e.str("stages", "names", 0) == ("all commands")?;
+    }
+
+    assert (fromTransfers);
+
+    // the lifetime and the memory of a transient image
+    if let Ok(albedo) = named(cfg, "resources", "albedo") {
+        assert (albedo.boolean("transient") == (true)?);
+        assert (albedo.int("first") == (2i64)? && albedo.int("last") == (6i64)?);
+        assert (albedo.int("slot") == (2i64)?);
+        assert (albedo.int("width") == (32i64)?);
+    } else { assert (false); }
+
+    // a dump in json reads back the same
+    assert (json::parse(json::dump(cfg)).str("passes", 1, "uses", 0, "usage") == ("indirect commands")?);
+}
+
+/**
+ * @returns: the span of an image used from the pass 'first' to the pass 'last'
+ * */
+fn span(name: [c8], first: usize, last: usize, size: usize, typeBits: u32 = 1u32)-> AliasSpan {
+    AliasSpan(name-> name, first-> first, last-> last, size-> size, alignment-> 256us, typeBits-> typeBits)
+}
+
+/**
+ * @returns: the images of each slot, a slot written as its images joined by '+', the slots joined by '|'
+ * */
+fn members(slots: [AliasSlot])-> [c8] {
+    let mut result: [c8] = "";
+    for i, s in slots {
+        if i != 0us { result = result ~ "|"; }
+        for j, m in s.members {
+            result = if j == 0us { result ~ m.name } else { result ~ "+" ~ m.name };
+        }
+    }
+
+    result
+}
+
+/**
+ * Images whose uses do not overlap share a slot, as large as the largest of them; those used at the same time do not
+ * */
+__test images_used_apart_share_their_memory {
+    let slots = planSlots(copy [span("gbuffer", 0us, 3us, 100us),
+                                span("depth", 0us, 4us, 50us),
+                                span("bloom", 4us, 5us, 80us),
+                                span("tonemap", 5us, 6us, 40us)]);
+
+    assert (members(slots) == "gbuffer+bloom|depth+tonemap");
+    assert (slots[0].size == 100us && slots[1].size == 50us);
+    assert (slots[0].alignment == 256us);
+}
+
+/**
+ * An image goes in the slot it grows the least
+ * */
+__test an_image_goes_where_it_grows_the_memory_least {
+    let slots = planSlots(copy [span("small", 0us, 1us, 10us),
+                                span("large", 0us, 1us, 100us),
+                                span("later", 2us, 3us, 90us)]);
+
+    assert (members(slots) == "small|large+later");
+    assert (slots[1].size == 100us);
+}
+
+/**
+ * Images bound into different memory types never share a slot, nor do images used by the same pass
+ * */
+__test incompatible_images_do_not_share {
+    let slots = planSlots(copy [span("a", 0us, 1us, 10us, typeBits-> 1u32),
+                                span("b", 2us, 3us, 10us, typeBits-> 2u32),
+                                span("c", 1us, 2us, 10us, typeBits-> 3u32)]);
+
+    assert (members(slots) == "a|b|c");
+}

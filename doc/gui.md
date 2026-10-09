@@ -6,7 +6,7 @@ today; [gui-v2.md](gui-v2.md) is the design it comes from, and still describes p
 (components, signals, the CSS box model).
 
 The second half of the page, from [Widget types](#widget-types) on, is generated from the widget registry and the
-property table by `gyllir run reference`, and a test fails when it no longer matches the code.
+property table by `gyllir run reference` in `tools/`, and a test fails when it no longer matches the code.
 
 ## Loading the files
 

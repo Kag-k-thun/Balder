@@ -1,0 +1,371 @@
+in main;
+
+use std::config::{_, access, args::errors, json};
+use std::fs::{path, sys};
+use std::io;
+use std::stream;
+
+/**
+ * An edge between two passes of a same subpass, ordering the resources the second uses after the first wrote them
+ * */
+@data
+record Flow {
+    pub let from: [c8] = "";
+    pub let to: [c8] = "";
+    pub let resources: [[c8]] = [];
+}
+
+/**
+ * The fill color of a raster pass
+ * */
+def RASTER_COLOR = "#cfe2ff";
+
+/**
+ * The fill color of a compute pass
+ * */
+def COMPUTE_COLOR = "#d1f0d6";
+
+/**
+ * The fill color of the node of the transfers of the frame
+ * */
+def TRANSFER_COLOR = "#fde2c8";
+
+/**
+ * Write a render graph exported in json (src/balder/core/driver/graph/export.yr) as a graphviz dot graph:
+ *    - each subpass is a cluster holding its passes in the order they are recorded, a disabled pass being dashed
+ *    - the semaphores between the subpasses are bold edges, labeled with the resources they order and the stages
+ *      awaiting them
+ *    - inside a subpass, an edge goes from the last pass writing a resource to the next pass using it; with
+ *      --resources, the resources are nodes instead, written and read by the passes
+ * @example:
+ * ```
+ * ./passgraph ../out.json | dot -Tsvg -o graph.svg
+ * ```
+ * */
+fn main(args: [[c8]]) {
+    let dmut parser = (copy ArgumentParser)
+        :.help("help", short-> "h", comments-> "print this help and exit")
+        :.position!{[c8]} ("graph", comments-> "the render graph exported in json")
+        :.option!{[c8]} ("output", short-> "o", comments-> "the dot file to write (the standard output by default)")
+        :.flag("resources", short-> "r", comments-> "draw the resources as nodes, written and read by the passes");
+
+    {
+        let cfg = parser.parse(args);
+        let path = cfg.str("graph") ?? "";
+        let dot = toDot(json::parse(readFile(Path(path))), cfg.boolean("resources") ?? false);
+        if let Ok(out) = cfg.str("output") {
+            writeFile(Path(out), dot);
+        } else {
+            print(dot);
+        }
+    } catch {
+        err: &CommandLineError => {
+            eprintln(parser.explain(err, usage-> "passgraph"));
+        }
+        err => {
+            eprintln("Failed to draw the pass graph: ", err);
+        }
+    }
+}
+
+/**
+ * @returns: the dot graph of the render graph `graph`, its resources drawn as nodes iif `withResources`
+ * */
+fn toDot(graph: &Config, withResources: bool)-> [c8] {
+    let passes = graph.elements("passes");
+    let subpasses = subpassesOf(graph, passes);
+
+    let dmut stream = copy StringStream();
+    stream:.writeln("digraph render_graph {");
+    stream:.writeln("  rankdir=LR; compound=true; newrank=true;");
+    stream:.writeln("  node [fontname=\"sans\"]; edge [fontname=\"sans\"];");
+
+    for i, s in subpasses {
+        stream:.writeln("  subgraph cluster_", i, " {");
+        stream:.writeln("    label=", quote(s), "; style=\"rounded\"; color=\"gray60\";");
+        for p in passes if subpassOf(p) == s {
+            stream:.writeln("    ", passId(nameOf(p)), " ", passNode(p), ";");
+        }
+
+        stream:.writeln("  }");
+    }
+
+    if withResources {
+        writeResources(alias stream, graph, passes);
+    } else {
+        writeFlows(alias stream, passes);
+    }
+
+    writeSemaphores(alias stream, graph, passes, subpasses, withResources);
+    stream:.writeln("}");
+    stream[]
+}
+
+/**
+ * @returns: the subpasses in the order of their submission, then the ones only named by the passes (disabled ones)
+ * */
+fn subpassesOf(graph: &Config, passes: [&Config])-> [[c8]] {
+    let mut res: [[c8]] = copy [s.str("name") ?? "" for s in graph.elements("subpasses")];
+    for p in passes {
+        let s = subpassOf(p);
+        let mut known = false;
+        for r in res if r == s {
+            known = true;
+        }
+
+        if !known {
+            res = res ~ [s];
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the attributes of the node of the pass `p`, filled after its kind, dashed when it is disabled
+ * */
+fn passNode(p: &Config)-> [c8] {
+    let kind = p.str("kind") ?? "";
+    let fill = if kind == "raster" { RASTER_COLOR } else { COMPUTE_COLOR };
+
+    let dmut label = copy StringStream();
+    if let Ok(order) = p.int("order") {
+        label:.write(order, ". ");
+    }
+
+    label:.write(nameOf(p), "\\n", kind);
+
+    let dmut stream = copy StringStream();
+    stream:.write("[shape=box, label=", quote(label[]), ", fillcolor=", quote(fill));
+    if p.boolean("enabled") ?? true {
+        stream:.write(", style=\"filled,rounded\"]");
+    } else {
+        stream:.write(", style=\"dashed,rounded\", color=\"gray50\", fontcolor=\"gray50\"]");
+    }
+
+    stream[]
+}
+
+/**
+ * Write the resources as nodes, with their size, format, lifetime and slot of memory, and the edges from the passes
+ * writing them and to the passes reading them, labeled with their usage
+ * */
+fn writeResources(dmut stream: &StringStream, graph: &Config, passes: [&Config]) {
+    for r in graph.elements("resources") {
+        let dmut label = copy StringStream();
+        label:.write(nameOf(r));
+        if let Ok(format) = r.str("format") {
+            label:.write("\\n", r.int("width") ?? 0i64, "x", r.int("height") ?? 0i64, " ", format);
+        }
+
+        if let Ok(first) = r.int("first") {
+            label:.write("\\npasses ", first, "..", r.int("last") ?? first);
+        }
+
+        if let Ok(slot) = r.int("slot") {
+            label:.write("\\nslot ", slot);
+            let shared = copy [s.str() ?? "" for s in r.elements("sharedWith")];
+            if shared.len != 0us {
+                label:.write(" with ", join(shared, ", "));
+            }
+        }
+
+        let shape = if (r.str("kind") ?? "") == "image" { "note" } else { "cylinder" };
+        let style = if r.boolean("transient") ?? false { "dashed" } else { "solid" };
+        stream:.writeln("  ", resourceId(nameOf(r)), " [shape=", shape, ", style=", style, ", fontsize=10, label=",
+                        quote(label[]), "];");
+    }
+
+    for p in passes {
+        for u in p.elements("uses") {
+            let pass = passId(nameOf(p));
+            let resource = resourceId(u.str("resource") ?? "");
+            if u.boolean("writes") ?? false {
+                stream:.writeln("  ", pass, " -> ", resource, " ", useEdge(u), ";");
+            }
+
+            if u.boolean("reads") ?? false {
+                stream:.writeln("  ", resource, " -> ", pass, " ", useEdge(u), ";");
+            }
+        }
+    }
+}
+
+/**
+ * @returns: the attributes of the edge of the use `u` of a resource, dashed when it is optional, red when it is dropped
+ * */
+fn useEdge(u: &Config)-> [c8] {
+    let dmut stream = copy StringStream();
+    stream:.write("[fontsize=9, label=", quote(u.str("usage") ?? ""));
+    if u.boolean("optional") ?? false {
+        stream:.write(", style=dashed");
+    }
+
+    if u.boolean("dropped") ?? false {
+        stream:.write(", color=red, fontcolor=red");
+    }
+
+    stream:.write("]");
+    stream[]
+}
+
+/**
+ * Write the edges from the last pass writing a resource to the next enabled pass of the same subpass using it,
+ * labeled with the resources
+ * */
+fn writeFlows(dmut stream: &StringStream, passes: [&Config]) {
+    let mut flows: [Flow] = [];
+    let dmut writers: [[c8] => usize] = copy [];
+    for i, p in passes if p.boolean("enabled") ?? true {
+        for u in p.elements("uses") {
+            let resource = u.str("resource") ?? "";
+            if let Ok(w) = writers[resource] {
+                if w != i && subpassOf(passes[w]) == subpassOf(p) {
+                    flows = addFlow(flows, nameOf(passes[w]), nameOf(p), resource);
+                }
+            }
+        }
+
+        for u in p.elements("uses") if u.boolean("writes") ?? false {
+            writers[u.str("resource") ?? ""] = i;
+        }
+    }
+
+    for f in flows {
+        stream:.writeln("  ", passId(f.from), " -> ", passId(f.to), " [fontsize=9, label=",
+                        quote(join(f.resources, "\\n")), "];");
+    }
+}
+
+/**
+ * @returns: `flows` with the resource `resource` ordered from the pass `from` to the pass `to`
+ * */
+fn addFlow(flows: [Flow], from: [c8], to: [c8], resource: [c8])-> [Flow] {
+    for i, f in flows if f.from == from && f.to == to {
+        for r in f.resources if r == resource {
+            return flows;
+        }
+
+        let added = Flow(from-> from, to-> to, resources-> f.resources ~ [resource]);
+        return flows[0us .. i] ~ [added] ~ flows[i + 1us .. $];
+    }
+
+    flows ~ [Flow(from-> from, to-> to, resources-> copy [resource])]
+}
+
+/**
+ * Write the semaphores between the subpasses, from the last pass of the waited subpass to the first of the waiting one,
+ * labeled with the stages awaiting them, and the resources they order unless `withResources` already draws them
+ * */
+fn writeSemaphores(dmut stream: &StringStream, graph: &Config, passes: [&Config], subpasses: [[c8]], withResources: bool) {
+    let edges = graph.elements("edges");
+    for e in edges if (e.str("from") ?? "") == "transfers" {
+        stream:.writeln("  \"transfers\" [shape=box, style=filled, fillcolor=", quote(TRANSFER_COLOR), "];");
+        break;
+    }
+
+    for e in edges {
+        let dmut label = copy StringStream();
+        if !withResources {
+            for r in e.elements("resources") {
+                label:.write(r.str() ?? "", "\\n");
+            }
+        }
+
+        label:.write("wait: ", join(copy [s.str() ?? "" for s in e.elements("stages", "names")], ", "));
+
+        let (src, tail) = anchorOf(e.str("from") ?? "", passes, subpasses, true);
+        let (dst, head) = anchorOf(e.str("to") ?? "", passes, subpasses, false);
+        stream:.write("  ", src, " -> ", dst, " [penwidth=2, fontsize=9, label=", quote(label[]));
+        if tail != "" { stream:.write(", ltail=", tail); }
+        if head != "" { stream:.write(", lhead=", head); }
+        stream:.writeln("];");
+    }
+}
+
+/**
+ * @returns: the node a semaphore of the subpass `subpass` is drawn from (its last enabled pass, iif `last`) or to
+ * (its first one), and the cluster it is clipped to; the subpass itself and no cluster when it has no pass
+ * */
+fn anchorOf(subpass: [c8], passes: [&Config], subpasses: [[c8]], last: bool)-> ([c8], [c8]) {
+    let mut anchor = "";
+    for p in passes if subpassOf(p) == subpass && (p.boolean("enabled") ?? true) {
+        if anchor == "" || last {
+            anchor = nameOf(p);
+        }
+    }
+
+    if anchor == "" {
+        return (quote(subpass), "");
+    }
+
+    for i, s in subpasses if s == subpass {
+        let dmut cluster = copy StringStream();
+        cluster:.write("cluster_", i);
+        return (passId(anchor), cluster[]);
+    }
+
+    (passId(anchor), "")
+}
+
+/**
+ * @returns: the name of a pass, a resource or a subpass
+ * */
+fn nameOf(cfg: &Config)-> [c8] {
+    cfg.str("name") ?? ""
+}
+
+/**
+ * @returns: the subpass of the pass `p`
+ * */
+fn subpassOf(p: &Config)-> [c8] {
+    p.str("subpass") ?? ""
+}
+
+/**
+ * @returns: the id of the node of the pass `name`, apart from the resources and the subpasses named the same
+ * */
+fn passId(name: [c8])-> [c8] {
+    quote("pass:" ~ name)
+}
+
+/**
+ * @returns: the id of the node of the resource `name`
+ * */
+fn resourceId(name: [c8])-> [c8] {
+    quote("res:" ~ name)
+}
+
+/**
+ * @returns: `s` as a dot string, its quotes escaped and its "\n" kept as line breaks
+ * */
+fn quote(s: [c8])-> [c8] {
+    let dmut stream = copy StringStream();
+    stream:.write("\"");
+    for c in s {
+        if c == '"'c8 {
+            stream:.write("\\");
+        }
+
+        stream:.write(c);
+    }
+
+    stream:.write("\"");
+    stream[]
+}
+
+/**
+ * @returns: the strings `parts` separated by `sep`
+ * */
+fn join(parts: [[c8]], sep: [c8])-> [c8] {
+    let dmut stream = copy StringStream();
+    for i, p in parts {
+        if i != 0us {
+            stream:.write(sep);
+        }
+
+        stream:.write(p);
+    }
+
+    stream[]
+}

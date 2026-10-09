@@ -3,9 +3,9 @@ in cascade;
 pub mod ::fit;
 
 use balder::utils;
-use balder::core::{_, application::_};
-use balder::core::driver::subpass;
-use balder::core::shader::texture;
+use balder::core::_;
+use balder::core::application::window;
+use balder::core::driver::{graph, subpass};
 use balder::core::shader::buffers::ubo;
 use balder::math::{bounds, matrix};
 use balder::scene::node::node3D::{camera, light};
@@ -71,8 +71,8 @@ def CASTER_THRESHOLD = 1.0f;
 /**
  * The shadow map of the direction light of a scene casting shadows: its cascades, each seeing a slice of the view of
  * the camera from the light (see fit), drawn by a subpass in a depth atlas the composition reads
- * @info: the subpass outputs to the deferred, drawn before it, the composition reading the atlas once the deferred is
- * drawn
+ * @info: the atlas is a transient image of the render graph, written by the pass of the shadow map and read by the
+ * composition, nothing ordering the shadow map and the deferred
  * @info: the cascades are fitted again at each tick of the scene, their views written in the uniform buffer the
  * recordings read, so they follow the camera without recording the subpass again; the composition finds the cascade of
  * a point by its projection, so cascades fitted to the camera of an earlier tick still shadow it right
@@ -88,8 +88,9 @@ pub record CascadeShadowScene {
 
     prv { // Shadow map
 
-        // The depth atlas holding the cascades
-        let dmut _atlas : (&RefCount!{&Texture})? = none;
+        // The name of the depth atlas holding the cascades in the render graph, owned by the graph, empty while no light
+        // casts shadows
+        let mut _atlas : [c8] = "";
 
         // The subpass drawing the casters in the atlas
         let dmut _pass : (&DrawSubpass)? = none;
@@ -152,15 +153,16 @@ pub record CascadeShadowScene {
     }
 
     /**
-     * Cast the shadows of a direction light: the atlas of its cascades and the subpass drawing it are created, the
-     * subpass registered in the pipeline of the window
+     * Cast the shadows of a direction light: the atlas of its cascades is declared in the render graph of the window,
+     * and the subpass drawing it registered
      * @params:
-     *    - passName: the name of the subpass in the pipeline
+     *    - passName: the name of the subpass in the render graph
+     *    - atlasName: the name of the atlas in the render graph
      *    - light: the light
      *    - size: the number of texels on a side of the atlas, twice the number on a side of a cascade
-     * @returns: the subpass, its output to set and its signals to connect
+     * @returns: the subpass, the pass drawing in it to declare and its signals to connect
      * */
-    pub fn start (mut self, passName : [c8], dmut light : &Light, size : u32)-> dmut &DrawSubpass
+    pub fn start (mut self, passName : [c8], atlasName : [c8], dmut light : &Light, size : u32)-> dmut &DrawSubpass
         throws BalderError
     {
         self:.stop ();
@@ -170,12 +172,14 @@ pub record CascadeShadowScene {
         };
 
         let dmut device = win:.getVulkanDevice ();
-        let dmut atlas = copy OutputTexture (alias device, device.getDepthFormat (), size, size, depth-> true);
-        self._atlas = (alias win:.insertResource (alias atlas))?;
+        let desc = ImageDesc (format-> device.getDepthFormat (), width-> size, height-> size, depth-> true);
+        let dmut pipeline = win:.getVulkanPipeline ();
+        pipeline:.createImage (atlasName, desc);
 
-        let dmut pass = copy DrawSubpass::toTextures (alias device, passName, size, size, copy [atlas]);
-        win:.getVulkanPipeline ():.registerSubPass (passName, alias pass);
+        let dmut pass = copy DrawSubpass::toImages (alias device, passName, size, size, copy [desc]);
+        pipeline:.registerSubPass (passName, alias pass);
 
+        self._atlas = atlasName;
         self._pass = (alias pass)?;
         self._passName = passName;
         self._resolution = size / 2u32;
@@ -186,24 +190,16 @@ pub record CascadeShadowScene {
     }
 
     /**
-     * Stop casting the shadows of the light, the subpass being removed from the pipeline, and retired with the atlas
+     * Stop casting the shadows of the light, the subpass and the atlas being removed from the render graph, the subpass
+     * retired with the frames drawing it
      * */
     pub fn stop (mut self) {
         if let Ok (dmut win) = alias self._window {
             if let Ok (dmut pass) = alias self._pass {
-                {
-                    win:.getVulkanPipeline ():.removeSubPass (self._passName);
-                } catch {
-                    err => {
-                        log::error #("Scene", "Failed to remove the shadow subpass", err);
-                    }
-                }
-
+                let dmut pipeline = win:.getVulkanPipeline ();
+                pipeline:.removeSubPass (self._passName);
+                pipeline:.removeResource (self._atlas);
                 win:.retire (alias pass);
-            }
-
-            if let Ok (dmut atlas) = alias self._atlas {
-                win:.retire (alias atlas);
             }
         }
 
@@ -212,7 +208,7 @@ pub record CascadeShadowScene {
         }
 
         self._pass = none;
-        self._atlas = none;
+        self._atlas = "";
         self._passName = "";
         self._light = none;
         self._views = [];
@@ -247,10 +243,10 @@ pub record CascadeShadowScene {
     }
 
     /**
-     * @returns: the depth atlas holding the cascades, none while no light casts shadows
+     * @returns: the name of the depth atlas holding the cascades in the render graph, empty while no light casts shadows
      * */
     @field
-    pub fn atlas (self)-> (&RefCount!{&Texture})? {
+    pub fn atlas (self)-> [c8] {
         self._atlas
     }
 

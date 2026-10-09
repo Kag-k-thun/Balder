@@ -5,7 +5,7 @@ pub mod ::utils;
 
 use balder::utils;
 use balder::core::{_, application::_};
-use balder::core::driver::cmd_alloc;
+use balder::core::driver::{cmd_alloc, graph};
 use balder::core::shader::texture;
 use balder::math::bounds;
 use balder::scene::utils::_;
@@ -17,6 +17,25 @@ use ::std::time::dur;
 
 
 
+
+/**
+ * The names of the subpasses, the passes and the resources of a scene in the render graph of its window, suffixed by the
+ * name of the scene
+ * */
+def DEFERRED     = "deferred";
+def COMPOSE      = "compose";
+def SHADOW       = "shadow";
+def CULL         = "cull";
+def GBUFFER      = "gbuffer";
+def PYRAMID      = "pyramid";
+def LATE_CULL    = "late_cull";
+def LATE_GBUFFER = "late_gbuffer";
+def OUTPUT       = "output";
+def ATLAS        = "shadow_atlas";
+def DRAWS        = "draws";
+def LATE_DRAWS   = "late_draws";
+def CULL_STATE   = "cull_state";
+def HZB          = "hzb";
 
 /*!
  * ====================================================================================================
@@ -123,7 +142,8 @@ pub class Scene {
      */
 
     /**
-     * Configure the scene and load the basic shaders, and subpasses
+     * Configure the scene: its passes are declared in the render graph of the window, with the images they draw at the
+     * size of the generated texture
      * @info: the size of the shadow map and the distance of the shadows are those of the configuration of the window
      * (its [shadow] table), the distance changing afterwards through shadowDistance
      * */
@@ -131,24 +151,23 @@ pub class Scene {
         throws BalderError
     {
         log::debug #("Scene", "Configure scene :", width, height);        
-        self:.dispose ();
-        
-        if height != 0 && width != 0 {
-            {
+        {
+            // the render graph is compiled at the next frame, once it is declared entirely
+            self._window:.lockFrame ();
+            self:.disposeGraph ();
+
+            if height != 0 && width != 0 {
                 self._width = width;
                 self._height = height;
                 let shadow = self._window.getShadowConfig ();
                 self._shadowScale = shadow.scale;
                 self._shadowDistance = shadow.distance;
 
-                let dmut pipeline = self._window:.getVulkanPipeline ();
-                let dname = "deferred_" ~ self._name;
-                let cname = "compose_" ~ self._name;
-
                 self._tree:.configure (alias self._window, alias self);
-                self._deferred:.configure (dname, alias self._window, self._width, self._height);
+                self._deferred:.configure (self.named (DEFERRED), self._name, alias self._window, self._width, self._height);
                 self._shadow:.configure (alias self._window);
-                self._compose:.configure (cname,
+                self._compose:.configure (self.named (COMPOSE),
+                                          self.named (OUTPUT),
                                           alias self._window,
                                           self._width,
                                           self._height,
@@ -156,24 +175,121 @@ pub class Scene {
                                           self._shadow.ubo);
 
                 let dmut dpass = alias self._deferred.subpass;
-                let dmut cpass = alias self._compose.subpass;
-
-                self._shaderToNode:.configure (alias self._window, self._deferred.outputTextures, alias dpass);
-
+                self._shaderToNode:.configure (alias self._window, self._deferred.depth, alias dpass);
                 dpass:.onPrepare ():.connect (&self:.onDeferredPrepare);
-                dpass:.onDraw ():.connect (&self:.onDeferredDraw);
-                cpass:.onDraw ():.connect (&self:.onComposeDraw);
 
-                pipeline:.setPassOutput (dname, cname);
-
+                self:.declarePasses ();
+                self:.enablePasses ();
                 self:.setAspect (width, height);
-            } catch {
-                err => {
-                    log::error #("Scene", "Configuration failed", err);
-                    throw err;
-                }
             }
+        } catch {
+            err => {
+                log::error #("Scene", "Configuration failed", err);
+                throw err;
+            }
+        } exit {
+            self._window:.unlockFrame ();
         }
+    }
+
+    /**
+     * Declare the buffers and the passes of the scene in the render graph of the window, in the order a frame runs them:
+     * the cull pass and the g-buffer drawing the instances it finds, the depth pyramid, the late cull pass and the
+     * g-buffer drawing the occluded instances it finds again, then the composition (the shadow map is declared before it
+     * when a light casts shadows)
+     * */
+    fn declarePasses (mut self)
+        throws BalderError
+    {
+        let dmut pipeline = self._window:.getVulkanPipeline ();
+        for b in copy [DRAWS, LATE_DRAWS, CULL_STATE, HZB] {
+            pipeline:.importBuffer (self.named (b));
+        }
+
+        let deferred = self.named (DEFERRED);
+        let attachments = self.gbufferUses ();
+
+        pipeline:.declarePass (GraphPass (name-> self.named (CULL),
+                                          submission-> deferred,
+                                          kind-> PassKind::COMPUTE,
+                                          uses-> copy [ResourceUse (resource-> self.named (DRAWS), usage-> Usage::STORAGE_WRITE),
+                                                       ResourceUse (resource-> self.named (CULL_STATE), usage-> Usage::STORAGE_READ_WRITE)],
+                                          recording-> (&self:.recordCull)?));
+
+        pipeline:.declarePass (GraphPass (name-> self.named (GBUFFER),
+                                          submission-> deferred,
+                                          uses-> copy [ResourceUse (resource-> self.named (DRAWS), usage-> Usage::INDIRECT),
+                                                       ResourceUse (resource-> self.named (DRAWS), usage-> Usage::VERTEX_READ)] ~ attachments,
+                                          recording-> (&self:.recordGbuffer)?));
+
+        pipeline:.declarePass (GraphPass (name-> self.named (PYRAMID),
+                                          submission-> deferred,
+                                          kind-> PassKind::COMPUTE,
+                                          uses-> copy [ResourceUse (resource-> self._deferred.depth, usage-> Usage::SAMPLED_COMPUTE),
+                                                       ResourceUse (resource-> self.named (HZB), usage-> Usage::STORAGE_WRITE)],
+                                          recording-> (&self:.recordPyramid)?));
+
+        pipeline:.declarePass (GraphPass (name-> self.named (LATE_CULL),
+                                          submission-> deferred,
+                                          kind-> PassKind::COMPUTE,
+                                          uses-> copy [ResourceUse (resource-> self.named (HZB), usage-> Usage::STORAGE_READ),
+                                                       ResourceUse (resource-> self.named (CULL_STATE), usage-> Usage::STORAGE_READ_WRITE),
+                                                       ResourceUse (resource-> self.named (LATE_DRAWS), usage-> Usage::STORAGE_WRITE)],
+                                          recording-> (&self:.recordLateCull)?));
+
+        pipeline:.declarePass (GraphPass (name-> self.named (LATE_GBUFFER),
+                                          submission-> deferred,
+                                          uses-> copy [ResourceUse (resource-> self.named (LATE_DRAWS), usage-> Usage::INDIRECT),
+                                                       ResourceUse (resource-> self.named (LATE_DRAWS), usage-> Usage::VERTEX_READ)] ~ attachments,
+                                          recording-> (&self:.recordLateGbuffer)?));
+
+        let mut reads : [ResourceUse] = [];
+        for a in self._deferred.attachments {
+            reads = reads ~ [ResourceUse (resource-> a, usage-> Usage::SAMPLED_COMPUTE)];
+        }
+
+        pipeline:.declarePass (GraphPass (name-> self.named (COMPOSE),
+                                          submission-> self.named (COMPOSE),
+                                          kind-> PassKind::COMPUTE,
+                                          uses-> reads ~ [ResourceUse (resource-> self.named (ATLAS), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
+                                                          ResourceUse (resource-> self.named (OUTPUT), usage-> Usage::STORAGE_WRITE)],
+                                          recording-> (&self:.recordCompose)?));
+    }
+
+    /**
+     * @returns: the uses of the g-buffer by the passes drawing it, in the order of the attachments of the deferred
+     * */
+    fn gbufferUses (self)-> [ResourceUse] {
+        let mut result : [ResourceUse] = [];
+        for a in self._deferred.attachments {
+            let usage = if a == self._deferred.depth { Usage::DEPTH_ATTACHMENT } else { Usage::COLOR_ATTACHMENT };
+            result = result ~ [ResourceUse (resource-> a, usage-> usage)];
+        }
+
+        result
+    }
+
+    /**
+     * Enable the passes of the culling the scene does: the cull pass when the instances are culled on the GPU, the depth
+     * pyramid and the late passes when the occluded instances are culled too
+     * */
+    fn enablePasses (mut self) {
+        let (gpu, occlusion) = atomic self {
+            (self._shaderToNode.cullsOnGpu (), self._shaderToNode.cullsOccluded ())
+        };
+
+        let dmut pipeline = self._window:.getVulkanPipeline ();
+        pipeline:.enablePass (self.named (CULL), gpu);
+        pipeline:.enablePass (self.named (PYRAMID), occlusion);
+        pipeline:.enablePass (self.named (LATE_CULL), occlusion);
+        pipeline:.enablePass (self.named (LATE_GBUFFER), occlusion);
+    }
+
+    /**
+     * @returns: the name of a subpass, a pass or a resource of the scene in the render graph of its window
+     * */
+    fn named (self, base : [c8])-> [c8] {
+        base ~ "_" ~ self._name
     }
 
     /**
@@ -259,6 +375,7 @@ pub class Scene {
         };
 
         if changed {
+            self:.enablePasses ();
             self._window:.redrawPipeline ();
         }
     }
@@ -287,6 +404,7 @@ pub class Scene {
         };
 
         if changed {
+            self:.enablePasses ();
             self._window:.redrawPipeline ();
         }
     }
@@ -416,48 +534,6 @@ pub class Scene {
      */
 
     /**
-     * @returns: the generated position texture of the scene
-     * */
-    pub fn getPositionTexture (mut self)-> dmut &RefCount!{&Texture} {
-        alias self._deferred.positions
-    }
-
-    /**
-     * @returns: the generated albedo texture of the scene
-     * */
-    pub fn getAlbedoTexture (mut self)-> dmut &RefCount!{&Texture} {
-        alias self._deferred.albedo
-    }
-
-    /**
-     * @returns: the generated material ID texture of the scene
-     * */
-    pub fn getMaterialIDTexture (mut self)-> dmut &RefCount!{&Texture} {
-        alias self._deferred.materialID
-    }
-
-    /**
-     * @returns: the generated normal texture of the scene
-     * */
-    pub fn getNormalTexture (mut self)-> dmut &RefCount!{&Texture} {
-        alias self._deferred.normals
-    }
-
-    /**
-     * @returns: the generated binormal texture of the scene
-     * */
-    pub fn getBinormalTexture (mut self)-> dmut &RefCount!{&Texture} {
-        alias self._deferred.binormals
-    }
-
-    /**
-     * @returns: the generated depth texture of the scene
-     * */
-    pub fn getDepthTexture (mut self)-> dmut &RefCount!{&Texture} {
-        alias self._deferred.depth
-    }
-
-    /**
      * @returns: the generated output texture (composition) of the scene
      * */
     pub fn getOutputTexture (mut self)-> dmut &RefCount!{&Texture} {
@@ -473,41 +549,84 @@ pub class Scene {
      */
 
     /**
-     * Slot called when the deferred pass is redrawn, before its render pass begins: the draws laid out, and culled on
-     * the GPU when they are
+     * Slot called when the deferred is redrawn, before its passes are recorded: the draws laid out
      * */
     fn onDeferredPrepare (mut self) {
-        if !self._tree.camera.hasValue { // nothing to draw if there is no camera
-            return;
-        }
-
-        let dmut subpass = alias self._deferred.subpass;
-        let frame = subpass.getCurrentFrame ();
-
+        let frame = self._deferred.subpass.getCurrentFrame ();
         atomic self {
-            self._shaderToNode:.prepare (frame, alias subpass, cast!f32 (self._width), cast!f32 (self._height), self._cullThreshold);
+            self._shaderToNode:.prepare (frame);
         }
     }
 
-    fn onDeferredDraw (mut self) {
-        log::debug #("Scene", "Drawing deferred pass scene");
-        if !self._tree.camera.hasValue { // nothing to draw if there is no camera
-            return;
+    /**
+     * Record the cull pass of the instances culled on the GPU, writing the commands of the g-buffer
+     * */
+    fn recordCull (mut self) {
+        self:.recordCullPhase (false);
+    }
+
+    /**
+     * Record the cull pass of the instances the first one did not draw, against the depth pyramid
+     * */
+    fn recordLateCull (mut self) {
+        self:.recordCullPhase (true);
+    }
+
+    /**
+     * Record a phase of the cull pass
+     * */
+    fn recordCullPhase (mut self, late : bool) {
+        if !self._tree.camera.hasValue { return; }
+
+        let dmut subpass = alias self._deferred.subpass;
+        let frame = subpass.getCurrentFrame ();
+        atomic self {
+            self._shaderToNode:.recordCull (frame, alias subpass, cast!f32 (self._width), cast!f32 (self._height), self._cullThreshold, late);
         }
+    }
+
+    /**
+     * Record the draws of the instances in the g-buffer, those the cull pass found when the instances are culled on the
+     * GPU
+     * */
+    fn recordGbuffer (mut self) {
+        self:.recordDraws (false);
+    }
+
+    /**
+     * Record the draws of the instances the late cull pass found
+     * */
+    fn recordLateGbuffer (mut self) {
+        self:.recordDraws (true);
+    }
+
+    /**
+     * Record the draws of a phase of the culling in the g-buffer
+     * */
+    fn recordDraws (mut self, late : bool) {
+        log::debug #("Scene", "Drawing deferred pass scene");
+        if !self._tree.camera.hasValue { return; }
         
         let dmut subpass = alias self._deferred.subpass;        
         let dmut cmd = copy IndexedDrawCommandAllocator (alias subpass);
         let frame = subpass.getCurrentFrame ();
         
         atomic self {
-            self._shaderToNode:.draw (frame,
-                                      alias cmd,
-                                      alias subpass,
-                                      cast!f32 (self._width),
-                                      cast!f32 (self._height),
-                                      self._cullThreshold);
+            self._shaderToNode:.drawGroups (frame, alias cmd, late);
         }
-    }        
+    }
+
+    /**
+     * Record the reduction of the depth the g-buffer drew into the depth pyramid
+     * */
+    fn recordPyramid (mut self) {
+        let dmut subpass = alias self._deferred.subpass;
+        let frame = subpass.getCurrentFrame ();
+        let cmd = subpass.getDrawingCommandBuffer ();
+        atomic self {
+            self._shaderToNode:.recordPyramid (frame, cmd);
+        }
+    }
     
     /*!
      * ====================================================================================================
@@ -518,9 +637,9 @@ pub class Scene {
      */
 
     /**
-     * Slot called when the composition pass is redrawn
+     * Record the composition of the g-buffer, lit and shadowed, into the output of the scene
      * */
-    fn onComposeDraw (mut self) {        
+    fn recordCompose (mut self) {        
         let dmut pass = alias self._compose.subpass;            
         
         let frame = pass.getCurrentFrame ();                                    
@@ -536,14 +655,12 @@ pub class Scene {
             cmd:.registerDispatch (groupX-> sizes [0], groupY-> sizes [1], groupZ-> sizes [2]);
             cmd:.finalizeRegister ();
             
-            self._compose:.prepareTexture (cmdV, frame);
             self._compose:.select (frame,
                                    self._shaderToNode,
                                    self._shadow,
                                    cmdV);
             
             cmd:.dispatchNext ();
-            self._compose:.finalizeTexture (cmdV, frame);
         } catch {
             err => {
                 log::error #("Scene", "Failed to call compose shader", err);                
@@ -737,8 +854,10 @@ pub class Scene {
      */
     
     /**
-     * Cast the shadows of a direction light, drawn in the cascades of a shadow map by a subpass before the composition
+     * Cast the shadows of a direction light, drawn in the cascades of a shadow map read by the composition
      * @info: one direction light casts shadows at a time, the others lighting the scene without casting any
+     * @info: the pass of the shadow map is declared before the composition in the render graph, the composition reading
+     * the atlas it writes
      * @assume: light is a direction light
      * */
     fn addShadowPass (mut self, dmut light : &Light) {
@@ -747,19 +866,21 @@ pub class Scene {
             return;
         }
 
-        let sname = "shadow_" ~ self._name;
+        let sname = self.named (SHADOW);
+        let atlas = self.named (ATLAS);
         {
-            let dmut pass = self._shadow:.start (sname, alias light, self._shadowScale);
+            let dmut pass = self._shadow:.start (sname, atlas, alias light, self._shadowScale);
             pass:.onPrepare ():.connect (&self:.onShadowPrepare);
-            pass:.onDraw ():.connect (&self:.onShadowDraw);
 
             atomic self {
                 self._shaderToNode:.castShadows (alias pass, self._shadow.ubo, self._shadow.cameraOffsets ());
             }
 
-            // the shadow map is drawn before the deferred, the entry of the pipeline waiting for the transfers (a
-            // second entry would wait for them too, and only one pass can wait for a signal of the transfers)
-            self._window:.getVulkanPipeline ():.setPassOutput (sname, "deferred_" ~ self._name);
+            self._window:.getVulkanPipeline ():.declarePass (GraphPass (name-> sname,
+                                                                        submission-> sname,
+                                                                        uses-> copy [ResourceUse (resource-> atlas, usage-> Usage::DEPTH_ATTACHMENT)],
+                                                                        recording-> (&self:.recordShadow)?),
+                                                             before-> self.named (COMPOSE));
         } catch {
             err => {
                 log::error #("Scene", "Failed to cast the shadows of the light", light.name, err);
@@ -775,7 +896,7 @@ pub class Scene {
     }
 
     /**
-     * Stop casting the shadows of a direction light, its shadow map removed from the rendering pipeline
+     * Stop casting the shadows of a direction light, its shadow map removed from the render graph
      * @info: does nothing unless the light casts the shadows of the scene
      * */
     fn removeShadowPass (mut self, light : &Light) {
@@ -803,9 +924,9 @@ pub class Scene {
     }
 
     /**
-     * Slot called when the shadow map is redrawn: the casters drawn in each cascade, in its tile of the atlas
+     * Record the pass of the shadow map: the casters drawn in each cascade, in its tile of the atlas
      * */
-    fn onShadowDraw (mut self) {
+    fn recordShadow (mut self) {
         if !self._tree.camera.hasValue { return; }
 
         let dmut subpass = alias self._shadow.subpass;
@@ -912,18 +1033,30 @@ pub class Scene {
      * ====================================================================================================
      */
 
+    /**
+     * Remove the passes and the resources of the scene from the render graph, the passes first, so the graph stays valid
+     * if a frame compiles it in the middle
+     * */
+    fn disposeGraph (mut self) {
+        self._compose:.dispose ();
+        self._shadow:.dispose ();
+        self._tree:.dispose ();
+        self._shaderToNode:.dispose ();
+        self._deferred:.dispose ();
+
+        if self._width != 0u32 && self._height != 0u32 {
+            let dmut pipeline = self._window:.getVulkanPipeline ();
+            for b in copy [DRAWS, LATE_DRAWS, CULL_STATE, HZB] {
+                pipeline:.removeResource (self.named (b));
+            }
+        }
+    }
+
     impl Disposable {
 
         pub over dispose (mut self) {
             log::debug #("Scene", "dispose scene");
-                    
-            self._tree:.dispose ();                                            
-            self._shaderToNode:.dispose ();
-            self._shadow:.dispose ();
-            
-            self._deferred:.dispose ();
-            self._compose:.dispose ();
-            
+            self:.disposeGraph ();
         }
 
     }

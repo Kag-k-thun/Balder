@@ -551,29 +551,109 @@ pub class MemoryAllocator {
         throws BalderError
     {
         atomic self {
-            let mut imageInfo = VkImageCreateInfo();
-            imageInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-            imageInfo.imageType = VkImageType::VK_IMAGE_TYPE_2D;
-            imageInfo.extent.width = width;
-            imageInfo.extent.height = height;
-            imageInfo.extent.depth = 1;
-            imageInfo.mipLevels = 1;
-            imageInfo.arrayLayers = 1;
-            imageInfo.format = format;
-            imageInfo.tiling = tiling;
-            imageInfo.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
-            imageInfo.usage = usage;
-            imageInfo.samples = numSamples;
-            imageInfo.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
-
-            let dmut image: VkImage = null;
-            if vkCreateImage(self._device.getDeviceHandle(), &imageInfo, null, alias &image) != VkResult::VK_SUCCESS {
-                throw copy BalderError("Failed to create image");
-            }
-
+            let dmut image = self:.createImage2D(width, height, format, tiling, usage, numSamples-> numSamples);
             let memAlloc = self:.findSuitableMemoryImage(image, memoryFlags);
             copy Image2D(width, height, format, alias self, memAlloc, alias image)
         }
+    }
+
+    /**
+     * Create a 2D image bound to no memory, to bind into memory shared with other images (see allocImageMemory and
+     * bindImage2D)
+     * @params:
+     *    - width: the width of the image
+     *    - height: the height of the image
+     *    - usage: the usage of the image
+     * */
+    pub fn createImage2D(mut self,
+                         width: u32,
+                         height: u32,
+                         format: VkFormat,
+                         tiling: VkImageTiling,
+                         usage: VkImageUsageFlags,
+                         numSamples: VkSampleCountFlagBits = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT)-> dmut VkImage
+        throws BalderError
+    {
+        let mut imageInfo = VkImageCreateInfo();
+        imageInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VkImageType::VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = format;
+        imageInfo.tiling = tiling;
+        imageInfo.initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = usage;
+        imageInfo.samples = numSamples;
+        imageInfo.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
+
+        let dmut image: VkImage = null;
+        if vkCreateImage(self._device.getDeviceHandle(), &imageInfo, null, alias &image) != VkResult::VK_SUCCESS {
+            throw copy BalderError("Failed to create image");
+        }
+
+        alias image
+    }
+
+    /**
+     * @returns: the memory requirements of an image
+     * */
+    pub fn getImageRequirements(self, image: VkImage)-> VkMemoryRequirements {
+        let dmut memReq = VkMemoryRequirements();
+        vkGetImageMemoryRequirements(self._device.getDeviceHandle(), image, alias &memReq);
+
+        memReq
+    }
+
+    /**
+     * Reserve memory the images created by createImage2D are bound into, several images sharing it when they are not used
+     * at the same time
+     * @params:
+     *    - memReq: the requirements of every image bound into the memory merged (the largest size and alignment, the
+     *              memory types they all accept)
+     * @returns: the memory reserved, to release with freeImageMemory once the images bound into it are destroyed
+     * */
+    pub fn allocImageMemory(mut self, memReq: VkMemoryRequirements, memoryFlags: VkMemoryPropertyFlags)-> MemoryAllocation
+        throws BalderError
+    {
+        atomic self {
+            let type = self:.findMemoryType(memReq.memoryTypeBits, memoryFlags);
+            for _, dmut list in alias self._staticAllocations {
+                if let Ok(res) = self:.reserveInList(alias list, type, memReq) {
+                    return res;
+                }
+            }
+
+            let allocSize = max(self._memorySegmentSize, cast!usize(memReq.size));
+            let dmut mem  = self:.allocateNewStaticMemorySegment(type, allocSize);
+            if let Ok(res) = self:.reserveInList(alias mem, type, memReq) {
+                return res;
+            }
+
+            throw copy BalderError("Failed to allocate memory");
+        }
+    }
+
+    /**
+     * Bind an image created by createImage2D into memory reserved by allocImageMemory, the image not owning the memory
+     * @returns: the image, disposing it destroys the image only
+     * */
+    pub fn bindImage2D(mut self,
+                       width: u32,
+                       height: u32,
+                       format: VkFormat,
+                       dmut image: VkImage,
+                       memAlloc: MemoryAllocation)-> dmut &Image2D
+        throws BalderError
+    {
+        if vkBindImageMemory(self._device.getDeviceHandle(), image, memAlloc.mem, cast!u64(memAlloc.offset))
+           != VkResult::VK_SUCCESS {
+            throw copy BalderError("Failed to bind image memory");
+        }
+
+        copy Image2D(width, height, format, alias self, memAlloc, alias image, ownsMemory-> false)
     }
 
     /**
@@ -585,9 +665,7 @@ pub class MemoryAllocator {
     fn findSuitableMemoryImage(mut self, image: VkImage, memoryFlags: VkMemoryPropertyFlags)-> MemoryAllocation
         throws BalderError
     {
-        let dmut memReq = VkMemoryRequirements();
-        vkGetImageMemoryRequirements(self._device.getDeviceHandle(), image, alias &memReq);
-
+        let memReq = self.getImageRequirements(image);
         let type = self:.findMemoryType(memReq.memoryTypeBits, memoryFlags);
         for _, dmut list in alias self._staticAllocations {
             if let Ok(res) = self:.allocateImageInList(alias list, type, image, memReq) {
@@ -621,25 +699,39 @@ pub class MemoryAllocator {
                            memReq: VkMemoryRequirements)-> (MemoryAllocation)?
         throws BalderError
     {
+        if let Ok(res) = self:.reserveInList(alias list, type, memReq) {
+            if (vkBindImageMemory(self._device.getDeviceHandle(), image, res.mem, cast!u64(res.offset))
+                != VkResult::VK_SUCCESS) {
+                throw copy BalderError("Failed to bind buffer memory");
+            }
+
+            return res?;
+        }
+
+        none
+    }
+
+    /**
+     * Tries to reserve a segment in the list
+     * @params:
+     *    - list: the list used to try the reservation
+     *    - type: the type of the memory
+     *    - memReq: the memory requirements of the reservation
+     * @returns: the reserved memory segment (or none if failed)
+     * */
+    fn reserveInList(mut self, dmut list: &FreeList, type: u32, memReq: VkMemoryRequirements)-> (MemoryAllocation)? {
         // Cannot allocate in mismatching allocation type
         if (list.getType() != type) return none;
 
         let (succ, off, segIndex) = list:.findFreeSegment(cast!usize(memReq.size), cast!usize(memReq.alignment));
         if (succ) {
             list:.reserve(segIndex, off, cast!usize(memReq.size));
-            let res = MemoryAllocation(type-> type,
-                                       index-> list.getUniqId(),
-                                       offset-> off,
-                                       size-> cast!usize(memReq.size),
-                                       fullSize-> list.getSize(),
-                                       mem-> list:.getMemory());
-
-            if (vkBindImageMemory(self._device.getDeviceHandle(), image, list:.getMemory(), cast!u64(off))
-                != VkResult::VK_SUCCESS) {
-                throw copy BalderError("Failed to bind buffer memory");
-            }
-
-            return res?;
+            return MemoryAllocation(type-> type,
+                                    index-> list.getUniqId(),
+                                    offset-> off,
+                                    size-> cast!usize(memReq.size),
+                                    fullSize-> list.getSize(),
+                                    mem-> list:.getMemory())?;
         }
 
         none
@@ -806,7 +898,22 @@ pub class MemoryAllocator {
     pub fn freeImage(mut self, dmut buf: VkImage, memAlloc: MemoryAllocation) {
         atomic self {
             vkDestroyImage(self._device.getDeviceHandle(), buf, null);
+            self:.freeImageMemory(memAlloc);
+        }
+    }
 
+    /**
+     * Destroy an image bound into memory it does not own (see bindImage2D)
+     * */
+    pub fn destroyImage(mut self, dmut image: VkImage) {
+        vkDestroyImage(self._device.getDeviceHandle(), image, null);
+    }
+
+    /**
+     * Release memory reserved for images, the images bound into it being destroyed
+     * */
+    pub fn freeImageMemory(mut self, memAlloc: MemoryAllocation) {
+        atomic self {
             if let Ok(dmut list) = alias self._staticAllocations[memAlloc.index] {
                 list:.free(memAlloc.offset, memAlloc.size);
                 if list.isEmpty() {

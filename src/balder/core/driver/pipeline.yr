@@ -1,9 +1,14 @@
 in pipeline;
 
-use balder::core::{_, driver::_};
+use balder::core::_;
+use balder::core::driver::_;
+use balder::core::driver::graph;
+use balder::core::driver::graph::{edge, export};
+use balder::core::shader::texture;
 use balder::utils::log;
 
 use std::time::_;
+use std::config::data;
 
 use ::vulkan::core;
 
@@ -14,10 +19,20 @@ enum FrameDrawing
 | SWAPPED   = 3
 | AWAITED   = 4;
 
-record PassContent {    
+/**
+ * The name of the subpass drawing the screen, and of its pass in the render graph, recorded last
+ * */
+pub def SCREEN = "screen";
+
+record PassContent {
     pub let dmut pass : &VulkanSubpass;
+
+    // The semaphores the subpass waits for, and the stages waiting for each of them, for each frame slot
     pub let mut sems : [mut [VkSemaphore]] = [];
     pub let dmut stages : [u32] = [];
+
+    // The semaphores the subpass signals, for each frame slot
+    pub let mut signals : [mut [VkSemaphore]] = [];
 
     // True for the frame slots in which the pass alone has to be recorded again
     pub let dmut dirty : [bool];
@@ -25,13 +40,16 @@ record PassContent {
     pub self (dmut pass : &VulkanSubpass, nbFrames : u32)
         with pass = alias pass
         , dirty = copy [false ; nbFrames]
-    {}            
+    {}
 }
 
 
 /**
- * A pass pipeline is a DAG of subpasses ending with the swapchain renderpass
- * The DAG of a pipeline has a particularity, nodes have only one output node, they can have mutliple entries but only one exit edge
+ * A pass pipeline records and submits the subpasses of a render graph: the passes of a frame are declared with the
+ * resources they use (see RenderGraph), each recorded in a subpass, and the pipeline derives the order of the subpasses,
+ * the barriers between the passes of a subpass and the semaphores between the subpasses
+ * @info: the subpass of the screen is submitted last, its pass reading the images the scenes show
+ * @info: the graph is compiled again at the next frame once it changed, every subpass being recorded again
  * */
 @final
 pub class VulkanPipeline {
@@ -57,21 +75,39 @@ pub class VulkanPipeline {
         let mut _gpuTime : Duration = dur::micros (0u64);
     }
 
-    prot { // pass graph
+    prot { // render graph
 
-        // The list of subpasses (name => index in passgraph)
-        let dmut _passes : [[c8] => &VulkanSubpass] = copy [];
+        // The passes of the frames and the resources they use
+        let dmut _graph : &RenderGraph = copy RenderGraph (SCREEN);
 
-        // The pass Directed Acyclic Graph
-        let mut _DAG : [[c8] => mut [c8]] = copy [];        
-        
-        // The DAG of passes sorted by dependences
+        // The subpasses recording the passes, by name
+        let dmut _subpasses : [[c8] => &VulkanSubpass] = copy [];
+
+        // The images of each frame slot of the imported images, by name
+        let dmut _images : [[c8] => [VkImage]] = copy [];
+
+        // The images the graph owns
+        let dmut _transients : &TransientPool;
+
+        // The graph compiled last
+        let mut _schedule : RenderSchedule = RenderSchedule ();
+
+        // True when the graph changed since it was compiled last
+        let mut _changed : bool = true;
+
+        // The subpasses of the frame, in the order of their submission
         let dmut _passGraph : [PassContent] = [];
+
+        // The semaphores of each frame slot, one per edge of the schedule, created on demand
+        let mut _semaphores : [mut [VkSemaphore]] = [];
+
+        // The semaphores the transfers of each frame slot signal
+        let mut _transferSignals : [mut [VkSemaphore]] = [];
 
         // The transfer subpass
         let dmut _transfer : &VulkanTransferPass;
         
-        // The compose pass (out node of the pipeline DAG)
+        // The subpass of the screen (the last one of the frame)
         let dmut _compose : &VulkanSubpass;        
     }
 
@@ -88,6 +124,7 @@ pub class VulkanPipeline {
         with _device = alias device
         , _transfer = alias device:.getTransferPass ()
         , _compose = alias device:.getSwapchain ():.getRenderPass ()        
+        , _transients = copy TransientPool (alias device)
     {
         self:.resetToDefault ();
     }        
@@ -167,6 +204,7 @@ pub class VulkanPipeline {
      * */
     pub fn submitFrame (mut self) {
         let frame = self._device.getCurrentFrameIndex ();        
+        self:.compileIfChanged ();
         if self._device:.takeRedrawRequest () {
             self:.forceRedraw ();
         }
@@ -214,9 +252,9 @@ pub class VulkanPipeline {
      * @atomic
      * */
     prot fn submitNoDraw (mut self, frame : u32) {
-        self._transfer:.submit (frame);
+        self._transfer:.submit (frame, self._transferSignals [frame]);
         for dmut pass in alias self._passGraph {
-            pass.pass:.submit (frame, pass.stages, pass.sems [frame]);
+            pass.pass:.submit (frame, pass.stages, pass.sems [frame], pass.signals [frame]);
         }        
     }
     
@@ -285,87 +323,199 @@ pub class VulkanPipeline {
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * =================================          DAG MANAGEMENT          =================================
-     * ==================================================================== ================================
+     * =================================          RENDER GRAPH          ===================================
+     * ====================================================================================================
      * ====================================================================================================
      */
 
     /**
-     * Add a subpass in the DAG
+     * Register a subpass, recording the passes of the render graph declared in it
+     * @throws: if a subpass already has the name
      * */
     pub fn registerSubPass (mut self, name : [c8], dmut pass : &VulkanSubpass)
         throws BalderError
     {        
         atomic self {            
-            if name == "" {
-                throw copy BalderError ("Empty pass name");
+            self._graph:.addSubmission (name);
+            self._subpasses [name] = alias pass;
+            self._changed = true;
+        }
+    }
+
+    /**
+     * Remove a subpass, and the passes of the render graph recorded in it
+     * @warning: the subpass is still used by the frames in flight, it has to be retired
+     * */
+    pub fn removeSubPass (mut self, name : [c8]) {
+        atomic self {            
+            self._graph:.removeSubmission (name);
+            self._subpasses:.remove (name);
+            self._changed = true;
+        }
+    }
+
+    /**
+     * Declare a pass of the render graph, after those already declared, or before the pass 'before' (see
+     * RenderGraph::declarePass)
+     * */
+    pub fn declarePass (mut self, pass : GraphPass, before : [c8] = "")
+        throws BalderError
+    {
+        atomic self {
+            self._graph:.declarePass (pass, before-> before);
+            self._changed = true;
+        }
+    }
+
+    /**
+     * Remove a pass of the render graph
+     * */
+    pub fn removePass (mut self, name : [c8]) {
+        atomic self {
+            self._graph:.removePass (name);
+            self._changed = true;
+        }
+    }
+
+    /**
+     * Enable or disable a pass of the render graph, a disabled pass not being recorded
+     * */
+    pub fn enablePass (mut self, name : [c8], enabled : bool) {
+        atomic self {
+            if self._graph:.enablePass (name, enabled) {
+                self._changed = true;
             }
-            
-            self._passes [name] = alias pass;
-            self._DAG [name] = ""; // compose pass
         }
     }
 
     /**
-     * Remove a subpass in the DAG
-     * @warning: connect the passes having 'name' as output to the output of 'name'
+     * Declare an image of the render graph its declarer owns, a frame using the image of its frame slot
      * */
-    pub fn removeSubPass (mut self, name : [c8])
+    pub fn importImage (mut self, name : [c8], dmut texture : &OutputTexture)
         throws BalderError
-    {        
-        atomic self {            
-            self._passes:.remove (name);        
-
-            // Connect the predecessor of 'name' to the output of 'name'        
-            if let Ok (out) = self._DAG [name] {
-                
-                let mut result : [[c8] => mut [c8]] = copy [];
-                for i, o in self._DAG if i != name {                
-                    if o == name {
-                        result [i] = out;
-                    } else {
-                        result [i] = o;
-                    }
-                }
-                self._DAG = alias result;
-                self:.constructGraph ();
-            }                
+    {
+        atomic self {
+            self._graph:.importImage (name, depth-> texture.isDepth ());
+            self._images [name] = imagesOfTexture (alias texture);
+            self._changed = true;
         }
     }
 
     /**
-     * Change the output pass of the pass 'name'
-     * @throws: if a cycle is detected or the pass don't exist
+     * Declare buffers of the render graph its declarer owns, named as one
      * */
-    pub fn setPassOutput (mut self, name : [c8], output : [c8]) 
+    pub fn importBuffer (mut self, name : [c8])
         throws BalderError
-    {        
-        atomic self {            
-            if name == "" throw copy BalderError ("Empty pass name");
-            if output == "" throw copy BalderError ("Empty pass name");
-            
-            if output !in self._passes throw copy BalderError ("No pass named " ~ output);
-            if name !in self._passes throw copy BalderError ("No pass named " ~ name);
-            
-            self._DAG [name] = output;            
-        
-            self:.constructGraph (); 
+    {
+        atomic self {
+            self._graph:.importBuffer (name);
+            self._changed = true;
         }
     }
 
     /**
-     * Set the pass output as the swapchain final pass
-     * @throws: if the pass doesn't exist
+     * Declare an image the render graph owns, allocated while a pass of the frames uses it, its memory shared with the
+     * images no pass uses at the same time
+     * @info: its texture changes when its memory is shared differently (see getTexture), the subpasses rendering in it
+     * having their framebuffers created again
      * */
-    pub fn setPassOutputToSwap (mut self, name : [c8])
+    pub fn createImage (mut self, name : [c8], desc : ImageDesc)
         throws BalderError
-    {        
-        atomic self {            
-            if name == "" throw copy BalderError ("Empty pass name");
-            if name !in self._passes throw copy BalderError ("No pass named " ~ name);
-            
-            self._DAG [name] = "";
-            self:.constructGraph ();        
+    {
+        atomic self {
+            self._graph:.createImage (name, desc);
+            self._changed = true;
+        }
+    }
+
+    /**
+     * Forget a resource of the render graph, the passes using it being removed first
+     * */
+    pub fn removeResource (mut self, name : [c8]) {
+        atomic self {
+            self._graph:.removeResource (name);
+            self._images:.remove (name);
+            self._changed = true;
+        }
+    }
+
+    /**
+     * Make the pass of the screen read an image, drawn in the screen by a widget
+     * */
+    pub fn readOnScreen (mut self, name : [c8], usage : Usage = Usage::SAMPLED_FRAGMENT)
+        throws BalderError
+    {
+        atomic self {
+            self._graph:.addUse (SCREEN, ResourceUse (resource-> name, usage-> usage));
+            self._changed = true;
+        }
+    }
+
+    /**
+     * Stop reading an image in the pass of the screen
+     * */
+    pub fn stopReadingOnScreen (mut self, name : [c8]) {
+        atomic self {
+            self._graph:.removeUses (SCREEN, name);
+            self._changed = true;
+        }
+    }
+
+    /**
+     * @returns: the texture of a transient image of the render graph for the frames recorded from now on, none if no pass
+     * uses it
+     * @assume: called while the subpasses are recorded, the graph being compiled
+     * */
+    pub fn getTexture (mut self, name : [c8])-> dmut (&OutputTexture)? {
+        alias self._transients:.getTexture (name)
+    }
+
+    /**
+     * @returns: the render graph, the passes and the resources declared
+     * */
+    pub fn getGraph (self)-> &RenderGraph {
+        self._graph
+    }
+
+    /**
+     * @returns: the render graph compiled last
+     * */
+    pub fn getSchedule (self)-> RenderSchedule {
+        atomic self {
+            self._schedule
+        }
+    }
+
+    /**
+     * @returns: the transient images sharing each memory, as allocated for the render graph compiled last
+     * */
+    pub fn getAliasSlots (self)-> [[[c8]]] {
+        atomic self {
+            self._transients.getSlots ()
+        }
+    }
+
+    /**
+     * @returns: the render graph compiled last, as a configuration to dump in json: its subpasses, its passes with their
+     * uses and barriers, the semaphores between its subpasses, and its resources with their memory (see toConfig)
+     * */
+    pub fn exportGraph (self)-> &Config {
+        atomic self {
+            toConfig (self._graph, self._schedule, self._transients.getSlots ())
+        }
+    }
+
+    /**
+     * Compile the render graph now, the subpasses being recorded with it from the next frame
+     * @throws: if the graph cannot be compiled (see RenderGraph::compile), the previous one being kept
+     * */
+    pub fn compile (mut self)
+        throws BalderError
+    {
+        atomic self {
+            let schedule = self._graph.compile ();
+            self:.apply (schedule);
+            self._changed = false;
         }
     }
 
@@ -378,135 +528,277 @@ pub class VulkanPipeline {
      */
 
     /**
-     * Reset the drawing pipeline to its default state (only the final compose pass)
+     * Reset the drawing pipeline to its default state (only the pass of the screen)
      * */
     fn resetToDefault (mut self) {        
         atomic self {            
-            let dmut content = PassContent (alias self._compose, self._device.getNbFrames ());                
-            
-            content.stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-            content.sems = copy [copy [self._transfer.getSemaphore (i)] for i in 0 .. self._device.getNbFrames ()];        
-            
-            self._passGraph = copy [content];    
+            self._graph = copy RenderGraph (SCREEN);
+            self._subpasses = copy [];
+            self._images = copy [];
+            {
+                self._graph:.addSubmission (SCREEN);
+                self._graph:.declarePass (GraphPass (name-> SCREEN, submission-> SCREEN));
+            } catch {
+                err => {
+                    log::error #("VulkanPipeline", "Failed to declare the pass of the screen", err);
+                }
+            }
+
+            self._subpasses [SCREEN] = alias self._compose;
             self._updated = copy [FrameDrawing::REDRAW ; self._device.getNbFrames ()];
             self._generations = copy SlotGenerations (self._device.getNbFrames ());
-            self._passes [""] = alias self._compose;
+
+            // compiled by the next frame, nothing being created for a pipeline disposed with its device
+            self._changed = true;
         }
     }
-    
-    /**
-     * Construct the graph of pass dependencies, and construct the semaphores lists
-     * */
-    fn constructGraph (mut self)
-        throws BalderError
-    {        
-        let (sortedPass, deps) = self.constructSortedList ();
-        let nbFrames = self._device:.getSwapchain ().nbFrames;
-        let dmut result : [PassContent] = [];                
-        
-        for pname in sortedPass {
-            let mut sems : [mut [VkSemaphore]] = copy [[] ; nbFrames];
-            let dmut stages : [u32] = [];
 
-            // List the semaphores of predecessor passes
-            if let Ok (lst) = deps [pname] for previous in lst {
-                if let Ok (pass : &DrawSubpass) = self._passes [previous] {
-                    stages ~= [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-                    for f in 0 .. nbFrames {                    
-                        sems [f] ~= [pass.getSemaphore (f)];
-                    }
-                } else if let Ok (pass : &ComputeSubpass) = self._passes [previous] {
-                    stages ~= [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT];
-                    for f in 0 .. nbFrames {
-                        sems [f] ~= [pass.getSemaphore (f)];
-                    }
-                } else {
-                    log::error #("VulkanPipeline", "Undefined subpass kind :", previous, " ", self._passes [previous]);
-                    throw copy BalderError ("Failed to contrusct pass graph");
+    /**
+     * Compile the render graph if it changed, the previous one being kept if it cannot be compiled
+     * @atomic
+     * */
+    fn compileIfChanged (mut self) {
+        atomic self {
+            if !self._changed { return; }
+            self._changed = false;
+
+            {
+                let schedule = self._graph.compile ();
+                self:.apply (schedule);
+            } catch {
+                err => {
+                    log::error #("VulkanPipeline", "Failed to compile the render graph", err);
                 }
-            }            
-            
-            // Then it's an entry node, and it depends on transfer pass
-            if stages.len == 0 {                                
-                stages = copy [VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT];
-                sems = copy [copy [self._transfer.getSemaphore (f)] for f in 0 .. self._device.getNbFrames ()];                
             }
-
-            // Adding it on the result graph
-            if let Ok (dmut p) = alias self._passes [pname] {
-                let dmut content = PassContent (alias p, nbFrames);
-                content.sems = alias sems;
-                content.stages = alias stages;                
-                
-                result ~= [alias content];                
-            } else {
-                log::error #("VulkanPipeline", "malformed graph", self._passes, '(', pname, ')');
-                panic;
-            }             
         }
-
-        self:.forceRedraw ();
-        self._passGraph = alias result;        
     }
 
     /**
-     * Sorted the passes by dependencies
+     * Record and submit the subpasses of a compiled render graph from the next frame: the transient images it uses
+     * allocated, the passes of each subpass given to it with their barriers, and the semaphores between the subpasses
+     * @atomic
      * */
-    fn constructSortedList (self)-> ([[c8]], [[c8] => [[c8] => ()]])
+    fn apply (mut self, schedule : RenderSchedule)
         throws BalderError
     {
-        let dmut reversed = self.reverseGraph (self._DAG);        
-        let dmut deps = dcopy reversed;
-                
-        let mut result : [mut [c8]] = [];
-
-        while reversed.len != 0 {
-            let mut fnd : [c8] = "";
-            let mut hasFnd = false;
-            for i, lst in reversed {
-                if lst.len == 0 {
-                    result ~= [i];
-                    hasFnd = true;
-                    fnd = i;
-                    break;
-                }
+        for sub in schedule.submissions {
+            if sub.name !in self._subpasses {
+                throw copy BalderError ("No subpass is registered for " ~ sub.name);
             }
-                
-            if !hasFnd {
-                log::error #("Pipeline", "failed", reversed);
-                throw copy BalderError ("Failed to construct graph, cycle detected");
-            }
-
-            // Remove the node from dependencies
-            reversed:.remove (fnd);            
-            for _, dmut lst in alias reversed {                
-                lst:.remove (fnd);            
-            }                                
         }
 
-        (result, deps)
+        let changed = self._transients:.realize (schedule, self._graph);
+        let nbFrames = self._device.getNbFrames ();
+        self:.reserveSemaphores (schedule.edges.len, nbFrames);
+
+        let dmut result : [PassContent] = [];
+        for sub in schedule.submissions {
+            let dmut subpass = if let Ok (dmut p) = alias self._subpasses [sub.name] { alias p } else {
+                throw copy BalderError ("No subpass is registered for " ~ sub.name);
+            };
+
+            self:.attach (sub, alias subpass, changed);
+            let dmut steps : [PassStep] = [];
+            for p in sub.passes {
+                steps ~= [self:.stepOf (p)];
+            }
+
+            subpass:.setSteps (alias steps);
+
+            let dmut content = PassContent (alias subpass, nbFrames);
+            let dmut stages : [u32] = [];
+            for k in sub.waits {
+                stages ~= [schedule.edges [k].stage];
+            }
+
+            let mut sems : [mut [VkSemaphore]] = copy [[] ; nbFrames];
+            let mut signals : [mut [VkSemaphore]] = copy [[] ; nbFrames];
+            for f in 0u32 .. nbFrames {
+                sems [f] = copy [self._semaphores [f][k] for k in sub.waits];
+                signals [f] = copy [self._semaphores [f][k] for k in sub.signals];
+
+                // the present waits for the screen
+                if subpass is self._compose {
+                    signals [f] = signals [f] ~ [self._compose.getSemaphore (f)];
+                }
+            }
+
+            content.stages = alias stages;
+            content.sems = alias sems;
+            content.signals = alias signals;
+            result ~= [alias content];
+        }
+
+        let mut transfer : [mut [VkSemaphore]] = copy [[] ; nbFrames];
+        for f in 0u32 .. nbFrames {
+            let mut lst : [VkSemaphore] = [];
+            for k, e in schedule.edges if e.from == TRANSFER {
+                lst = lst ~ [self._semaphores [f][k]];
+            }
+
+            transfer [f] = lst;
+        }
+
+        self._passGraph = alias result;
+        self._transferSignals = alias transfer;
+        self._schedule = schedule;
+        self:.forceRedraw ();
     }
 
     /**
-     * @returns: the reversed graph, where every node list its predecessors
+     * Create the framebuffers of a draw subpass rendering in transient images whose textures changed
+     * @params:
+     *    - sub: the subpass in the schedule
+     *    - subpass: the subpass
+     *    - changed: the transient images whose texture changed
      * */
-    fn reverseGraph (self, graph : [[c8] => [c8]])-> dmut [[c8] => [[c8] => ()]] {
-        let dmut result : [[c8] => [[c8] => ()]] = copy [];
-        for i, out in graph {
-            if let Ok (dmut lst) = alias result [out] {
-                lst [i] = ();                 
-            } else {
-                result [out] = copy [i => ()];
-            }
+    fn attach (mut self, sub : ScheduledSubmission, dmut subpass : &VulkanSubpass, changed : [[c8]])
+        throws BalderError
+    {
+        let attachments = self.attachmentsOf (sub);
+        if attachments.len == 0us { return; }
 
-            if i !in result {
-                result [i] = copy [];
+        let mut renew = false;
+        for a in attachments {
+            for c in changed if c == a { renew = true; }
+        }
+
+        if !renew { return; }
+
+        let dmut textures : [&OutputTexture] = [];
+        for a in attachments {
+            if let Ok (dmut t) = alias self._transients:.getTexture (a) {
+                textures ~= [alias t];
+            } else {
+                // an attachment the subpass does not own is attached when the subpass is created
+                return;
             }
         }
 
-        alias result
+        if let Ok (dmut draw : &DrawSubpass) = (alias subpass)? {
+            draw:.setAttachments (textures);
+        } else {
+            throw copy BalderError ("The subpass " ~ sub.name ~ " has attachments but does not draw");
+        }
     }
-    
+
+    /**
+     * @returns: the attachments of the first raster pass of a subpass, in the order of its uses
+     * */
+    fn attachmentsOf (self, sub : ScheduledSubmission)-> [[c8]] {
+        for p in sub.passes if p.kind == PassKind::RASTER {
+            for g in self._graph.getPasses () if g.name == p.name {
+                let mut result : [[c8]] = [];
+                for u in g.uses if u.usage == Usage::COLOR_ATTACHMENT || u.usage == Usage::DEPTH_ATTACHMENT {
+                    let mut known = false;
+                    for r in result if r == u.resource { known = true; }
+                    if !known {
+                        result = result ~ [u.resource];
+                    }
+                }
+
+                return result;
+            }
+        }
+
+        []
+    }
+
+    /**
+     * @returns: the step a subpass records for a pass of the schedule, its barriers merged into one, the images resolved
+     * */
+    fn stepOf (mut self, p : ScheduledPass)-> dmut PassStep {
+        let mut srcStage = 0u32;
+        let mut dstStage = 0u32;
+        let mut srcAccess = 0u32;
+        let mut dstAccess = 0u32;
+        let dmut transitions : [ImageTransition] = [];
+
+        for b in p.barriers {
+            srcStage = srcStage | b.srcStage;
+            dstStage = dstStage | b.dstStage;
+            if b.image && b.oldLayout != b.newLayout {
+                let aspect = if b.depth { VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT } else { VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT };
+                let dmut images = self:.imagesOf (b.resource);
+                if images.len == 0us {
+                    log::error #("VulkanPipeline", "No image to transition for", b.resource);
+                    continue;
+                }
+
+                transitions ~= [ImageTransition (alias images, aspect, b.srcAccess, b.dstAccess, b.oldLayout, b.newLayout)];
+            } else {
+                srcAccess = srcAccess | b.srcAccess;
+                dstAccess = dstAccess | b.dstAccess;
+            }
+        }
+
+        PassStep (p.name,
+                  p.kind == PassKind::RASTER,
+                  (srcStage, dstStage),
+                  (srcAccess, dstAccess),
+                  alias transitions,
+                  p.recording)
+    }
+
+    /**
+     * @returns: the image of each frame slot of an image of the render graph
+     * */
+    fn imagesOf (mut self, name : [c8])-> dmut [VkImage] {
+        if let Ok (dmut images) = alias self._images [name] {
+            return alias images;
+        }
+
+        if let Ok (dmut t) = alias self._transients:.getTexture (name) {
+            return imagesOfTexture (alias t);
+        }
+
+        []
+    }
+
+    /**
+     * Create the semaphores of the edges of a schedule, the semaphores of each frame slot being reused once its previous
+     * submission is awaited (every edge is signaled and awaited in the same frame)
+     * */
+    fn reserveSemaphores (mut self, count : usize, nbFrames : u32)
+        throws BalderError
+    {
+        if self._semaphores.len != cast!usize (nbFrames) {
+            self._semaphores = copy [[] ; nbFrames];
+        }
+
+        let mut semInfo = VkSemaphoreCreateInfo ();
+        semInfo.sType = VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        for f in 0u32 .. nbFrames {
+            let mut lst = self._semaphores [f];
+            while lst.len < count {
+                let dmut sem : VkSemaphore = null;
+                if vkCreateSemaphore (self._device.getDeviceHandle (), &semInfo, null, alias &sem) != VkResult::VK_SUCCESS {
+                    throw copy BalderError ("Failed to create the semaphore of an edge of the render graph");
+                }
+
+                lst = lst ~ [sem];
+            }
+
+            self._semaphores [f] = lst;
+        }
+    }
+
+    /**
+     * Destroy the semaphores of the edges
+     * @assume: the device is idle
+     * */
+    fn destroySemaphores (mut self) {
+        for lst in self._semaphores {
+            for sem in lst {
+                vkDestroySemaphore (self._device.getDeviceHandle (), sem, null);
+            }
+        }
+
+        self._semaphores = [];
+        self._transferSignals = [];
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -519,18 +811,20 @@ pub class VulkanPipeline {
         pub over dispose (mut self) {            
             atomic self {                
                 self._device:.waitIdle ();                                                
-                for dmut pass in alias self._passGraph {
-                    if pass.pass !is self._compose {
-                        pass.pass:.dispose ();
+                for _, dmut pass in alias self._subpasses {
+                    if pass !is self._compose {
+                        pass:.dispose ();
                     }
                 }                
                 
                 self._compose:.resetCommands ();
                 self._compose:.resetDrawSignal ();
+                self._compose:.setSteps ([]);
+                self._transients:.dispose ();
+                self:.destroySemaphores ();
+                self._passGraph = [];
 
                 // The disposed subpasses are forgotten, a subpass removed afterwards rebuilding the graph without them
-                self._passes = copy [];
-                self._DAG = copy [];
                 self:.resetToDefault ();
                 for i in 0 .. self._updated.len {
                     self._updated [i] = FrameDrawing::REDRAW;
@@ -542,4 +836,16 @@ pub class VulkanPipeline {
             self._device:.drainRetired ();
         }
     }
+}
+
+/**
+ * @returns: the image of each frame slot of a texture
+ * */
+fn imagesOfTexture (dmut texture : &OutputTexture)-> dmut [VkImage] {
+    let dmut result : [VkImage] = [];
+    for dmut img in alias texture:.getImages () {
+        result ~= [alias img:.getVulkanImage ()];
+    }
+
+    alias result
 }
