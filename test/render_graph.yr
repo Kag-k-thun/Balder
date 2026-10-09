@@ -2,7 +2,9 @@ in render_graph;
 
 use balder::core::error;
 use balder::core::driver::graph;
-use balder::core::driver::graph::edge;
+use balder::core::driver::graph::{edge, export};
+
+use std::config::{access, data, json};
 
 use ::vulkan::core;
 
@@ -417,4 +419,65 @@ __test removed_subpasses_take_their_passes {
     for p in g.getPasses() {
         assert (p.name != "shadow");
     }
+}
+
+/**
+ * @returns: the entry of an array of a configuration whose name is 'name', none if there is none
+ * */
+fn named(cfg: &Config, array: [c8], name: [c8])-> (&Config)? {
+    for e in cfg.elements(array) {
+        if e.str("name") == (name)? { return e?; }
+    }
+
+    none
+}
+
+/**
+ * The exported graph lists the subpasses in their order, the passes with their uses and barriers, the semaphores and
+ * the memory of the transient images
+ * */
+__test the_exported_graph_holds_passes_barriers_and_memory {
+    let dmut g = sceneGraph();
+    g:.enablePass("lateCull", false);
+    let s = g.compile();
+    let cfg = toConfig(g, s, copy [copy ["atlas"], copy ["albedo"], copy ["depth"]]);
+
+    assert (cfg.str("subpasses", 0, "name") == ("deferred")?);
+    assert (cfg.str("subpasses", 3, "name") == ("screen")?);
+    assert (cfg.str("subpasses", 0, "passes", 1) == ("gbuffer")?);
+
+    // the passes in the order they are recorded, the disabled one last
+    assert (cfg.str("passes", 0, "name") == ("cull")?);
+    assert (cfg.int("passes", 0, "order") == (1i64)?);
+    assert (cfg.str("passes", 7, "name") == ("lateCull")?);
+    assert (cfg.boolean("passes", 7, "enabled") == (false)?);
+
+    // the transition of the output for the screen
+    if let Ok(screen) = named(cfg, "passes", "screen") {
+        assert (screen.str("barriers", 0, "resource") == ("output")?);
+        assert (screen.str("barriers", 0, "oldLayout") == ("general")?);
+        assert (screen.str("barriers", 0, "newLayout") == ("shader read only")?);
+        assert (screen.str("barriers", 0, "srcStages", "names", 0) == ("fragment shader")?);
+        assert (screen.int("barriers", 0, "dstStages", "value") == (cast!i64(FRAGMENT))?);
+    } else { assert (false); }
+
+    // the semaphores, from the transfers too
+    assert (cfg.str("edges", 0, "from") == ("deferred")?);
+    let mut fromTransfers = false;
+    for e in cfg.elements("edges") if e.str("from") == ("transfers")? && e.str("to") == ("deferred")? {
+        fromTransfers = e.str("stages", "names", 0) == ("all commands")?;
+    }
+
+    assert (fromTransfers);
+
+    // the lifetime and the memory of a transient image
+    if let Ok(albedo) = named(cfg, "resources", "albedo") {
+        assert (albedo.boolean("transient") == (true)?);
+        assert (albedo.int("first") == (2i64)? && albedo.int("last") == (6i64)?);
+        assert (albedo.int("slot") == (2i64)?);
+        assert (albedo.int("width") == (32i64)?);
+    } else { assert (false); }
+
+    // a dump in json reads back the same
+    assert (json::parse(json::dump(cfg)).str("passes", 1, "uses", 0, "usage") == ("indirect commands")?);
 }
