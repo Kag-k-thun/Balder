@@ -146,6 +146,6 @@ flowchart LR
 | `draws`, `late_draws` | imported buffers | the cull passes | the g-buffers (indirect, vertices) |
 | `cull_state` | imported buffers | both cull passes | both cull passes |
 | `hzb` | imported buffer (the depth pyramid) | the pyramid | the late cull pass |
-| `gbuffer_*` (4 images: normals, albedo, materials, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth) |
+| `gbuffer_*` (6 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials) |
 | `shadow_atlas` | transient | the shadow map | the composition (optional) |
 | `output` | imported image | the composition | the screen |
