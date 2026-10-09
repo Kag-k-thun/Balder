@@ -11,8 +11,16 @@ layout (location = 3) flat in uint inMaterial;
 
 // The normal, folded by octEncode
 layout (location = 0) out vec2 normals;
+
+// The base colour, and the occlusion in alpha
 layout (location = 1) out vec4 albedo;
 layout (location = 2) out uint materialID;
+
+// The metalness and the roughness, multiplying the factors of the material
+layout (location = 3) out vec2 surface;
+
+// The emissive colour, multiplying the emissive colour of the material
+layout (location = 4) out vec4 emissive;
 
 
 layout (set = 0, binding = 2) uniform sampler2D diffuse;
@@ -58,6 +66,10 @@ void main() {
 
     normals = octEncode (inNormals);
     albedo = vec4 (texture (diffuse, inUV).xyz, 1);
+
+    // the material has no map but its base colour, its factors used as they are
+    surface = vec2 (1.0);
+    emissive = vec4 (1.0);
     
     materialID = inMaterial;
 }
