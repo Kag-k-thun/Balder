@@ -11,9 +11,8 @@ layout (location = 4) flat in uint inMaterial;
 
 layout (location = 0) out vec3 position;
 layout (location = 1) out vec3 normals;
-layout (location = 2) out vec3 binormals;
-layout (location = 3) out vec4 albedo;
-layout (location = 4) out uint materialID;
+layout (location = 2) out vec4 albedo;
+layout (location = 3) out uint materialID;
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -42,7 +41,6 @@ void main() {
 
     position = vec3 (inPosition.xyz);
     normals = vec3 (inNormals);
-    binormals = vec3 (inNormals);
     albedo = vec4 (1, 1, 1, 1); 
     materialID = inMaterial;
 }
