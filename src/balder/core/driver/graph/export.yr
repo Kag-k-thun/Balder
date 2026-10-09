@@ -1,0 +1,300 @@
+in export;
+
+use balder::core::driver::graph::{edge, usage};
+
+use std::format;
+use std::config::data;
+
+use ::vulkan::core;
+
+/**
+ * The names of the pipeline stages, as the exported graph writes them
+ * */
+enum StageNames
+| TOP_OF_PIPE     = (0x00000001u32, "top of pipe")
+| DRAW_INDIRECT   = (0x00000002u32, "draw indirect")
+| VERTEX_INPUT    = (0x00000004u32, "vertex input")
+| VERTEX_SHADER   = (0x00000008u32, "vertex shader")
+| FRAGMENT_SHADER = (0x00000080u32, "fragment shader")
+| EARLY_TESTS     = (0x00000100u32, "early fragment tests")
+| LATE_TESTS      = (0x00000200u32, "late fragment tests")
+| COLOR_OUTPUT    = (0x00000400u32, "color attachment output")
+| COMPUTE_SHADER  = (0x00000800u32, "compute shader")
+| TRANSFER        = (0x00001000u32, "transfer")
+| BOTTOM_OF_PIPE  = (0x00002000u32, "bottom of pipe")
+| HOST            = (0x00004000u32, "host")
+| ALL_GRAPHICS    = (0x00008000u32, "all graphics")
+| ALL_COMMANDS    = (0x00010000u32, "all commands");
+
+/**
+ * The names of the accesses, as the exported graph writes them
+ * */
+enum AccessNames
+| INDIRECT_READ    = (0x00000001u32, "indirect command read")
+| INDEX_READ       = (0x00000002u32, "index read")
+| VERTEX_READ      = (0x00000004u32, "vertex attribute read")
+| UNIFORM_READ     = (0x00000008u32, "uniform read")
+| INPUT_READ       = (0x00000010u32, "input attachment read")
+| SHADER_READ      = (0x00000020u32, "shader read")
+| SHADER_WRITE     = (0x00000040u32, "shader write")
+| COLOR_READ       = (0x00000080u32, "color attachment read")
+| COLOR_WRITE      = (0x00000100u32, "color attachment write")
+| DEPTH_READ       = (0x00000200u32, "depth attachment read")
+| DEPTH_WRITE      = (0x00000400u32, "depth attachment write")
+| TRANSFER_READ    = (0x00000800u32, "transfer read")
+| TRANSFER_WRITE   = (0x00001000u32, "transfer write")
+| HOST_READ        = (0x00002000u32, "host read")
+| HOST_WRITE       = (0x00004000u32, "host write")
+| MEMORY_READ      = (0x00008000u32, "memory read")
+| MEMORY_WRITE     = (0x00010000u32, "memory write");
+
+/**
+ * Write a render graph and its compiled schedule as a configuration, to dump in json:
+ *    - subpasses: the subpasses in the order of their submission, their passes in the order they are recorded
+ *    - passes: the passes in the order they are recorded, then the disabled ones; their uses and the barriers recorded
+ *      before them
+ *    - edges: the semaphores between the subpasses (from "transfers" for the transfers of the frame), the stages awaiting
+ *      them and the resources they order
+ *    - resources: the resources by name, the passes using them (1 for the first pass recorded), and the slot of memory of
+ *      a transient image with the images sharing it
+ * @info: a mask of stages or accesses is written as its names and as its value
+ * @params:
+ *    - graph: the render graph, its passes and its resources as declared
+ *    - schedule: the graph compiled
+ *    - slots: the transient images sharing each slot of memory
+ * @returns: the configuration
+ * */
+pub fn toConfig(graph: &RenderGraph, schedule: RenderSchedule, slots: [[[c8]]])-> &Config {
+    let dmut root = copy Dict();
+    let dmut submissions = copy Array();
+    let dmut passes = copy Array();
+    let mut index = 1i64;
+
+    for s in schedule.submissions {
+        let dmut sub = copy Dict();
+        sub["name"] = copy Str(s.name);
+        sub["passes"] = names(copy [p.name for p in s.passes]);
+        submissions:.push(sub);
+
+        for p in s.passes {
+            for g in graph.getPasses() if g.name == p.name {
+                let dmut pass = passOf(graph, g, schedule);
+                pass["order"] = copy Int(index);
+
+                let dmut barriers = copy Array();
+                for b in p.barriers {
+                    barriers:.push(barrierOf(b));
+                }
+
+                pass["barriers"] = barriers;
+                passes:.push(pass);
+            }
+
+            index += 1i64;
+        }
+    }
+
+    for g in graph.getPasses() if !g.enabled {
+        passes:.push(passOf(graph, g, schedule));
+    }
+
+    let dmut edges = copy Array();
+    for e in schedule.edges {
+        let dmut d = copy Dict();
+        d["from"] = copy Str(if e.from == TRANSFER { "transfers" } else { schedule.submissions[e.from].name });
+        d["to"] = copy Str(schedule.submissions[e.to].name);
+        d["stages"] = mask(e.stage, true);
+        d["resources"] = names(e.resources);
+        edges:.push(d);
+    }
+
+    let dmut resources = copy Array();
+    for r in graph.getResources() {
+        resources:.push(resourceOf(r, schedule, slots));
+    }
+
+    root["subpasses"] = submissions;
+    root["passes"] = passes;
+    root["edges"] = edges;
+    root["resources"] = resources;
+    root
+}
+
+/**
+ * @returns: a pass and its uses, without its barriers
+ * */
+fn passOf(graph: &RenderGraph, g: GraphPass, schedule: RenderSchedule)-> dmut &Dict {
+    let dmut pass = copy Dict();
+    pass["name"] = copy Str(g.name);
+    pass["subpass"] = copy Str(g.submission);
+    pass["kind"] = copy Str(if g.kind == PassKind::RASTER { "raster" } else { "compute" });
+    pass["enabled"] = copy Bool(g.enabled);
+
+    let dmut uses = copy Array();
+    for u in g.uses {
+        let a = describe(u.usage);
+        let dmut d = copy Dict();
+        d["resource"] = copy Str(u.resource);
+        d["usage"] = copy Str(a.name);
+        d["reads"] = copy Bool(a.reads);
+        d["writes"] = copy Bool(a.writes);
+        d["optional"] = copy Bool(u.optional);
+        d["dropped"] = copy Bool(g.enabled && (!graph.getResource(u.resource).hasValue || !isUsed(schedule, u.resource)));
+        uses:.push(d);
+    }
+
+    pass["uses"] = uses;
+    alias pass
+}
+
+/**
+ * @returns: a barrier, its masks as names and values, its layouts as names
+ * */
+fn barrierOf(b: GraphBarrier)-> dmut &Dict {
+    let dmut d = copy Dict();
+    d["resource"] = copy Str(b.resource);
+    d["srcStages"] = mask(b.srcStage, true);
+    d["srcAccesses"] = mask(b.srcAccess, false);
+    d["dstStages"] = mask(b.dstStage, true);
+    d["dstAccesses"] = mask(b.dstAccess, false);
+    if b.image && b.oldLayout != b.newLayout {
+        d["oldLayout"] = copy Str(layoutName(b.oldLayout));
+        d["newLayout"] = copy Str(layoutName(b.newLayout));
+    }
+
+    alias d
+}
+
+/**
+ * @returns: a resource, the passes using it and the slot of memory of a transient image
+ * */
+fn resourceOf(r: GraphResource, schedule: RenderSchedule, slots: [[[c8]]])-> dmut &Dict {
+    let dmut d = copy Dict();
+    d["name"] = copy Str(r.name);
+    d["kind"] = copy Str(if r.image { "image" } else { "buffer" });
+    d["depth"] = copy Bool(r.depth);
+    d["transient"] = copy Bool(r.transient);
+
+    if r.transient {
+        d["width"] = copy Int(cast!i64(r.desc.width));
+        d["height"] = copy Int(cast!i64(r.desc.height));
+        d["format"] = copy Str(formatName(r.desc.format));
+        d["storage"] = copy Bool(r.desc.storage);
+    }
+
+    for l in schedule.lifetimes if l.name == r.name {
+        d["first"] = copy Int(cast!i64(l.first + 1us));
+        d["last"] = copy Int(cast!i64(l.last + 1us));
+    }
+
+    for i, slot in slots {
+        for m in slot if m == r.name {
+            d["slot"] = copy Int(cast!i64(i + 1us));
+            let mut shared : [[c8]] = [];
+            for o in slot if o != r.name {
+                shared = shared ~ [o];
+            }
+
+            d["sharedWith"] = names(shared);
+        }
+    }
+
+    alias d
+}
+
+/**
+ * @returns: an array of names
+ * */
+fn names(lst: [[c8]])-> dmut &Array {
+    let dmut a = copy Array();
+    for n in lst {
+        a:.push(copy Str(n));
+    }
+
+    alias a
+}
+
+/**
+ * @returns: a mask of stages or accesses: its names and its value
+ * */
+fn mask(value: u32, stages: bool)-> dmut &Dict {
+    let dmut d = copy Dict();
+    d["names"] = names(if stages { stageNames(value) } else { accessNames(value) });
+    d["value"] = copy Int(cast!i64(value));
+    alias d
+}
+
+/**
+ * @returns: true iif a pass of a schedule uses a resource
+ * */
+fn isUsed(schedule: RenderSchedule, resource: [c8])-> bool {
+    for l in schedule.lifetimes if l.name == resource {
+        return true;
+    }
+
+    false
+}
+
+/**
+ * @returns: the names of the stages of a mask, in the order of the pipeline
+ * */
+fn stageNames(mask: u32)-> [[c8]] {
+    let mut out : [[c8]] = [];
+    cte for s in StageNames::__members__ {
+        if (mask & s._0) != 0u32 {
+            out = out ~ [s._1];
+        }
+    }
+
+    out
+}
+
+/**
+ * @returns: the names of the accesses of a mask
+ * */
+fn accessNames(mask: u32)-> [[c8]] {
+    let mut out : [[c8]] = [];
+    cte for a in AccessNames::__members__ {
+        if (mask & a._0) != 0u32 {
+            out = out ~ [a._1];
+        }
+    }
+
+    out
+}
+
+/**
+ * @returns: the name of an image layout
+ * */
+fn layoutName(layout: VkImageLayout)-> [c8] {
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED { return "undefined"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL { return "general"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL { return "color attachment"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL { return "depth attachment"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL { return "depth read only"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL { return "shader read only"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL { return "transfer source"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL { return "transfer destination"; }
+    if layout == VkImageLayout::VK_IMAGE_LAYOUT_PRESENT_SRC_KHR { return "present"; }
+
+    let value : u32 = layout;
+    format("layout {}", value)
+}
+
+/**
+ * @returns: the name of an image format
+ * */
+fn formatName(fmt: VkFormat)-> [c8] {
+    if fmt == VkFormat::VK_FORMAT_R8G8B8A8_UNORM { return "R8G8B8A8 unorm"; }
+    if fmt == VkFormat::VK_FORMAT_B8G8R8A8_UNORM { return "B8G8R8A8 unorm"; }
+    if fmt == VkFormat::VK_FORMAT_R16G16B16_SFLOAT { return "R16G16B16 sfloat"; }
+    if fmt == VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT { return "R16G16B16A16 sfloat"; }
+    if fmt == VkFormat::VK_FORMAT_R32_UINT { return "R32 uint"; }
+    if fmt == VkFormat::VK_FORMAT_D16_UNORM { return "D16 unorm"; }
+    if fmt == VkFormat::VK_FORMAT_D32_SFLOAT { return "D32 sfloat"; }
+    if fmt == VkFormat::VK_FORMAT_D24_UNORM_S8_UINT { return "D24 unorm S8 uint"; }
+    if fmt == VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT { return "D32 sfloat S8 uint"; }
+
+    let value : u32 = fmt;
+    format("format {}", value)
+}
