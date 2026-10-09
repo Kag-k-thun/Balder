@@ -2,22 +2,22 @@ in chain;
 
 use balder::utils;
 use balder::core::{_, application::_};
-use balder::core::driver::{cmd_alloc, subpass};
+use balder::core::driver::subpass;
 use balder::core::shader::texture;
 use balder::scene::node::node3D::camera;
-use balder::scene::utils::post::{effect, plan, sources, stage, tonemap};
+use balder::scene::utils::post::{effect, pass, plan, sources, tonemap};
 
 use ::vulkan::core;
 
 /**
- * The post-process chain of a scene: the ordered list of the fullscreen passes between its composition and the screen,
- * each reading the image the pass before it wrote
+ * The post-process chain of a scene: the ordered list of the effects between its composition and the screen, each
+ * reading the image the effect before it wrote
  * @info:
  * =====
  * The effects in HDR space run before the tone mapping, in their order, and the effects in display space after it, in
- * their order (see PostPlan); the last pass writes the output of the scene, read by the screen. Each pass is declared in
- * the render graph of the window, recorded in the subpass of the composition, and each image between two passes is a
- * transient image of the graph.
+ * their order (see PostPlan); the last effect writes the output of the scene, read by the screen. The passes of each
+ * effect (see PostEffect::passes) are declared in the render graph of the window, recorded in the subpass of the
+ * composition, and each image between two passes is a transient image of the graph.
  * Adding, removing, moving, enabling or disabling an effect declares the passes again, the graph being compiled again
  * at the next frame; an effect disabled is skipped, the pass after it reading the image the pass before it wrote.
  * ====
@@ -54,8 +54,8 @@ pub class PostChain {
     let mut _width : u32 = 0u32;
     let mut _height : u32 = 0u32;
 
-    // The stages declared in the render graph, removed when the chain changes
-    let mut _declared : PostPlan = PostPlan ();
+    // The passes declared in the render graph, removed when the chain changes
+    let mut _declared : [PostPass] = [];
 
     /*!
      * ====================================================================================================
@@ -293,6 +293,23 @@ pub class PostChain {
     }
 
     /**
+     * @returns: the passes of the effects that run, the tone mapping included, in their order, around the images of
+     * sources
+     * @params:
+     *    - width, height: the size of the images of the chain
+     * */
+    pub fn passes (self, sources : PostSources, width : u32, height : u32)-> [PostPass] {
+        let mut result : [PostPass] = [];
+        for s in self.plan (sources).stages {
+            if let Ok (e) = self.effectOf (s.effect) {
+                result = result ~ e.passes (s, width, height);
+            }
+        }
+
+        result
+    }
+
+    /**
      * @returns: the output of the scene, written by the last pass of the chain
      * */
     @field
@@ -327,6 +344,21 @@ pub class PostChain {
         alias self:.get (name)
     }
 
+    /**
+     * @returns: the effect of the chain named name, the tone mapping included
+     * */
+    fn effectOf (self, name : [c8])-> (&PostEffect)? {
+        if name == self._tonemap.name {
+            return (self._tonemap)?;
+        }
+
+        if let Ok (i) = self.indexOf (name) {
+            return (self._effects [i])?;
+        }
+
+        none
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -336,27 +368,28 @@ pub class PostChain {
      */
 
     /**
-     * Declare the passes of the chain and the images between them in the render graph, recorded in the subpass of the
+     * Declare the passes of the chain and the images they write in the render graph, recorded in the subpass of the
      * composition
      * */
     fn declare (mut self)
         throws BalderError
     {
-        let plan = self.plan ();
-        self._declared = plan;
+        let passes = self.passes (self._sources, self._width, self._height);
+        self._declared = passes;
 
         if let Ok (dmut win) = alias self._window {
-            if let Ok (dmut pass) = alias self._pass {
+            if let Ok (dmut sub) = alias self._pass {
                 if let Ok (dmut output) = alias self._outputTexture {
                     let dmut pipeline = win:.getVulkanPipeline ();
-                    for s in plan.stages {
-                        if !s.last {
-                            pipeline:.createImage (s.output, s.image (self._width, self._height));
+                    for p in passes {
+                        if !p.imported {
+                            pipeline:.createImage (p.output, p.image);
                         }
 
-                        if let Ok (dmut effect) = alias self:.effect (s.effect) {
-                            let dmut rec = copy PostRecorder (alias effect, s, alias pass, alias win, alias output);
-                            pipeline:.declarePass (s.toPass (self._sources.submission, (&rec:.dispatch)?));
+                        if let Ok (dmut effect) = alias self:.effect (p.effect) {
+                            effect:.prepare (p);
+                            let dmut rec = copy PostRecorder (alias effect, p, alias sub, alias win, alias output);
+                            pipeline:.declarePass (p.toPass (self._sources.submission, (&rec:.dispatch)?));
                         }
                     }
                 }
@@ -365,20 +398,20 @@ pub class PostChain {
     }
 
     /**
-     * Remove the passes of the chain and the images between them from the render graph
+     * Remove the passes of the chain and the images they write from the render graph
      * */
     fn undeclare (mut self) {
         if let Ok (dmut win) = alias self._window {
             let dmut pipeline = win:.getVulkanPipeline ();
-            for s in self._declared.stages {
-                pipeline:.removePass (s.pass);
-                if !s.last {
-                    pipeline:.removeResource (s.output);
+            for p in self._declared {
+                pipeline:.removePass (p.name);
+                if !p.imported {
+                    pipeline:.removeResource (p.output);
                 }
             }
         }
 
-        self._declared = PostPlan ();
+        self._declared = [];
     }
 
     /**
@@ -442,71 +475,59 @@ pub class PostChain {
 }
 
 /**
- * The recording of a stage of a chain: the images of the frame bound, and the effect dispatched over the image it writes
+ * The recording of a pass of a chain: the images of the frame bound, and the shader of the pass dispatched over the image
+ * it writes
  * */
 class PostRecorder {
 
     let dmut _effect : &PostEffect;
 
-    let _stage : PostStage;
+    let _pass : PostPass;
 
-    // The subpass recording the stage
-    let dmut _pass : &ComputeSubpass;
+    // The subpass recording the pass
+    let dmut _subpass : &ComputeSubpass;
 
     let dmut _window : &Window;
 
-    // The output of the scene, written by the last stage
+    // The output of the scene, written by the last pass
     let dmut _output : &OutputTexture;
 
-    pub self (dmut effect : &PostEffect, stage : PostStage, dmut pass : &ComputeSubpass, dmut win : &Window, dmut output : &OutputTexture)
+    pub self (dmut effect : &PostEffect, pass : PostPass, dmut sub : &ComputeSubpass, dmut win : &Window, dmut output : &OutputTexture)
         with _effect = alias effect
-        , _stage = stage
-        , _pass = alias pass
+        , _pass = pass
+        , _subpass = alias sub
         , _window = alias win
         , _output = alias output
     {}
 
     /**
-     * Record the dispatch of the effect, reading and writing the transient images of the render graph compiled last
+     * Record the dispatch of the pass, reading and writing the transient images of the render graph compiled last
      * */
     pub fn dispatch (mut self) {
-        let frame = self._pass.getCurrentFrame ();
-        let cmdV = self._pass.getDrawingCommandBuffer ();
+        let frame = self._subpass.getCurrentFrame ();
+        let cmd = self._subpass.getDrawingCommandBuffer ();
         let dmut pipeline = self._window:.getVulkanPipeline ();
 
-        let input = if let Ok (t) = pipeline:.getTexture (self._stage.input) { t } else {
-            log::error #("PostChain", "The image", self._stage.input, "is not allocated");
-            return;
-        };
-
-        let output = if self._stage.last { self._output } else if let Ok (t) = pipeline:.getTexture (self._stage.output) { t } else {
-            log::error #("PostChain", "The image", self._stage.output, "is not allocated");
-            return;
-        };
-
-        let mut reads : [&Texture] = [];
-        for r in self._stage.reads {
-            if let Ok (t) = pipeline:.getTexture (r) {
+        let mut images : [&Texture] = [];
+        for i in self._pass.images {
+            if let Ok (t) = pipeline:.getTexture (i) {
                 let tex : &Texture = t;
-                reads = reads ~ [tex];
+                images = images ~ [tex];
             } else {
-                log::error #("PostChain", "The image", r, "is not allocated");
+                log::error #("PostChain", "The image", i, "is not allocated");
                 return;
             }
         }
 
-        let dmut cmd = copy ComputeDispatchCommandAllocator (alias self._pass);
-        let sizes = self._effect.groupSizes;
-        {
-            cmd:.registerDispatch (groupX-> sizes [0], groupY-> sizes [1], groupZ-> sizes [2]);
-            cmd:.finalizeRegister ();
+        let output = if self._pass.imported { self._output } else if let Ok (t) = pipeline:.getTexture (self._pass.output) { t } else {
+            log::error #("PostChain", "The image", self._pass.output, "is not allocated");
+            return;
+        };
 
-            self._effect:.select (frame, cmdV, input, output, reads);
-            cmd:.dispatchNext ();
-        } catch {
-            err => {
-                log::error #("PostChain", "Failed to call the shader of the effect", self._effect.name, err);
-            }
-        }
+        let groups = self._effect.groupSizes (self._pass.shader);
+        let width = self._pass.image.width, height = self._pass.image.height;
+
+        self._effect:.select (frame, cmd, self._pass, images, output);
+        vkCmdDispatch (cmd, (width + groups [0] - 1u32) / groups [0], (height + groups [1] - 1u32) / groups [1], 1u32);
     }
 }
