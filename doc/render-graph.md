@@ -16,7 +16,8 @@ recording its passes in its command buffer and submitting it.
 A **subpass** is a command buffer submitted once per frame (a render target of its own for a `DrawSubpass`). A
 **pass** is something recorded in a subpass, a raster pass drawing in its render pass or a compute pass dispatching
 outside of it. A subpass holds several passes: the deferred subpass of a scene records its cull pass, its g-buffer, its
-depth pyramid, its late cull pass and its late g-buffer, and its compose subpass its composition and its tone mapping.
+depth pyramid, its late cull pass and its late g-buffer, and its compose subpass its composition and the passes of its
+post-process chain.
 
 ```
 let dmut pipeline = window:.getVulkanPipeline ();
@@ -129,7 +130,7 @@ flowchart LR
         shadow_map[shadow]
     end
     subgraph compose
-        composition[compose] --> tonemap
+        composition[compose] --> vignette[post_vignette] --> tonemap[post_tonemap] --> invert[post_invert]
     end
     subgraph screen
         widgets[screen]
@@ -148,5 +149,50 @@ flowchart LR
 | `hzb` | imported buffer (the depth pyramid) | the pyramid | the late cull pass |
 | `gbuffer_*` (6 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials) |
 | `shadow_atlas` | transient | the shadow map | the composition (optional) |
-| `radiance` | transient (`R16G16B16A16_SFLOAT`, storage) | the composition (the light the camera sees, linear and unbounded) | the tonemap pass |
-| `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the tonemap pass (exposure of the camera, tone map operator of the scene, sRGB encoding) | the screen |
+| `radiance` | transient (`R16G16B16A16_SFLOAT`, storage) | the composition (the light the camera sees, linear and unbounded) | the first pass of the post-process chain |
+| `post_<effect>_out` | transient (`R16G16B16A16_SFLOAT` before the tone mapping, `R8G8B8A8_UNORM` after it, storage) | a pass of the post-process chain, but the last one | the next pass of the chain |
+| `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the last pass of the post-process chain, the tone mapping without effects in display space | the screen |
+
+## The post-process chain
+
+The passes between the composition and the screen are the `PostChain` of the scene (`Scene::getPostChain`), an ordered
+list of `PostEffect`s: fullscreen compute passes, each reading the image the pass before it wrote and writing its own.
+An effect declares the space of the colours it works on, `HDR` (the light, before the tone mapping) or `DISPLAY` (the
+colours of the screen, encoded in sRGB, after it), the images of the g-buffer it reads besides (`DEPTH`, `NORMALS`),
+its compute shader and the size of its parameters. The tone mapping is the effect the chain always holds: the effects
+in HDR space run before it and those in display space after it, each in the order of the chain.
+
+```
+let dmut chain = scene:.getPostChain ();
+chain:.add (copy VignetteEffect (intensity-> 0.6f));    // before the tone mapping
+chain:.add (copy InvertEffect (), enabled-> false);     // after it, skipped until enabled
+chain:.enable ("invert", true);
+chain:.reorder ("vignette", 0us);
+chain:.remove ("invert");
+```
+
+The chain plans its stages (`PostPlan`) and declares each one as a pass of the render graph, in the subpass of the
+composition: the pass `post_<effect>_<scene>` samples the image before it and stores its own, a transient image
+`post_<effect>_out_<scene>` (rgba16f in HDR space, rgba8 in display space), the last pass storing the output of the
+scene. The graph derives the barriers between them and shares the memory of their images. Adding, removing, moving,
+enabling or disabling an effect declares the stages again, between `lockFrame` and `unlockFrame`, the graph being
+compiled at the next frame; a disabled effect is not declared, so `--graph` shows the effects that run. No change to
+`Scene::configure` is needed: an effect is a subclass of `PostEffect`.
+
+```
+@final
+pub class InvertEffect over PostEffect {
+    pub self (name : [c8] = "invert")
+        with super (name, PostSpace::DISPLAY, DefaultShaders::INVERT_3D)
+    {}
+}
+```
+
+Its shader binds, in its global set, `input` (the image before it, a texture), `output` (the image it writes, a storage
+texture), `depth` and `normals` when it reads them, `params` (a uniform buffer written by `writeParams`, when its
+parameters have a size) and `camera` (when it reads the camera). The parameters change without recording the frames
+again (`updateParams`).
+
+A `Scene3D` of a `.gui` file describes its chain with `post: vignette(0.6, 0.35), invert(off);`, the kinds of effects
+created by the `PostRegistry` of the widget manager (see `doc/gui.md`). The demo describes a vignette and a disabled
+inversion in `res/config/app.gui`, `V` and `I` toggling them.
