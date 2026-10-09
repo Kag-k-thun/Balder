@@ -1,0 +1,249 @@
+in d3;
+
+use balder::core::_;
+use balder::core::driver::device;
+use balder::core::memory::image3D;
+use balder::utils::log;
+
+use std::fs::path;
+
+use ::sdl3::{image, pixels, surface};
+
+use ::vulkan::core;
+
+extern (C) fn memcpy(src: *void, dst: *void, size: usize);
+
+/**
+ * A 3D texture of N³ texels, loaded from an image of N² × N texels laying its N slices side by side, from left to right:
+ * the texel (x, y, z) of the texture is the pixel (x + z × N, y) of the image, the first row on top
+ * @info: a colour lookup table of N³ entries is stored so, the red growing along x, the green along y and the blue from
+ * slice to slice (a 1024 × 32 strip for a 32³ table); the texels hold data, read as they are stored
+ * */
+@final
+pub class ITexture3D over Texture {
+
+    // The vulkan image of the texture
+    let dmut _image: (&Image3D)? = none;
+
+    // The number of slices of the texture
+    let mut _depth: u32 = 0;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut device: &VulkanDevice)
+        with super(alias device, 0, 0)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CONFIGURE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load the slices of the texture from an image laying them side by side
+     * @params:
+     *    - file: the project path to the image, N² pixels wide and N pixels tall
+     * @throws: if the image cannot be loaded, or is not N² pixels wide and N pixels tall
+     * */
+    pub fn configure(mut self, file: [c8])
+        throws BalderError
+    {
+        let path      = path::projectPath(file);
+        let dmut surf = IMG_Load(std::conv::toStringZ(path.toStr()));
+        if surf == null {
+            throw copy BalderError("Failed to load texture image : " ~ path.toStr());
+        }
+
+        {
+            self:.loadSlices(alias surf);
+        } exit {
+            SDL_DestroySurface(alias surf);
+        }
+
+        self:.createImageView();
+        log::debug #("Texture3D", "Loaded from file :", path);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    @field
+    pub over format(self)-> VkFormat {
+        VkFormat::VK_FORMAT_R8G8B8A8_UNORM
+    }
+
+    /**
+     * @returns: the number of slices of the texture
+     * */
+    @field
+    pub fn depth(self)-> u32 {
+        self._depth
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          LOADING CONTENT          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Allocate the image of the texture, and copy each slice of a surface into it through a staging buffer
+     * */
+    fn loadSlices(mut self, dmut surf: *SDL_Surface)
+        throws BalderError
+    {
+        let (dmut converted, needFree) = alias self.convertSurface(alias surf);
+
+        {
+            if converted == null {
+                throw copy BalderError("Failed to convert the slices of a 3D texture to RGBA");
+            }
+
+            let width  = cast!u32({ unsafe { (*converted).w } });
+            let height = cast!u32({ unsafe { (*converted).h } });
+            let pitch  = cast!u32({ unsafe { (*converted).pitch } });
+            if height == 0u32 || width != height * height {
+                throw copy BalderError(std::format::format("The slices of a 3D texture are an image N² pixels wide and N tall, not {}x{}",
+                                                           width, height));
+            }
+
+            self._width = height;
+            self._height = height;
+            self._depth = height;
+
+            let dmut image = self._device
+                :.getMemoryAllocator()
+                :.allocImage3D(height,
+                               height,
+                               height,
+                               self.format,
+                               cast!u32(VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                                        | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
+                               cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+            self._image = (alias image)?;
+
+            let size = cast!usize(pitch * height);
+            let dmut stagingBuf = self._device
+                :.getMemoryAllocator()
+                :.allocBuffer(size,
+                              cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+                              cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                       | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
+
+            atomic self._device {
+                let dmut mptr = stagingBuf:.map();
+                memcpy(mptr, unsafe { (*converted).pixels }, size);
+                stagingBuf:.unmap();
+            }
+
+            // the slice z starts at the pixel (z × N, 0) of the strip, its rows a pitch apart
+            let mut regions: [VkBufferImageCopy] = [];
+            for z in 0u32 .. height {
+                let mut region = VkBufferImageCopy();
+                region.bufferOffset = cast!u64(z * height * 4u32);
+                region.bufferRowLength = pitch / 4u32;
+                region.imageSubresource.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+                region.imageSubresource.layerCount = 1;
+                region.imageOffset.z = cast!i32(z);
+                region.imageExtent.width = height;
+                region.imageExtent.height = height;
+                region.imageExtent.depth = 1;
+                regions = regions ~ [region];
+            }
+
+            self._device
+                :.getTransferPass()
+                :.add(callback-> copy |cmd| {
+                          image:.copyRegionsFrom(cmd, alias stagingBuf, regions);
+                      },
+                      clean-> copy || {
+                          stagingBuf:.dispose();
+                      });
+        } exit {
+            if needFree && converted != null {
+                SDL_DestroySurface(alias converted);
+            }
+        }
+    }
+
+    /**
+     * @returns: the surface in RGBA, and true iif it was converted, to destroy
+     * */
+    fn convertSurface(self, dmut surf: *SDL_Surface)-> dmut (*SDL_Surface, bool) {
+        let sdlFormat = unsafe { (*surf).format };
+        if sdlFormat == pixels::SDL_PIXELFORMAT_RGBA32 { return (alias surf, false); }
+
+        let dmut converted = SDL_ConvertSurface(alias surf, pixels::SDL_PIXELFORMAT_RGBA32);
+        (alias converted, true)
+    }
+
+    /**
+     * Create the image view used to attach the texture to a descriptor set
+     * */
+    fn createImageView(mut self)
+        throws BalderError
+    {
+        if let Ok(img) = self._image {
+            let mut info = VkImageViewCreateInfo();
+            info.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            info.image = img.getVulkanImage();
+            info.viewType = VkImageViewType::VK_IMAGE_VIEW_TYPE_3D;
+            info.format = img.getFormat();
+
+            info.subresourceRange.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+            info.subresourceRange.levelCount = 1;
+            info.subresourceRange.layerCount = 1;
+            info.components.r = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_R;
+            info.components.g = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_G;
+            info.components.b = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_B;
+            info.components.a = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_A;
+
+            if vkCreateImageView(self._device.getDeviceHandle(), &info, null, &self._imageView)
+               != VkResult::VK_SUCCESS {
+                throw copy BalderError("Failed to create image view");
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            if self._imageView != null {
+                vkDestroyImageView(self._device.getDeviceHandle(), self._imageView, null);
+                self._imageView = null;
+            }
+
+            if let Ok(dmut img) = alias self._image {
+                img:.dispose();
+                self._image = none;
+            }
+
+            self._width = 0;
+            self._height = 0;
+            self._depth = 0;
+        }
+    }
+}

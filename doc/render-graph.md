@@ -130,7 +130,7 @@ flowchart LR
         shadow_map[shadow]
     end
     subgraph compose
-        composition[compose] --> vignette[post_vignette] --> tonemap[post_tonemap] --> invert[post_invert]
+        composition[compose] --> bloom[post_bloom: 6 down, 5 up, 1 added] --> vignette[post_vignette] --> tonemap[post_tonemap] --> lut[post_lut] --> fxaa[post_fxaa]
     end
     subgraph screen
         widgets[screen]
@@ -150,16 +150,17 @@ flowchart LR
 | `gbuffer_*` (6 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials) |
 | `shadow_atlas` | transient | the shadow map | the composition (optional) |
 | `radiance` | transient (`R16G16B16A16_SFLOAT`, storage) | the composition (the light the camera sees, linear and unbounded) | the first pass of the post-process chain |
-| `post_<effect>_out` | transient (`R16G16B16A16_SFLOAT` before the tone mapping, `R8G8B8A8_UNORM` after it, storage) | a pass of the post-process chain, but the last one | the next pass of the chain |
+| `post_<effect>_out` | transient (`R16G16B16A16_SFLOAT` before the tone mapping, `R8G8B8A8_UNORM` after it, storage) | the last pass of an effect of the post-process chain, but the last effect | the first pass of the next effect |
+| `post_bloom_mip<k>`, `post_bloom_up<k>` | transient (`R16G16B16A16_SFLOAT`, storage, 2^k times smaller) | the downsampling and the upsampling passes of the bloom | the next pass of the bloom |
 | `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the last pass of the post-process chain, the tone mapping without effects in display space | the screen |
 
 ## The post-process chain
 
 The passes between the composition and the screen are the `PostChain` of the scene (`Scene::getPostChain`), an ordered
-list of `PostEffect`s: fullscreen compute passes, each reading the image the pass before it wrote and writing its own.
-An effect declares the space of the colours it works on, `HDR` (the light, before the tone mapping) or `DISPLAY` (the
-colours of the screen, encoded in sRGB, after it), the images of the g-buffer it reads besides (`DEPTH`, `NORMALS`),
-its compute shader and the size of its parameters. The tone mapping is the effect the chain always holds: the effects
+list of `PostEffect`s: fullscreen compute passes, each effect reading the image the effect before it wrote and writing
+its own. An effect declares the space of the colours it works on, `HDR` (the light, before the tone mapping) or
+`DISPLAY` (the colours of the screen, encoded in sRGB, after it), the images of the g-buffer it reads besides (`DEPTH`,
+`NORMALS`), its compute shaders and the size of its parameters. The tone mapping is the effect the chain always holds: the effects
 in HDR space run before it and those in display space after it, each in the order of the chain.
 
 ```
@@ -171,10 +172,13 @@ chain:.reorder ("vignette", 0us);
 chain:.remove ("invert");
 ```
 
-The chain plans its stages (`PostPlan`) and declares each one as a pass of the render graph, in the subpass of the
-composition: the pass `post_<effect>_<scene>` samples the image before it and stores its own, a transient image
-`post_<effect>_out_<scene>` (rgba16f in HDR space, rgba8 in display space), the last pass storing the output of the
-scene. The graph derives the barriers between them and shares the memory of their images. Adding, removing, moving,
+The chain plans its stages (`PostPlan`), one per effect, and declares the passes of each stage (`PostPass`, from
+`PostEffect::passes`) in the render graph, in the subpass of the composition. An effect runs one pass by default: the
+pass `post_<effect>_<scene>` samples the image before it and stores its own, a transient image
+`post_<effect>_out_<scene>` (rgba16f in HDR space, rgba8 in display space), the last effect storing the output of the
+scene. An effect of several passes (the bloom) writes transient images of its own between them, each pass naming the
+shader it dispatches, the images it binds to the textures of that shader, the image it writes and its size, the size
+of its dispatch. The graph derives the barriers between them and shares the memory of their images. Adding, removing, moving,
 enabling or disabling an effect declares the stages again, between `lockFrame` and `unlockFrame`, the graph being
 compiled at the next frame; a disabled effect is not declared, so `--graph` shows the effects that run. No change to
 `Scene::configure` is needed: an effect is a subclass of `PostEffect`.
@@ -188,11 +192,40 @@ pub class InvertEffect over PostEffect {
 }
 ```
 
-Its shader binds, in its global set, `input` (the image before it, a texture), `output` (the image it writes, a storage
-texture), `depth` and `normals` when it reads them, `params` (a uniform buffer written by `writeParams`, when its
-parameters have a size) and `camera` (when it reads the camera). The parameters change without recording the frames
-again (`updateParams`).
+Its shaders bind, in their global set, `input` (the image before it, a texture), `output` (the image the pass writes,
+a storage texture), `depth` and `normals` when it reads them, `params` (a uniform buffer written by `writeParams`, when
+its parameters have a size), `camera` (when it reads the camera and the shader declares it) and the push constant
+`level` (the level of the pass, the mip of a bloom) when they declare it. Each pass has its own descriptor set; the
+textures of an effect that are not images of the graph (a LUT) are bound by `bindTextures` when a frame is recorded.
+The parameters change without recording the frames again (`updateParams`).
 
-A `Scene3D` of a `.gui` file describes its chain with `post: vignette(0.6, 0.35), invert(off);`, the kinds of effects
-created by the `PostRegistry` of the widget manager (see `doc/gui.md`). The demo describes a vignette and a disabled
-inversion in `res/config/app.gui`, `V` and `I` toggling them.
+### The effects of Balder
+
+| Kind | Space | Parameters (`.gui` order) | Passes |
+|---|---|---|---|
+| `vignette` | HDR | intensity (0.5), radius (0.4), softness (0.6) | 1 |
+| `bloom` | HDR | threshold (1), knee (0.5), intensity (0.05), radius (1), levels (6) | 2 × levels |
+| `invert` | display | | 1 |
+| `lut` | display | `"path"` (`res:/lut/neutral.png`), contribution (1) | 1 |
+| `fxaa` | display | subpix (0.75), edgeThreshold (0.166), edgeThresholdMin (0.0833) | 1 |
+
+- **Bloom** (`BloomEffect`): the light brighter than the threshold, exposed by the camera (1 is white on the screen),
+  through a soft knee, is downsampled into `levels` levels, each half the size of the one before it, by the 13 taps
+  of Jorge Jimenez, the boxes of the first level weighed by the average of Karis against fireflies
+  (`post_bloom_down<k>` writing `post_bloom_mip<k+1>`); the levels are upsampled back from the smallest by a 3x3 tent
+  of `radius` texels, each adding the blurred levels below it (`post_bloom_up<k>`), and the last pass adds the bloom
+  to the light with its intensity. A level is at least a texel: `levelsOf` drops the levels past it.
+- **Colour grading** (`LutEffect`): each colour of the screen, encoded in sRGB, is replaced by the colour a lookup
+  table holds for it, interpolated by the sampler of a 3D texture of N³ entries (`Texture3D`). The table is a strip of
+  its N slices side by side, N² pixels wide and N tall (1024 × 32 for 32³): the pixel `(r + b × N, g)` holds the
+  colour graded from `(r, g, b) / (N - 1)`, the first row on top. `tools/lut.py neutral res/lut/neutral.png` writes the
+  neutral table shipped in `res/lut`; a grade is made by grading a screenshot holding it in an image editor, then
+  cutting the table out (`tools/lut.py film` writes the grade of the demo).
+- **FXAA** (`FxaaEffect`): FXAA 3.11, its quality version at preset 12, on the colours of the screen after the tone
+  mapping, the edges found from their luma; it smooths everything drawn, so it runs after the effects changing the
+  colours (put it after a grading).
+
+A `Scene3D` of a `.gui` file describes its chain with `post: bloom, vignette(0.6, 0.35), lut("res:/lut/film.png"), fxaa,
+invert(off);`, the kinds of effects created by the `PostRegistry` of the widget manager (see `doc/gui.md`). The demo
+describes a bloom, a vignette, a filmic grading, FXAA and a disabled inversion in `res/config/app.gui`, `B`, `V`, `L`,
+`F` and `I` toggling them.

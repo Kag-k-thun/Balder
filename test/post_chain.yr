@@ -54,10 +54,21 @@ fn stageOf (plan : PostPlan, effect : [c8])-> PostStage {
 }
 
 /**
- * @returns: the graph of a scene, its g-buffer writing the depth and its composition the light, the passes of a plan
+ * @returns: the pass of a chain named name in the render graph, an empty pass if there is none
+ * */
+fn passOf (chain : &PostChain, name : [c8])-> PostPass {
+    for p in chain.passes (sources (), 32u32, 32u32) if p.name == name {
+        return p;
+    }
+
+    PostPass ()
+}
+
+/**
+ * @returns: the graph of a scene, its g-buffer writing the depth and its composition the light, the passes of a chain
  * declared after them in the subpass of the composition, and the screen reading the output
  * */
-fn graphOf (plan : PostPlan)-> dmut &RenderGraph
+fn graphOf (chain : &PostChain)-> dmut &RenderGraph
     throws BalderError
 {
     let dmut g = copy RenderGraph ("screen");
@@ -81,12 +92,12 @@ fn graphOf (plan : PostPlan)-> dmut &RenderGraph
                                uses-> copy [ResourceUse (resource-> "depth", usage-> Usage::SAMPLED_COMPUTE),
                                             ResourceUse (resource-> "radiance", usage-> Usage::STORAGE_WRITE)]));
 
-    for s in plan.stages {
-        if !s.last {
-            g:.createImage (s.output, s.image (32u32, 32u32));
+    for p in chain.passes (sources (), 32u32, 32u32) {
+        if !p.imported {
+            g:.createImage (p.output, p.image);
         }
 
-        g:.declarePass (s.toPass ("compose", none));
+        g:.declarePass (p.toPass ("compose", none));
     }
 
     alias g
@@ -155,7 +166,9 @@ __test the_spaces_place_the_effects_around_the_tone_mapping {
 
     let fog = stageOf (plan, "fog");
     assert (fog.input == "post_vignette_out_scene" && fog.reads == ["depth"]);
-    let uses = fog.uses ();
+    let fogPass = passOf (chain, "post_fog_scene");
+    assert (fogPass.textures == ["input", "depth"] && fogPass.images == ["post_vignette_out_scene", "depth"]);
+    let uses = fogPass.uses ();
     assert (uses.len == 3us);
     assert (uses [0].resource == "post_vignette_out_scene" && uses [0].usage == Usage::SAMPLED_COMPUTE);
     assert (uses [1].resource == "depth" && uses [1].usage == Usage::SAMPLED_COMPUTE);
@@ -232,7 +245,7 @@ __test the_render_graph_chains_the_passes {
     chain:.add (copy InvertEffect ());
     chain:.add (copy FogEffect ());
 
-    let g = graphOf (chain.plan (sources ()));
+    let g = graphOf (chain);
     let s = g.compile ();
     assert (passNames (s, "compose") == ["compose", "post_fog_scene", "post_tonemap_scene", "post_invert_scene"]);
 
@@ -270,4 +283,145 @@ __test the_registry_creates_the_described_effects {
     assert (!registry.create (PostDescription (kind-> "fog")).hasValue);
     registry:.register ("fog", |_|-> dmut &PostEffect => copy FogEffect ());
     assert (registry.has ("fog") && registry.create (PostDescription (kind-> "fog")).hasValue);
+}
+
+/**
+ * @returns: the names of the passes of a chain in the render graph, in their order
+ * */
+fn passNamesOf (chain : &PostChain)-> [[c8]] {
+    let mut result : [[c8]] = [];
+    for p in chain.passes (sources (), 32u32, 32u32) {
+        result = result ~ [p.name];
+    }
+
+    result
+}
+
+/**
+ * A bloom of n levels runs 2n passes: n downsamplings, each writing a level half the size of the one it reads, the
+ * first one reading the light; n - 1 upsamplings from the smallest level, each adding the blurred levels below to a level;
+ * and the pass of its stage adding the bloom to the light
+ * */
+__test the_bloom_downsamples_then_upsamples_its_levels {
+    let dmut chain = PostChain ();
+    chain:.add (copy BloomEffect (levels-> 3u32));
+
+    assert (passNamesOf (chain) == ["post_bloom_scene_down0", "post_bloom_scene_down1", "post_bloom_scene_down2",
+                                    "post_bloom_scene_up2", "post_bloom_scene_up1", "post_bloom_scene",
+                                    "post_tonemap_scene"]);
+
+    let down0 = passOf (chain, "post_bloom_scene_down0");
+    assert (down0.images == ["radiance"] && down0.textures == ["input"] && down0.output == "post_bloom_scene_mip1");
+    assert (down0.shader == 0us && down0.level == 0u32 && down0.index == 0us && !down0.imported);
+    assert (down0.image.width == 16u32 && down0.image.height == 16u32);
+    assert (down0.image.format == VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT && down0.image.storage);
+
+    let down2 = passOf (chain, "post_bloom_scene_down2");
+    assert (down2.images == ["post_bloom_scene_mip2"] && down2.output == "post_bloom_scene_mip3");
+    assert (down2.level == 2u32 && down2.image.width == 4u32);
+
+    let up2 = passOf (chain, "post_bloom_scene_up2");
+    assert (up2.textures == ["input", "low"] && up2.images == ["post_bloom_scene_mip2", "post_bloom_scene_mip3"]);
+    assert (up2.output == "post_bloom_scene_up2" && up2.shader == 1us && up2.level == 2u32 && up2.image.width == 8u32);
+
+    let up1 = passOf (chain, "post_bloom_scene_up1");
+    assert (up1.images == ["post_bloom_scene_mip1", "post_bloom_scene_up2"] && up1.image.width == 16u32);
+
+    let last = passOf (chain, "post_bloom_scene");
+    assert (last.images == ["radiance", "post_bloom_scene_up1"] && last.output == "post_bloom_out_scene");
+    assert (last.shader == 1us && last.level == 0u32 && last.index == 5us && last.image.width == 32u32);
+    assert (passOf (chain, "post_tonemap_scene").images == ["post_bloom_out_scene"]);
+}
+
+/**
+ * A bloom has at most its levels, fewer when a level would get under a texel, one at least
+ * */
+__test the_levels_of_a_bloom_fit_the_images {
+    let bloom = BloomEffect (levels-> 6u32);
+    assert (bloom.levelsOf (1280u32, 720u32) == 6u32);
+    assert (bloom.levelsOf (32u32, 32u32) == 5u32);
+    assert (bloom.levelsOf (32u32, 4u32) == 2u32);
+    assert (bloom.levelsOf (1u32, 1u32) == 1u32);
+    assert (BloomEffect (levels-> 0u32).levels == 1u32);
+
+    let dmut chain = PostChain ();
+    chain:.add (copy BloomEffect (levels-> 1u32));
+    assert (passNamesOf (chain) == ["post_bloom_scene_down0", "post_bloom_scene", "post_tonemap_scene"]);
+    assert (passOf (chain, "post_bloom_scene").images == ["radiance", "post_bloom_scene_mip1"]);
+}
+
+/**
+ * The render graph orders the passes of a bloom by the levels they read and write, each level sampled once written
+ * */
+__test the_render_graph_chains_the_levels_of_a_bloom {
+    let dmut chain = PostChain ();
+    chain:.add (copy BloomEffect (levels-> 2u32));
+    chain:.add (copy FxaaEffect ());
+    chain:.add (copy LutEffect ());
+
+    let s = graphOf (chain).compile ();
+    assert (passNames (s, "compose") == ["compose", "post_bloom_scene_down0", "post_bloom_scene_down1",
+                                         "post_bloom_scene_up1", "post_bloom_scene", "post_tonemap_scene",
+                                         "post_fxaa_scene", "post_lut_scene"]);
+
+    for link in [("post_bloom_scene_down1", "post_bloom_scene_mip1"),
+                 ("post_bloom_scene_up1", "post_bloom_scene_mip2"),
+                 ("post_bloom_scene", "post_bloom_scene_up1"),
+                 ("post_tonemap_scene", "post_bloom_out_scene")] {
+        let read = barrierOf (s, link._0, link._1);
+        assert (read.srcStage == COMPUTE && read.srcAccess == SHADER_WRITE && read.dstStage == COMPUTE);
+        assert (read.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    // the grading, last, stores the output
+    assert (barrierOf (s, "post_lut_scene", "output").newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+}
+
+/**
+ * The anti-aliasing and the grading run in display space after the tone mapping, in the order they were added, the
+ * bloom in HDR space before it
+ * */
+__test the_effects_of_balder_take_their_space {
+    let dmut chain = PostChain ();
+    chain:.add (copy LutEffect ());
+    chain:.add (copy FxaaEffect ());
+    chain:.add (copy BloomEffect ());
+
+    assert (effectsOf (chain.plan (sources ())) == ["bloom", "tonemap", "lut", "fxaa"]);
+    let fxaa = stageOf (chain.plan (sources ()), "fxaa");
+    assert (fxaa.input == "post_lut_out_scene" && fxaa.output == "output" && fxaa.last);
+    assert (passOf (chain, "post_fxaa_scene").imported);
+}
+
+/**
+ * The registry creates the anti-aliasing, the bloom and the grading with their numbers and their texts
+ * */
+__test the_registry_creates_the_effects_of_balder {
+    let registry = PostRegistry ();
+
+    if let Ok (f : &FxaaEffect) = registry.create (PostDescription (kind-> "fxaa", params-> copy [0.5f])) {
+        assert (f.subpix == 0.5f && f.edgeThreshold == 0.166f && f.edgeThresholdMin == 0.0833f);
+        assert (f.space == PostSpace::DISPLAY);
+    } else {
+        assert (false);
+    }
+
+    if let Ok (b : &BloomEffect) = registry.create (PostDescription (kind-> "bloom", params-> copy [1.5f, 0.2f, 0.1f, 2.0f, 4.0f])) {
+        assert (b.threshold == 1.5f && b.knee == 0.2f && b.intensity == 0.1f && b.radius == 2.0f && b.levels == 4u32);
+        assert (b.space == PostSpace::HDR);
+    } else {
+        assert (false);
+    }
+
+    if let Ok (l : &LutEffect) = registry.create (PostDescription (kind-> "lut", params-> copy [0.5f], texts-> copy ["res:/lut/film.png"])) {
+        assert (l.path == "res:/lut/film.png" && l.contribution == 0.5f && l.space == PostSpace::DISPLAY);
+    } else {
+        assert (false);
+    }
+
+    if let Ok (l : &LutEffect) = registry.create (PostDescription (kind-> "lut")) {
+        assert (l.path == NEUTRAL_LUT && l.contribution == 1.0f);
+    } else {
+        assert (false);
+    }
 }

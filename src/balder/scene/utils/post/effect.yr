@@ -5,62 +5,69 @@ use balder::core::{_, application::_};
 use balder::core::config::shader::_;
 use balder::core::shader::{_, buffers::_};
 use balder::scene::node::node3D::camera;
-use balder::scene::utils::post::{input, space};
+use balder::scene::utils::post::{input, pass, space, stage};
 
 use ::vulkan::core;
 
 /**
  * The images of the shader of a post effect, besides those of the g-buffer it reads (see PostInput)
  * */
-enum PostBindings : [c8]
+pub enum PostBindings : [c8]
 | INPUT  = "input"   // the texture of the image the pass before it wrote
 | OUTPUT = "output"; // the storage texture of the image it writes
 
 /**
- * A post effect: a fullscreen compute pass of the post-process chain of a scene (see PostChain), reading the image the
- * pass before it wrote and writing its own, read by the pass after it
+ * A post effect: the fullscreen compute passes of a stage of the post-process chain of a scene (see PostChain), reading
+ * the image the stage before it wrote and writing its own, read by the stage after it
  * @info:
  * =====
  * The effect declares the space of the colours it reads and writes (see PostSpace), the images of the g-buffer it reads
- * besides (see PostInput), the configuration of its compute shader, and the size of its parameters; the chain declares
- * it as a pass of the render graph, which derives its barriers and allocates the image it writes.
- * Its shader binds, in its global set:
- *   - `input`, a texture: the image the pass before it wrote
- *   - `output`, a storage texture: the image it writes, rgba16f in HDR space, rgba8 in display space
+ * besides (see PostInput), the configurations of its compute shaders, the size of its parameters, and its passes (see
+ * passes): one by default, dispatching its first shader. The chain declares the passes in the render graph, which
+ * derives their barriers and allocates the images they write.
+ * Its shaders bind, in their global set:
+ *   - `input`, a texture: the image the stage before it wrote
+ *   - `output`, a storage texture: the image the pass writes, rgba16f in HDR space, rgba8 in display space
  *   - `depth`, `normals`, textures: the images of the g-buffer it reads
  *   - `params`, a uniform buffer: its parameters, written by writeParams, when their size is not 0
  *   - `camera`, a uniform buffer: the camera of the scene, when it reads it
+ *   - `level`, a push constant: the level of the pass (see PostPass), when they take one
  * ====
  * */
 @abstract
 pub class PostEffect {
 
-    // The name of the effect, unique in its chain, naming its pass and the image it writes in the render graph
+    // The name of the effect, unique in its chain, naming its passes and the images they write in the render graph
     let _name : [c8];
 
     // The space of the colours the effect reads and writes
     let _space : PostSpace;
 
-    // The configuration of the compute shader of the effect
-    let _shaderPath : [c8];
+    // The configurations of the compute shaders of the effect
+    let _shaderPaths : [[c8]];
 
-    // The images of the g-buffer the effect reads besides the image the pass before it wrote
+    // The images of the g-buffer the effect reads besides the image the stage before it wrote
     let _reads : [PostInput];
 
     // The size of the parameters of the effect, 0 for none
     let _paramsSize : usize;
 
-    // True iif the shader of the effect reads the camera
+    // True iif shaders of the effect read the camera, those declaring it
     let _readsCamera : bool;
 
     prot { // pipeline
 
-        let dmut _shader : (&RefCount!{&Shader})? = none;
-        let dmut _computeShader : (&ComputeShader)? = none;
-        let dmut _set : (&DescriptorSet)? = none;
+        let dmut _shaders : [&RefCount!{&Shader}] = [];
+        let dmut _computeShaders : [&ComputeShader] = [];
 
-        // The parameters of the effect, read by its shader
+        // The descriptor set of each pass, by its place among the passes of the effect
+        let dmut _sets : [usize => &DescriptorSet] = copy [];
+
+        // The parameters of the effect, read by its shaders
         let dmut _params : (&UniformBufferObject)? = none;
+
+        // The camera of the scene, read by the shaders declaring it
+        let dmut _camera : (&Camera)? = none;
 
         // The window the effect is configured for
         let dmut _window : (&Window)? = none;
@@ -75,6 +82,7 @@ pub class PostEffect {
      */
 
     /**
+     * An effect of one compute shader
      * @params:
      *    - name: the name of the effect, unique in its chain
      *    - space: the space of the colours the effect reads and writes
@@ -91,7 +99,28 @@ pub class PostEffect {
                readsCamera : bool = false)
         with _name = name
         , _space = space
-        , _shaderPath = shaderPath
+        , _shaderPaths = copy [shaderPath]
+        , _reads = reads
+        , _paramsSize = paramsSize
+        , _readsCamera = readsCamera
+    {}
+
+    /**
+     * An effect of several compute shaders, dispatched by its passes (see passes)
+     * @params:
+     *    - shaderPaths: the configurations of its compute shaders, a pass naming its shader by its place among them
+     *    - paramsSize: the size of its parameters, the params block of its shaders
+     *    - readsCamera: true iif shaders read the camera, those declaring it
+     * */
+    prot self (name : [c8],
+               space : PostSpace,
+               shaderPaths : [[c8]],
+               reads : [PostInput] = [],
+               paramsSize : usize = 0us,
+               readsCamera : bool = false)
+        with _name = name
+        , _space = space
+        , _shaderPaths = shaderPaths
         , _reads = reads
         , _paramsSize = paramsSize
         , _readsCamera = readsCamera
@@ -106,52 +135,72 @@ pub class PostEffect {
      */
 
     /**
-     * Load the compute shader of the effect, and the uniform buffer of its parameters
+     * Load the compute shaders of the effect, and the uniform buffer of its parameters
      * */
     pub fn configure (mut self, dmut win : &Window)
         throws BalderError
     {
-        let dmut shader = win:.loadResource!{&ComputeShader} (self._shaderPath);
-        self._shader = (alias shader)?;
+        for path in self._shaderPaths {
+            let dmut shader = win:.loadResource!{&ComputeShader} (path);
+            self._shaders ~= [alias shader];
 
-        if let Ok (dmut c : &ComputeShader) = (alias shader:.get ())? {
-            self._computeShader = (alias c)?;
-        }
-
-        {
-            let dmut set = shader:.get ():.allocateDescriptorSet (DescriptorContext::GLOBAL);
-            self._set = (alias set)?;
-
-            if self._paramsSize != 0us {
-                let dmut ubo = copy UniformBufferObject (alias win:.getVulkanDevice (), self._paramsSize);
-                self._params = (alias ubo)?;
-                self.writeParams (alias ubo);
-                set:.setUniform (UniformNames::PARAMS, ubo);
-            }
-        } catch {
-            err => {
-                log::error #("PostEffect", "Malformed shader of the effect", self._name, err);
+            if let Ok (dmut c : &ComputeShader) = (alias shader:.get ())? {
+                self._computeShaders ~= [alias c];
+            } else {
+                log::error #("PostEffect", "Malformed shader of the effect", self._name, path);
                 throw copy BalderError ("Failed to configure the post effect " ~ self._name);
             }
+        }
+
+        if self._paramsSize != 0us {
+            let dmut ubo = copy UniformBufferObject (alias win:.getVulkanDevice (), self._paramsSize);
+            self._params = (alias ubo)?;
+            self.writeParams (alias ubo);
         }
 
         self._window = (alias win)?;
     }
 
     /**
-     * Read the camera of the scene, when the shader of the effect reads it
+     * Allocate the descriptor set of a pass of the effect, binding the parameters and the camera when its shader declares
+     * them
+     * @assume: the effect is configured
      * */
-    pub fn setCamera (mut self, dmut cam : &Camera) {
-        if !self._readsCamera { return; }
-        if let Ok (dmut set) = alias self._set {
-            if let Ok (dmut ubo) = alias cam:.getUBO () {
-                set:.setUniform (UniformNames::CAMERA, ubo);
+    pub fn prepare (mut self, pass : PostPass)
+        throws BalderError
+    {
+        if self._sets [pass.index].hasValue { return; }
+        if pass.shader >= self._shaders.len {
+            throw copy BalderError ("The post effect " ~ self._name ~ " has no shader " ~ std::conv::to!{[c8]} (pass.shader));
+        }
+
+        let dmut set = self._shaders [pass.shader]:.get ():.allocateDescriptorSet (DescriptorContext::GLOBAL);
+        if let Ok (dmut ubo) = alias self._params {
+            if declares (set:.getShader (), UniformNames::PARAMS) {
+                set:.setUniform (UniformNames::PARAMS, ubo);
             }
+        }
+
+        self._sets [pass.index] = alias set;
+        if let Ok (dmut cam) = alias self._camera {
+            self:.bindCamera (alias set, alias cam);
         }
     }
 
     /**
-     * Write the parameters of the effect in the uniform buffer its shader reads, when it is configured and when they
+     * Read the camera of the scene, in the shaders of the effect declaring it when it reads it
+     * */
+    pub fn setCamera (mut self, dmut cam : &Camera) {
+        if !self._readsCamera { return; }
+
+        self._camera = (alias cam)?;
+        for _, dmut set in alias self._sets {
+            self:.bindCamera (alias set, alias cam);
+        }
+    }
+
+    /**
+     * Write the parameters of the effect in the uniform buffer its shaders read, when it is configured and when they
      * change (see updateParams)
      * @params:
      *    - ubo: the uniform buffer, of the size of the parameters
@@ -166,6 +215,14 @@ pub class PostEffect {
             self.writeParams (alias ubo);
         }
     }
+
+    /**
+     * Bind the textures of the effect besides the images of the render graph (a LUT), when a frame records a pass
+     * @params:
+     *    - set: the descriptor set of the pass
+     *    - frame: the frame recorded
+     * */
+    prot fn bindTextures (self, dmut _ : &DescriptorSet, _ : PostPass, _ : i32) {}
 
     /*!
      * ====================================================================================================
@@ -192,7 +249,7 @@ pub class PostEffect {
     }
 
     /**
-     * @returns: the images of the g-buffer the effect reads besides the image the pass before it wrote
+     * @returns: the images of the g-buffer the effect reads besides the image the stage before it wrote
      * */
     @field
     pub fn reads (self)-> [PostInput] {
@@ -200,24 +257,50 @@ pub class PostEffect {
     }
 
     /**
-     * @returns: true iif the compute shader of the effect is loaded
+     * @returns: true iif the compute shaders of the effect are loaded
      * */
     @field
     pub fn isConfigured (self)-> bool {
-        self._computeShader.hasValue
+        self._computeShaders.len != 0us && self._computeShaders.len == self._shaderPaths.len
     }
 
     /**
-     * @returns: the group size of the compute shader of the effect
+     * @returns: the group size of a compute shader of the effect
+     * @params:
+     *    - shader: the place of the shader among the shaders of the effect
      * */
-    @field
-    pub fn groupSizes (self)-> [u32 ; 3] {
-        if let Ok (sh) = self._computeShader {
-            return sh.getGroupSizes ();
+    pub fn groupSizes (self, shader : usize)-> [u32 ; 3] {
+        if shader < self._computeShaders.len {
+            return self._computeShaders [shader].getGroupSizes ();
         }
 
         log::error #("PostEffect", "Problem of configuration of", self._name);
         panic;
+    }
+
+    /**
+     * @returns: the passes of the effect in a stage of the chain, in the order they run; one by default, dispatching the
+     * first shader, binding the image the stage before it wrote to `input` and the images of the g-buffer it reads to
+     * theirs, and writing the image of the stage
+     * @params:
+     *    - stage: the stage of the effect
+     *    - width, height: the size of the images of the chain
+     * */
+    pub fn passes (self, stage : PostStage, width : u32, height : u32)-> [PostPass] {
+        let input : [c8] = PostBindings::INPUT;
+        let mut textures : [[c8]] = copy [input];
+        for r in self._reads {
+            let name : [c8] = r;
+            textures = textures ~ [name];
+        }
+
+        copy [PostPass (effect-> self._name,
+                        name-> stage.pass,
+                        textures-> textures,
+                        images-> [stage.input] ~ stage.reads,
+                        output-> stage.output,
+                        image-> stage.image (width, height),
+                        imported-> stage.last)]
     }
 
     /*!
@@ -229,33 +312,48 @@ pub class PostEffect {
      */
 
     /**
-     * Bind the images of a frame, and select the compute shader and the descriptor set for the next dispatch
+     * Bind the images of a frame, and select the compute shader of a pass and its descriptor set for its dispatch
      * @params:
-     *    - input: the image the pass before the effect wrote
-     *    - output: the image the effect writes
-     *    - reads: the images of the g-buffer the effect reads, in the order of reads
+     *    - pass: the pass dispatched, prepared
+     *    - images: the textures of the images the pass samples, in the order of its images
+     *    - output: the image the pass writes
      * */
-    pub fn select (mut self, frame : u32, cmd : VkCommandBuffer, input : &Texture, output : &Texture, reads : [&Texture]) {
-        let dmut set = (if let Ok (dmut s) = alias self._set {
+    pub fn select (mut self, frame : u32, cmd : VkCommandBuffer, pass : PostPass, images : [&Texture], output : &Texture) {
+        let dmut set = (if let Ok (dmut s) = alias self._sets [pass.index] {
             alias s
         } else {
-            log::error #("PostEffect", "Descriptor set malformed", self._name);
+            log::error #("PostEffect", "The pass", pass.name, "is not prepared");
             return;
         });
 
         let f = cast!i32 (frame);
-        set:.setTexture (PostBindings::INPUT, input, frame-> f);
-        set:.setStorageTexture (PostBindings::OUTPUT, output, frame-> f);
-        for i, r in self._reads {
-            set:.setTexture (r, reads [i], frame-> f);
+        for i, t in pass.textures {
+            set:.setTexture (t, images [i], frame-> f);
         }
 
-        set.select (frame, cmd);
-        if let Ok (dmut sh) = alias self._computeShader {
+        set:.setStorageTexture (PostBindings::OUTPUT, output, frame-> f);
+        self.bindTextures (alias set, pass, f);
+
+        if pass.shader < self._computeShaders.len {
+            let dmut sh = alias self._computeShaders [pass.shader];
             sh.select (cmd);
+            set.select (frame, cmd);
+            if sh.getPushConstantInfo (UniformNames::LEVEL).hasValue {
+                sh:.setPush (cmd, UniformNames::LEVEL, pass.level);
+            }
         } else {
             log::error #("PostEffect", "Problem of configuration of", self._name);
             panic;
+        }
+    }
+
+    /**
+     * Bind the uniform buffer of a camera to a descriptor set whose shader declares it
+     * */
+    fn bindCamera (mut self, dmut set : &DescriptorSet, dmut cam : &Camera) {
+        if !declares (set:.getShader (), UniformNames::CAMERA) { return; }
+        if let Ok (dmut ubo) = alias cam:.getUBO () {
+            set:.setUniform (UniformNames::CAMERA, ubo);
         }
     }
 
@@ -270,12 +368,12 @@ pub class PostEffect {
     impl Disposable {
 
         /**
-         * Release the shader of the effect, its descriptor set and its uniform buffer, retired with the frames recorded
+         * Release the shaders of the effect, its descriptor sets and its uniform buffer, retired with the frames recorded
          * with them (an effect removed from a running chain); the effect can be configured again
          * */
         pub over dispose (mut self) {
             if let Ok (dmut win) = alias self._window {
-                if let Ok (dmut s) = alias self._set {
+                for _, dmut s in alias self._sets {
                     win:.retire (alias s);
                 }
 
@@ -283,18 +381,31 @@ pub class PostEffect {
                     win:.retire (alias ubo);
                 }
 
-                if let Ok (dmut shader) = alias self._shader {
-                    win:.retire (alias shader);
+                for i in 0us .. self._shaders.len {
+                    win:.retire (alias self._shaders [i]);
                 }
-            } else if let Ok (dmut shader) = alias self._shader {
-                shader:.dispose ();
+            } else {
+                for i in 0us .. self._shaders.len {
+                    self._shaders [i]:.dispose ();
+                }
             }
 
-            self._shader = none;
-            self._computeShader = none;
-            self._set = none;
+            self._shaders = [];
+            self._computeShaders = [];
+            self._sets = copy [];
             self._params = none;
             self._window = none;
         }
     }
+}
+
+/**
+ * @returns: true iif the global set of a shader declares a uniform buffer
+ * */
+fn declares (shader : &Shader, uniform : [c8])-> bool {
+    if let Ok (info) = shader.getDescriptorSetInfo (DescriptorContext::GLOBAL) {
+        return info.uniforms [uniform].hasValue;
+    }
+
+    false
 }
