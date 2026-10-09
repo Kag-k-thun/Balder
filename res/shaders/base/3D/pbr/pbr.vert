@@ -1,0 +1,77 @@
+#version 450 core
+
+layout (location = 0) in vec3 inPosition;
+layout (location = 1) in vec3 inNormals;
+
+// The tangent, along the growing u of the texture coordinates, and in w the handedness of the tangent space (see the
+// fragment shader)
+layout (location = 2) in vec4 inTangents;
+layout (location = 3) in vec2 inUV;
+
+layout(set = 1, binding = 0) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+} camera;
+
+// The data of an object, in the slot given by the words of its instances (see the draws of IndexedMesh3D)
+struct Object {
+    mat4 model;
+
+    // The progress of the cross-fade between two levels of detail of the mesh, from 0 to 1
+    float fade;
+
+    // The index of the material of the object in the composition pass
+    uint material;
+
+    // The center and the half size along each axis of the box enclosing the object in world space, read by the cull
+    // pass of the scene (an empty box has a negative extent)
+    vec4 boxCenter;
+    vec4 boxExtent;
+};
+
+layout (std430, set = 0, binding = 0) readonly buffer Objects {
+    Object objects [];
+};
+
+// The word of each instance drawn: the slot of its object above the two low bits, and in them the role of the draw
+layout (std430, set = 0, binding = 1) readonly buffer Instances {
+    uint instances [];
+};
+
+layout (location = 0) out vec3 outNormals;
+layout (location = 1) out vec2 outUV;
+
+// The cross-fade of the draw: .x its progress, .y the role of the draw, the two low bits of its word (0 for a level
+// drawn alone, 1 for the outgoing level of a cross-fade, 2 for the incoming one)
+layout (location = 2) flat out vec2 outFade;
+
+// The material of the object
+layout (location = 3) flat out uint outMaterial;
+
+// The tangent in world space, its handedness in w
+layout (location = 4) out vec4 outTangents;
+
+// Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
+out gl_PerVertex {
+    invariant vec4 gl_Position;
+};
+
+void main () {    
+    uint word = instances [gl_InstanceIndex];
+    Object object = objects [word >> 2];
+
+    vec4 viewPos = camera.view * object.model * vec4 (inPosition, 1.0);
+    gl_Position = camera.proj * viewPos;
+    
+    // the normals of the object turned into world space, by the inverse transpose of its world so a non uniform scale
+    // keeps them perpendicular to its surface
+    outNormals = transpose (inverse (mat3 (object.model))) * inNormals;
+
+    // the tangents lie in the surface, turned by its world as its positions are
+    outTangents = vec4 (mat3 (object.model) * inTangents.xyz, inTangents.w);
+    outUV = inUV;
+    outFade = vec2 (object.fade, float (word & 3u));
+    outMaterial = object.material;
+}
