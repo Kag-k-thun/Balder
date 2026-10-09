@@ -1,0 +1,512 @@
+in chain;
+
+use balder::utils;
+use balder::core::{_, application::_};
+use balder::core::driver::{cmd_alloc, subpass};
+use balder::core::shader::texture;
+use balder::scene::node::node3D::camera;
+use balder::scene::utils::post::{effect, plan, sources, stage, tonemap};
+
+use ::vulkan::core;
+
+/**
+ * The post-process chain of a scene: the ordered list of the fullscreen passes between its composition and the screen,
+ * each reading the image the pass before it wrote
+ * @info:
+ * =====
+ * The effects in HDR space run before the tone mapping, in their order, and the effects in display space after it, in
+ * their order (see PostPlan); the last pass writes the output of the scene, read by the screen. Each pass is declared in
+ * the render graph of the window, recorded in the subpass of the composition, and each image between two passes is a
+ * transient image of the graph.
+ * Adding, removing, moving, enabling or disabling an effect declares the passes again, the graph being compiled again
+ * at the next frame; an effect disabled is skipped, the pass after it reading the image the pass before it wrote.
+ * ====
+ * */
+@final
+pub class PostChain {
+
+    // The effects, in the order they run within their space
+    let dmut _effects : [&PostEffect] = [];
+
+    // True for the effects that run, in the order of the effects
+    let mut _enabled : [bool] = [];
+
+    // The tone mapping, between the effects in HDR space and those in display space
+    let dmut _tonemap : &ToneMapEffect;
+
+    // The window of the scene, none while the chain is not configured
+    let dmut _window : (&Window)? = none;
+
+    // The subpass recording the passes, the one of the composition
+    let dmut _pass : (&ComputeSubpass)? = none;
+
+    // The output of the scene, written by the last pass and read by the screen
+    let dmut _output : (&RefCount!{&Texture})? = none;
+    let dmut _outputTexture : (&OutputTexture)? = none;
+
+    // The camera of the scene, read by the effects reading it
+    let dmut _camera : (&Camera)? = none;
+
+    // The names of the images around the chain in the render graph
+    let mut _sources : PostSources = PostSources ();
+
+    // The size of the images of the chain
+    let mut _width : u32 = 0u32;
+    let mut _height : u32 = 0u32;
+
+    // The stages declared in the render graph, removed when the chain changes
+    let mut _declared : PostPlan = PostPlan ();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A chain with the tone mapping alone
+     * */
+    pub self ()
+        with _tonemap = copy ToneMapEffect ()
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CONFIGURE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the output of the scene, read by the screen, configure the effects, and declare their passes in the render
+     * graph of a window
+     * @info: the output is written in sRGB through a unorm view, the screen sampling it through an sRGB view decoding it
+     * @params:
+     *    - pass: the subpass recording the passes, named sources.submission
+     *    - sources: the names of the images around the chain
+     * @assume: called between Window::lockFrame and unlockFrame
+     * */
+    pub fn configure (mut self, dmut win : &Window, dmut pass : &ComputeSubpass, sources : PostSources, width : u32, height : u32)
+        throws BalderError
+    {
+        let dmut output = copy OutputTexture (alias win:.getVulkanDevice (),
+                                              VkFormat::VK_FORMAT_R8G8B8A8_UNORM,
+                                              width,
+                                              height,
+                                              forStorage-> true,
+                                              sampledFormat-> (VkFormat::VK_FORMAT_R8G8B8A8_SRGB)?);
+        self._output = (alias win:.insertResource (alias output))?;
+        self._outputTexture = (alias output)?;
+
+        let dmut pipeline = win:.getVulkanPipeline ();
+        pipeline:.importImage (sources.output, alias output);
+        pipeline:.readOnScreen (sources.output);
+
+        self._window = (alias win)?;
+        self._pass = (alias pass)?;
+        self._sources = sources;
+        self._width = width;
+        self._height = height;
+
+        self._tonemap:.configure (alias win);
+        for i in 0us .. self._effects.len {
+            self._effects [i]:.configure (alias win);
+        }
+
+        if let Ok (dmut cam) = alias self._camera {
+            self:.setCamera (alias cam);
+        }
+
+        self:.declare ();
+    }
+
+    /**
+     * Read the camera of the scene in the effects reading it, those added afterwards too
+     * */
+    pub fn setCamera (mut self, dmut cam : &Camera) {
+        self._camera = (alias cam)?;
+        self._tonemap:.setCamera (alias cam);
+        for i in 0us .. self._effects.len {
+            self._effects [i]:.setCamera (alias cam);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          EFFECTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add an effect after the effects of its space
+     * @params:
+     *    - enabled: false to add the effect skipped, until enable
+     * @throws: if an effect of the chain, the tone mapping included, has its name
+     * */
+    pub fn add (mut self, dmut effect : &PostEffect, enabled : bool = true)
+        throws BalderError
+    {
+        if effect.name == self._tonemap.name || self.indexOf (effect.name).hasValue {
+            throw copy BalderError ("A post effect is already named " ~ effect.name);
+        }
+
+        if let Ok (dmut win) = alias self._window {
+            effect:.configure (alias win);
+            if let Ok (dmut cam) = alias self._camera {
+                effect:.setCamera (alias cam);
+            }
+        }
+
+        self._effects ~= [alias effect];
+        self._enabled = self._enabled ~ [enabled];
+        self:.rebuild ();
+    }
+
+    /**
+     * Remove an effect, released once its pass is removed
+     * @returns: true iif the chain had an effect of that name
+     * */
+    pub fn remove (mut self, name : [c8])-> bool {
+        let i = if let Ok (i) = self.indexOf (name) { i } else { return false; };
+
+        let dmut effect = alias self._effects [i];
+        self._effects = alias (self._effects [0us .. i] ~ self._effects [i + 1us .. $]);
+        self._enabled = self._enabled [0us .. i] ~ self._enabled [i + 1us .. $];
+        self:.rebuild ();
+
+        effect:.dispose ();
+        true
+    }
+
+    /**
+     * Move an effect to another place in the chain, the order of the effects of its space being the order they run in
+     * @params:
+     *    - index: the place of the effect among the effects of the chain, the last place when farther
+     * @returns: true iif the chain had an effect of that name
+     * */
+    pub fn reorder (mut self, name : [c8], index : usize)-> bool {
+        let i = if let Ok (i) = self.indexOf (name) { i } else { return false; };
+
+        let dmut effect = alias self._effects [i];
+        let enabled = self._enabled [i];
+        let dmut effects = alias (self._effects [0us .. i] ~ self._effects [i + 1us .. $]);
+        let mut flags = self._enabled [0us .. i] ~ self._enabled [i + 1us .. $];
+
+        let at = if index > effects.len { effects.len } else { index };
+        self._effects = alias (effects [0us .. at] ~ [alias effect] ~ effects [at .. $]);
+        self._enabled = flags [0us .. at] ~ [enabled] ~ flags [at .. $];
+        self:.rebuild ();
+        true
+    }
+
+    /**
+     * Enable an effect, or skip it, the pass after it reading the image the pass before it wrote
+     * @returns: true iif the chain had an effect of that name
+     * */
+    pub fn enable (mut self, name : [c8], enabled : bool)-> bool {
+        let i = if let Ok (i) = self.indexOf (name) { i } else { return false; };
+        if self._enabled [i] != enabled {
+            self._enabled = self._enabled [0us .. i] ~ [enabled] ~ self._enabled [i + 1us .. $];
+            self:.rebuild ();
+        }
+
+        true
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the effects, in the order they run within their space, the tone mapping excluded
+     * */
+    @field
+    pub fn effects (self)-> [&PostEffect] {
+        self._effects
+    }
+
+    /**
+     * @returns: the effect of the chain named name, the tone mapping excluded, none if there is none
+     * */
+    pub fn get (mut self, name : [c8])-> dmut (&PostEffect)? {
+        if let Ok (i) = self.indexOf (name) {
+            return (alias self._effects [i])?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif the chain has an effect named name that runs
+     * */
+    pub fn isEnabled (self, name : [c8])-> bool {
+        if let Ok (i) = self.indexOf (name) {
+            return self._enabled [i];
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the tone mapping, between the effects in HDR space and those in display space
+     * */
+    @field
+    pub fn tonemap (mut self)-> dmut &ToneMapEffect {
+        alias self._tonemap
+    }
+
+    /**
+     * @returns: the tone mapping, between the effects in HDR space and those in display space
+     * */
+    @field
+    pub fn tonemap (self)-> &ToneMapEffect {
+        self._tonemap
+    }
+
+    /**
+     * @returns: the stages of the effects that run, the tone mapping included, around the images of the sources the
+     * chain is configured with
+     * */
+    pub fn plan (self)-> PostPlan {
+        self.plan (self._sources)
+    }
+
+    /**
+     * @returns: the stages of the effects that run, the tone mapping included, around the images of sources
+     * */
+    pub fn plan (self, sources : PostSources)-> PostPlan {
+        let mut running : [&PostEffect] = [];
+        for i, e in self._effects if self._enabled [i] {
+            running = running ~ [e];
+        }
+
+        PostPlan (running, self._tonemap, sources)
+    }
+
+    /**
+     * @returns: the output of the scene, written by the last pass of the chain
+     * */
+    @field
+    pub fn output (mut self)-> dmut &RefCount!{&Texture} {
+        if let Ok (dmut out) = alias self._output {
+            return alias out;
+        }
+
+        log::error #("PostChain", "Problem of configuration");
+        panic;
+    }
+
+    /**
+     * @returns: the place of the effect named name in the chain, none if there is none
+     * */
+    fn indexOf (self, name : [c8])-> (usize)? {
+        for i, e in self._effects if e.name == name {
+            return i?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the effect of the chain named name, the tone mapping included
+     * */
+    fn effect (mut self, name : [c8])-> dmut (&PostEffect)? {
+        if name == self._tonemap.name {
+            return (alias self._tonemap)?;
+        }
+
+        alias self:.get (name)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          RENDER GRAPH          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Declare the passes of the chain and the images between them in the render graph, recorded in the subpass of the
+     * composition
+     * */
+    fn declare (mut self)
+        throws BalderError
+    {
+        let plan = self.plan ();
+        self._declared = plan;
+
+        if let Ok (dmut win) = alias self._window {
+            if let Ok (dmut pass) = alias self._pass {
+                if let Ok (dmut output) = alias self._outputTexture {
+                    let dmut pipeline = win:.getVulkanPipeline ();
+                    for s in plan.stages {
+                        if !s.last {
+                            pipeline:.createImage (s.output, s.image (self._width, self._height));
+                        }
+
+                        if let Ok (dmut effect) = alias self:.effect (s.effect) {
+                            let dmut rec = copy PostRecorder (alias effect, s, alias pass, alias win, alias output);
+                            pipeline:.declarePass (s.toPass (self._sources.submission, (&rec:.dispatch)?));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Remove the passes of the chain and the images between them from the render graph
+     * */
+    fn undeclare (mut self) {
+        if let Ok (dmut win) = alias self._window {
+            let dmut pipeline = win:.getVulkanPipeline ();
+            for s in self._declared.stages {
+                pipeline:.removePass (s.pass);
+                if !s.last {
+                    pipeline:.removeResource (s.output);
+                }
+            }
+        }
+
+        self._declared = PostPlan ();
+    }
+
+    /**
+     * Declare the passes of the chain again after it changed, the render graph being compiled again at the next frame
+     * */
+    fn rebuild (mut self) {
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else { return; };
+
+        win:.lockFrame ();
+        {
+            self:.undeclare ();
+            self:.declare ();
+        } catch {
+            err => {
+                log::error #("PostChain", "Failed to declare the post-process chain", err);
+            }
+        } exit {
+            win:.unlockFrame ();
+        }
+
+        win:.redrawPipeline ();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+
+        /**
+         * Remove the passes and the output from the render graph, and release the effects; the effects stay in the
+         * chain, configured again with it
+         * */
+        pub over dispose (mut self) {
+            self:.undeclare ();
+            if let Ok (dmut win) = alias self._window {
+                let dmut pipeline = win:.getVulkanPipeline ();
+                pipeline:.stopReadingOnScreen (self._sources.output);
+                pipeline:.removeResource (self._sources.output);
+            }
+
+            self._tonemap:.dispose ();
+            for i in 0us .. self._effects.len {
+                self._effects [i]:.dispose ();
+            }
+
+            if let Ok (dmut output) = alias self._output {
+                output:.dispose ();
+            }
+
+            self._output = none;
+            self._outputTexture = none;
+            self._pass = none;
+            self._window = none;
+        }
+    }
+}
+
+/**
+ * The recording of a stage of a chain: the images of the frame bound, and the effect dispatched over the image it writes
+ * */
+class PostRecorder {
+
+    let dmut _effect : &PostEffect;
+
+    let _stage : PostStage;
+
+    // The subpass recording the stage
+    let dmut _pass : &ComputeSubpass;
+
+    let dmut _window : &Window;
+
+    // The output of the scene, written by the last stage
+    let dmut _output : &OutputTexture;
+
+    pub self (dmut effect : &PostEffect, stage : PostStage, dmut pass : &ComputeSubpass, dmut win : &Window, dmut output : &OutputTexture)
+        with _effect = alias effect
+        , _stage = stage
+        , _pass = alias pass
+        , _window = alias win
+        , _output = alias output
+    {}
+
+    /**
+     * Record the dispatch of the effect, reading and writing the transient images of the render graph compiled last
+     * */
+    pub fn dispatch (mut self) {
+        let frame = self._pass.getCurrentFrame ();
+        let cmdV = self._pass.getDrawingCommandBuffer ();
+        let dmut pipeline = self._window:.getVulkanPipeline ();
+
+        let input = if let Ok (t) = pipeline:.getTexture (self._stage.input) { t } else {
+            log::error #("PostChain", "The image", self._stage.input, "is not allocated");
+            return;
+        };
+
+        let output = if self._stage.last { self._output } else if let Ok (t) = pipeline:.getTexture (self._stage.output) { t } else {
+            log::error #("PostChain", "The image", self._stage.output, "is not allocated");
+            return;
+        };
+
+        let mut reads : [&Texture] = [];
+        for r in self._stage.reads {
+            if let Ok (t) = pipeline:.getTexture (r) {
+                let tex : &Texture = t;
+                reads = reads ~ [tex];
+            } else {
+                log::error #("PostChain", "The image", r, "is not allocated");
+                return;
+            }
+        }
+
+        let dmut cmd = copy ComputeDispatchCommandAllocator (alias self._pass);
+        let sizes = self._effect.groupSizes;
+        {
+            cmd:.registerDispatch (groupX-> sizes [0], groupY-> sizes [1], groupZ-> sizes [2]);
+            cmd:.finalizeRegister ();
+
+            self._effect:.select (frame, cmdV, input, output, reads);
+            cmd:.dispatchNext ();
+        } catch {
+            err => {
+                log::error #("PostChain", "Failed to call the shader of the effect", self._effect.name, err);
+            }
+        }
+    }
+}
