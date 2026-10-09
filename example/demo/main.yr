@@ -7,6 +7,7 @@ use balder::interface::_;
 use balder::interface::widget;
 use balder::interface::widget::{button, layout::_, text::_};
 use balder::scene::node::{_, node3D::_, node3D::camera, node3D::visual::_, node3D::visual::material::_};
+use balder::scene::utils::tonemap::operator;
 use balder::utils;
 use balder::utils::path;
 
@@ -44,6 +45,16 @@ lazy dmut __SHADOWS__ = copy [false];
  * The model (a glTF file, an OBJ file...) standing beside the Raymans, set by '--model', empty for none
  * */
 lazy mut __MODEL__: [mut [c8]] = copy [""];
+
+/**
+ * The exposure of the camera at the start, in stops, set by '--exposure' ('Page Up' and 'Page Down' changing it)
+ * */
+lazy dmut __EXPOSURE__ = copy [0.0f];
+
+/**
+ * The operator of the tone mapping at the start, set by '--tone-map' ('T' cycling through them)
+ * */
+lazy dmut __TONE_MAP__ = copy [ToneMap::AGX];
 
 /**
  * The file the render graph is written to in json, set by '--graph' ('X' writes it again), empty for none
@@ -107,6 +118,9 @@ class MyActivity over Activity {
         self.input:.keyboard(KeyInfo(SDLK_O, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleOcclusion);
         self.input:.keyboard(KeyInfo(SDLK_H, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleShadows);
         self.input:.keyboard(KeyInfo(SDLK_X, KeyEvent::DOWN)):.connect(self.box, &self:.onExportGraph);
+        self.input:.keyboard(KeyInfo(SDLK_PAGEUP, KeyEvent::DOWN)):.connect(self.box, &self:.onExposeMore);
+        self.input:.keyboard(KeyInfo(SDLK_PAGEDOWN, KeyEvent::DOWN)):.connect(self.box, &self:.onExposeLess);
+        self.input:.keyboard(KeyInfo(SDLK_T, KeyEvent::DOWN)):.connect(self.box, &self:.onCycleToneMap);
 
         self.input:.mouseMotion():.connect(self.box, &self:.onMouseMove);
 
@@ -134,6 +148,7 @@ class MyActivity over Activity {
                 self:.createLight(alias s);
                 s.gpuCulling = __GPU_CULL__[0];
                 s.occlusionCulling = __OCCLUSION__[0];
+                s.toneMap = __TONE_MAP__[0];
             }
         } catch {
             err => {
@@ -287,6 +302,45 @@ class MyActivity over Activity {
         if let Ok(dmut l) = alias self._light {
             l.castShadow = !l.castShadow;
             log::info #("Main", "Shadows :", l.castShadow);
+        }
+    }
+
+    /**
+     * Raise the exposure of the camera by half a stop
+     * */
+    fn onExposeMore(mut self, _: KeyInfo) {
+        self:.expose(0.5f);
+    }
+
+    /**
+     * Lower the exposure of the camera by half a stop
+     * */
+    fn onExposeLess(mut self, _: KeyInfo) {
+        self:.expose(-0.5f);
+    }
+
+    /**
+     * Change the exposure of the camera by a number of stops
+     * */
+    fn expose(mut self, stops: f32) {
+        if let Ok(dmut cam) = alias self._cam {
+            cam.exposure = cam.exposure + stops;
+            log::info #("Main", "Exposure :", cam.exposure);
+        }
+    }
+
+    /**
+     * Tone map the scene with the next operator: none, ACES, then AgX
+     * */
+    fn onCycleToneMap(mut self, _: KeyInfo) {
+        if let Ok(dmut s) = alias self._scene {
+            s.toneMap = match s.toneMap {
+                ToneMap::NONE => { ToneMap::ACES }
+                ToneMap::ACES => { ToneMap::AGX }
+                _             => { ToneMap::NONE }
+            };
+
+            log::info #("Main", "Tone mapping :", s.toneMap);
         }
     }
 
@@ -445,6 +499,7 @@ class MyActivity over Activity {
     fn createCamera(mut self, dmut scene: &Scene) {
         let dmut cam = copy PerspectiveCamera("cam", scene:.getRootNode());
         cam.fov = 90.0f;
+        cam.exposure = __EXPOSURE__[0];
 
         self._yaw = 0.0f;
         self._pitch = 45.0f;
@@ -552,6 +607,8 @@ fn readArguments(args: [[c8]])-> bool {
         :.flag("gpu-cull", comments-> "cull the instances on the GPU from the start, 'G' toggling it (on the CPU by default)")
         :.flag("occlusion", comments-> "cull the instances hidden behind others when culled on the GPU, 'O' toggling it (off by default)")
         :.flag("shadows", comments-> "the light casts shadows, 'H' toggling them (off by default)")
+        :.option!{[c8]} ("exposure", comments-> "the exposure of the camera in stops, 'Page Up' and 'Page Down' changing it (0 by default)")
+        :.option!{[c8]} ("tone-map", comments-> "the operator of the tone mapping, none, aces or agx, 'T' cycling through them (agx by default)")
         :.option!{[c8]} ("graph", comments-> "write the render graph in json in this file once the scene is drawn, 'X' writing it again (none by default)");
 
     {
@@ -572,6 +629,22 @@ fn readArguments(args: [[c8]])-> bool {
             __CROWD__[0] = std::conv::to!{usize} (side);
         }
 
+        if let Ok(Str(value-> ev)) = cfg["exposure"]? {
+            __EXPOSURE__[0] = std::conv::to!{f32} (ev);
+        }
+
+        if let Ok(Str(value-> op)) = cfg["tone-map"]? {
+            __TONE_MAP__[0] = match op {
+                "none" => { ToneMap::NONE }
+                "aces" => { ToneMap::ACES }
+                "agx"  => { ToneMap::AGX }
+                _      => {
+                    eprintln("demo: --tone-map expects none, aces or agx");
+                    return false;
+                }
+            };
+        }
+
         __GPU_CULL__[0] = cfg["gpu-cull"].to!{bool} () ?? false;
         __OCCLUSION__[0] = cfg["occlusion"].to!{bool} () ?? false;
         __SHADOWS__[0] = cfg["shadows"].to!{bool} () ?? false;
@@ -583,7 +656,7 @@ fn readArguments(args: [[c8]])-> bool {
             false
         }
         _: &std::conv::errors::CastFailure => {
-            eprintln("demo: --crowd expects a number of Raymans");
+            eprintln("demo: --crowd expects a number of Raymans, --exposure a number of stops");
             false
         }
     }
