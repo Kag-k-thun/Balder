@@ -4,7 +4,8 @@ use balder::utils;
 use balder::core::{_, driver::_};
 use balder::core::application::window;
 use balder::core::config::shader;
-use balder::core::shader::{_, buffers::_};
+use balder::core::shader;
+use balder::core::shader::buffers::_;
 use balder::math::{bounds, matrix, vector};
 use balder::scene::node::node3D::camera;
 use balder::scene::node::node3D::visual;
@@ -12,6 +13,8 @@ use balder::scene::node::node3D::visual::{material, mesh};
 use balder::scene::utils::{batch, cull, draw_stats, light, material, pyramid, visibility};
 
 use std::time::dur;
+
+use ::vulkan::core;
 
 
 
@@ -94,8 +97,8 @@ pub record ShaderNodeScene {
 
     prv { // Deferred
         
-        // The output texture of deferred (to created shaders)
-        let mut _outputTextures : [&OutputTexture] = [];
+        // The name of the depth of the deferred in the render graph of the window, reduced into the depth pyramid
+        let mut _depth : [c8] = "";
                 
         // The subpass of the deferred
         let dmut _subpass : (&DrawSubpass)? = none;
@@ -120,7 +123,12 @@ pub record ShaderNodeScene {
      * ====================================================================================================
      */
 
-    pub fn configure (mut self, dmut win : &Window, outTex : [&OutputTexture], dmut subPass : &DrawSubpass)
+    /**
+     * @params:
+     *    - depth: the name of the depth of the deferred in the render graph of the window
+     *    - subPass: the subpass of the deferred, the shaders drawing in it
+     * */
+    pub fn configure (mut self, dmut win : &Window, depth : [c8], dmut subPass : &DrawSubpass)
         throws BalderError
     {
         self:.dispose ();
@@ -131,7 +139,7 @@ pub record ShaderNodeScene {
         self._pointLights:.configure (alias win);
                 
         self._window = (alias win)?;        
-        self._outputTextures = outTex;
+        self._depth = depth;
         self._subpass = (alias subPass)?;
     }
 
@@ -307,7 +315,7 @@ pub record ShaderNodeScene {
                                                                          sub.getRenderPass (),
                                                                          sub.getDimension ()._0,
                                                                          sub.getDimension ()._1,
-                                                                         self._outputTextures);
+                                                                         sub.getColorCount ());
 
                     let dmut g = copy ShaderGroup (alias shader, shCfg);
                     if let Ok (cam) = self._cam {
@@ -658,46 +666,67 @@ pub record ShaderNodeScene {
      */
 
     /**
-     * Lay out the draws of the nodes for the recording of a frame, and record the cull passes of the nodes culled on the
-     * GPU, before the render pass of the deferred begins (their first phase only when the hidden nodes are culled, see
-     * draw)
-     * @params:
-     *    - frame: the frame being recorded
-     *    - pass: the subpass of the deferred, being prepared
-     *    - width: the width of the view, in pixels
-     *    - height: the height of the view, in pixels
-     *    - threshold: the size on screen under which a node is culled, in pixels
+     * @returns: true iif the nodes are culled on the GPU, in a cull pass writing their commands before they are drawn
      * */
-    pub fn prepare (mut self, frame : u32, dmut pass : &DrawSubpass, width : f32, height : f32, threshold : f32) {
+    pub fn cullsOnGpu (self)-> bool {
+        self._gpuCulling && self._cull.hasValue
+    }
+
+    /**
+     * @returns: true iif the nodes hidden behind those the last frame saw are culled, in a second phase of the cull pass
+     * testing them against the depth pyramid of the nodes the first phase drew
+     * */
+    pub fn cullsOccluded (self)-> bool {
+        self.cullsOnGpu () && self.pyramidLevels () != 0u32
+    }
+
+    /**
+     * Lay out the draws of the nodes for the recording of a frame, before the passes of the deferred are recorded
+     * */
+    pub fn prepare (mut self, frame : u32) {
         for _, dmut g in alias self._groups {
             g:.layout (frame);
         }
+    }
 
+    /**
+     * Record a phase of the cull passes of the nodes culled on the GPU, writing the commands the draws of the phase read
+     * @info: the counters are cleared by the first phase, and read back for the CPU by the last one
+     * @params:
+     *    - frame: the frame being recorded
+     *    - pass: the subpass of the deferred, being recorded outside of its render pass
+     *    - width: the width of the view, in pixels
+     *    - height: the height of the view, in pixels
+     *    - threshold: the size on screen under which a node is culled, in pixels
+     *    - late: false for the first phase, true for the second one, testing the nodes against the depth pyramid
+     * */
+    pub fn recordCull (mut self, frame : u32, dmut pass : &DrawSubpass, width : f32, height : f32, threshold : f32, late : bool) {
         if !self._gpuCulling { return; }
 
         let levels = self.pyramidLevels ();
         if let Ok (dmut cull) = alias self._cull {
             let dmut cmd = copy CullCommandAllocator (alias pass);
             {
-                for _, dmut g in alias self._groups {
-                    g:.clearCounters (alias cmd);
+                if !late {
+                    for _, dmut g in alias self._groups {
+                        g:.clearCounters (alias cmd);
+                    }
+
+                    cmd:.afterClear ();
                 }
 
-                cmd:.afterClear ();
                 cull.select (frame, cmd.getCommandBuffer ());
                 for _, dmut g in alias self._groups {
-                    g:.cull (frame, alias cmd, false, width, height, threshold, levels);
+                    g:.cull (frame, alias cmd, late, width, height, threshold, levels);
                 }
 
                 cmd:.afterCull ();
                 for _, dmut g in alias self._groups {
-                    g:.writeCommands (frame, alias cmd, false);
+                    g:.writeCommands (frame, alias cmd, late);
                 }
 
-                cmd:.afterCommands ();
-
-                // the counters are complete once the second phase wrote its commands
-                if levels == 0u32 {
+                // the counters are complete once the last phase wrote its commands
+                if late || levels == 0u32 {
                     self:.readBack (alias cmd);
                 }
             } catch {
@@ -709,72 +738,39 @@ pub record ShaderNodeScene {
     }
 
     /**
-     * Record the draws of the nodes, one multi-draw per shader and material key: the depth of every node first, written
-     * by the depth prepass of the shaders having one, then the nodes, each pixel being shaded by its closest fragment
-     * @info: when the hidden nodes are culled, the render pass is interrupted once the nodes of the first phase of the cull
-     * pass are drawn, their depth reduced into the depth pyramid and the second phase recorded, then resumed to draw the
-     * nodes the second phase found
-     * @assume: the draws of the frame are laid out, see prepare
+     * Record the reduction of the depth of the deferred into the depth pyramid, once the first phase of the draws wrote
+     * it
      * @params:
      *    - frame: the frame being recorded
-     *    - cmd: the command allocator of the recording
-     *    - pass: the subpass of the deferred, being drawn
-     *    - width: the width of the view, in pixels
-     *    - height: the height of the view, in pixels
-     *    - threshold: the size on screen under which a node is culled, in pixels
+     *    - cmd: the command buffer of the deferred, outside of its render pass
      * */
-    pub fn draw (mut self,
-                 frame : u32,
-                 dmut cmd : &IndexedDrawCommandAllocator,
-                 dmut pass : &DrawSubpass,
-                 width : f32,
-                 height : f32,
-                 threshold : f32)
-    {
-        self:.drawGroups (frame, alias cmd, false);
-
-        let levels = if self._gpuCulling { self.pyramidLevels () } else { 0u32 };
-        if levels == 0u32 { return; }
-
-        if let Ok (dmut cull) = alias self._cull {
+    pub fn recordPyramid (mut self, frame : u32, cmd : VkCommandBuffer) {
+        if let Ok (dmut win) = alias self._window {
             if let Ok (dmut p) = alias self._pyramid {
-                pass:.interrupt ();
-
-                let dmut cullCmd = copy CullCommandAllocator (alias pass);
-                {
-                    p:.build (frame, cullCmd.getCommandBuffer ());
-
-                    cull.select (frame, cullCmd.getCommandBuffer ());
-                    for _, dmut g in alias self._groups {
-                        g:.cull (frame, alias cullCmd, true, width, height, threshold, levels);
-                    }
-
-                    cullCmd:.afterCull ();
-                    for _, dmut g in alias self._groups {
-                        g:.writeCommands (frame, alias cullCmd, true);
-                    }
-
-                    cullCmd:.afterCommands ();
-                    self:.readBack (alias cullCmd);
-                } catch {
-                    err => {
-                        log::error #("Scene", "Failed to record the second phase of the cull passes", err);
+                if let Ok (depth) = win:.getVulkanPipeline ():.getTexture (self._depth) {
+                    {
+                        p:.build (frame, cmd, depth);
+                    } catch {
+                        err => {
+                            log::error #("Scene", "Failed to record the depth pyramid", err);
+                        }
                     }
                 }
-
-                pass:.resume ();
-                self:.drawGroups (frame, alias cmd, true);
             }
         }
     }
 
     /**
-     * Record the draws of the groups: their depth first, then their nodes
+     * Record the draws of the nodes, one multi-draw per shader and material key: the depth of every node first, written
+     * by the depth prepass of the shaders having one, then the nodes, each pixel being shaded by its closest fragment
+     * @assume: the draws of the frame are laid out, see prepare
      * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the recording
      *    - late: false for the draws of the first phase of the cull passes (every draw when the nodes are culled on the
      *            CPU), true for those of the second one
      * */
-    fn drawGroups (mut self, frame : u32, dmut cmd : &IndexedDrawCommandAllocator, late : bool) {
+    pub fn drawGroups (mut self, frame : u32, dmut cmd : &IndexedDrawCommandAllocator, late : bool) {
         for name, dmut g in alias self._groups {
             {
                 g:.drawDepth (frame, alias cmd, late);
@@ -800,6 +796,7 @@ pub record ShaderNodeScene {
      * Record the copy of the counters of the cull passes for the CPU, once their commands are written
      * */
     fn readBack (mut self, dmut cmd : &CullCommandAllocator) {
+        cmd:.beforeReadBack ();
         for _, dmut g in alias self._groups {
             g:.readBack (alias cmd);
         }
@@ -825,11 +822,10 @@ pub record ShaderNodeScene {
     fn loadPyramid (mut self, dmut win : &Window)-> dmut &DepthPyramid
         throws BalderError
     {
-        for t in self._outputTextures {
-            if t.isDepth () {
-                let dmut shader = win:.loadResource!{&ComputeShader} (DefaultShaders::PYRAMID_3D);
-                return copy DepthPyramid (alias shader, t, t.width, t.height);
-            }
+        if let Ok (sub) = self._subpass {
+            let dmut shader = win:.loadResource!{&ComputeShader} (DefaultShaders::PYRAMID_3D);
+            let (w, h) = sub.getDimension ();
+            return copy DepthPyramid (alias shader, w, h);
         }
 
         throw copy BalderError ("The deferred has no depth to build a depth pyramid from");

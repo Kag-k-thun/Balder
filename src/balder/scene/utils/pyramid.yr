@@ -62,11 +62,10 @@ pub class DepthPyramid {
     /**
      * @params:
      *    - shader: the pyramid shader, loaded (DefaultShaders::PYRAMID_3D)
-     *    - depth: the depth texture of the deferred pass, one image per frame
      *    - width: the width of the depth
      *    - height: the height of the depth
      * */
-    pub self (dmut shader: &RefCount!{&Shader}, depth: &Texture, width: u32, height: u32)
+    pub self (dmut shader: &RefCount!{&Shader}, width: u32, height: u32)
         with _shader = alias shader
         , _set = shader:.get():.allocateDescriptorSet(DescriptorContext::GLOBAL)
         , _width = width
@@ -87,7 +86,6 @@ pub class DepthPyramid {
         }
 
         self._buffers = alias buffers;
-        self._set:.setTexture(UniformNames::DEPTH, depth);
         for f, b in self._buffers {
             self._set:.setBuffer(UniformNames::PYRAMID, b, cast!u32(f));
         }
@@ -124,14 +122,15 @@ pub class DepthPyramid {
      */
 
     /**
-     * Record the reduction of the depth of a frame into its pyramid, level by level, the pyramid being readable by the
-     * compute shaders afterwards
-     * @assume: the render pass writing the depth ended, the depth being in its read only layout
+     * Record the reduction of the depth of a frame into its pyramid, level by level
+     * @assume: the depth is written and readable by the compute shaders (the pass of the render graph recording the
+     * reduction reads it), outside of a render pass
      * @params:
      *    - frame: the frame being recorded
      *    - cmd: the command buffer of the frame, outside of a render pass
+     *    - depth: the depth texture of the deferred pass, the one of the render graph of the frame
      * */
-    pub fn build(mut self, frame: u32, cmd: VkCommandBuffer)
+    pub fn build(mut self, frame: u32, cmd: VkCommandBuffer, depth: &Texture)
         throws BalderError
     {
         let dmut shader = if let Ok(dmut c: &ComputeShader) = (alias self._shader:.get())? {
@@ -143,12 +142,8 @@ pub class DepthPyramid {
         let groups = shader.getGroupSizes();
         if groups[0] == 0u32 || groups[1] == 0u32 { return; }
 
-        // the depth written by the render pass, read by the first level
-        barrier(cmd,
-                VkPipelineStageFlagBits::VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
-                | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                VkAccessFlagBits::VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT);
+        // a transient image of the render graph, its texture changing when the graph is compiled again
+        self._set:.setTexture(UniformNames::DEPTH, depth, frame-> cast!i32(frame));
 
         shader.select(cmd);
         self._set.select(frame, cmd);
@@ -174,11 +169,10 @@ pub class DepthPyramid {
             shader:.setPush(cmd, UniformNames::LEVEL, push);
             vkCmdDispatch(cmd, (dstWidth + groups[0] - 1u32) / groups[0], (dstHeight + groups[1] - 1u32) / groups[1], 1u32);
 
-            // the level written, read by the next one and by the cull pass
-            barrier(cmd,
-                    VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
-                    VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT);
+            // the level written, read by the next one (the render graph orders the pyramid and its readers)
+            if level != levels {
+                barrier(cmd);
+            }
         }
     }
 
@@ -207,16 +201,16 @@ pub class DepthPyramid {
 }
 
 /**
- * Record a memory barrier from a stage to the compute shaders
+ * Record a memory barrier between the levels of the pyramid, from the writes of the compute shaders to their reads
  * */
-fn barrier(cmd: VkCommandBuffer, srcStage: u32, srcAccess: u32, dstAccess: u32) {
+fn barrier(cmd: VkCommandBuffer) {
     let mut b = VkMemoryBarrier();
     b.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    b.srcAccessMask = srcAccess;
-    b.dstAccessMask = dstAccess;
+    b.srcAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
 
     vkCmdPipelineBarrier(cmd,
-                         srcStage,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0u32,
                          1u32,
