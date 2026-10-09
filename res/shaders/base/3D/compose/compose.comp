@@ -10,20 +10,42 @@ layout (local_size_x = 32, local_size_y = 32) in;
  * ====================================================================================================
  */
 
+// A metallic/roughness material (MaterialConfig), its factors multiplying the texels of its maps
 struct Material {
-    vec3 diffuse;
-    vec3 ambient;
-    vec3 specular;
-    vec3 emissive;
-    vec3 transparent;
+    vec3 baseColor;
 
-    int model;
-    int anisotropy;
-    
-    float illum;
-    float shininess;
-    float opacity;
-    float refraction;    
+    // 1 for a metal, 0 for a dielectric
+    float metallic;
+
+    // The light the surface emits whatever its lights
+    vec3 emissive;
+
+    // The perceptual roughness, from 0 (a mirror) to 1
+    float roughness;
+
+    // The reflectance of the surface where it is a dielectric, facing the eye: 0.08 times it
+    float specular;
+
+    // The strength of the occlusion, from 0 (none) to 1
+    float occlusion;
+
+    float padd1;
+    float padd2;
+};
+
+// The surface seen at a texel, its material combined with the texels of the g-buffer
+struct Surface {
+    // The unit normal of the surface, and the unit direction from the point to the eye
+    vec3 N;
+    vec3 V;
+
+    // The colour of the diffuse reflection, black for a metal
+    vec3 diffuse;
+
+    // The reflectance facing the eye, the colour of the reflections of a metal
+    vec3 F0;
+
+    float roughness;
 };
 
 // A direction light, shining along its direction from infinitely far (DirectionLightContent)
@@ -87,9 +109,17 @@ struct CameraContent {
  */
 
 layout (binding = 1) uniform sampler2D normals;
+
+// The texels of the base colour (.rgb) and of the occlusion (.a) of the maps of the materials
 layout (binding = 2) uniform sampler2D albedo;
 layout (binding = 3) uniform sampler2D depth;
 layout (binding = 4) uniform usampler2D materialID;
+
+// The texels of the metalness (.r) and of the roughness (.g) of the maps of the materials
+layout (binding = 13) uniform sampler2D surface;
+
+// The texels of the emissive colour of the maps of the materials
+layout (binding = 14) uniform sampler2D emissive;
 
 // The cascades of the shadow map of the direction light casting shadows, side by side in a 2x2 atlas, the first one at
 // the top left: a lookup gives the fraction of the four texels around a point whose depth is not closer to the light
@@ -220,43 +250,73 @@ vec3 worldPosition (vec2 ndc, float d) {
 /*!
  * ====================================================================================================
  * ====================================================================================================
- * ====================================          METALLIC          ====================================
+ * ======================================          BRDF          ======================================
  * ====================================================================================================
  * ====================================================================================================
  */
 
+const float PI = 3.14159265359;
 
-vec3 shadeMetallic (vec3 N, vec3 V, vec3 L, vec3 albedo, float roughness) {
-    // Termes de base
-    float NdotL = max(dot(N, L), 0.0);
-    float NdotV = max(dot(N, V), 0.0);
+/**
+ * @returns: the light a point reflects toward the eye, lit from a direction, the same BRDF for every type of light: a
+ * GGX distribution of the microfacets, the height-correlated Smith visibility, the Fresnel of Schlick and a Lambert
+ * diffuse
+ * @info: the BRDF is scaled by PI, so a white diffuse surface facing a light reflects its radiance: the intensity of a
+ * light is the colour such a surface takes
+ * @params:
+ *    - s: the surface at the point
+ *    - L: the unit direction from the point to the light
+ *    - radiance: the light reaching the point, the colour of the light times its intensity and its attenuation
+ */
+vec3 shade (Surface s, vec3 L, vec3 radiance) {
+    float NdotL = dot (s.N, L);
+    if (NdotL <= 0.0) {
+        return vec3 (0.0);
+    }
 
-    // Fresnel de Schlick simplifié
-    vec3 F0 = albedo; // pour un métal, F0 = couleur du métal
-    float VoH = max(dot(V, normalize(V + L)), 0.0);
-    vec3 F = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
+    vec3 H = normalize (s.V + L);
+    float NdotV = max (dot (s.N, s.V), 1e-4);
+    float NdotH = max (dot (s.N, H), 0.0);
+    float VdotH = max (dot (s.V, H), 0.0);
 
-    // Distribution GGX simplifiée
-    float a = roughness * roughness;
+    // the perceptual roughness squared, kept above 0 so the highlight of a mirror does not vanish into a point
+    float a = max (s.roughness * s.roughness, 2e-3);
     float a2 = a * a;
-    float NdotH = max(dot(N, normalize(V + L)), 0.0);
-    float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    float D = a2 / (3.14159 * denom * denom);
 
-    // Géométrie Smith simplifiée
-    float k = (roughness + 1.0);
-    k = (k * k) / 8.0;
-    float Gv = NdotV / (NdotV * (1.0 - k) + k);
-    float Gl = NdotL / (NdotL * (1.0 - k) + k);
-    float G = Gv * Gl;
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    float D = a2 / (PI * d * d);
 
-    // BRDF spéculaire
-    vec3 spec = (D * F * G) / max(4.0 * NdotL * NdotV, 0.001);
+    // the masking of the eye and the shadowing of the light, divided by 4 NdotL NdotV
+    float smithV = NdotL * sqrt (NdotV * NdotV * (1.0 - a2) + a2);
+    float smithL = NdotV * sqrt (NdotL * NdotL * (1.0 - a2) + a2);
+    float visibility = 0.5 / (smithV + smithL);
 
-    // Pas de diffuse pour un métal pur
-    return spec * NdotL;
+    vec3 F = s.F0 + (1.0 - s.F0) * pow (1.0 - VdotH, 5.0);
+
+    vec3 diffuse = (1.0 - F) * s.diffuse / PI;
+    vec3 specular = D * visibility * F;
+
+    return PI * (diffuse + specular) * radiance * NdotL;
 }
 
+/**
+ * @returns: the light a point reflects toward the eye under the ambient light, reaching it from all around: its diffuse
+ * colour, and its reflectance integrated over the hemisphere (the analytic fit of Physically Based Shading on Mobile,
+ * Karis)
+ * @params:
+ *    - s: the surface at the point
+ */
+vec3 shadeAmbient (Surface s) {
+    const vec4 c0 = vec4 (-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4 (1.0, 0.0425, 1.04, -0.04);
+
+    float NdotV = max (dot (s.N, s.V), 1e-4);
+    vec4 r = s.roughness * c0 + c1;
+    float a004 = min (r.x * r.x, exp2 (-9.28 * NdotV)) * r.x + r.y;
+    vec2 scaleBias = vec2 (-1.04, 1.04) * a004 + r.zw;
+
+    return (s.diffuse + s.F0 * scaleBias.x + scaleBias.y) * ambient.color;
+}
 
 /*!
  * ====================================================================================================
@@ -265,23 +325,6 @@ vec3 shadeMetallic (vec3 N, vec3 V, vec3 L, vec3 albedo, float roughness) {
  * ====================================================================================================
  * ====================================================================================================
  */
-
-/**
- * @returns: the light a point reflects toward the eye, lit from a direction, its diffuse and its specular reflections
- * @params:
- *    - N: the unit normal of the surface at the point
- *    - V: the unit direction from the point to the eye
- *    - L: the unit direction from the point to the light
- *    - radiance: the light reaching the point, the colour of the light times its intensity and its attenuation
- *    - mat: the material of the surface
- *    - baseColor: the colour of the surface at the point
- */
-vec3 shade (vec3 N, vec3 V, vec3 L, vec3 radiance, Material mat, vec3 baseColor) {
-    vec3 diffuse = baseColor * mat.diffuse * max (dot (N, L), 0.0);
-    vec3 specular = shadeMetallic (N, V, L, baseColor * mat.specular, mat.shininess);
-
-    return (diffuse + specular) * radiance;
-}
 
 /**
  * @returns: the share of the intensity of a point or a spot light reaching a point at a distance, its inverse square
@@ -373,31 +416,49 @@ void main () {
 	ivec2 size = imageSize(outTex);
 
     if(texelCoord.x < size.x && texelCoord.y < size.y)
-        {                
-            vec3 color = vec3 (0);
+        {
+            // the depth is still the one it was cleared to where nothing was drawn
+            float z = texelFetch (depth, texelCoord, 0).x;
+            if (z >= 1.0) {
+                imageStore (outTex, texelCoord, vec4 (0.0, 0.0, 0.0, 1.0));
+                return;
+            }
 
             // the g-buffer has the size of the output, its texels read as they were written, never filtered; the depth
             // was written with the camera of this frame, the one bound here
             vec2 ndc = (vec2 (texelCoord) + 0.5) / vec2 (size) * 2.0 - 1.0;
-            vec3 position = worldPosition (ndc, texelFetch (depth, texelCoord, 0).x);
-            vec3 normal = octDecode (texelFetch (normals, texelCoord, 0).xy);
-            vec3 baseColor = texelFetch (albedo, texelCoord, 0).xyz;
-        
+            vec3 position = worldPosition (ndc, z);
+
             uint matID = texelFetch (materialID, texelCoord, 0).x;
             Material mat = materials [matID];
 
-            vec3 view = normalize (camera.eyePos - position);
-            color += ambient.color * baseColor * mat.diffuse;
+            // the factors of the material times the texels of its maps
+            vec4 albedoTexel = texelFetch (albedo, texelCoord, 0);
+            vec2 surfaceTexel = texelFetch (surface, texelCoord, 0).xy;
+
+            vec3 baseColor = albedoTexel.rgb * mat.baseColor;
+            float metallic = surfaceTexel.x * mat.metallic;
+            float occlusion = mix (1.0, albedoTexel.a, mat.occlusion);
+
+            Surface s;
+            s.N = octDecode (texelFetch (normals, texelCoord, 0).xy);
+            s.V = normalize (camera.eyePos - position);
+            s.roughness = surfaceTexel.y * mat.roughness;
+            s.diffuse = baseColor * (1.0 - metallic);
+            s.F0 = mix (vec3 (0.08 * mat.specular), baseColor, metallic);
+
+            // the occlusion baked in the maps shades the ambient light only, the lights being direct
+            vec3 color = shadeAmbient (s) * occlusion + texelFetch (emissive, texelCoord, 0).rgb * mat.emissive;
 
             for (uint i = 0 ; i < directionLights.nbLights ; i++) {
                 DirectionLight light = directionLights.lights [i];
 
                 float lit = 1.0;
                 if (shadow.count != 0 && i == shadow.light) {
-                    lit = shadowFactor (position, normal);
+                    lit = shadowFactor (position, s.N);
                 }
 
-                color += shade (normal, view, -light.direction, light.color * light.intensity * lit, mat, baseColor);
+                color += shade (s, -light.direction, light.color * light.intensity * lit);
             }
 
             for (uint i = 0 ; i < pointLights.nbLights ; i++) {
@@ -410,7 +471,7 @@ void main () {
                 }
 
                 vec3 L = toLight / max (d, 1e-4);
-                color += shade (normal, view, L, light.color * light.intensity * attenuation (d, light.range), mat, baseColor);
+                color += shade (s, L, light.color * light.intensity * attenuation (d, light.range));
             }
 
             for (uint i = 0 ; i < spotLights.nbLights ; i++) {
@@ -424,7 +485,7 @@ void main () {
 
                 vec3 L = toLight / max (d, 1e-4);
                 float share = attenuation (d, light.range) * cone (light, L);
-                color += shade (normal, view, L, light.color * light.intensity * share, mat, baseColor);
+                color += shade (s, L, light.color * light.intensity * share);
             }
 
             imageStore (outTex, texelCoord, vec4 (color, 1.0));

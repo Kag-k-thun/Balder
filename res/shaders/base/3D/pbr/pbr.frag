@@ -9,6 +9,9 @@ layout (location = 2) flat in vec2 inFade;
 // The material of the object
 layout (location = 3) flat in uint inMaterial;
 
+// The tangent in world space, its handedness in w
+layout (location = 4) in vec4 inTangents;
+
 // The normal, folded by octEncode
 layout (location = 0) out vec2 normals;
 
@@ -23,7 +26,14 @@ layout (location = 3) out vec2 surface;
 layout (location = 4) out vec4 emissive;
 
 
-layout (set = 0, binding = 2) uniform sampler2D diffuse;
+// The maps of the materials drawn together, those a material has not being white (the normal map flat)
+layout (set = 0, binding = 2) uniform sampler2D baseColorMap;
+
+// The roughness in green, the metalness in blue, as glTF packs them
+layout (set = 0, binding = 3) uniform sampler2D metallicRoughnessMap;
+layout (set = 0, binding = 4) uniform sampler2D normalMap;
+layout (set = 0, binding = 5) uniform sampler2D occlusionMap;
+layout (set = 0, binding = 6) uniform sampler2D emissiveMap;
 
 
 /**
@@ -61,15 +71,38 @@ vec2 octEncode (vec3 n) {
     return n.xy;
 }
 
+/**
+ * @returns: the normal of the surface at the fragment, its interpolated normal bent by the normal map
+ * @info: the tangent space is the tangent, along the growing u, the bitangent, along the growing v, which runs down the
+ * images (the texture coordinates of the meshes start at the top left), and the normal; the normal maps point their y up
+ * the images (as glTF and OpenGL read them), against the bitangent; the handedness flips the bitangent where the
+ * texture is mirrored
+ */
+vec3 bentNormal () {
+    vec3 N = normalize (inNormals);
+
+    // the tangent made perpendicular to the interpolated normal; none where the texture coordinates are degenerate
+    vec3 T = inTangents.xyz - N * dot (N, inTangents.xyz);
+    if (dot (T, T) < 1e-12 || any (isnan (T))) {
+        return N;
+    }
+
+    T = normalize (T);
+    vec3 B = cross (N, T) * (inTangents.w < 0.0 ? -1.0 : 1.0);
+
+    vec3 m = texture (normalMap, inUV).xyz * 2.0 - 1.0;
+    return normalize (T * m.x - B * m.y + N * m.z);
+}
+
 void main() {
     crossFade ();
 
-    normals = octEncode (inNormals);
-    albedo = vec4 (texture (diffuse, inUV).xyz, 1);
+    normals = octEncode (bentNormal ());
+    albedo = vec4 (texture (baseColorMap, inUV).rgb, texture (occlusionMap, inUV).r);
 
-    // the material has no map but its base colour, its factors used as they are
-    surface = vec2 (1.0);
-    emissive = vec4 (1.0);
-    
+    vec4 metallicRoughness = texture (metallicRoughnessMap, inUV);
+    surface = vec2 (metallicRoughness.b, metallicRoughness.g);
+    emissive = vec4 (texture (emissiveMap, inUV).rgb, 1.0);
+
     materialID = inMaterial;
 }
