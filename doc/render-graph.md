@@ -16,7 +16,7 @@ recording its passes in its command buffer and submitting it.
 A **subpass** is a command buffer submitted once per frame (a render target of its own for a `DrawSubpass`). A
 **pass** is something recorded in a subpass, a raster pass drawing in its render pass or a compute pass dispatching
 outside of it. A subpass holds several passes: the deferred subpass of a scene records its cull pass, its g-buffer, its
-depth pyramid, its late cull pass and its late g-buffer.
+depth pyramid, its late cull pass and its late g-buffer, and its compose subpass its composition and its tone mapping.
 
 ```
 let dmut pipeline = window:.getVulkanPipeline ();
@@ -129,7 +129,7 @@ flowchart LR
         shadow_map[shadow]
     end
     subgraph compose
-        composition[compose]
+        composition[compose] --> tonemap
     end
     subgraph screen
         widgets[screen]
@@ -148,4 +148,5 @@ flowchart LR
 | `hzb` | imported buffer (the depth pyramid) | the pyramid | the late cull pass |
 | `gbuffer_*` (6 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials) |
 | `shadow_atlas` | transient | the shadow map | the composition (optional) |
-| `output` | imported image | the composition | the screen |
+| `radiance` | transient (`R16G16B16A16_SFLOAT`, storage) | the composition (the light the camera sees, linear and unbounded) | the tonemap pass |
+| `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the tonemap pass (exposure of the camera, tone map operator of the scene, sRGB encoding) | the screen |

@@ -19,6 +19,12 @@ pub class IOutputTexture over Texture {
     // The image views to bind the output textures
     let dmut _imageViews: [VkImageView] = [];
 
+    // The format the images are sampled in, when it differs from the format they are written in
+    let _sampledFormat: (VkFormat)?;
+
+    // The image views sampling the images in that format, none when they are sampled in the format they are written in
+    let dmut _sampledViews: [VkImageView] = [];
+
     let _depth: bool;
 
     // The images created without memory, until they are bound (see unbound)
@@ -26,6 +32,12 @@ pub class IOutputTexture over Texture {
 
     /**
      * Create a color texture of a given dimension
+     * @params:
+     *    - sampledFormat: the format the images are sampled in, when it differs from 'format', the format they are
+     *                     written in: a compute shader writes the bytes of an sRGB image through a unorm view (a storage
+     *                     image cannot be sRGB), the sampling decoding them through an sRGB view
+     * @info: the images sampled in another format are created with a mutable format, their sampled views restricted to
+     * sampling (a usage of the views of Vulkan 1.1)
      * */
     pub self (dmut device: &VulkanDevice,
               format: VkFormat,
@@ -35,9 +47,11 @@ pub class IOutputTexture over Texture {
               forStorage: bool = false,
               depth: bool = false,
               nbImages: u32? = none,
-              numSamples: VkSampleCountFlagBits = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT)
+              numSamples: VkSampleCountFlagBits = VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+              sampledFormat: VkFormat? = none)
         with super(alias device, width, height)
         , _format = format
+        , _sampledFormat = sampledFormat
         , _depth = depth
         throws BalderError
     {
@@ -57,6 +71,7 @@ pub class IOutputTexture over Texture {
                      depth: bool = false)
         with super(alias device, width, height)
         , _format = format
+        , _sampledFormat = none
         , _depth = depth
         throws BalderError
     {
@@ -101,42 +116,70 @@ pub class IOutputTexture over Texture {
     {
         let usage = usageOf(depth, forSubpass, forStorage);
         let nbImage = if let Ok(i) = nbImages { i } else { cast!u32(self._device:.getSwapchain().nbFrames) };
+        let flags = if self._sampledFormat.hasValue { cast!u32(VkImageCreateFlagBits::VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) } else { 0u32 };
 
-        self._images = copy [self._device:.getMemoryAllocator():.allocImage2D(self._width, self._height, self._format, VkImageTiling::VK_IMAGE_TILING_OPTIMAL, usage, numSamples-> numSamples, VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) for _ in 0 .. nbImage];
+        self._images = copy [self._device:.getMemoryAllocator():.allocImage2D(self._width, self._height, self._format, VkImageTiling::VK_IMAGE_TILING_OPTIMAL, usage, numSamples-> numSamples, VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, flags-> flags) for _ in 0 .. nbImage];
     }
 
     /**
-     * Create the image view to attach the texture to a rendering pass
+     * Create the image view to attach the texture to a rendering pass, and those sampling it in another format
      * */
     fn createImageViews(mut self, depth: bool)
         throws BalderError
     {
         self._imageViews = copy [null; self._images.len];
         for i, img in self._images {
-            let mut info = VkImageViewCreateInfo();
-            info.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            info.image = img.getVulkanImage();
-            info.viewType = VkImageViewType::VK_IMAGE_VIEW_TYPE_2D;
-            info.format = img.getFormat();
+            self._imageViews[i] = alias self.createView(img, img.getFormat(), depth, null);
+        }
 
-            info.subresourceRange.aspectMask = if depth {
-                VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT
-            } else {
-                VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT
-            };
-            info.subresourceRange.levelCount = 1;
-            info.subresourceRange.layerCount = 1;
+        if let Ok(sampled) = self._sampledFormat {
+            // the format of the image may not be sampled in another format with the usages of the image (storage...)
+            let mut usage = VkImageViewUsageCreateInfo();
+            usage.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+            usage.usage = cast!u32(VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT);
 
-            info.components.r = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_R;
-            info.components.g = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_G;
-            info.components.b = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_B;
-            info.components.a = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_A;
-
-            if vkCreateImageView(self._device.getDeviceHandle(), &info, null, &self._imageViews[i])
-               != VkResult::VK_SUCCESS {
-                throw copy BalderError("Failed to create image view");
+            self._sampledViews = copy [null; self._images.len];
+            for i, img in self._images {
+                self._sampledViews[i] = alias self.createView(img, sampled, depth, cast!{*void} (&usage));
             }
         }
+    }
+
+    /**
+     * @returns: a view of an image of the texture
+     * @params:
+     *    - format: the format the view reads the image in
+     *    - next: the structures extending the creation of the view
+     * */
+    fn createView(self, img: &Image2D, format: VkFormat, depth: bool, next: *void)-> dmut VkImageView
+        throws BalderError
+    {
+        let mut info = VkImageViewCreateInfo();
+        info.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        info.pNext = next;
+        info.image = img.getVulkanImage();
+        info.viewType = VkImageViewType::VK_IMAGE_VIEW_TYPE_2D;
+        info.format = format;
+
+        info.subresourceRange.aspectMask = if depth {
+            VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT
+        } else {
+            VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT
+        };
+        info.subresourceRange.levelCount = 1;
+        info.subresourceRange.layerCount = 1;
+
+        info.components.r = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_R;
+        info.components.g = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_G;
+        info.components.b = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_B;
+        info.components.a = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_A;
+
+        let dmut view: VkImageView = null;
+        if vkCreateImageView(self._device.getDeviceHandle(), &info, null, alias &view) != VkResult::VK_SUCCESS {
+            throw copy BalderError("Failed to create image view");
+        }
+
+        alias view
     }
 
     /**
@@ -194,6 +237,17 @@ pub class IOutputTexture over Texture {
     }
 
     /**
+     * @returns: the image views sampling the output texture, in the format it is sampled in (see sampledFormat)
+     * */
+    pub fn getSampledViews(self)-> [VkImageView] {
+        if self._sampledViews.len != 0us {
+            return self._sampledViews;
+        }
+
+        self._imageViews
+    }
+
+    /**
      * @returns: the images of the texture
      * */
     pub fn getImages(self)-> [&Image2D] {
@@ -238,6 +292,10 @@ pub class IOutputTexture over Texture {
                     vkDestroyImageView(self._device.getDeviceHandle(), self._imageViews[i], null);
                 }
 
+                if i < self._sampledViews.len && self._sampledViews[i] != null {
+                    vkDestroyImageView(self._device.getDeviceHandle(), self._sampledViews[i], null);
+                }
+
                 log::debug #("OutputTexture", "Disposing texture");
                 self._images[i]:.dispose();
             }
@@ -248,6 +306,7 @@ pub class IOutputTexture over Texture {
 
             self._images = [];
             self._imageViews = [];
+            self._sampledViews = [];
             self._unbound = [];
             self._width = 0;
             self._height = 0;
