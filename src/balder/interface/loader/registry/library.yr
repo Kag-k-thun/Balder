@@ -1,10 +1,24 @@
 in library;
 
+use balder::core::error;
 use balder::interface::loader::parser;
-use balder::interface::loader::registry::definition;
+use balder::interface::loader::registry::{definition, error};
+use balder::interface::style::sheets;
 
 /**
- * The components the .gui files can use, by file: those a file declares (doc/gui-v2.md, §8)
+ * The components the .gui files can use, by file, and the style sheets giving them their default look (doc/gui-v2.md,
+ * §8)
+ * @info:
+ * =====
+ * A file can use the components it declares and those of the files it imports with `@import "file.gui";`, these
+ * bringing in the components they import themselves. The path of an import is relative to the directory of the
+ * importing file, unless it is qualified (`res:/`) or absolute. A file imported several times is read once, a file
+ * importing itself, directly or not, is an error naming the chain of its imports, and two components of the same
+ * name reaching a file from two files are an error.
+ *
+ * The sheets named by `@style "file.style";` are relative to their file the same way, and kept in the order the files
+ * are read, each one once: the sheets of the imported files come before those of the importing file.
+ * ====
  * */
 @final
 pub class Library {
@@ -12,20 +26,26 @@ pub class Library {
     // The components each file can use, by the path of the file
     let mut _scopes: [[c8] => mut [Definition]] = copy [];
 
+    // The components of every file loaded, by name, the last one loaded winning
+    let mut _named: [[c8] => mut Definition] = copy [];
+
+    // The style sheets of the components, resolved, in the order the files were read
+    let mut _styles: [[c8]] = [];
+
     pub self () {}
 
     /**
-     * Add the components of a document to the library
+     * Add the components of a document to the library, after those of the files it imports, the files already in the
+     * library not being read again
      * @params:
      *    - file: the path of the file the document was read from, the scope of its components
+     * @throws: when an imported file cannot be read, is not a .gui file, or imports itself, and when two components of
+     * the same name reach the file
      * */
-    pub fn load(mut self, doc: Document, file: [c8]) {
-        let mut defs: [Definition] = [];
-        for c in doc.components {
-            defs ~= [Definition(c, file)];
-        }
-
-        self._scopes[file] = defs;
+    pub fn load(mut self, doc: Document, file: [c8])
+        throws LoadError
+    {
+        self:.loadFile(doc, file, copy [file]);
     }
 
     /**
@@ -39,5 +59,106 @@ pub class Library {
         }
 
         none
+    }
+
+    /**
+     * @returns: the component named name among those of every file loaded, the last one loaded, none if there is none
+     * */
+    pub fn find(self, name: [c8])-> (Definition)? {
+        if let Ok(d) = self._named[name] {
+            return (d)?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the style sheets of the components of the files loaded, resolved, in the order the files were read
+     * */
+    pub fn getStyles(self)-> [[c8]] {
+        self._styles
+    }
+
+    /**
+     * Add the components of a document after those of the files it imports
+     * @params:
+     *    - chain: the files being read, each one importing the next, the last one being this file
+     * */
+    fn loadFile(mut self, doc: Document, file: [c8], chain: [[c8]])
+        throws LoadError
+    {
+        let mut defs: [Definition] = [];
+        for i in doc.imports {
+            let target = SheetLoader::resolve(file, i.path);
+            if SheetLoader::contains(chain, target) {
+                throw copy LoadError(file,
+                                     "'" ~ target ~ "' imports itself: " ~ SheetLoader::join(chain ~ [target]),
+                                     i.line,
+                                     i.col);
+            }
+
+            if !self._scopes[target].hasValue {
+                let imported = {
+                    readGuiFile(target)
+                } catch {
+                    e: &LoadError => { throw e; }
+                    _: &BalderError => {
+                        throw copy LoadError(file, "cannot read the imported file '" ~ target ~ "'", i.line, i.col);
+                    }
+                };
+
+                self:.loadFile(imported, target, chain ~ [target]);
+            }
+
+            if let Ok(scope) = self._scopes[target] {
+                for d in scope {
+                    defs = Library::add(defs, d, file, i.line, i.col);
+                }
+            }
+        }
+
+        for s in doc.styles {
+            let target = SheetLoader::resolve(file, s.path);
+            if !SheetLoader::contains(self._styles, target) {
+                self._styles ~= [target];
+            }
+        }
+
+        for c in doc.components {
+            defs = Library::add(defs, Definition(c, file), file, c.line, c.col);
+            self._named[c.name] = Definition(c, file);
+        }
+
+        self._scopes[file] = defs;
+    }
+}
+
+/**
+ * The helpers of the library
+ * */
+mod Library {
+
+    /**
+     * @returns: the components a file can use, with one more
+     * @params:
+     *    - defs: the components the file can use so far
+     *    - d: the component reaching the file
+     *    - file, line, col: where it reaches it, for the errors
+     * @throws: when another component of the same name reaches the file
+     * */
+    pub fn add(defs: [Definition], d: Definition, file: [c8], line: usize, col: usize)-> [Definition]
+        throws LoadError
+    {
+        for e in defs {
+            if e.component.name == d.component.name {
+                if e.file == d.file { return defs; }
+
+                let reason = "component '" ~ d.component.name ~ "' of '" ~ d.file ~ "' is already declared by '"
+                             ~ e.file ~ "'";
+                throw copy LoadError(file, reason, line, col);
+            }
+        }
+
+        defs ~ [d]
     }
 }
