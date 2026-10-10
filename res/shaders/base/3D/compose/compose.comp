@@ -125,6 +125,20 @@ layout (binding = 14) uniform sampler2D emissive;
 // not 0 (another image of the g-buffer stands in for it otherwise), the size of the output or smaller (upsampled)
 layout (binding = 15) uniform sampler2D occlusionTex;
 
+// The environment as a cube, the background of the scene where nothing is drawn while it lights the scene
+layout (binding = 16) uniform samplerCube environmentMap;
+
+// The irradiance of the environment divided by PI, the light a white diffuse surface facing each direction reflects
+layout (binding = 17) uniform samplerCube irradianceMap;
+
+// The prefiltered environment, the light a surface reflects in each direction, its levels for the roughness growing from
+// 0 to 1 (ambient.levels being the last one)
+layout (binding = 18) uniform samplerCube prefilteredMap;
+
+// The split-sum table of the BRDF: the scale (.r) and the bias (.g) of the reflectance facing the eye, by the cosine
+// between the normal and the eye (x) and the roughness (y)
+layout (binding = 19) uniform sampler2D brdfLut;
+
 // The cascades of the shadow map of the direction light casting shadows, side by side in a 2x2 atlas, the first one at
 // the top left: a lookup gives the fraction of the four texels around a point whose depth is not closer to the light
 // than the depth it is compared to
@@ -187,13 +201,25 @@ layout (std430, binding = 11) readonly buffer Spots {
     SpotLight lights[];
 } spotLights;
 
-// The light reaching every point of the scene from all around, whatever its lights, added once to each pixel: it stands
-// in for the indirect light
+// The light reaching every point of the scene from all around, whatever its lights, added once to each pixel: the colour
+// of the scene, or the light of its environment when one lights it (the indirect light)
 layout (binding = 12) uniform Ambient {
     vec3 color;
 
     // 1 when the screen-space ambient occlusion shades the ambient light, 0 when it is disabled
     uint occluded;
+
+    // The scale of the light of the environment
+    float intensity;
+
+    // 1 when the environment lights the scene in place of the colour, 0 when it does not
+    uint lit;
+
+    // 1 when the environment is the background where nothing is drawn, black otherwise
+    uint skybox;
+
+    // The last level of the prefiltered environment, read for a roughness of 1
+    float levels;
 } ambient;
 
 
@@ -253,6 +279,16 @@ vec3 worldPosition (vec2 ndc, float d) {
 
     mat3 rotation = mat3 (camera.view);
     return transpose (rotation) * (vec3 (xy, z) - camera.view [3].xyz);
+}
+
+/**
+ * @returns: the unit direction the camera looks along through a texel, from the eye for a perspective camera, along the
+ * axis of the view for an orthographic one
+ * @params:
+ *    - ndc: the center of the texel, in normalized device coordinates
+ */
+vec3 viewDirection (vec2 ndc) {
+    return normalize (worldPosition (ndc, 0.5) - worldPosition (ndc, 0.0));
 }
 
 /*!
@@ -324,6 +360,33 @@ vec3 shadeAmbient (Surface s) {
     vec2 scaleBias = vec2 (-1.04, 1.04) * a004 + r.zw;
 
     return (s.diffuse + s.F0 * scaleBias.x + scaleBias.y) * ambient.color;
+}
+
+/**
+ * @returns: the light a point reflects toward the eye under the light of the environment (the split sum of Karis): its
+ * diffuse colour lit by the irradiance around its normal, and the prefiltered environment along the reflection of the
+ * eye at its roughness, scaled by the integral of the BRDF the table holds; the diffuse light is what the specular
+ * reflection leaves
+ * @params:
+ *    - s: the surface at the point
+ *    - occlusion: the share of the ambient light reaching the point, shading the diffuse light, and the specular light
+ *      through the specular occlusion of Lagarde (the cone of the reflection of a rough surface sees more of the
+ *      occluders)
+ */
+vec3 shadeEnvironment (Surface s, float occlusion) {
+    float NdotV = max (dot (s.N, s.V), 1e-4);
+    vec3 R = reflect (-s.V, s.N);
+
+    vec2 scaleBias = texture (brdfLut, vec2 (NdotV, s.roughness)).rg;
+    vec3 reflectance = s.F0 * scaleBias.x + scaleBias.y;
+
+    vec3 diffuse = texture (irradianceMap, s.N).rgb * s.diffuse * (1.0 - reflectance);
+    vec3 specular = textureLod (prefilteredMap, R, s.roughness * ambient.levels).rgb * reflectance;
+
+    float a = s.roughness * s.roughness;
+    float specularOcclusion = clamp (pow (NdotV + occlusion, exp2 (-16.0 * a - 1.0)) - 1.0 + occlusion, 0.0, 1.0);
+
+    return (diffuse * occlusion + specular * specularOcclusion) * ambient.intensity;
 }
 
 /*!
@@ -497,16 +560,22 @@ void main () {
 
     if(texelCoord.x < size.x && texelCoord.y < size.y)
         {
-            // the depth is still the one it was cleared to where nothing was drawn
-            float z = texelFetch (depth, texelCoord, 0).x;
-            if (z >= 1.0) {
-                imageStore (outTex, texelCoord, vec4 (0.0, 0.0, 0.0, 1.0));
-                return;
-            }
-
             // the g-buffer has the size of the output, its texels read as they were written, never filtered; the depth
             // was written with the camera of this frame, the one bound here
             vec2 ndc = (vec2 (texelCoord) + 0.5) / vec2 (size) * 2.0 - 1.0;
+
+            // the depth is still the one it was cleared to where nothing was drawn: the environment is seen there
+            float z = texelFetch (depth, texelCoord, 0).x;
+            if (z >= 1.0) {
+                vec3 sky = vec3 (0.0);
+                if (ambient.lit != 0u && ambient.skybox != 0u) {
+                    sky = textureLod (environmentMap, viewDirection (ndc), 0.0).rgb * ambient.intensity;
+                }
+
+                imageStore (outTex, texelCoord, vec4 (sky, 1.0));
+                return;
+            }
+
             vec3 position = worldPosition (ndc, z);
 
             uint matID = texelFetch (materialID, texelCoord, 0).x;
@@ -532,7 +601,8 @@ void main () {
 
             // the occlusion baked in the maps and the occlusion of the screen shade the ambient light only, the lights
             // being direct
-            vec3 color = shadeAmbient (s) * occlusion + texelFetch (emissive, texelCoord, 0).rgb * mat.emissive;
+            vec3 indirect = ambient.lit != 0u ? shadeEnvironment (s, occlusion) : shadeAmbient (s) * occlusion;
+            vec3 color = indirect + texelFetch (emissive, texelCoord, 0).rgb * mat.emissive;
 
             for (uint i = 0 ; i < directionLights.nbLights ; i++) {
                 DirectionLight light = directionLights.lights [i];
