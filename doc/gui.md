@@ -3,7 +3,7 @@
 A `.gui` file says which widgets exist, what they say and how they behave. A `.style` file says how they look and
 where they go. Both share one lexer and one grammar of values. This page describes the language as Balder reads it
 today; [gui-v2.md](gui-v2.md) is the design it comes from, and still describes parts that are not implemented yet
-(components, signals, the CSS box model).
+(signals).
 
 The second half of the page, from [Widget types](#widget-types) on, is generated from the widget registry and the
 property table by `gyllir run reference` in `tools/`, and a test fails when it no longer matches the code.
@@ -18,8 +18,12 @@ self.gui:.loadGUIFile ("res:/dialog/message.gui")?;
 - `loadStyleFile` reads a sheet after the sheets it imports, decodes every rule against the widget types, registers
   the fonts of its `@font-face` blocks and computes the styles of the widgets already loaded again. A sheet refused
   adds no rule.
-- `loadGUIFile` reads a `.gui` file, checks every node against the widget types, then creates the widgets and makes
-  the root the content of the manager.
+- `loadGUIFile` reads a `.gui` file and the files it imports, unfolds its [components](#components), checks every
+  node against the widget types, then creates the widgets and makes the root the content of the manager. The sheets
+  the components name with `@style` are loaded the first time a file names them.
+- `loadComponents` reads only the components of a file and of those it imports, a file holding only components being
+  a library of widgets, and `instantiate` creates an instance of a component from code (see
+  [Instances written by code](#instances-written-by-code)).
 - A path is qualified (`res:/`, `shaders:/`, …, relative to the project) or relative to the working directory.
 - An error names the file, the line and the column, and says what was expected:
   `example/form/form.gui:5:32: unknown attribute 'len' of 'InputText' under 'LinearLayout'`.
@@ -44,10 +48,14 @@ LinearLayout #FL .root {
 ```
 
 ```
-document  = node ;
+document  = { directive | component } [ node ] ;
+directive = "@import" string ";" | "@style" string ";" ;
+component = "@component" Type "(" [ param { "," param } ] ")" "{" node "}" ;
+param     = "$" ident [ ":" values ] ;
 node      = Type { "#" ident | "." ident } [ values ] ( ";" | "{" { member } "}" ) ;
-member    = attribute | node ;
+member    = attribute | node | slot ;
 attribute = ident ":" values ";" ;
+slot      = "@slot" [ ident ] ";" ;                (* only inside a component *)
 ```
 
 - **A node** is its type, then an optional id after `#`, then its classes after `.`, then an optional default value,
@@ -68,7 +76,110 @@ attribute = ident ":" values ";" ;
   file), followed by its parameters, numbers and texts (the path of a LUT), `off` adding it disabled. The effects are
   added to the chain of the scene when the widget is attached (see `doc/render-graph.md`), the temporal anti-aliasing
   running first among the effects in HDR space wherever it is in the list.
-- `@import`, `@style` and `@component` are read but refused at load: components are not implemented yet.
+
+### Components
+
+A component is a group of widgets declared once and used like a widget type. An instance is written as any node,
+with an id, classes, a default value, attributes and children.
+
+```
+@component FieldRow ($label, $max-length: 64, $only-numbers: false) {
+    LinearLayout .field-row {
+        Label .field $label;
+        InputText #INPUT .input {
+            max-length: $max-length;
+            only-numbers: $only-numbers;
+        }
+    }
+}
+
+LinearLayout #FORM {
+    FieldRow #NAME "Name";
+    FieldRow #AGE "Age" { max-length: 3; only-numbers: true; }
+}
+```
+
+- **Parameters** are `$name`, with an optional default after `:`. The default value of an instance sets the first
+  parameter, and an attribute of the instance named like a parameter sets it. A parameter without a default is
+  required. The value is substituted whole where the parameter is written, a tuple being spliced as a constant of a
+  sheet, and checked against the kind of the attribute it lands in: a value of the wrong kind is an error where the
+  value was given, in the instance or in the default of the parameter.
+- **The instance is the root** of the component: the root takes the id of the instance (it keeps its own when the
+  instance has none), and the classes of the instance after its own. The other attributes of the instance are those
+  its parent gives its children, so `tab: "Form";` works on an instance under a `TabLayout`; an attribute of the root
+  itself is not reachable from the instance.
+- **The ids are scoped to the instance**: `find ("FORM/AGE/INPUT")` reaches the input of the second row, and two
+  instances may use the same inner ids. An anonymous instance adds no segment, as an anonymous widget.
+- **The style selects the root** by its type and by the name of the component: `FieldRow`, `LinearLayout.field-row`
+  and `#AGE` all match it. A selector naming a component is checked against the type of its root, so the sheet has to
+  be loaded after the `.gui` file declaring the component; the `@style` sheets of the components always are.
+- **A cycle** between components is an error naming the chain: `component 'A' used in its own expansion: A -> B -> A`.
+- **A code-backed component** takes as its root the widget type registered under its own name: in
+  `@component Collapsible (…) { Collapsible .collapsible { … } }`, the root is the registered `Collapsible`, given its
+  inner structure by the component.
+
+#### Slots
+
+`@slot;` marks where the children of an instance go, and `@slot tools;` receives the children that say `slot: tools;`,
+the unnamed slot receiving the others.
+
+```
+@component Panel ($title) {
+    LinearLayout .panel {
+        LinearLayout #BAR .panel-bar { Label .panel-title $title; @slot tools; }
+        LinearLayout #BODY .panel-body { @slot; }
+    }
+}
+
+Panel #INSPECTOR "Inspector" {
+    PushButton #PIN .tool "Pin" { slot: tools; }
+    Label #SELECTION .info "Nothing selected yet.";
+}
+```
+
+- **The widgets put in a slot are found under the instance**, not under the container of the slot:
+  `find ("INSPECTOR/SELECTION")`, so the component can move its slots without breaking the paths of the code.
+- A child naming a slot the component does not have, or given to a component without slots, is an error. The container
+  of the slot still checks the children it receives.
+- `@slot;` written in the block of an instance inside a component passes the children of that slot on, to the unnamed
+  slot of the instance: they stay found under the outer instance.
+
+#### Libraries
+
+```
+// res:/widgets/field-row.gui, a library of widgets
+@style "field-row.style";
+
+@component FieldRow ($label, $max-length: 64) { … }
+```
+
+```
+// the application
+@import "res:/widgets/field-row.gui";
+
+LinearLayout #FORM {
+    FieldRow #NAME "Name";
+}
+```
+
+- `@import "file.gui";` brings in the components of another file, and those it imports itself. The path is relative to
+  the importing file unless it is qualified or absolute. A file imported twice is read once; a file importing itself is
+  an error naming the chain, and two components of the same name reaching a file from two files are an error.
+- `@style "file.style";` gives the components of a file their default look. The sheet is loaded the first time a file
+  names it, at the origin of the components: every sheet of the application wins over it, whatever the specificity of
+  its selectors.
+
+#### Instances written by code
+
+```
+self.gui:.loadComponents ("res:/widgets/field-row.gui")?;
+self.gui:.instantiate ("FieldRow", "Phone", parent-> "BODY/FORM", id-> "PHONE", attributes-> "max-length: 20;")?;
+```
+
+`instantiate` creates an instance of a component of the files loaded after the children of the widget at `parent`,
+the root of the interface when it is `""`, as if it were written there. The value is the text of the default value,
+and `attributes` the block of the instance in the syntax of the `.gui` files. A path already taken, a parent that takes
+no more children and an instance refused are errors.
 
 ## The style file
 
@@ -102,7 +213,8 @@ compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part {
 
 - **A compound is glued**: `PushButton.yes:hover::label`. A space between two compounds means a descendant
   (`.sidebar PushButton`), `>` a direct child, and `,` separates selectors sharing one block.
-- **A type**, `#id`, `.class` and `:state` all have to hold. `*` or no type selects every type.
+- **A type**, `#id`, `.class` and `:state` all have to hold. `*` or no type selects every type. The name of a
+  component selects the roots of its instances, as their type does.
 - **States** are registered by the widget types: `:hover`, `:focus`, `:check` for every widget.
 - **Parts** style a piece of a widget, `PushButton::label`, and end their selector. A part with states of its own takes
   them after it: `TabLayout::tab:selected` is the selected tab, `TabLayout:hover::tab` every tab of a hovered layout.
@@ -112,9 +224,10 @@ compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part {
 
 ### Cascade
 
-- The rules matching a widget apply by origin, then by specificity (ids, then classes, states and parts, then types,
-  summed over the compounds), then in the order they were loaded, the later one winning a tie. A rule matching
-  through several of its selectors takes the specificity of the most specific one.
+- The rules matching a widget apply by origin (the `@style` sheets of the components, then the sheets of the
+  application), then by specificity (ids, then classes, states and parts, then types, summed over the compounds), then
+  in the order they were loaded, the later one winning a tie. A rule matching through several of its selectors takes
+  the specificity of the most specific one.
 - The inherited properties (`text-color`, the `font-*` properties, `text-xalign`, `text-yalign`, `text-wrap`, and those
   a widget type registers as inherited) pass from a widget to its children and to its parts. Set the font once on a
   container.
