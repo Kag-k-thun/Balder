@@ -57,7 +57,10 @@ pipeline:.declarePass (GraphPass (name-> "gbuffer",
 
 The graph allocates a transient image while an enabled pass uses it. `getTexture (name)` returns its texture for the
 frames recorded from now on; a pass binds it when it is recorded, its texture changing when the memory is shared
-differently. The framebuffers of a `DrawSubpass::toImages` are created by the graph once its attachments are
+differently. Two transient images share memory when no pass uses both at the same time: their lifetimes, from the first
+to the last pass using them in the order the passes are recorded, do not overlap. The GPU may run two subpasses no
+dependency orders at the same time (the deferred and the shadow maps), so the memory of an image is in use over the
+passes of those subpasses too (`ResourceLifetime::aliasFirst` and `aliasLast`). The framebuffers of a `DrawSubpass::toImages` are created by the graph once its attachments are
 allocated, in the order of the attachments of its first raster pass.
 
 A persistent image keeps its content from a frame to the next: one image (`OutputTexture::shared`) every frame slot
@@ -137,6 +140,9 @@ flowchart LR
     subgraph shadow
         shadow_map[shadow]
     end
+    subgraph local_shadow
+        local_shadow_map[local_shadow]
+    end
     subgraph occlusion
         horizons[occlusion_horizons] --> blur_x[occlusion_blur_x] --> blur_y[occlusion_blur_y]
     end
@@ -148,10 +154,12 @@ flowchart LR
     end
     transfers -. all commands .-> deferred
     transfers -. all commands .-> shadow
+    transfers -. all commands .-> local_shadow
     deferred -. compute shader .-> occlusion
     deferred -. compute shader .-> compose
     occlusion -. compute shader .-> compose
     shadow -. compute shader .-> compose
+    local_shadow -. compute shader .-> compose
     compose -. fragment shader .-> screen
 ```
 
@@ -162,6 +170,7 @@ flowchart LR
 | `hzb` | imported buffer (the depth pyramid) | the pyramid | the late cull pass |
 | `gbuffer_*` (7 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, velocity, depth) | transient | both g-buffers | the pyramid (depth), the ambient occlusion (depth and normals), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials, all but the velocity), the post effects reading them (the anti-aliasing: depth and velocity) |
 | `shadow_atlas` | transient | the shadow map | the composition (optional) |
+| `local_shadow_atlas` | transient (`atlas` texels on a side, depth) | the views of the point and spot lights, each in its tile | the composition (optional) |
 | `occlusion_noisy`, `occlusion_rows`, `occlusion_out` | transient (`R8_UNORM`, storage, `occlusionScale` times the size of the g-buffer) | the horizons of the ambient occlusion, its blur along the rows, its blur along the columns | the blur along the rows, the blur along the columns, the composition (optional) |
 | `radiance` | transient (`R16G16B16A16_SFLOAT`, storage) | the composition (the light the camera sees, linear and unbounded) | the first pass of the post-process chain |
 | `post_<effect>_out` | transient (`R16G16B16A16_SFLOAT` before the tone mapping, `R8G8B8A8_UNORM` after it, storage) | the last pass of an effect of the post-process chain, but the last effect | the first pass of the next effect |
@@ -169,6 +178,50 @@ flowchart LR
 | `post_taa_history` | persistent (`R16G16B16A16_SFLOAT`, storage) | the copy of the blend | the resolve of the next frame |
 | `post_bloom_mip<k>`, `post_bloom_up<k>` | transient (`R16G16B16A16_SFLOAT`, storage, 2^k times smaller) | the downsampling and the upsampling passes of the bloom | the next pass of the bloom |
 | `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the last pass of the post-process chain, the tone mapping without effects in display space | the screen |
+
+## The shadows of the point and spot lights
+
+A point or a spot light casting shadows (`Light::castShadow`) is shadowed through the tiles of a shared depth atlas
+(`LocalShadowScene`), drawn by a subpass of its own, `local_shadow`, declared before the composition while one of them
+casts shadows; the direction light keeps its cascades. Each light has views, perspective projections from the light
+writing the depth from a hundredth of its range to its range:
+
+- a point light, six: the faces of a cube around it, each seeing a quarter turn along an axis of the world (+x, -x, +y,
+  -y, +z, -z), in six tiles of the same side;
+- a spot light, one: the square enclosing its cone, up to 80° from its axis, the light of a wider cone unshadowed past
+  it.
+
+A view sees a little more than its face or its cone, so two texels on each side of the tile hold what the filtering
+around a point reads.
+
+The tiles are allocated again at each tick of the scene. A light whose sphere (a point light) or cone (a spot light) is
+outside the view of the camera has none. The others are taken in the order of their size on screen, the largest first,
+up to `lights` of the `[shadow]` table (8, at most 16); the side of the tile of each is a power of two following its size
+on screen (half of it for a spot light, a quarter for each face of a point light), from a 64th to a quarter of the
+atlas, and changes only once the size leaves its range by a fifth, so the tiles stay the same while the camera moves.
+The tiles are then fitted to the atlas (`atlas` of the `[shadow]` table, 4096 by default): while they do not fit, the
+largest tile is halved, the least important light first, and the least important light is left out once every tile is
+the smallest. They are packed along a Morton curve from the top left corner, the largest first, which leaves no hole.
+
+The views are written at each tick in two uniform buffers, at once: the cameras the shadow pipelines draw them with, and
+the views and the shadows the composition reads. A light finds its views through the index of its shadow
+(`Light::getShadowIndex`, written in the content of the light the composition reads, 64 lights at most): the first one
+and their number, none when the frame does not shadow it. The subpass is recorded again only when the tiles change;
+each view culls its casters through the hierarchy of the boxes of the scene, as the cascades do, when the views or the
+instances changed.
+
+The composition looks a point up in the view seeing it, the face along the largest coordinate of the direction from a
+point light, moved along its normal (`Light::shadowNormalOffset`, 1.5 texels) and toward the light (`Light::shadowBias`,
+1 texel) by texels of the view at the depth of the point, the casters being drawn with a depth bias growing with their
+slope; the 3x3 lookups around it, each filtering four texels, soften the edges of the shadows as for the cascades,
+clamped to the tile.
+
+`Scene::localShadowStats` counts the lights casting shadows, those shadowed, their views and the texels of their tiles,
+with the time the GPU took to draw the atlas at the last submission measured (the time of each subpass, measured by its
+clock, kept by `VulkanSubpass::getGpuTime`); the demo shows them under the frame rate (`./demo --shadows --room`, the
+room holding a lamp under its ceiling). At 1280 × 720 on an Intel Lunar Lake iGPU, with the lamp, the spot and the lamp
+of the room shadowed (13 views, 13.6 million texels), the subpass took from 0.4 to 1 ms depending on the casters the
+views saw, a point light drawing its casters in six views, a spot light in one.
 
 ## The ambient occlusion
 
