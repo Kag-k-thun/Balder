@@ -1,6 +1,708 @@
 in local_shadow;
 
 pub mod ::atlas;
+pub mod ::stats;
 pub mod ::tile;
+pub mod ::utils;
 pub mod ::view;
 pub mod ::views;
+
+use balder::utils;
+use balder::core::_;
+use balder::core::application::window;
+use balder::core::config::shadow;
+use balder::core::driver::{graph, subpass};
+use balder::core::shader::buffers::ubo;
+use balder::math::{bounds, matrix, vector};
+use balder::scene::node::node3D::{camera, light};
+use balder::scene::utils::local_shadow::{atlas, stats, tile, utils, view, views};
+
+use std::algorithm::{comparison, sorting};
+
+use ::vulkan::core;
+
+/**
+ * The number of point and spot lights a frame shadows at most, whatever the configuration (see ShadowConfig::lights)
+ * */
+pub def MAX_LIGHTS = 16u32;
+
+/**
+ * The number of point and spot lights casting shadows at most in a scene, the slots of their shadows in the composition
+ * */
+pub def MAX_SHADOWS = 64u32;
+
+/**
+ * The number of views drawn at most, six for each light shadowed
+ * */
+pub def MAX_VIEWS = 96u32;
+
+/**
+ * The size of the block of a view in the buffer of the cameras of the views, the largest alignment of the offset of a
+ * uniform buffer: the camera read by the shadow pipelines of the shaders (its projection, the view of the light, an
+ * identity, and their product); the camera of the shaders being longer than a block (CAMERA_SIZE), the buffer ends
+ * CAMERA_TAIL bytes after the last block
+ * */
+def CAMERA_STRIDE = 256us;
+def CAMERA_TAIL   = 16us;
+
+def CAMERA_PROJ     = 0us;
+def CAMERA_VIEW     = 64us;
+def CAMERA_VIEWPROJ = 128us;
+
+/**
+ * The layout of the uniform buffer of the shadows the composition reads, as std140 aligns it (see the LocalShadows block
+ * of the compose shader): MAX_VIEWS views, each its projection, its tile and the size of its texels, then MAX_SHADOWS
+ * shadows, each the first of its views, their number (0 when the light is not shadowed), its normal offset and its bias
+ * @info: the buffer is written at once with the cameras of the views, so the shadow pipelines and the composition of a
+ * frame read the same views
+ * */
+pub def LOCAL_SHADOW_SIZE = 10240us;
+
+def VIEW_STRIDE   = 96us;
+def VIEW_VIEWPROJ = 0us;
+def VIEW_TILE     = 64us;
+def VIEW_INFO     = 80us;
+
+def SHADOWS_OFFSET       = 9216us;
+def SHADOW_STRIDE        = 16us;
+def SHADOW_FIRST         = 0us;
+def SHADOW_COUNT         = 4us;
+def SHADOW_NORMAL_OFFSET = 8us;
+def SHADOW_BIAS          = 12us;
+
+/**
+ * The depth bias of the casters drawn in the atlas: a constant one, and one growing with the slope of their triangles
+ * seen from the light (see vkCmdSetDepthBias)
+ * */
+def CONSTANT_BIAS = 1.25f;
+def SLOPE_BIAS    = 1.75f;
+
+/**
+ * The size on screen under which a view does not draw a caster, in texels of the view
+ * */
+def CASTER_THRESHOLD = 1.0f;
+
+/**
+ * The texels on a side of the tile of a light wanted for each pixel on a side of the box enclosing the light on screen:
+ * a spot light sees its cone in one tile, a point light its sphere in six faces of a quarter turn
+ * */
+def SPOT_DENSITY  = 0.5f;
+def POINT_DENSITY = 0.25f;
+
+/**
+ * The sides of the smallest and of the largest tiles, in shares of the side of the atlas, and the side of the smallest
+ * tile of a small atlas
+ * */
+def MIN_TILE_SHARE = 64u32;
+def MAX_TILE_SHARE = 4u32;
+def MIN_TILE       = 32u32;
+
+/**
+ * A view drawn in the atlas: the shadow it belongs to, its face, its tile and its projection
+ * */
+@data
+record LayoutView {
+
+    // The index of the shadow of the light in the composition
+    pub let shadow: u32 = 0u32;
+
+    // The face of the view, 0 for a spot light
+    pub let face: u32 = 0u32;
+
+    pub let tile: ShadowTile = ShadowTile();
+
+    pub let view: ShadowView = ShadowView();
+
+}
+
+/**
+ * The shadows of the point and spot lights of a scene casting shadows: the views of each light (the six faces of a cube
+ * around a point light, the cone of a spot light, see views), drawn by a subpass in the tiles of a shared depth atlas
+ * the composition reads
+ * @info: the tiles are allocated again at each tick of the scene (see atlas): the lights the camera does not see have
+ * none, the others a tile following their size on screen, the largest on screen first up to the number of lights of the
+ * configuration, fitted to the atlas; the subpass is recorded again only when the tiles change
+ * @info: the views are written at each tick in the uniform buffers the shadow pipelines and the composition read, so
+ * they follow the lights without recording the subpass again; a light finds its views through the index of its shadow
+ * (see Light::getShadowIndex), the same while it casts shadows
+ * @info: the atlas is a transient image of the render graph, written by the pass of the subpass and read by the
+ * composition, cleared to the farthest depth where no tile is drawn
+ * */
+pub record LocalShadowScene {
+
+    // The window of the scene
+    let dmut _window : (&Window)? = none;
+
+    // The cameras of the views, read by the shadow pipelines (see CAMERA_STRIDE)
+    let dmut _cameras : (&UniformBufferObject)? = none;
+
+    // The views and the shadows read by the composition (see LOCAL_SHADOW_SIZE)
+    let dmut _ubo : (&UniformBufferObject)? = none;
+
+    prv { // Atlas
+
+        // The name of the depth atlas in the render graph, owned by the graph, empty while no light casts shadows
+        let mut _atlas : [c8] = "";
+
+        // The subpass drawing the views in the atlas
+        let dmut _pass : (&DrawSubpass)? = none;
+
+        // The name of the subpass in the pipeline of the window
+        let mut _passName : [c8] = "";
+
+        // The number of texels on a side of the atlas
+        let mut _side : u32 = 0u32;
+
+        // The number of lights a frame shadows at most
+        let mut _maxLights : u32 = 0u32;
+    }
+
+    prv { // Lights
+
+        // The lights casting shadows, by the index of their shadow
+        let dmut _lights : [u32 => &Light] = copy [];
+
+        // The side of the tile of each light at the last tick, by the index of its shadow, none when it had no tile
+        let dmut _sides : [u32 => u32] = copy [];
+    }
+
+    prv { // Views
+
+        // The views drawn at the last tick, in the order of the cameras of their blocks
+        let mut _layout : [LayoutView] = [];
+
+        // True when the tiles of the views changed since the subpass was last recorded
+        let mut _relayout : bool = false;
+
+        // The contents of the uniform buffers written last
+        let mut _writtenCameras : [u8] = [];
+        let mut _written : [u8] = [];
+
+        // The projections of the views when their casters were last culled
+        let mut _culledViews : [mat4] = [];
+
+        // The changes of the instances of the scene when the casters were last culled
+        let mut _culledChanges : usize = 0us;
+
+        // The counters of the last tick
+        let mut _stats : ShadowStats = ShadowStats ();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          CONFIGURATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Allocate the uniform buffers of the views, no light casting shadows
+     * @params:
+     *    - cfg: the configuration of the shadows, the side of the atlas and the number of lights a frame shadows
+     * */
+    pub fn configure (mut self, dmut win : &Window, cfg : ShadowConfig)
+        throws BalderError
+    {
+        self:.dispose ();
+        self._window = (alias win)?;
+        self._side = cfg.atlas;
+        self._maxLights = comparison::min (cfg.lights, MAX_LIGHTS);
+
+        let dmut cameras = copy UniformBufferObject (alias win:.getVulkanDevice (), self.camerasSize ());
+        self._cameras = (alias cameras)?;
+
+        let dmut ubo = copy UniformBufferObject (alias win:.getVulkanDevice (), LOCAL_SHADOW_SIZE);
+        ubo:.setData (0us, copy [0u8; LOCAL_SHADOW_SIZE]);
+        self._ubo = (alias ubo)?;
+    }
+
+    /**
+     * Cast the shadows of a point or a spot light, the index of its shadow in the composition given to it
+     * @info: the light is shadowed from the next tick, once the atlas is drawn (see start)
+     * @returns: false when MAX_SHADOWS lights already cast shadows, the light casting none
+     * */
+    pub fn add (mut self, dmut light : &Light)-> bool {
+        for i in 0u32 .. MAX_SHADOWS {
+            if i !in self._lights {
+                self._lights [i] = alias light;
+                light:.setShadowIndex (i);
+                return true;
+            }
+        }
+
+        light:.setShadowIndex (u32::max);
+        false
+    }
+
+    /**
+     * Stop casting the shadows of a light, the index of its shadow taken back
+     * @info: does nothing unless the light casts shadows
+     * */
+    pub fn remove (mut self, dmut light : &Light) {
+        let index = light.getShadowIndex ();
+        if let Ok (l) = self._lights [index] {
+            if l is light {
+                self._lights:.remove (index);
+                self._sides:.remove (index);
+            }
+        }
+
+        light:.setShadowIndex (u32::max);
+    }
+
+    /**
+     * Draw the atlas: it is declared in the render graph of the window, and the subpass drawing it registered
+     * @params:
+     *    - passName: the name of the subpass in the render graph
+     *    - atlasName: the name of the atlas in the render graph
+     * @returns: the subpass, the pass drawing in it to declare and its signals to connect
+     * */
+    pub fn start (mut self, passName : [c8], atlasName : [c8])-> dmut &DrawSubpass
+        throws BalderError
+    {
+        self:.stop ();
+
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else {
+            throw copy BalderError ("Shadows not configured");
+        };
+
+        let dmut device = win:.getVulkanDevice ();
+        let desc = ImageDesc (format-> device.getDepthFormat (), width-> self._side, height-> self._side, depth-> true);
+        let dmut pipeline = win:.getVulkanPipeline ();
+        pipeline:.createImage (atlasName, desc);
+
+        let dmut pass = copy DrawSubpass::toImages (alias device, passName, self._side, self._side, copy [desc]);
+        pipeline:.registerSubPass (passName, alias pass);
+
+        self._atlas = atlasName;
+        self._pass = (alias pass)?;
+        self._passName = passName;
+
+        alias pass
+    }
+
+    /**
+     * Stop drawing the atlas, the subpass and the atlas being removed from the render graph, the subpass retired with
+     * the frames drawing it; the lights keep the index of their shadow
+     * */
+    pub fn stop (mut self) {
+        if let Ok (dmut win) = alias self._window {
+            if let Ok (dmut pass) = alias self._pass {
+                let dmut pipeline = win:.getVulkanPipeline ();
+                pipeline:.removeSubPass (self._passName);
+                pipeline:.removeResource (self._atlas);
+                win:.retire (alias pass);
+            }
+        }
+
+        self._pass = none;
+        self._atlas = "";
+        self._passName = "";
+        self._layout = [];
+        self._relayout = false;
+        self._sides = copy [];
+        self._culledViews = [];
+        self:.write ([], []);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the atlas is drawn
+     * */
+    @field
+    pub fn isCasting (self)-> bool {
+        self._pass.hasValue
+    }
+
+    /**
+     * @returns: true iif a light casts shadows
+     * */
+    @field
+    pub fn hasLights (self)-> bool {
+        self._lights.len != 0us
+    }
+
+    /**
+     * @returns: the name of the depth atlas in the render graph, empty while it is not drawn
+     * */
+    @field
+    pub fn atlas (self)-> [c8] {
+        self._atlas
+    }
+
+    /**
+     * @returns: the subpass drawing the atlas
+     * @assume: the atlas is drawn
+     * */
+    @field
+    pub fn subpass (mut self)-> dmut &DrawSubpass {
+        if let Ok (dmut pass) = alias self._pass {
+            return alias pass;
+        }
+
+        log::error #("LocalShadowScene", "No light casts shadows");
+        panic;
+    }
+
+    /**
+     * @returns: the buffer of the cameras of the views, read by the shadow pipelines
+     * */
+    @field
+    pub fn cameras (self)-> &UniformBufferObject {
+        if let Ok (c) = self._cameras {
+            return c;
+        }
+
+        log::error #("LocalShadowScene", "Problem of configuration");
+        panic;
+    }
+
+    /**
+     * @returns: the uniform buffer of the views and the shadows, read by the composition
+     * */
+    @field
+    pub fn ubo (self)-> &UniformBufferObject {
+        if let Ok (u) = self._ubo {
+            return u;
+        }
+
+        log::error #("LocalShadowScene", "Problem of configuration");
+        panic;
+    }
+
+    /**
+     * @returns: the offset of the camera of each view in the buffer of the cameras (see cameras), as many as the views a
+     * frame draws at most
+     * */
+    pub fn cameraOffsets (self)-> [usize] {
+        copy [cast!usize (v) * CAMERA_STRIDE for v in 0u32 .. self._maxLights * FACES]
+    }
+
+    /**
+     * @returns: the number of views drawn, the cameras of the first blocks of the buffer of the cameras
+     * */
+    @field
+    pub fn viewCount (self)-> usize {
+        self._layout.len
+    }
+
+    /**
+     * @returns: the size on screen under which a view does not draw a caster, in texels of the view
+     * */
+    pub fn casterThreshold (self)-> f32 {
+        CASTER_THRESHOLD
+    }
+
+    /**
+     * @returns: the counters of the last tick, and the time the GPU took to draw the atlas at the last submission
+     * measured
+     * */
+    @field
+    pub fn stats (self)-> ShadowStats {
+        let mut result = self._stats;
+        result.casters = cast!u32 (self._lights.len);
+        if let Ok (pass) = self._pass {
+            result.time = pass.getGpuTime ();
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UPDATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Allocate the tiles of the lights the camera sees, and write their views at once for the next submissions when they
+     * changed (a frame being requested then)
+     * @params:
+     *    - camera: the camera of the scene
+     *    - height: the height of the view of the camera, in pixels
+     * @returns:
+     *    - .0: the volume each view drawn sees, in the order of their cameras, none while the atlas is not drawn
+     *    - .1: true iif the tiles changed, the subpass having to be recorded again
+     * */
+    pub fn update (mut self, camera : &Camera, height : f32)-> ([ViewVolume], bool) {
+        if !self.isCasting { return ([], false); }
+
+        let screen = ViewVolume (camera.viewProj, height);
+        let minTile = comparison::max (self._side / MIN_TILE_SHARE, MIN_TILE);
+        let maxTile = self._side / MAX_TILE_SHARE;
+
+        // the lights seen, with their size on screen and the side of their tile
+        let mut seen : [(u32, f32, u32, u32)] = [];
+        for index, l in self._lights {
+            let bounds = lightBounds (l);
+            if !screen.frustum.intersects (bounds) {
+                self._sides:.remove (index);
+                continue;
+            }
+
+            let r = makeVec3 (bounds.radius, bounds.radius, bounds.radius);
+            let pixels = screen.pixelSize (Aabb (bounds.center - r, bounds.center + r));
+            let point = l.type == LightType::POINT;
+            let density = if point { POINT_DENSITY } else { SPOT_DENSITY };
+            let current = if let Ok (s) = self._sides [index] { s } else { 0u32 };
+            let side = tileSide (pixels * density, current, minTile, maxTile);
+
+            self._sides [index] = side;
+            seen = seen ~ [(index, pixels, side, if point { FACES } else { 1u32 })];
+        }
+
+        let dmut ordered = copy seen;
+        sorting::sort (alias ordered, |a, b| {
+            if a._1 != b._1 { return a._1 > b._1; }
+            a._0 < b._0
+        });
+
+        let shadowed = ordered [0us .. comparison::min (ordered.len, cast!usize (self._maxLights))];
+        let fitted = fitTiles (copy [s._2 for s in shadowed], copy [s._3 for s in shadowed], self._side, minTile);
+
+        // the views of each light shadowed, a tile each
+        let mut layout : [LayoutView] = [];
+        for i, s in shadowed {
+            if fitted [i] == 0u32 { continue; }
+            if let Ok (l) = self._lights [s._0] {
+                let lightViews = if s._3 == FACES {
+                    pointViews (l.worldPosition, l.range, fitted [i])
+                } else {
+                    copy [spotView (l.worldPosition, l.worldDirection, l.outerAngle, l.range, fitted [i])]
+                };
+
+                for f, v in lightViews {
+                    layout = layout ~ [LayoutView (shadow-> s._0, face-> cast!u32 (f), tile-> ShadowTile (side-> fitted [i]), view-> v)];
+                }
+            }
+        }
+
+        let tiles = packTiles (copy [v.tile.side for v in layout], self._side, minTile);
+        let dmut placed = copy layout;
+        for i, t in tiles {
+            placed [i] = LayoutView (shadow-> layout [i].shadow, face-> layout [i].face, tile-> t, view-> layout [i].view);
+        }
+
+        if !self.sameTiles (placed) {
+            self._relayout = true;
+        }
+
+        self._layout = placed;
+        self:.write (self.camerasContent (), self.content ());
+
+        let mut texels = 0u64;
+        let mut lights = 0u32;
+        for i, v in placed {
+            texels += cast!u64 (v.tile.side) * cast!u64 (v.tile.side);
+            if i == 0us || placed [i - 1us].shadow != v.shadow { lights += 1u32; }
+        }
+
+        self._stats = ShadowStats (lights-> lights, views-> cast!u32 (placed.len), texels-> texels);
+
+        let relayout = self._relayout;
+        self._relayout = false;
+        (copy [ViewVolume (v.view.viewProj, cast!f32 (v.tile.side)) for v in placed], relayout)
+    }
+
+    /**
+     * @returns: true iif the casters seen by the views have to be culled again, the views written last or the instances
+     * of the scene having changed since their last culling, which is marked done
+     * @params:
+     *    - changes: the number of changes of the instances of the scene
+     * */
+    pub fn cullAgain (mut self, changes : usize)-> bool {
+        let views = copy [v.view.viewProj for v in self._layout];
+        if changes == self._culledChanges && sameViews (views, self._culledViews) { return false; }
+
+        self._culledViews = views;
+        self._culledChanges = changes;
+        true
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DRAWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw in the tile of a view of the atlas from now on, the casters biased by the slope of their triangles
+     * @params:
+     *    - cmd: the command buffer of the subpass, its render pass begun
+     *    - view: the index of the view, less than viewCount
+     * */
+    pub fn selectView (self, cmd : VkCommandBuffer, view : usize) {
+        let tile = self._layout [view].tile;
+
+        let mut viewport = VkViewport ();
+        viewport.x = cast!f32 (tile.x);
+        viewport.y = cast!f32 (tile.y);
+        viewport.width = cast!f32 (tile.side);
+        viewport.height = cast!f32 (tile.side);
+        viewport.maxDepth = 1.0f;
+
+        let mut scissor = VkRect2D ();
+        scissor.offset.x = cast!i32 (tile.x);
+        scissor.offset.y = cast!i32 (tile.y);
+        scissor.extent.width = tile.side;
+        scissor.extent.height = tile.side;
+
+        vkCmdSetViewport (cmd, 0, 1, &viewport);
+        vkCmdSetScissor (cmd, 0, 1, &scissor);
+        vkCmdSetDepthBias (cmd, CONSTANT_BIAS, 0.0f, SLOPE_BIAS);
+    }
+
+    /**
+     * @returns: the size of the buffer of the cameras of the views
+     * */
+    fn camerasSize (self)-> usize {
+        cast!usize (self._maxLights * FACES) * CAMERA_STRIDE + CAMERA_TAIL
+    }
+
+    /**
+     * @returns: true iif the views are drawn in the tiles of the views of the last tick
+     * */
+    fn sameTiles (self, layout : [LayoutView])-> bool {
+        if layout.len != self._layout.len { return false; }
+        for i, v in layout {
+            let o = self._layout [i];
+            if v.shadow != o.shadow || v.face != o.face || v.tile.x != o.tile.x || v.tile.y != o.tile.y || v.tile.side != o.tile.side {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /**
+     * @returns: the content of the buffer of the cameras, the camera of each view drawn: the shadow pipelines project the
+     * view of the camera, the view of the light being in the projection
+     * */
+    fn camerasContent (self)-> [u8] {
+        let dmut content = copy [0u8; self.camerasSize ()];
+        for i, v in self._layout {
+            let block = i * CAMERA_STRIDE;
+            put (alias content, block + CAMERA_PROJ, v.view.viewProj);
+            put (alias content, block + CAMERA_VIEW, mat4 ());
+            put (alias content, block + CAMERA_VIEWPROJ, v.view.viewProj);
+        }
+
+        content
+    }
+
+    /**
+     * @returns: the content of the buffer the composition reads: the views drawn, and the views of each shadow
+     * */
+    fn content (self)-> [u8] {
+        let dmut content = copy [0u8; LOCAL_SHADOW_SIZE];
+        let atlas = cast!f32 (self._side);
+        for i, v in self._layout {
+            let block = i * VIEW_STRIDE;
+            let t = v.tile;
+            put (alias content, block + VIEW_VIEWPROJ, v.view.viewProj);
+            put (alias content, block + VIEW_TILE, makeVec4 (cast!f32 (t.x) / atlas, cast!f32 (t.y) / atlas, cast!f32 (t.side) / atlas, cast!f32 (t.side) / atlas));
+            put (alias content, block + VIEW_INFO, makeVec4 (v.view.texel, 0.0f, 0.0f, 0.0f));
+
+            if v.face == 0u32 {
+                let shadow = SHADOWS_OFFSET + cast!usize (v.shadow) * SHADOW_STRIDE;
+                let mut count = 0u32;
+                for w in self._layout [i .. $] {
+                    if w.shadow != v.shadow { break; }
+                    count += 1u32;
+                }
+
+                put (alias content, shadow + SHADOW_FIRST, cast!u32 (i));
+                put (alias content, shadow + SHADOW_COUNT, count);
+                if let Ok (l) = self._lights [v.shadow] {
+                    put (alias content, shadow + SHADOW_NORMAL_OFFSET, l.shadowNormalOffset);
+                    put (alias content, shadow + SHADOW_BIAS, l.shadowBias);
+                }
+            }
+        }
+
+        content
+    }
+
+    /**
+     * Write the uniform buffers at once for the next submissions, when their content changed
+     * @params:
+     *    - cameras: the content of the buffer of the cameras, the cameras of no view when empty
+     *    - content: the content of the buffer the composition reads, no view and no shadow when empty
+     * */
+    fn write (mut self, cameras : [u8], content : [u8]) {
+        let c = if cameras.len == 0us { copy [0u8; self.camerasSize ()] } else { cameras };
+        let u = if content.len == 0us { copy [0u8; LOCAL_SHADOW_SIZE] } else { content };
+
+        if c != self._writtenCameras {
+            if let Ok (dmut ubo) = alias self._cameras {
+                ubo:.setData (0us, c);
+                self._writtenCameras = c;
+            }
+        }
+
+        if u != self._written {
+            if let Ok (dmut ubo) = alias self._ubo {
+                ubo:.setData (0us, u);
+                self._written = u;
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            self:.stop ();
+
+            if let Ok (dmut win) = alias self._window {
+                if let Ok (dmut c) = alias self._cameras {
+                    win:.retire (alias c);
+                }
+
+                if let Ok (dmut ubo) = alias self._ubo {
+                    win:.retire (alias ubo);
+                }
+            }
+
+            for _, dmut l in alias self._lights {
+                l:.setShadowIndex (u32::max);
+            }
+
+            self._lights = copy [];
+            self._cameras = none;
+            self._ubo = none;
+            self._writtenCameras = [];
+            self._written = [];
+            self._window = none;
+        }
+    }
+
+}
