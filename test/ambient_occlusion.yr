@@ -1,0 +1,245 @@
+in ambient_occlusion;
+
+use balder::core::error;
+use balder::core::driver::graph;
+use balder::scene::utils::occlusion;
+use balder::scene::utils::post::pass;
+
+use ::vulkan::core;
+
+def COMPUTE      = 0x00000800u32; // VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+def SHADER_WRITE = 0x00000040u32; // VK_ACCESS_SHADER_WRITE_BIT
+
+/**
+ * @returns: the passes of the occlusion of a scene named "scene", reading the images "depth" and "normals"
+ * */
+fn passesOf ()-> [PostPass] {
+    AmbientOcclusion ().passes ("scene", "depth", "normals", 32u32, 16u32)
+}
+
+/**
+ * @returns: the graph of a scene, its g-buffer writing the depth and the normals, the passes of its occlusion in a
+ * subpass of their own, its composition reading them all and the screen reading the light it writes
+ * */
+fn graphOf ()-> dmut &RenderGraph
+    throws BalderError
+{
+    let dmut g = copy RenderGraph ("screen");
+    g:.addSubmission ("screen");
+    g:.addSubmission ("deferred");
+    g:.addSubmission ("occlusion");
+    g:.addSubmission ("compose");
+
+    g:.createImage ("depth", ImageDesc (width-> 32u32, height-> 16u32, depth-> true));
+    g:.createImage ("normals", ImageDesc (format-> VkFormat::VK_FORMAT_R16G16_SFLOAT, width-> 32u32, height-> 16u32));
+    g:.createImage ("radiance", ImageDesc (format-> VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT, width-> 32u32, height-> 16u32, storage-> true));
+
+    g:.declarePass (GraphPass (name-> "screen",
+                               submission-> "screen",
+                               uses-> copy [ResourceUse (resource-> "radiance", usage-> Usage::SAMPLED_FRAGMENT)]));
+    g:.declarePass (GraphPass (name-> "gbuffer",
+                               submission-> "deferred",
+                               uses-> copy [ResourceUse (resource-> "depth", usage-> Usage::DEPTH_ATTACHMENT),
+                                            ResourceUse (resource-> "normals", usage-> Usage::COLOR_ATTACHMENT)]));
+
+    for p in passesOf () {
+        g:.createImage (p.output, p.image);
+        g:.declarePass (p.toPass ("occlusion", none));
+    }
+
+    let image = AmbientOcclusion ().image ("scene");
+    g:.declarePass (GraphPass (name-> "compose",
+                               submission-> "compose",
+                               kind-> PassKind::COMPUTE,
+                               uses-> copy [ResourceUse (resource-> "depth", usage-> Usage::SAMPLED_COMPUTE),
+                                            ResourceUse (resource-> "normals", usage-> Usage::SAMPLED_COMPUTE),
+                                            ResourceUse (resource-> image, usage-> Usage::SAMPLED_COMPUTE, optional-> true),
+                                            ResourceUse (resource-> "radiance", usage-> Usage::STORAGE_WRITE)]));
+
+    alias g
+}
+
+/**
+ * @returns: the names of the subpasses of a schedule, in the order they are submitted
+ * */
+fn submissionNames (s : RenderSchedule)-> [[c8]] {
+    let mut result : [[c8]] = [];
+    for sub in s.submissions {
+        result = result ~ [sub.name];
+    }
+
+    result
+}
+
+/**
+ * @returns: the names of the passes of a subpass of a schedule, in their order
+ * */
+fn passNames (s : RenderSchedule, submission : [c8])-> [[c8]] {
+    let mut result : [[c8]] = [];
+    for sub in s.submissions if sub.name == submission {
+        for p in sub.passes {
+            result = result ~ [p.name];
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the resources of the edge from a subpass to another one, none if there is no edge
+ * */
+fn edgeResources (s : RenderSchedule, from : [c8], to : [c8])-> [[c8]] {
+    let mut f = usize::max, mut t = usize::max;
+    for i, sub in s.submissions {
+        if sub.name == from { f = i; }
+        if sub.name == to { t = i; }
+    }
+
+    for e in s.edges if e.from == f && e.to == t {
+        return e.resources;
+    }
+
+    []
+}
+
+/**
+ * @returns: the barrier of a resource before a pass, a barrier of no stage if there is none
+ * */
+fn barrierOf (s : RenderSchedule, pass : [c8], resource : [c8])-> GraphBarrier {
+    for sub in s.submissions {
+        for p in sub.passes if p.name == pass {
+            for b in p.barriers if b.resource == resource {
+                return b;
+            }
+        }
+    }
+
+    GraphBarrier ()
+}
+
+/**
+ * The occlusion searches the horizons from the depth and the normals, then blurs them along the rows and the columns,
+ * each pass writing an r8 image of the size of the g-buffer, the last one the image the composition reads
+ * */
+__test the_horizons_are_blurred_along_both_axes {
+    let passes = passesOf ();
+    assert (passes.len == 3us);
+
+    let horizons = passes [0], rows = passes [1], columns = passes [2];
+    assert (horizons.name == "occlusion_horizons_scene" && horizons.index == 0us && horizons.shader == 0us);
+    assert (horizons.textures == ["depth", "normals"] && horizons.images == ["depth", "normals"]);
+    assert (horizons.output == "occlusion_noisy_scene");
+
+    assert (rows.name == "occlusion_blur_x_scene" && rows.index == 1us && rows.shader == 1us && rows.level == 0u32);
+    assert (rows.textures == ["input", "depth", "normals"] && rows.images == ["occlusion_noisy_scene", "depth", "normals"]);
+    assert (rows.output == "occlusion_rows_scene");
+
+    assert (columns.name == "occlusion_blur_y_scene" && columns.index == 2us && columns.shader == 1us && columns.level == 1u32);
+    assert (columns.images == ["occlusion_rows_scene", "depth", "normals"]);
+    assert (columns.output == "occlusion_out_scene" && columns.output == AmbientOcclusion ().image ("scene"));
+
+    for p in passes {
+        assert (p.image.format == VkFormat::VK_FORMAT_R8_UNORM && p.image.storage && !p.image.persistent);
+        assert (p.image.width == 32u32 && p.image.height == 16u32);
+        assert (!p.imported);
+
+        let uses = p.uses ();
+        assert (uses [$ - 1us].resource == p.output && uses [$ - 1us].usage == Usage::STORAGE_WRITE);
+        for u in uses [0us .. $ - 1us] {
+            assert (u.usage == Usage::SAMPLED_COMPUTE);
+        }
+    }
+}
+
+/**
+ * The subpass of the occlusion runs between the g-buffer, whose depth and normals it reads, and the composition, which
+ * reads the occlusion it blurred; its passes are separated by the barriers of their images
+ * */
+__test the_occlusion_runs_between_the_gbuffer_and_the_composition {
+    let g = graphOf ();
+    let s = g.compile ();
+
+    assert (submissionNames (s) == ["deferred", "occlusion", "compose", "screen"]);
+    assert (passNames (s, "occlusion") == ["occlusion_horizons_scene", "occlusion_blur_x_scene", "occlusion_blur_y_scene"]);
+
+    let read = edgeResources (s, "deferred", "occlusion");
+    assert (read.len == 2us);
+    for r in read {
+        assert (r == "depth" || r == "normals");
+    }
+
+    assert (edgeResources (s, "occlusion", "compose") == ["occlusion_out_scene"]);
+
+    let noisy = barrierOf (s, "occlusion_blur_x_scene", "occlusion_noisy_scene");
+    assert (noisy.srcStage == COMPUTE && noisy.srcAccess == SHADER_WRITE && noisy.dstStage == COMPUTE);
+    assert (noisy.newLayout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    let rows = barrierOf (s, "occlusion_blur_y_scene", "occlusion_rows_scene");
+    assert (rows.srcStage == COMPUTE && rows.srcAccess == SHADER_WRITE);
+}
+
+/**
+ * Disabled, the passes of the occlusion are left out, its subpass is not submitted, and the composition reads no
+ * occlusion
+ * */
+__test a_disabled_occlusion_is_left_out_of_the_frame {
+    let dmut g = graphOf ();
+    for p in passesOf () {
+        assert (g:.enablePass (p.name, false));
+    }
+
+    let s = g.compile ();
+    assert (submissionNames (s) == ["deferred", "compose", "screen"]);
+    assert (edgeResources (s, "deferred", "compose").len == 2us);
+
+    for l in s.lifetimes {
+        assert (l.name != "occlusion_noisy_scene" && l.name != "occlusion_rows_scene" && l.name != "occlusion_out_scene");
+    }
+}
+
+/**
+ * An occlusion is disabled until enabled, runs once configured on a device storing r8 images only, and keeps its
+ * parameters in their range
+ * */
+__test the_parameters_of_the_occlusion_stay_in_their_range {
+    let dmut ao = copy AmbientOcclusion ();
+    assert (!ao.enabled && !ao.isRunning && ao.output == "");
+    assert (ao.radius == 0.5f && ao.intensity == 1.5f && ao.samples == 4u32 && ao.scale == 1.0f);
+
+    ao.enabled = true;
+    assert (ao.enabled && !ao.isRunning && ao.output == "");
+
+    ao.radius = -1.0f;
+    ao.intensity = -2.0f;
+    ao.samples = 0u32;
+    assert (ao.radius == 0.0f && ao.intensity == 0.0f && ao.samples == 1u32);
+
+    ao.radius = 2.0f;
+    ao.samples = 8u32;
+    assert (ao.radius == 2.0f && ao.samples == 8u32);
+
+    ao.scale = 0.1f;
+    assert (ao.scale == 0.25f);
+    ao.scale = 2.0f;
+    assert (ao.scale == 1.0f);
+    ao.scale = 0.5f;
+    assert (ao.scale == 0.5f);
+}
+
+/**
+ * Scaled, the images of the occlusion are smaller than the g-buffer, rounded up so they cover it, a texel at least; the
+ * passes read the g-buffer at its own size
+ * */
+__test the_scale_sizes_the_images_of_the_occlusion {
+    let dmut ao = copy AmbientOcclusion ();
+    ao.scale = 0.5f;
+    for p in ao.passes ("scene", "depth", "normals", 33u32, 16u32) {
+        assert (p.image.width == 17u32 && p.image.height == 8u32);
+        assert (p.images [$ - 2us .. $] == ["depth", "normals"]);
+    }
+
+    ao.scale = 0.25f;
+    for p in ao.passes ("scene", "depth", "normals", 2u32, 1u32) {
+        assert (p.image.width == 1u32 && p.image.height == 1u32);
+    }
+}

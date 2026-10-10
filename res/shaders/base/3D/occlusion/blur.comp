@@ -1,0 +1,152 @@
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The occlusion to blur, written by the pass before it
+layout (binding = 1) uniform sampler2D inputTex;
+
+// The depth of the g-buffer, 1 where nothing is drawn
+layout (binding = 2) uniform sampler2D depthTex;
+
+// The normals of the g-buffer, in world space, folded on an octahedron
+layout (binding = 3) uniform sampler2D normalsTex;
+
+// The camera, its exposure after its position
+layout (binding = 4) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+    float exposure;
+} camera;
+
+// The axis of the blur, 0 along the rows, 1 along the columns
+layout (push_constant) uniform Level {
+    uint level;
+} pc;
+
+// The occlusion blurred along the axis
+layout (set = 0, binding = 0, r8) uniform writeonly image2D outTex;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          CONSTANTS          ===================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The texels blurred on each side of a pixel, the width of the noise of the occlusion
+const int RADIUS = 4;
+
+// The distance of a texel to the plane of the pixel, in shares of the depth of the pixel, from which it weighs nothing:
+// the texels of another surface are left out, so the occlusion of a surface does not bleed over its edges
+const float PLANE_TOLERANCE = 0.05;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          GEOMETRY          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the unit direction a normal of the g-buffer was folded from
+ */
+vec3 octDecode (vec2 e) {
+    vec3 n = vec3 (e, 1.0 - abs (e.x) - abs (e.y));
+    float t = max (-n.z, 0.0);
+    n.xy += vec2 (n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize (n);
+}
+
+/**
+ * @returns: the position of the point seen at a texel, in the space of the view, rebuilt from its depth (see the
+ * horizons shader)
+ */
+vec3 viewPosition (ivec2 texel, vec2 size, float d) {
+    mat4 p = camera.proj;
+    vec2 ndc = (vec2 (texel) + 0.5) / size * 2.0 - 1.0;
+
+    float z = (p [3][2] - d * p [3][3]) / (d * p [2][3] - p [2][2]);
+    float w = p [2][3] * z + p [3][3];
+    vec2 xy = (ndc * w - vec2 (p [2][0], p [2][1]) * z - vec2 (p [3][0], p [3][1])) / vec2 (p [0][0], p [1][1]);
+    return vec3 (xy, z);
+}
+
+/**
+ * @returns: the texel of the g-buffer at the center of a texel of the occlusion (see the horizons shader)
+ */
+ivec2 fullTexel (ivec2 texel, ivec2 size, ivec2 full) {
+    return min (ivec2 ((vec2 (texel) + 0.5) * vec2 (full) / vec2 (size)), full - 1);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * A bilateral blur along an axis: the texels around each pixel weighed by a gaussian of their distance, and by their
+ * distance to the tangent plane of the pixel, each texel of an occlusion smaller than the g-buffer placed at the texel
+ * of the g-buffer at its center
+ */
+void main () {
+    ivec2 texel = ivec2 (gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize (outTex);
+    if (any (greaterThanEqual (texel, size))) {
+        return;
+    }
+
+    ivec2 full = textureSize (depthTex, 0);
+    ivec2 pixel = fullTexel (texel, size, full);
+    float d = texelFetch (depthTex, pixel, 0).r;
+    if (d >= 1.0) {
+        imageStore (outTex, texel, vec4 (1.0));
+        return;
+    }
+
+    vec2 fsize = vec2 (full);
+    vec3 P = viewPosition (pixel, fsize, d);
+    vec3 N = normalize (mat3 (camera.view) * octDecode (texelFetch (normalsTex, pixel, 0).xy));
+    float tolerance = PLANE_TOLERANCE * max (abs (P.z), 1e-4);
+
+    ivec2 axis = pc.level == 0u ? ivec2 (1, 0) : ivec2 (0, 1);
+    float sigma = float (RADIUS) * 0.5;
+
+    float sum = 0.0;
+    float total = 0.0;
+    for (int i = -RADIUS; i <= RADIUS; i++) {
+        ivec2 t = texel + axis * i;
+        if (any (lessThan (t, ivec2 (0))) || any (greaterThanEqual (t, size))) {
+            continue;
+        }
+
+        ivec2 ft = fullTexel (t, size, full);
+        float dt = texelFetch (depthTex, ft, 0).r;
+        if (dt >= 1.0) {
+            continue;
+        }
+
+        float plane = abs (dot (viewPosition (ft, fsize, dt) - P, N));
+        float weight = exp (-float (i * i) / (2.0 * sigma * sigma)) * max (1.0 - plane / tolerance, 0.0);
+
+        sum += texelFetch (inputTex, t, 0).r * weight;
+        total += weight;
+    }
+
+    // the pixel weighs 1 itself, in its own plane
+    imageStore (outTex, texel, vec4 (sum / total));
+}

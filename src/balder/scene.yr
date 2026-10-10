@@ -83,6 +83,9 @@ pub class Scene {
     // The compose rendering textures and subpasses
     let dmut _compose : ComposeRenderScene = ComposeRenderScene ();
 
+    // The screen-space ambient occlusion, shading the ambient light in the composition
+    let dmut _occlusion : &AmbientOcclusion = copy AmbientOcclusion ();
+
     // The passes between the composition and the screen, reading the light the composition writes, the last one
     // writing the output of the scene
     let dmut _post : &PostChain = copy PostChain ();
@@ -187,6 +190,13 @@ pub class Scene {
                                           self._deferred,
                                           self._shadow.ubo,
                                           self._ambient);
+                self._occlusion:.configure (alias self._window,
+                                            self._name,
+                                            self._deferred.depth,
+                                            self._deferred.normals,
+                                            self._width,
+                                            self._height);
+                self._compose:.setOcclusion (self._occlusion.isRunning);
 
                 let dmut dpass = alias self._deferred.subpass;
                 self._shaderToNode:.configure (alias self._window, self._deferred.depth, alias dpass);
@@ -224,8 +234,9 @@ pub class Scene {
     /**
      * Declare the buffers and the passes of the scene in the render graph of the window, in the order a frame runs them:
      * the cull pass and the g-buffer drawing the instances it finds, the depth pyramid, the late cull pass and the
-     * g-buffer drawing the occluded instances it finds again, then the composition (the shadow map is declared before it
-     * when a light casts shadows); the post-process chain declares its passes after it, in the subpass of the composition
+     * g-buffer drawing the occluded instances it finds again, the ambient occlusion, then the composition (the shadow map
+     * is declared before it when a light casts shadows); the post-process chain declares its passes after it, in the
+     * subpass of the composition
      * */
     fn declarePasses (mut self)
         throws BalderError
@@ -272,6 +283,8 @@ pub class Scene {
                                                        ResourceUse (resource-> self.named (LATE_DRAWS), usage-> Usage::VERTEX_READ)] ~ attachments,
                                           recording-> (&self:.recordLateGbuffer)?));
 
+        self._occlusion:.declare (self.named (COMPOSE));
+
         let mut reads : [ResourceUse] = [];
         for a in self._deferred.shaded {
             reads = reads ~ [ResourceUse (resource-> a, usage-> Usage::SAMPLED_COMPUTE)];
@@ -281,6 +294,7 @@ pub class Scene {
                                           submission-> self.named (COMPOSE),
                                           kind-> PassKind::COMPUTE,
                                           uses-> reads ~ [ResourceUse (resource-> self.named (ATLAS), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
+                                                          ResourceUse (resource-> self._occlusion.image (self._name), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
                                                           ResourceUse (resource-> self.named (RADIANCE), usage-> Usage::STORAGE_WRITE)],
                                           recording-> (&self:.recordCompose)?));
     }
@@ -495,6 +509,119 @@ pub class Scene {
             self._ambient = color;
             self._compose:.setAmbient (color);
         }
+    }
+
+    /**
+     * @returns: true iif the screen-space ambient occlusion shades the ambient light, when the device supports it
+     * */
+    @field
+    pub fn ambientOcclusion (self)-> bool {
+        atomic self {
+            self._occlusion.enabled
+        }
+    }
+
+    /**
+     * Shade the ambient light by the screen-space ambient occlusion (see AmbientOcclusion), or stop shading it: the
+     * contact areas (the feet of the objects, the corners, the creases) darken under the ambient light, the lights being
+     * direct; off by default
+     * @info: the occlusion runs on the devices storing r8 images (shaderStorageImageExtendedFormats), in a compute subpass
+     * of its own between the g-buffer and the composition
+     * */
+    @field
+    pub fn ambientOcclusion (mut self, enabled : bool) {
+        let changed = atomic self {
+            if self._occlusion.enabled != enabled {
+                self._occlusion.enabled = enabled;
+                self._compose:.setOcclusion (self._occlusion.isRunning);
+                true
+            } else { false }
+        };
+
+        if changed {
+            self._window:.redrawPipeline ();
+        }
+    }
+
+    /**
+     * @returns: the distance around a point within which the surfaces occlude it, in world units
+     * */
+    @field
+    pub fn occlusionRadius (self)-> f32 {
+        atomic self {
+            self._occlusion.radius
+        }
+    }
+
+    /**
+     * Set the distance around a point within which the surfaces occlude it, in world units (0.5 by default): the size of
+     * the creases the ambient occlusion darkens
+     * */
+    @field
+    pub fn occlusionRadius (mut self, radius : f32) {
+        atomic self {
+            self._occlusion.radius = radius;
+        }
+    }
+
+    /**
+     * @returns: the exponent of the visibility of the ambient occlusion
+     * */
+    @field
+    pub fn occlusionIntensity (self)-> f32 {
+        atomic self {
+            self._occlusion.intensity
+        }
+    }
+
+    /**
+     * Set the exponent of the visibility of the ambient occlusion (1.5 by default): 1 as it is computed, more to darken
+     * the occlusion, 0 for none
+     * */
+    @field
+    pub fn occlusionIntensity (mut self, intensity : f32) {
+        atomic self {
+            self._occlusion.intensity = intensity;
+        }
+    }
+
+    /**
+     * @returns: the number of directions around each pixel the ambient occlusion searches its horizons in
+     * */
+    @field
+    pub fn occlusionSamples (self)-> u32 {
+        atomic self {
+            self._occlusion.samples
+        }
+    }
+
+    /**
+     * Set the number of directions around each pixel the ambient occlusion searches its horizons in (4 by default), each
+     * sampling the depth 8 times: its cost grows with it, its noise lessens
+     * */
+    @field
+    pub fn occlusionSamples (mut self, samples : u32) {
+        atomic self {
+            self._occlusion.samples = samples;
+        }
+    }
+
+    /**
+     * @returns: the size of the images of the ambient occlusion, in shares of the size of the generated texture
+     * */
+    @field
+    pub fn occlusionScale (self)-> f32 {
+        self._occlusion.scale
+    }
+
+    /**
+     * Set the size of the images of the ambient occlusion, in shares of the size of the generated texture, from a
+     * quarter to 1 (the default): its cost falls with the square of the scale, the composition upsampling it along the
+     * depth; 0.5 computes a texel of occlusion for 2x2 pixels
+     * */
+    @field
+    pub fn occlusionScale (mut self, scale : f32) {
+        self._occlusion.scale = scale;
     }
 
     /**
@@ -751,6 +878,7 @@ pub class Scene {
             self._compose:.select (frame,
                                    self._shaderToNode,
                                    self._shadow,
+                                   self._occlusion.output,
                                    cmdV);
             
             cmd:.dispatchNext ();
@@ -793,6 +921,7 @@ pub class Scene {
     pub fn onCameraUpdate (mut self, dmut cam : &Camera) {
         atomic self {
             self._compose:.setCamera (alias cam);
+            self._occlusion:.setCamera (alias cam);
             self._post:.setCamera (alias cam);
             self._shaderToNode:.setCamera (alias cam);
         }
@@ -1135,6 +1264,7 @@ pub class Scene {
         self._window:.disconnectFrameSubmit (&self:.onFrameSubmit);
         self._post:.dispose ();
         self._compose:.dispose ();
+        self._occlusion:.dispose ();
         self._shadow:.dispose ();
         self._tree:.dispose ();
         self._shaderToNode:.dispose ();

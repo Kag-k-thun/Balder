@@ -125,7 +125,8 @@ cd tools && gyllir build
 
 ## The graph of a scene
 
-With shadows, the culling on the GPU and the occlusion culling (`./demo --shadows --gpu-cull --occlusion`):
+With shadows, the culling on the GPU, the occlusion culling and the ambient occlusion (`./demo --shadows --gpu-cull
+--occlusion --ambient-occlusion`):
 
 ```mermaid
 flowchart LR
@@ -136,6 +137,9 @@ flowchart LR
     subgraph shadow
         shadow_map[shadow]
     end
+    subgraph occlusion
+        horizons[occlusion_horizons] --> blur_x[occlusion_blur_x] --> blur_y[occlusion_blur_y]
+    end
     subgraph compose
         composition[compose] --> taa[post_taa: resolve, history, sharpen] --> bloom[post_bloom: 6 down, 5 up, 1 added] --> vignette[post_vignette] --> tonemap[post_tonemap] --> lut[post_lut]
     end
@@ -144,7 +148,9 @@ flowchart LR
     end
     transfers -. all commands .-> deferred
     transfers -. all commands .-> shadow
+    deferred -. compute shader .-> occlusion
     deferred -. compute shader .-> compose
+    occlusion -. compute shader .-> compose
     shadow -. compute shader .-> compose
     compose -. fragment shader .-> screen
 ```
@@ -154,14 +160,43 @@ flowchart LR
 | `draws`, `late_draws` | imported buffers | the cull passes | the g-buffers (indirect, vertices) |
 | `cull_state` | imported buffers | both cull passes | both cull passes |
 | `hzb` | imported buffer (the depth pyramid) | the pyramid | the late cull pass |
-| `gbuffer_*` (7 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, velocity, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials, all but the velocity), the post effects reading them (the anti-aliasing: depth and velocity) |
+| `gbuffer_*` (7 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, velocity, depth) | transient | both g-buffers | the pyramid (depth), the ambient occlusion (depth and normals), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials, all but the velocity), the post effects reading them (the anti-aliasing: depth and velocity) |
 | `shadow_atlas` | transient | the shadow map | the composition (optional) |
+| `occlusion_noisy`, `occlusion_rows`, `occlusion_out` | transient (`R8_UNORM`, storage, `occlusionScale` times the size of the g-buffer) | the horizons of the ambient occlusion, its blur along the rows, its blur along the columns | the blur along the rows, the blur along the columns, the composition (optional) |
 | `radiance` | transient (`R16G16B16A16_SFLOAT`, storage) | the composition (the light the camera sees, linear and unbounded) | the first pass of the post-process chain |
 | `post_<effect>_out` | transient (`R16G16B16A16_SFLOAT` before the tone mapping, `R8G8B8A8_UNORM` after it, storage) | the last pass of an effect of the post-process chain, but the last effect | the first pass of the next effect |
 | `post_taa_resolved` | transient (`R16G16B16A16_SFLOAT`, storage) | the resolve of the anti-aliasing (the frame blended with the history) | the copy into the history, the sharpening |
 | `post_taa_history` | persistent (`R16G16B16A16_SFLOAT`, storage) | the copy of the blend | the resolve of the next frame |
 | `post_bloom_mip<k>`, `post_bloom_up<k>` | transient (`R16G16B16A16_SFLOAT`, storage, 2^k times smaller) | the downsampling and the upsampling passes of the bloom | the next pass of the bloom |
 | `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the last pass of the post-process chain, the tone mapping without effects in display space | the screen |
+
+## The ambient occlusion
+
+The ambient light of a scene stands in for the light reaching each point from all around, which the creases, the
+corners and the feet of the objects receive less of. The screen-space ambient occlusion (`AmbientOcclusion`, enabled by
+`Scene::ambientOcclusion`, off by default) computes the share of it reaching each pixel from what the g-buffer holds, in
+a compute subpass of its own between the g-buffer and the composition, the GPU time of its subpass measured with the
+others (`VulkanPipeline` debug logs):
+
+- `occlusion_horizons` (the ground truth ambient occlusion of Jimenez, 2016): around each pixel, along
+  `occlusionSamples` directions of the screen (4), the highest horizon on each side is searched among the points the
+  depth holds within `occlusionRadius` (0.5 world units, at most a fifth of the height of the image), 4 steps on each
+  side, and the visible arc between the two horizons integrated against the cosine of the normal, raised to the power
+  `occlusionIntensity` (1.5); the directions and the steps are rotated by an interleaved gradient noise of the pixel;
+- `occlusion_blur_x` and `occlusion_blur_y`: a separable bilateral blur of 9 texels removes the noise, the texels
+  away from the tangent plane of each pixel left out, so the occlusion of a surface does not bleed over its edges.
+
+The images are `occlusionScale` times the size of the g-buffer (from 0.25 to 1, 1 by default, `--occlusion-scale` in
+the demo): smaller, each texel of the occlusion is computed and blurred at the texel of the g-buffer at its center, and
+the composition upsamples it from the four texels around each pixel, weighed by their bilinear weights and by how close
+their depth is to the depth of the pixel, so the occlusion does not bleed over the edges; its cost falls with the
+square of the scale.
+
+The composition multiplies the ambient light alone by it, and by the occlusion baked in the maps of the materials: the
+lights are direct, not occluded. The images are `R8_UNORM` storage images, which needs the
+`shaderStorageImageExtendedFormats` feature of the device (`VulkanDevice::isExtendedStorage`), the occlusion staying
+disabled without it. Disabled, its passes are left out of the graph, its subpass is not submitted and the composition
+does not read it (an optional use). At 1280 × 720 on an Intel Lunar Lake iGPU, the subpass takes about 1.2 ms.
 
 ## The post-process chain
 

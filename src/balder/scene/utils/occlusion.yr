@@ -1,0 +1,631 @@
+in occlusion;
+
+use balder::utils;
+use balder::core::{_, application::_};
+use balder::core::config::shader::_;
+use balder::core::driver::{graph, subpass};
+use balder::core::shader::{_, buffers::_};
+use balder::scene::node::node3D::camera;
+use balder::scene::utils::post::pass;
+
+use std::math;
+
+use ::vulkan::core;
+
+/**
+ * The names of the subpass, the passes and the images of the ambient occlusion in the render graph, suffixed by the name
+ * of the scene
+ * */
+def OCCLUSION = "occlusion";              // the subpass
+def HORIZONS_PASS = "occlusion_horizons"; // the occlusion, noisy
+def ROWS_PASS = "occlusion_blur_x";       // the occlusion blurred along the rows
+def COLUMNS_PASS = "occlusion_blur_y";    // the occlusion blurred along the columns, read by the composition
+def NOISY = "occlusion_noisy";
+def ROWS = "occlusion_rows";
+def BLURRED = "occlusion_out";
+
+/**
+ * The shaders of the occlusion, by their place among its shaders
+ * */
+def HORIZONS = 0us; // the search of the horizons around each pixel
+def BLUR = 1us;     // the bilateral blur along an axis, the level of its pass (0 along the rows, 1 along the columns)
+
+/**
+ * The size of the parameters of the occlusion, its radius, its intensity and its number of directions (the params block
+ * of the horizons shader)
+ * */
+def PARAMS_SIZE = 16us;
+
+/**
+ * The smallest scale of the images of the occlusion, a quarter of the size of the g-buffer
+ * */
+def MIN_SCALE = 0.25f;
+
+/**
+ * The format of the images of the occlusion, the share of the ambient light reaching each pixel
+ * */
+def FORMAT = VkFormat::VK_FORMAT_R8_UNORM;
+
+/**
+ * The textures of the shaders the images of the passes are bound to
+ * */
+def INPUT = "input";
+def STORAGE = "output";
+
+/**
+ * The screen-space ambient occlusion of a scene: the share of the ambient light reaching each pixel, shading the ambient
+ * light in the composition, the lights being direct
+ * @info:
+ * =====
+ * A subpass of compute passes between the g-buffer and the composition, reading the depth and the normals of the
+ * g-buffer (see passes):
+ *   - the horizons (the ground truth ambient occlusion of Jimenez): around each pixel, along `samples` directions of the
+ *     screen, the highest horizon on each side is searched among the points within `radius`, and the visible arc
+ *     between them integrated against the cosine of the normal, raised to the power `intensity`; the directions and the
+ *     steps are rotated by a noise of the pixel
+ *   - a bilateral blur along the rows then the columns removes the noise, the texels away from the tangent plane of each
+ *     pixel left out, so the occlusion of a surface does not bleed over its edges (no halo)
+ * The images are transient images of the render graph, r8 (the device storing the extended formats), at the size of the
+ * g-buffer times `scale`: smaller, each texel of the occlusion is computed at the texel of the g-buffer it covers, and
+ * the composition upsamples it, the texels of another depth left out. Disabled, the passes are not declared and the composition reads no occlusion; the subpass, alone in the
+ * graph, has its time measured on the GPU (see VulkanPipeline::measureGpuTime).
+ * ====
+ * */
+@final
+pub class AmbientOcclusion {
+
+    // True iif the occlusion shades the ambient light, while the device stores r8 images
+    let mut _enabled : bool = false;
+
+    // The distance around a point within which the surfaces occlude it, in world units
+    let mut _radius : f32 = 0.5f;
+
+    // The exponent of the visibility, 1 as it is computed, more to darken the occlusion
+    let mut _intensity : f32 = 1.5f;
+
+    // The number of directions around each pixel the horizons are searched in, each of 4 steps on both sides
+    let mut _samples : u32 = 4u32;
+
+    // The size of the images of the occlusion, in shares of the size of the g-buffer
+    let mut _scale : f32 = 1.0f;
+
+    // True iif the device can store the r8 images of the occlusion
+    let mut _supported : bool = false;
+
+    prot { // pipeline
+
+        let dmut _shaders : [&RefCount!{&Shader}] = [];
+        let dmut _computeShaders : [&ComputeShader] = [];
+
+        // The descriptor set of each pass, in the order of the passes
+        let dmut _sets : [&DescriptorSet] = [];
+
+        // The parameters of the occlusion, read by the horizons shader
+        let dmut _params : (&UniformBufferObject)? = none;
+
+        // The camera of the scene, read by the shaders
+        let dmut _camera : (&Camera)? = none;
+
+        // The subpass recording the passes
+        let dmut _subpass : (&ComputeSubpass)? = none;
+
+        // The window of the scene, none while the occlusion is not configured
+        let dmut _window : (&Window)? = none;
+
+        // The name of the scene, suffixing the names in the render graph
+        let mut _scene : [c8] = "";
+
+        // The names of the depth and the normals of the g-buffer in the render graph, and its size
+        let mut _depth : [c8] = "";
+        let mut _normals : [c8] = "";
+        let mut _width : u32 = 0u32;
+        let mut _height : u32 = 0u32;
+
+        // The pass the passes are declared before, the composition reading the occlusion
+        let mut _before : [c8] = "";
+
+        // The passes in the render graph, in the order they run
+        let mut _passes : [PostPass] = [];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * An occlusion disabled, configured with its scene
+     * */
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CONFIGURE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load the shaders of the occlusion, its parameters and its descriptor sets, create its images and register its
+     * subpass in the render graph of a window; its passes are declared by declare, once the g-buffer is
+     * @params:
+     *    - scene: the name of the scene, suffixing the names in the render graph
+     *    - depth, normals: the names of the depth and the normals of the g-buffer in the render graph
+     *    - width, height: the size of the g-buffer
+     * @assume: called between Window::lockFrame and unlockFrame
+     * */
+    pub fn configure (mut self, dmut win : &Window, scene : [c8], depth : [c8], normals : [c8], width : u32, height : u32)
+        throws BalderError
+    {
+        let dmut device = alias win:.getVulkanDevice ();
+        self._supported = device.isExtendedStorage ();
+        if !self._supported {
+            log::warn #("AmbientOcclusion", "The device does not store r8 images, the scene", scene, "is not occluded");
+            return;
+        }
+
+        for path in copy [DefaultShaders::OCCLUSION_HORIZONS_3D, DefaultShaders::OCCLUSION_BLUR_3D] {
+            let dmut shader = win:.loadResource!{&ComputeShader} (path);
+            self._shaders ~= [alias shader];
+
+            if let Ok (dmut c : &ComputeShader) = (alias shader:.get ())? {
+                self._computeShaders ~= [alias c];
+            } else {
+                log::error #("AmbientOcclusion", "Malformed shader", path);
+                throw copy BalderError ("Failed to configure the ambient occlusion");
+            }
+        }
+
+        let dmut params = copy UniformBufferObject (alias device, PARAMS_SIZE);
+        self._params = (alias params)?;
+        self.writeParams (alias params);
+
+        self._scene = scene;
+        self._depth = depth;
+        self._normals = normals;
+        self._width = width;
+        self._height = height;
+        self._passes = self.passes (scene, depth, normals, width, height);
+
+        let dmut pipeline = win:.getVulkanPipeline ();
+        for p in self._passes {
+            let dmut set = self._shaders [p.shader]:.get ():.allocateDescriptorSet (DescriptorContext::GLOBAL);
+            if p.shader == HORIZONS {
+                set:.setUniform (UniformNames::PARAMS, params);
+            }
+
+            self._sets ~= [alias set];
+            pipeline:.createImage (p.output, p.image);
+        }
+
+        if let Ok (dmut cam) = alias self._camera {
+            self:.setCamera (alias cam);
+        }
+
+        let dmut sub = copy ComputeSubpass (alias device, named (OCCLUSION, scene), width, height, 1);
+        pipeline:.registerSubPass (named (OCCLUSION, scene), alias sub);
+
+        self._subpass = (alias sub)?;
+        self._window = (alias win)?;
+    }
+
+    /**
+     * Declare the passes of the occlusion in the render graph, after the passes drawing the g-buffer and before the
+     * composition reading the occlusion, each enabled while the occlusion is
+     * @params:
+     *    - before: the pass of the composition, the passes being declared before it (after the passes declared, while it
+     *              is not declared yet), declared there again when the scale changes
+     * */
+    pub fn declare (mut self, before : [c8])
+        throws BalderError
+    {
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else { return; };
+        self._before = before;
+
+        let dmut pipeline = win:.getVulkanPipeline ();
+        let recordings = copy [(&self:.recordHorizons)?, (&self:.recordRows)?, (&self:.recordColumns)?];
+        for i, p in self._passes {
+            pipeline:.declarePass (p.toPass (named (OCCLUSION, self._scene), recordings [i]), before-> before);
+        }
+
+        self:.enablePasses ();
+    }
+
+    /**
+     * Declare the passes and the images of the occlusion again, at the scale of the occlusion, the render graph being
+     * compiled again at the next frame
+     * */
+    fn redeclare (mut self) {
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else { return; };
+
+        win:.lockFrame ();
+        {
+            let dmut pipeline = win:.getVulkanPipeline ();
+            for p in self._passes {
+                pipeline:.removePass (p.name);
+                pipeline:.removeResource (p.output);
+            }
+
+            self._passes = self.passes (self._scene, self._depth, self._normals, self._width, self._height);
+            for p in self._passes {
+                pipeline:.createImage (p.output, p.image);
+            }
+
+            self:.declare (self._before);
+        } catch {
+            err => {
+                log::error #("AmbientOcclusion", "Failed to declare the passes of the occlusion again", err);
+            }
+        } exit {
+            win:.unlockFrame ();
+        }
+
+        win:.redrawPipeline ();
+    }
+
+    /**
+     * Read the camera of the scene in the shaders of the occlusion, configured again too
+     * */
+    pub fn setCamera (mut self, dmut cam : &Camera) {
+        self._camera = (alias cam)?;
+        if let Ok (dmut ubo) = alias cam:.getUBO () {
+            for dmut set in alias self._sets {
+                set:.setUniform (UniformNames::CAMERA, ubo);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          PARAMETERS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the occlusion is enabled, whether the device supports it or not (see isRunning)
+     * */
+    @field
+    pub fn enabled (self)-> bool {
+        self._enabled
+    }
+
+    /**
+     * Enable the occlusion, or disable it, its passes declared in the render graph or left out of it from the next frame
+     * */
+    @field
+    pub fn enabled (mut self, enabled : bool) {
+        self._enabled = enabled;
+        self:.enablePasses ();
+    }
+
+    /**
+     * @returns: true iif the passes of the occlusion run, the occlusion enabled, configured and supported by the device
+     * */
+    @field
+    pub fn isRunning (self)-> bool {
+        self._enabled && self._supported && self._passes.len != 0us
+    }
+
+    /**
+     * @returns: the distance around a point within which the surfaces occlude it, in world units
+     * */
+    @field
+    pub fn radius (self)-> f32 {
+        self._radius
+    }
+
+    /**
+     * Set the distance around a point within which the surfaces occlude it, in world units: the size of the creases that
+     * darken, the larger the farther the texels sampled (up to a fifth of the height of the image)
+     * */
+    @field
+    pub fn radius (mut self, radius : f32) {
+        self._radius = if radius > 0.0f { radius } else { 0.0f };
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the exponent of the visibility, 1 as it is computed
+     * */
+    @field
+    pub fn intensity (self)-> f32 {
+        self._intensity
+    }
+
+    /**
+     * Set the exponent of the visibility: 1 as it is computed, more to darken the occlusion, 0 for none
+     * */
+    @field
+    pub fn intensity (mut self, intensity : f32) {
+        self._intensity = if intensity > 0.0f { intensity } else { 0.0f };
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the number of directions around each pixel the horizons are searched in
+     * */
+    @field
+    pub fn samples (self)-> u32 {
+        self._samples
+    }
+
+    /**
+     * Set the number of directions around each pixel the horizons are searched in, each sampling the depth 8 times (4
+     * steps on both sides): the cost of the occlusion grows with it, its noise lessens
+     * */
+    @field
+    pub fn samples (mut self, samples : u32) {
+        self._samples = if samples == 0u32 { 1u32 } else { samples };
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the size of the images of the occlusion, in shares of the size of the g-buffer
+     * */
+    @field
+    pub fn scale (self)-> f32 {
+        self._scale
+    }
+
+    /**
+     * Set the size of the images of the occlusion, in shares of the size of the g-buffer, from a quarter to 1 (the
+     * default): the cost of the occlusion falls with the square of the scale, its creases blurring; the passes and their
+     * images are declared again
+     * */
+    @field
+    pub fn scale (mut self, scale : f32) {
+        let s = if scale < MIN_SCALE { MIN_SCALE } else if scale > 1.0f { 1.0f } else { scale };
+        if s == self._scale { return; }
+
+        self._scale = s;
+        if self._passes.len != 0us {
+            self:.redeclare ();
+        }
+    }
+
+    /**
+     * Write the parameters in the uniform buffer the horizons shader reads, read by the next frames without recording
+     * them again
+     * */
+    fn updateParams (mut self) {
+        if let Ok (dmut ubo) = alias self._params {
+            self.writeParams (alias ubo);
+        }
+    }
+
+    /**
+     * Write the parameters in the uniform buffer of the horizons shader
+     * */
+    fn writeParams (self, dmut ubo : &UniformBufferObject) {
+        ubo:.setData (0us, self._radius);
+        ubo:.setData (4us, self._intensity);
+        ubo:.setData (8us, self._samples);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PASSES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the name of the occlusion read by the composition in the render graph, written by the last pass
+     * @params:
+     *    - scene: the name of the scene
+     * */
+    pub fn image (self, scene : [c8])-> [c8] {
+        named (BLURRED, scene)
+    }
+
+    /**
+     * @returns: the name of the occlusion the composition reads in the render graph, empty while the passes do not run
+     * */
+    @field
+    pub fn output (self)-> [c8] {
+        if self.isRunning { named (BLURRED, self._scene) } else { "" }
+    }
+
+    /**
+     * @returns: the passes of the occlusion, in the order they run, all r8 images of the size of the g-buffer times the
+     * scale (rounded up):
+     * `occlusion_horizons_<scene>` writing the noisy occlusion `occlusion_noisy_<scene>` from the depth and the normals,
+     * `occlusion_blur_x_<scene>` blurring it along the rows into `occlusion_rows_<scene>`, and `occlusion_blur_y_<scene>`
+     * along the columns into `occlusion_out_<scene>`, read by the composition
+     * @params:
+     *    - scene: the name of the scene
+     *    - depth, normals: the names of the depth and the normals of the g-buffer
+     *    - width, height: the size of the g-buffer
+     * */
+    pub fn passes (self, scene : [c8], depth : [c8], normals : [c8], width : u32, height : u32)-> [PostPass] {
+        let image = ImageDesc (format-> FORMAT, width-> scaled (width, self._scale), height-> scaled (height, self._scale), storage-> true);
+        let noisy = named (NOISY, scene), rows = named (ROWS, scene);
+        let d : [c8] = UniformNames::DEPTH;
+
+        copy [PostPass (effect-> OCCLUSION,
+                        name-> named (HORIZONS_PASS, scene),
+                        index-> 0us,
+                        shader-> HORIZONS,
+                        textures-> copy [d, "normals"],
+                        images-> copy [depth, normals],
+                        output-> noisy,
+                        image-> image),
+              PostPass (effect-> OCCLUSION,
+                        name-> named (ROWS_PASS, scene),
+                        index-> 1us,
+                        shader-> BLUR,
+                        level-> 0u32,
+                        textures-> copy [INPUT, d, "normals"],
+                        images-> copy [noisy, depth, normals],
+                        output-> rows,
+                        image-> image),
+              PostPass (effect-> OCCLUSION,
+                        name-> named (COLUMNS_PASS, scene),
+                        index-> 2us,
+                        shader-> BLUR,
+                        level-> 1u32,
+                        textures-> copy [INPUT, d, "normals"],
+                        images-> copy [rows, depth, normals],
+                        output-> named (BLURRED, scene),
+                        image-> image)]
+    }
+
+    /**
+     * Enable the passes in the render graph while the occlusion runs
+     * */
+    fn enablePasses (mut self) {
+        if let Ok (dmut win) = alias self._window {
+            let running = self.isRunning;
+            let dmut pipeline = win:.getVulkanPipeline ();
+            for p in self._passes {
+                pipeline:.enablePass (p.name, running);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Record the search of the horizons
+     * */
+    fn recordHorizons (mut self) {
+        self:.dispatch (0us);
+    }
+
+    /**
+     * Record the blur along the rows
+     * */
+    fn recordRows (mut self) {
+        self:.dispatch (1us);
+    }
+
+    /**
+     * Record the blur along the columns
+     * */
+    fn recordColumns (mut self) {
+        self:.dispatch (2us);
+    }
+
+    /**
+     * Record the dispatch of a pass over the image it writes, the transient images of the render graph compiled last
+     * bound to the descriptor set of the frame
+     * @params:
+     *    - index: the place of the pass among the passes
+     * */
+    fn dispatch (mut self, index : usize) {
+        let dmut sub = if let Ok (dmut s) = alias self._subpass { alias s } else { return; };
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else { return; };
+
+        let pass = self._passes [index];
+        let frame = sub.getCurrentFrame ();
+        let f = cast!i32 (frame);
+        let cmd = sub.getDrawingCommandBuffer ();
+        let dmut pipeline = win:.getVulkanPipeline ();
+        let dmut set = alias self._sets [index];
+
+        for i, t in pass.textures {
+            if let Ok (tex) = pipeline:.getTexture (pass.images [i]) {
+                set:.setTexture (t, tex, frame-> f);
+            } else {
+                log::error #("AmbientOcclusion", "The image", pass.images [i], "is not allocated");
+                return;
+            }
+        }
+
+        if let Ok (tex) = pipeline:.getTexture (pass.output) {
+            set:.setStorageTexture (STORAGE, tex, frame-> f);
+        } else {
+            log::error #("AmbientOcclusion", "The image", pass.output, "is not allocated");
+            return;
+        }
+
+        let dmut sh = alias self._computeShaders [pass.shader];
+        sh.select (cmd);
+        set.select (frame, cmd);
+        if sh.getPushConstantInfo (UniformNames::LEVEL).hasValue {
+            sh:.setPush (cmd, UniformNames::LEVEL, pass.level);
+        }
+
+        let groups = sh.getGroupSizes ();
+        let width = pass.image.width, height = pass.image.height;
+        vkCmdDispatch (cmd, (width + groups [0] - 1u32) / groups [0], (height + groups [1] - 1u32) / groups [1], 1u32);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+
+        /**
+         * Remove the subpass, its passes and its images from the render graph, its descriptor sets, its parameters and
+         * its shaders retired with the frames using them; the parameters are kept, the occlusion can be configured
+         * again
+         * */
+        pub over dispose (mut self) {
+            if let Ok (dmut win) = alias self._window {
+                let dmut pipeline = win:.getVulkanPipeline ();
+                pipeline:.removeSubPass (named (OCCLUSION, self._scene));
+                for p in self._passes {
+                    pipeline:.removeResource (p.output);
+                }
+
+                if let Ok (dmut sub) = alias self._subpass {
+                    win:.retire (alias sub);
+                }
+
+                for dmut s in alias self._sets {
+                    win:.retire (alias s);
+                }
+
+                if let Ok (dmut ubo) = alias self._params {
+                    win:.retire (alias ubo);
+                }
+
+                for i in 0us .. self._shaders.len {
+                    win:.retire (alias self._shaders [i]);
+                }
+            }
+
+            self._shaders = [];
+            self._computeShaders = [];
+            self._sets = [];
+            self._passes = [];
+            self._params = none;
+            self._subpass = none;
+            self._window = none;
+        }
+    }
+}
+
+/**
+ * @returns: a size of the g-buffer times a scale, rounded up, a texel at least
+ * */
+fn scaled (size : u32, scale : f32)-> u32 {
+    let result = cast!u32 (math::ceil (cast!f32 (size) * scale));
+    if result == 0u32 { 1u32 } else { result }
+}
+
+/**
+ * @returns: the name of a subpass, a pass or an image of the occlusion of a scene in the render graph
+ * */
+fn named (base : [c8], scene : [c8])-> [c8] {
+    base ~ "_" ~ scene
+}

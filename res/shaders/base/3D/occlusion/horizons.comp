@@ -1,0 +1,274 @@
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The depth of the g-buffer, 1 where nothing is drawn
+layout (binding = 1) uniform sampler2D depthTex;
+
+// The normals of the g-buffer, in world space, folded on an octahedron
+layout (binding = 2) uniform sampler2D normalsTex;
+
+// The ambient occlusion of the scene (balder::scene::utils::occlusion::AmbientOcclusion)
+layout (binding = 3) uniform Params {
+    // The distance around a point within which the surfaces occlude it, in world units
+    float radius;
+
+    // The exponent of the visibility, 1 as it is computed, more to darken the occlusion
+    float intensity;
+
+    // The number of directions around each pixel the horizons are searched in
+    uint samples;
+} params;
+
+// The camera, its exposure after its position
+layout (binding = 4) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+    float exposure;
+} camera;
+
+// The share of the ambient light reaching each pixel, 1 where nothing occludes it, still noisy, at the size of the
+// g-buffer or smaller (the scale of the occlusion)
+layout (set = 0, binding = 0, r8) uniform writeonly image2D outTex;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          CONSTANTS          ===================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+const float PI = 3.14159265359;
+const float HALF_PI = 1.57079632679;
+
+// The samples taken on each side of a pixel along a direction, closer to the pixel than to the radius
+const uint STEPS = 4u;
+
+// The share of the radius over which an occluder fades out, so the occlusion does not stop at the radius
+const float FALLOFF = 0.615;
+
+// The largest radius on screen, as a share of the height of the image: a surface close to the camera samples farther
+// texels than the caches hold
+const float MAX_RADIUS = 0.2;
+
+// The visibility under which a pixel is never darkened, the occlusion of a closed crease
+const float MIN_VISIBILITY = 0.03;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          GEOMETRY          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the unit direction a normal of the g-buffer was folded from, the lower half of the octahedron folded back
+ * from the corners of the square
+ */
+vec3 octDecode (vec2 e) {
+    vec3 n = vec3 (e, 1.0 - abs (e.x) - abs (e.y));
+    float t = max (-n.z, 0.0);
+    n.xy += vec2 (n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize (n);
+}
+
+/**
+ * @returns: the position of the point seen at a texel, in the space of the view, rebuilt from its depth
+ * @info: the projections of the cameras (perspective or orthographic) leave the x and y of the view out of the depth and
+ * of w, so the depth of the view is solved first, then its x and y
+ * @params:
+ *    - texel: the texel
+ *    - size: the size of the image
+ *    - d: the depth of the texel
+ */
+vec3 viewPosition (ivec2 texel, vec2 size, float d) {
+    mat4 p = camera.proj;
+    vec2 ndc = (vec2 (texel) + 0.5) / size * 2.0 - 1.0;
+
+    float z = (p [3][2] - d * p [3][3]) / (d * p [2][3] - p [2][2]);
+    float w = p [2][3] * z + p [3][3];
+    vec2 xy = (ndc * w - vec2 (p [2][0], p [2][1]) * z - vec2 (p [3][0], p [3][1])) / vec2 (p [0][0], p [1][1]);
+    return vec3 (xy, z);
+}
+
+/**
+ * @returns: the texel of the g-buffer at the center of a texel of the occlusion, the same texel when they have the same
+ * size
+ * @params:
+ *    - texel: the texel of the occlusion
+ *    - size: the size of the occlusion
+ *    - full: the size of the g-buffer
+ */
+ivec2 fullTexel (ivec2 texel, ivec2 size, ivec2 full) {
+    return min (ivec2 ((vec2 (texel) + 0.5) * vec2 (full) / vec2 (size)), full - 1);
+}
+
+/**
+ * @returns: a noise in [0, 1[ spreading its values evenly between the neighbouring pixels (the interleaved gradient noise
+ * of Jimenez), so a small blur averages them
+ */
+float noise (vec2 pixel) {
+    return fract (52.9829189 * fract (dot (pixel, vec2 (0.06711056, 0.00583715))));
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          HORIZONS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the cosine of the angle between the direction to the eye and the direction to the point seen at a texel, the
+ * horizon it raises, lowered toward the lowest horizon as the point is farther than the radius
+ * @params:
+ *    - texel: the texel of the g-buffer sampled
+ *    - size: the size of the g-buffer
+ *    - P: the position of the pixel, in the space of the view
+ *    - V: the unit direction from the pixel to the eye
+ *    - low: the cosine of the lowest horizon, the tangent plane of the pixel
+ *    - falloff: the scale and the offset of the weight of the distance (1 up to the falloff, 0 from the radius)
+ */
+float horizonCos (ivec2 texel, ivec2 size, vec3 P, vec3 V, float low, vec2 falloff) {
+    if (any (lessThan (texel, ivec2 (0))) || any (greaterThanEqual (texel, size))) {
+        return low;
+    }
+
+    float d = texelFetch (depthTex, texel, 0).r;
+    if (d >= 1.0) {
+        return low;
+    }
+
+    vec3 delta = viewPosition (texel, vec2 (size), d) - P;
+    float dist = length (delta);
+    float weight = clamp (dist * falloff.x + falloff.y, 0.0, 1.0);
+
+    return mix (low, dot (delta, V) / max (dist, 1e-4), weight);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * The ground truth ambient occlusion of Jimenez (Practical Realtime Strategies for Accurate Indirect Occlusion, 2016):
+ * around each pixel, in slices of the hemisphere along a few directions of the screen, the highest horizon on each side
+ * is searched among the points the depth holds within the radius, and the visible arc between the two horizons is
+ * integrated, weighed by the cosine of the normal
+ * @info: a texel of an occlusion smaller than the g-buffer is computed at the texel of the g-buffer at its center, the
+ * horizons searched in the texels of the g-buffer
+ */
+void main () {
+    ivec2 texel = ivec2 (gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize (outTex);
+    if (any (greaterThanEqual (texel, size))) {
+        return;
+    }
+
+    ivec2 full = textureSize (depthTex, 0);
+    ivec2 pixel = fullTexel (texel, size, full);
+    float d = texelFetch (depthTex, pixel, 0).r;
+    if (d >= 1.0) {
+        imageStore (outTex, texel, vec4 (1.0));
+        return;
+    }
+
+    mat4 p = camera.proj;
+    vec2 fsize = vec2 (full);
+    vec3 P = viewPosition (pixel, fsize, d);
+    vec3 N = normalize (mat3 (camera.view) * octDecode (texelFetch (normalsTex, pixel, 0).xy));
+
+    // toward the eye, the axis of the view for an orthographic projection, the depth growing away from the camera
+    vec3 V = p [2][3] != 0.0 ? normalize (-P) : vec3 (0.0, 0.0, -sign (p [2][2]));
+
+    // the pixels a unit of the view along x and y covers at the depth of the pixel
+    float w = p [2][3] * P.z + p [3][3];
+    vec2 pixelsPerUnit = vec2 (p [0][0], p [1][1]) * fsize * 0.5 / w;
+
+    float maxPixels = MAX_RADIUS * fsize.y;
+    float falloffRange = FALLOFF * params.radius;
+    vec2 falloff = vec2 (-1.0 / falloffRange, (params.radius - falloffRange) / falloffRange + 1.0);
+
+    // a radius under a pixel occludes nothing the depth holds
+    if (params.radius * min (abs (pixelsPerUnit.x), abs (pixelsPerUnit.y)) < 1.0) {
+        imageStore (outTex, texel, vec4 (1.0));
+        return;
+    }
+
+    float sliceNoise = noise (vec2 (texel));
+    float stepNoise = noise (vec2 (texel) + vec2 (47.0, 17.0));
+    vec2 center = vec2 (pixel) + 0.5;
+
+    uint slices = max (params.samples, 1u);
+    float visibility = 0.0;
+    for (uint slice = 0u; slice < slices; slice++) {
+        float phi = (float (slice) + sliceNoise) * PI / float (slices);
+        vec3 dir = vec3 (cos (phi), sin (phi), 0.0);
+
+        // the direction on screen the direction of the view projects to (the signs of the projection flipping it), and
+        // the radius in pixels along it
+        vec2 omega = dir.xy * pixelsPerUnit;
+        float unit = length (omega);
+        vec2 onScreen = omega / unit;
+        float radiusPixels = min (params.radius * unit, maxPixels);
+
+        // the plane of the slice, holding the direction to the eye, and the normal projected in it
+        vec3 orthoDir = dir - dot (dir, V) * V;
+        vec3 axis = normalize (cross (orthoDir, V));
+        vec3 projN = N - axis * dot (N, axis);
+        float projLength = length (projN);
+
+        float cosN = clamp (dot (projN, V) / max (projLength, 1e-4), 0.0, 1.0);
+        float n = (dot (orthoDir, projN) < 0.0 ? -1.0 : 1.0) * acos (cosN);
+
+        // the horizons start in the tangent plane of the pixel, on each side
+        float low0 = cos (n + HALF_PI);
+        float low1 = cos (n - HALF_PI);
+        float cos0 = low0;
+        float cos1 = low1;
+
+        // the samples closer to the pixel than to the radius, a pixel away from it at least
+        float minStep = 1.3 / radiusPixels;
+        for (uint s = 0u; s < STEPS; s++) {
+            float t = (float (s) + stepNoise) / float (STEPS);
+            t = t * t + minStep;
+
+            vec2 offset = onScreen * (t * radiusPixels);
+            cos0 = max (cos0, horizonCos (ivec2 (floor (center + offset)), full, P, V, low0, falloff));
+            cos1 = max (cos1, horizonCos (ivec2 (floor (center - offset)), full, P, V, low1, falloff));
+        }
+
+        // the angles of the horizons from the direction to the eye, kept within the hemisphere of the normal
+        float h0 = acos (clamp (cos0, -1.0, 1.0));
+        float h1 = -acos (clamp (cos1, -1.0, 1.0));
+        h0 = n + min (h0 - n, HALF_PI);
+        h1 = n + max (h1 - n, -HALF_PI);
+
+        // the arcs between the normal and each horizon, integrated against the cosine of the normal
+        float sinN = sin (n);
+        float arc0 = (cosN + 2.0 * h0 * sinN - cos (2.0 * h0 - n)) * 0.25;
+        float arc1 = (cosN + 2.0 * h1 * sinN - cos (2.0 * h1 - n)) * 0.25;
+        visibility += projLength * (arc0 + arc1);
+    }
+
+    visibility = clamp (visibility / float (slices), 0.0, 1.0);
+    visibility = max (pow (visibility, params.intensity), MIN_VISIBILITY);
+    imageStore (outTex, texel, vec4 (visibility));
+}

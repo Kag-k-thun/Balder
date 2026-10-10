@@ -121,6 +121,10 @@ layout (binding = 13) uniform sampler2D surface;
 // The texels of the emissive colour of the maps of the materials
 layout (binding = 14) uniform sampler2D emissive;
 
+// The share of the ambient light reaching each texel, the screen-space ambient occlusion, read when ambient.occluded is
+// not 0 (another image of the g-buffer stands in for it otherwise), the size of the output or smaller (upsampled)
+layout (binding = 15) uniform sampler2D occlusionTex;
+
 // The cascades of the shadow map of the direction light casting shadows, side by side in a 2x2 atlas, the first one at
 // the top left: a lookup gives the fraction of the four texels around a point whose depth is not closer to the light
 // than the depth it is compared to
@@ -187,6 +191,9 @@ layout (std430, binding = 11) readonly buffer Spots {
 // in for the indirect light
 layout (binding = 12) uniform Ambient {
     vec3 color;
+
+    // 1 when the screen-space ambient occlusion shades the ambient light, 0 when it is disabled
+    uint occluded;
 } ambient;
 
 
@@ -407,6 +414,78 @@ float shadowFactor (vec3 world, vec3 normal) {
 /*!
  * ====================================================================================================
  * ====================================================================================================
+ * ===================================          OCCLUSION          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The difference of depth from which a texel of the occlusion weighs nothing in its upsampling, in shares of the depth
+// of the pixel: the texels of another surface are left out
+const float OCCLUSION_DEPTH_TOLERANCE = 0.05;
+
+/**
+ * @returns: the depth in the view of the point seen at a texel, from its depth (see worldPosition)
+ */
+float viewDepth (float d) {
+    mat4 p = camera.proj;
+    return (p [3][2] - d * p [3][3]) / (d * p [2][3] - p [2][2]);
+}
+
+/**
+ * @returns: the share of the ambient light reaching a pixel, the ambient occlusion at its texel, or upsampled from the
+ * four texels around it when the occlusion is smaller than the output: each weighed by its bilinear weight and by the
+ * difference between its depth and the depth of the pixel, so the occlusion of a surface does not bleed over its edges;
+ * the texel of the closest depth when none is close enough
+ * @params:
+ *    - texel: the pixel
+ *    - size: the size of the output and of the g-buffer
+ *    - z: the depth of the pixel in the view
+ */
+float occlusionAt (ivec2 texel, ivec2 size, float z) {
+    ivec2 aoSize = textureSize (occlusionTex, 0);
+    if (aoSize == size) {
+        return texelFetch (occlusionTex, texel, 0).r;
+    }
+
+    vec2 pos = (vec2 (texel) + 0.5) * vec2 (aoSize) / vec2 (size) - 0.5;
+    ivec2 base = ivec2 (floor (pos));
+    vec2 f = pos - vec2 (base);
+    float tolerance = OCCLUSION_DEPTH_TOLERANCE * max (abs (z), 1e-4);
+
+    float sum = 0.0;
+    float total = 0.0;
+    float closest = 1.0;
+    float closestDiff = 1e30;
+    for (int i = 0; i < 4; i++) {
+        ivec2 o = ivec2 (i & 1, i >> 1);
+        ivec2 t = clamp (base + o, ivec2 (0), aoSize - 1);
+
+        // the texel of the g-buffer at the center of the texel of the occlusion, where it was computed
+        ivec2 full = min (ivec2 ((vec2 (t) + 0.5) * vec2 (size) / vec2 (aoSize)), size - 1);
+        float d = texelFetch (depth, full, 0).x;
+        if (d >= 1.0) {
+            continue;
+        }
+
+        float ao = texelFetch (occlusionTex, t, 0).r;
+        float diff = abs (viewDepth (d) - z);
+        vec2 bilinear = mix (1.0 - f, f, vec2 (o));
+        float weight = bilinear.x * bilinear.y * max (1.0 - diff / tolerance, 0.0);
+
+        sum += ao * weight;
+        total += weight;
+        if (diff < closestDiff) {
+            closestDiff = diff;
+            closest = ao;
+        }
+    }
+
+    return total > 1e-4 ? sum / total : closest;
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
  * ======================================          MAIN          ======================================
  * ====================================================================================================
  * ====================================================================================================
@@ -440,6 +519,9 @@ void main () {
             vec3 baseColor = albedoTexel.rgb * mat.baseColor;
             float metallic = surfaceTexel.x * mat.metallic;
             float occlusion = mix (1.0, albedoTexel.a, mat.occlusion);
+            if (ambient.occluded != 0u) {
+                occlusion *= occlusionAt (texelCoord, size, viewDepth (z));
+            }
 
             Surface s;
             s.N = octDecode (texelFetch (normals, texelCoord, 0).xy);
@@ -448,7 +530,8 @@ void main () {
             s.diffuse = baseColor * (1.0 - metallic);
             s.F0 = mix (vec3 (0.08 * mat.specular), baseColor, metallic);
 
-            // the occlusion baked in the maps shades the ambient light only, the lights being direct
+            // the occlusion baked in the maps and the occlusion of the screen shade the ambient light only, the lights
+            // being direct
             vec3 color = shadeAmbient (s) * occlusion + texelFetch (emissive, texelCoord, 0).rgb * mat.emissive;
 
             for (uint i = 0 ; i < directionLights.nbLights ; i++) {
