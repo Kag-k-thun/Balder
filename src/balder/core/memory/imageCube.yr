@@ -1,0 +1,215 @@
+in imageCube;
+
+use balder::core::dispose;
+use balder::core::memory::segment;
+
+use ::vulkan::core;
+
+#if DEBUG
+use balder::utils::log;
+#end
+
+/**
+ * The number of faces of a cube, the layers of its image
+ * */
+pub def CUBE_FACES = 6u32;
+
+/**
+ * A cube image in device memory, six square layers (the faces +X, -X, +Y, -Y, +Z, -Z) and their levels of detail, each
+ * level half as large as the one before it
+ * */
+@final
+pub class ImageCube {
+
+    // The allocator used to allocate the memory of the image
+    let dmut _allocator: &MemoryAllocator;
+
+    // The image handle
+    let dmut _image: VkImage = null;
+
+    // The memory allocation of the image (description used by MemoryAllocator)
+    let _memAlloc: MemoryAllocation;
+
+    // The number of texels on a side of a face at the first level
+    let mut _size: u32;
+
+    // The number of levels of detail
+    let mut _levels: u32;
+
+    // The format of the image
+    let _format: VkFormat;
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * =======================================   CTOR AND CONFIGURE  ========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - size: the number of texels on a side of a face at the first level
+     *    - levels: the number of levels of detail
+     *    - alloc: the allocator the memory of the image comes from
+     *    - memAlloc: the memory the image is bound into, released with it
+     *    - image: the image, created by the allocator
+     * */
+    pub self (size: u32,
+              levels: u32,
+              format: VkFormat,
+              dmut alloc: &MemoryAllocator,
+              memAlloc: MemoryAllocation,
+              dmut image: VkImage)
+        with _allocator = alias alloc
+        , _size = size
+        , _levels = levels
+        , _format = format
+        , _image = alias image
+        , _memAlloc = memAlloc
+    {}
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * ================================================   GETTERS  ==========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    /**
+     * @returns: the handle on the vulkan image
+     */
+    pub fn getVulkanImage(self)-> VkImage {
+        self._image
+    }
+
+    /**
+     * @returns: the format of the image
+     * */
+    pub fn getFormat(self)-> VkFormat {
+        self._format
+    }
+
+    /**
+     * @returns: the number of texels on a side of a face at the first level
+     * */
+    pub fn getSize(self)-> u32 {
+        self._size
+    }
+
+    /**
+     * @returns: the number of levels of detail of the image
+     * */
+    pub fn getLevels(self)-> u32 {
+        self._levels
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TRANSITIONS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Record the transition of levels of the image from a layout to another, the six faces of each
+     * @params:
+     *    - srcAccess, srcStage: the accesses to the levels the transition waits for, and their stages
+     *    - dstAccess, dstStage: the accesses to the levels waiting for the transition, and their stages
+     *    - baseLevel: the first level of the transition
+     *    - levelCount: the number of levels of the transition, all the levels from the first one by default
+     * */
+    pub fn transition(mut self,
+                      cmd: VkCommandBuffer,
+                      oldLayout: VkImageLayout,
+                      newLayout: VkImageLayout,
+                      srcAccess: u32,
+                      dstAccess: u32,
+                      srcStage: u32,
+                      dstStage: u32,
+                      baseLevel: u32 = 0u32,
+                      levelCount: u32 = VK_REMAINING_MIP_LEVELS)
+    {
+        let mut barrier = VkImageMemoryBarrier();
+        barrier.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+        barrier.image = alias self._image;
+        barrier.subresourceRange.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = baseLevel;
+        barrier.subresourceRange.levelCount = levelCount;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = CUBE_FACES;
+
+        barrier.srcAccessMask = srcAccess;
+        barrier.dstAccessMask = dstAccess;
+
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
+    }
+
+    /**
+     * Record the clear of every level of the image to transparent black, the image left readable by the shaders
+     * @assume: the content of the image is not needed, its layout is discarded
+     * */
+    pub fn clear(mut self, cmd: VkCommandBuffer) {
+        self:.transition(cmd,
+                         VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+                         VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         0u32,
+                         VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        let color = VkClearColorValue();
+        let mut range = VkImageSubresourceRange();
+        range.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+        range.levelCount = self._levels;
+        range.layerCount = CUBE_FACES;
+
+        vkCmdClearColorImage(cmd, self._image, VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1u32, &range);
+
+        self:.transition(cmd,
+                         VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                         | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    /**
+     * ======================================================================================================
+     * ======================================================================================================
+     * ==============================================   DISPOSING  ==========================================
+     * ======================================================================================================
+     * ======================================================================================================
+     */
+
+    impl Disposable {
+
+        pub over dispose(mut self) {
+            if (self._image != null) {
+                self._allocator:.freeImage(alias self._image, self._memAlloc);
+                self._image = null;
+                self._size = 0;
+                self._levels = 0;
+            }
+        }
+    }
+
+    // Disposing from the collector races with the GPU and with the device teardown, the object has to be retired
+#if DEBUG
+    __dtor(mut self) {
+        if self._image != null {
+            log::warn #("Dispose", self.__typeinfo__.name, "collected without being retired");
+        }
+    }
+#end
+}

@@ -1,0 +1,309 @@
+in bake;
+
+use balder::core::_;
+use balder::core::config::shader::_;
+use balder::core::driver::device;
+use balder::core::memory::{buffer, image2D, imageCube};
+use balder::core::shader::{_, texture};
+use balder::core::shader::texture::hdr;
+
+use ::vulkan::core;
+
+extern (C) fn memcpy (dst : *void, src : *void, size : usize);
+
+/**
+ * The shaders of the image based lighting, by their place among its shaders
+ * */
+pub enum EnvironmentShader : usize
+| CUBE       = 0us  // the equirectangular image into the first level of the environment cube
+| DOWNSAMPLE = 1us  // a level of the environment cube from the level before it
+| IRRADIANCE = 2us  // the irradiance from the environment cube
+| PREFILTER  = 3us  // a level of the prefiltered environment from the environment cube
+| BRDF       = 4us; // the split-sum table of the BRDF
+
+/**
+ * The format of the texels of an equirectangular image of an environment as the .hdr file stores them, a mantissa for
+ * each of red, green and blue then their exponent (RGBE), decoded by the shader
+ * */
+def SOURCE_FORMAT = VkFormat::VK_FORMAT_R8G8B8A8_UINT;
+
+/**
+ * The textures of the shaders the images are bound to
+ * */
+def SOURCE = "source";
+def ENVIRONMENT = "environment";
+def INPUT = "input";
+def STORAGE = "output";
+
+/**
+ * The computation of the cubes lighting a scene from the image of its environment, recorded once in the transfer pass of
+ * a device when the environment changes, never again by the frames:
+ *   - the equirectangular image, its RGBE texels copied as they are, is projected on the first level of the environment
+ *     cube, each level after it averaging the level before it
+ *   - the irradiance cube is the environment convolved by the cosine around each direction (the diffuse light)
+ *   - each level of the prefiltered cube is the environment reflected by a surface of a roughness, growing from 0 at the
+ *     first level to 1 at the last (the specular light)
+ * The cubes are left readable by the shaders once computed, the image and its staging buffer, and the descriptor sets of
+ * the passes, released once the transfer is awaited (see release)
+ * */
+@final
+pub class EnvironmentBake {
+
+    // The shaders of the passes, in the order of EnvironmentShader
+    let dmut _shaders : [&ComputeShader];
+
+    // The equirectangular image, its view sampled by the cube shader, and the buffer it is copied from
+    let dmut _source : &Image2D;
+    let dmut _sourceView : &TextureView;
+    let dmut _staging : &Buffer;
+
+    // The cubes computed
+    let dmut _environment : &TextureCube;
+    let dmut _irradiance : &TextureCube;
+    let dmut _prefiltered : &TextureCube;
+
+    // The descriptor set of each pass, in the order they run: the cube, the levels of the environment, the irradiance,
+    // the levels of the prefiltered environment
+    let dmut _sets : [&DescriptorSet] = [];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Upload the image of an environment into a staging buffer, and bind the images of the passes in their descriptor
+     * sets
+     * @params:
+     *    - shaders: the shaders of the image based lighting, in the order of EnvironmentShader
+     *    - image: the equirectangular image of the environment
+     *    - environment, irradiance, prefiltered: the cubes to compute, their content undefined
+     * */
+    pub self (dmut device : &VulkanDevice,
+              dmut shaders : [&ComputeShader],
+              image : HdrImage,
+              dmut environment : &TextureCube,
+              dmut irradiance : &TextureCube,
+              dmut prefiltered : &TextureCube)
+        with _shaders = alias shaders
+        , _source = device:.getMemoryAllocator ():.allocImage2D (image.width,
+                                                                 image.height,
+                                                                 SOURCE_FORMAT,
+                                                                 VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+                                                                 cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                                                                           | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
+                                                                 cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        , _staging = device:.getMemoryAllocator ():.allocBuffer (image.texels.len,
+                                                                 cast!u32 (VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+                                                                 cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                                                           | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+        , _sourceView = copy TextureView (alias device,
+                                          self._source.getVulkanImage (),
+                                          VkImageViewType::VK_IMAGE_VIEW_TYPE_2D,
+                                          SOURCE_FORMAT,
+                                          image.width,
+                                          image.height)
+        , _environment = alias environment
+        , _irradiance = alias irradiance
+        , _prefiltered = alias prefiltered
+        throws BalderError
+    {
+        atomic device {
+            let dmut mptr = self._staging:.map ();
+            memcpy (mptr, cast!{*void} (image.texels.ptr), image.texels.len);
+            self._staging:.unmap ();
+        }
+
+        let dmut cube = self:.allocate (EnvironmentShader::CUBE);
+        cube:.setTexture (SOURCE, self._sourceView, frame-> 0);
+        cube:.setStorageTexture (STORAGE, self._environment.level (0u32), frame-> 0);
+
+        for l in 1u32 .. self._environment.levels {
+            let dmut down = self:.allocate (EnvironmentShader::DOWNSAMPLE);
+            down:.setStorageTexture (INPUT, self._environment.level (l - 1u32), frame-> 0);
+            down:.setStorageTexture (STORAGE, self._environment.level (l), frame-> 0);
+        }
+
+        let dmut irr = self:.allocate (EnvironmentShader::IRRADIANCE);
+        irr:.setTexture (ENVIRONMENT, self._environment, frame-> 0);
+        irr:.setStorageTexture (STORAGE, self._irradiance.level (0u32), frame-> 0);
+
+        for l in 0u32 .. self._prefiltered.levels {
+            let dmut pre = self:.allocate (EnvironmentShader::PREFILTER);
+            pre:.setTexture (ENVIRONMENT, self._environment, frame-> 0);
+            pre:.setStorageTexture (STORAGE, self._prefiltered.level (l), frame-> 0);
+        }
+    }
+
+    /**
+     * @returns: a descriptor set of a shader, placed after the sets of the passes before it
+     * */
+    fn allocate (mut self, shader : usize)-> dmut &DescriptorSet
+        throws BalderError
+    {
+        let dmut set = self._shaders [shader]:.allocateDescriptorSet (DescriptorContext::GLOBAL);
+        self._sets ~= [alias set];
+        alias set
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Record the passes computing the cubes, the cubes left readable by the shaders of the frames
+     * @params:
+     *    - cmd: the command buffer of the transfer pass, on a queue running compute shaders
+     * */
+    pub fn bake (mut self, cmd : VkCommandBuffer) {
+        self:.upload (cmd);
+
+        let dmut env = alias self._environment:.getImage ();
+        env:.transition (cmd,
+                         VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+                         VkImageLayout::VK_IMAGE_LAYOUT_GENERAL,
+                         0u32,
+                         VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        let mut set = 0us;
+        self:.dispatch (cmd, EnvironmentShader::CUBE, set, self._environment.levelSize (0u32), 0.0f);
+        set += 1us;
+
+        // each level reads the level before it once written
+        for l in 1u32 .. self._environment.levels {
+            utils::computeBarrier (cmd);
+            self:.dispatch (cmd, EnvironmentShader::DOWNSAMPLE, set, self._environment.levelSize (l), 0.0f);
+            set += 1us;
+        }
+
+        env:.transition (cmd,
+                         VkImageLayout::VK_IMAGE_LAYOUT_GENERAL,
+                         VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                         VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                         | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+        let dmut cubes = [alias self._irradiance:.getImage (), alias self._prefiltered:.getImage ()];
+        for i in 0us .. cubes.len {
+            cubes [i]:.transition (cmd,
+                                   VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VkImageLayout::VK_IMAGE_LAYOUT_GENERAL,
+                                   0u32,
+                                   VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                                   VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
+
+        self:.dispatch (cmd, EnvironmentShader::IRRADIANCE, set, self._irradiance.levelSize (0u32), 0.0f);
+        set += 1us;
+
+        let levels = self._prefiltered.levels;
+        for l in 0u32 .. levels {
+            self:.dispatch (cmd, EnvironmentShader::PREFILTER, set, self._prefiltered.levelSize (l), utils::levelRoughness (l, levels));
+            set += 1us;
+        }
+
+        for i in 0us .. cubes.len {
+            cubes [i]:.transition (cmd,
+                                   VkImageLayout::VK_IMAGE_LAYOUT_GENERAL,
+                                   VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                                   VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT,
+                                   VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                   | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        }
+    }
+
+    /**
+     * Record the copy of the staging buffer into the equirectangular image, left readable by the compute shaders
+     * */
+    fn upload (mut self, cmd : VkCommandBuffer) {
+        let dmut image = alias self._source:.getVulkanImage ();
+        utils::imageBarrier (cmd,
+                             alias image,
+                             VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+                             VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             0u32,
+                             VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
+                             VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        let mut region = VkBufferImageCopy ();
+        region.imageSubresource.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent.width = self._sourceView.width;
+        region.imageExtent.height = self._sourceView.height;
+        region.imageExtent.depth = 1;
+
+        vkCmdCopyBufferToImage (cmd,
+                                self._staging.getVulkanBuffer (),
+                                image,
+                                VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                1u32,
+                                &region);
+
+        utils::imageBarrier (cmd,
+                             alias image,
+                             VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
+                             VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT,
+                             VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    /**
+     * Record the dispatch of a pass over the six faces of the level it writes
+     * @params:
+     *    - set: the place of the descriptor set of the pass
+     *    - size: the number of texels on a side of a face of the level written
+     *    - roughness: the roughness of the level, pushed to the prefilter shader
+     * */
+    fn dispatch (mut self, cmd : VkCommandBuffer, shader : usize, set : usize, size : u32, roughness : f32) {
+        let dmut sh = alias self._shaders [shader];
+        sh.select (cmd);
+        self._sets [set].select (0u32, cmd);
+        if sh.getPushConstantInfo (UniformNames::LEVEL).hasValue {
+            sh:.setPush (cmd, UniformNames::LEVEL, roughness);
+        }
+
+        let groups = sh.getGroupSizes ();
+        let count = (size + groups [0] - 1u32) / groups [0];
+        vkCmdDispatch (cmd, count, (size + groups [1] - 1u32) / groups [1], CUBE_FACES);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Release the equirectangular image, its staging buffer and the descriptor sets of the passes, the cubes being kept
+     * @assume: the transfer recording the passes is awaited (the cleaner of the transfer)
+     * */
+    pub fn release (mut self) {
+        for dmut s in alias self._sets {
+            s:.dispose ();
+        }
+
+        self._sets = [];
+        self._sourceView:.dispose ();
+        self._source:.dispose ();
+        self._staging:.dispose ();
+    }
+}

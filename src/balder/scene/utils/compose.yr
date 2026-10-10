@@ -8,15 +8,15 @@ use balder::core::driver::{graph, pipeline, subpass};
 use balder::core::shader::{_, buffers::_};
 use balder::math::vector;
 use balder::scene::node::node3D::camera;
-use balder::scene::utils::{cascade, deferred, shader};
+use balder::scene::utils::{cascade, deferred, environment, shader};
 
 use ::vulkan::core;
 
 /**
- * The size of the uniform buffer of the ambient light, its colour and the use of the ambient occlusion (the Ambient block
- * of the shader)
+ * The size of the uniform buffer of the ambient light, its colour, the use of the ambient occlusion and the lighting of
+ * the environment (the Ambient block of the shader)
  * */
-def AMBIENT_SIZE = 16us;
+def AMBIENT_SIZE = 32us;
 
 /**
  * The offset of the use of the ambient occlusion in the uniform buffer of the ambient light, 1 when it shades the ambient
@@ -25,9 +25,27 @@ def AMBIENT_SIZE = 16us;
 def OCCLUDED_OFFSET = 12us;
 
 /**
+ * The offsets of the lighting of the environment in the uniform buffer of the ambient light: the scale of its light, 1
+ * when it lights the scene, 1 when it is the background, and the last level of its prefiltered cube
+ * */
+def INTENSITY_OFFSET = 16us;
+def LIT_OFFSET = 20us;
+def SKYBOX_OFFSET = 24us;
+def LEVELS_OFFSET = 28us;
+
+/**
  * The texture of the compose shader the ambient occlusion is bound to
  * */
 def OCCLUSION = "occlusion";
+
+/**
+ * The textures of the compose shader the images of the lighting of the environment are bound to
+ * */
+enum EnvironmentBindings : [c8]
+| ENVIRONMENT = "environment"
+| IRRADIANCE  = "irradiance"
+| PREFILTERED = "prefiltered"
+| LUT         = "brdf";
 
 /**
  * The textures of the compose shader the images of the g-buffer are bound to, in the order of the attachments of the
@@ -115,6 +133,10 @@ pub record ComposeRenderScene {
         let dmut ambientUbo = copy UniformBufferObject (alias device, AMBIENT_SIZE);
         ambientUbo:.setData (0us, ambient);
         ambientUbo:.setData (OCCLUDED_OFFSET, 0u32);
+        ambientUbo:.setData (INTENSITY_OFFSET, 1.0f);
+        ambientUbo:.setData (LIT_OFFSET, 0u32);
+        ambientUbo:.setData (SKYBOX_OFFSET, 0u32);
+        ambientUbo:.setData (LEVELS_OFFSET, cast!f32 (EnvironmentLighting::PREFILTERED_LEVELS - 1u32));
         self._ambient = (alias ambientUbo)?;
 
         let dmut pass = copy ComputeSubpass (alias device, passName, width, height, 1);
@@ -166,6 +188,22 @@ pub record ComposeRenderScene {
     pub fn setOcclusion (mut self, occluded : bool) {
         if let Ok (dmut ubo) = alias self._ambient {
             ubo:.setData (OCCLUDED_OFFSET, if occluded { 1u32 } else { 0u32 });
+        }
+    }
+
+    /**
+     * Light the scene by the environment in place of the ambient colour, or by the ambient colour again, from the frames
+     * recorded with the cubes of the environment bound (see select)
+     * @params:
+     *    - lit: true iif an environment lights the scene
+     *    - intensity: the scale of the light of the environment
+     *    - skybox: true iif the environment is the background where nothing is drawn
+     * */
+    pub fn setEnvironment (mut self, lit : bool, intensity : f32, skybox : bool) {
+        if let Ok (dmut ubo) = alias self._ambient {
+            ubo:.setData (INTENSITY_OFFSET, intensity);
+            ubo:.setData (LIT_OFFSET, if lit { 1u32 } else { 0u32 });
+            ubo:.setData (SKYBOX_OFFSET, if skybox { 1u32 } else { 0u32 });
         }
     }
 
@@ -224,12 +262,14 @@ pub record ComposeRenderScene {
      * @params:
      *    - shadow: the shadow map, its atlas read when a light casts shadows
      *    - occlusion: the name of the ambient occlusion in the render graph, empty when it does not run
+     *    - environment: the lighting of the environment, its cubes and its table read
      * */
     pub fn select (mut self,
                    frame : u32,
                    ref shaderAssoc : ShaderNodeScene,
                    ref shadow : CascadeShadowScene,
                    occlusion : [c8],
+                   environment : &EnvironmentLighting,
                    cmd : VkCommandBuffer)
     {
         let dmut set = (if let Ok (dmut s) = alias self._set {
@@ -258,6 +298,23 @@ pub record ComposeRenderScene {
             // the normals stand in for the occlusion while it does not run (they are never read then)
             let occlusionMap = if occlusion != "" { occlusion } else { self._gbuffer [0] };
             self.bindImage (alias set, alias pipeline, frame, OCCLUSION, occlusionMap);
+
+            // the black cube stands in for the cubes while no environment lights the scene, the normals for the table on a
+            // device not storing it (they are never read then)
+            let cubes = [environment.environment, environment.irradiance, environment.prefiltered];
+            for i, binding in [EnvironmentBindings::ENVIRONMENT, EnvironmentBindings::IRRADIANCE, EnvironmentBindings::PREFILTERED] {
+                if let Ok (cube) = cubes [i] {
+                    set:.setTexture (binding, cube, frame-> cast!i32 (frame));
+                } else {
+                    log::error #("ComposeRenderScene", "The lighting of the environment is not configured");
+                }
+            }
+
+            if let Ok (lut) = environment.lut {
+                set:.setTexture (EnvironmentBindings::LUT, lut, frame-> cast!i32 (frame));
+            } else {
+                self.bindImage (alias set, alias pipeline, frame, EnvironmentBindings::LUT, self._gbuffer [0]);
+            }
 
             if let Ok (t) = pipeline:.getTexture (self._radiance) {
                 set:.setStorageTexture ("output", t, frame-> cast!i32 (frame));

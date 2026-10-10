@@ -198,6 +198,29 @@ lights are direct, not occluded. The images are `R8_UNORM` storage images, which
 disabled without it. Disabled, its passes are left out of the graph, its subpass is not submitted and the composition
 does not read it (an optional use). At 1280 × 720 on an Intel Lunar Lake iGPU, the subpass takes about 1.2 ms.
 
+## The lighting of the environment
+
+The light of the environment (`EnvironmentLighting`, set by `Scene::setEnvironment` from an equirectangular Radiance
+`.hdr` image, `--environment` in the demo, `E` cycling through `res/environments`) is the indirect light of the
+composition in place of the ambient colour of the scene. It declares nothing in the graph: it is precomputed once when
+the environment changes, recorded in the transfer pass of the device, which runs before the subpasses of the frame that
+first samples it, and the frames only sample what it computed. Its images are owned by the lighting, bound to the
+composition like the shadow cascades, and retired with the frames using them when the environment changes:
+
+| Image | Format | Computed by |
+|---|---|---|
+| environment cube | `R16G16B16A16_SFLOAT`, twice a quarter of the width of the image (64 to 1024), all its levels | `environment_cube` projects the equirectangular image, its RGBE texels copied as they are and decoded by the shader, on the first level; `environment_downsample` averages each level from the one before it |
+| irradiance | `R16G16B16A16_SFLOAT`, 32² | `environment_irradiance`: the environment convolved by the cosine around each direction, divided by π (the diffuse light) |
+| prefiltered | `R16G16B16A16_SFLOAT`, 128², 6 levels | `environment_prefilter`: each level the environment reflected by a surface of a roughness from 0 to 1, 512 GGX samples reading the environment at the level of their solid angle (the specular light) |
+| BRDF table | `R16G16_SFLOAT`, 256² | `environment_brdf`, once when the scene is configured: the scale and the bias of the reflectance facing the eye, by the cosine to the eye and the roughness (the split sum of Karis) |
+
+The composition lights each pixel by the irradiance around its normal times its diffuse colour, and by the prefiltered
+level of its roughness along the reflection of the eye times the reflectance of the table, the diffuse light being what
+the specular reflection leaves; the occlusions shade the diffuse light, and the specular light through the specular
+occlusion of Lagarde. Where nothing is drawn, the environment cube is the background (`Scene::skybox`, on by default);
+`Scene::environmentIntensity` scales it all. The table is an extended storage format, so the scenes of the devices
+without `shaderStorageImageExtendedFormats` keep their ambient colour.
+
 ## The post-process chain
 
 The passes between the composition and the screen are the `PostChain` of the scene (`Scene::getPostChain`), an ordered
