@@ -1,0 +1,137 @@
+in utils;
+
+use balder::core::shader::_;
+
+use ::vulkan::core;
+
+/**
+ * The sizes of a face of the first level of the environment cube, in texels
+ * */
+def MIN_CUBE_SIZE = 64u32;
+def MAX_CUBE_SIZE = 1024u32;
+
+/**
+ * @returns: the number of texels on a side of a face of the environment cube projected from an equirectangular image:
+ * the power of two closest under half its width, so a face covering a quarter of the width has twice its texels and is
+ * filtered from them, between 64 and 1024
+ * @params:
+ *    - width: the width of the equirectangular image
+ * */
+pub fn cubeSize (width : u32)-> u32 {
+    let mut size = MIN_CUBE_SIZE;
+    while size * 2u32 <= width / 2u32 && size < MAX_CUBE_SIZE {
+        size *= 2u32;
+    }
+
+    size
+}
+
+/**
+ * @returns: the number of levels of detail of a cube of a size, down to a texel
+ * */
+pub fn levelCount (size : u32)-> u32 {
+    let mut levels = 1u32;
+    let mut s = size;
+    while s > 1u32 {
+        s /= 2u32;
+        levels += 1u32;
+    }
+
+    levels
+}
+
+/**
+ * @returns: the perceptual roughness of a level of the prefiltered environment, growing linearly from 0 at the first
+ * level to 1 at the last, the composition reading the level of a roughness at roughness × (levels - 1)
+ * */
+pub fn levelRoughness (level : u32, levels : u32)-> f32 {
+    if levels <= 1u32 { return 0.0f; }
+    cast!f32 (level) / cast!f32 (levels - 1u32)
+}
+
+/**
+ * Record the computation of the split-sum table of the BRDF, left readable by the shaders
+ * @params:
+ *    - brdf: the shader of the table
+ *    - set: the descriptor set binding the table as a storage image, in its first frame
+ *    - lut: the image of the table
+ *    - size: the number of texels on a side of the table
+ * */
+pub fn recordLut (cmd : VkCommandBuffer, dmut brdf : &ComputeShader, set : &DescriptorSet, dmut lut : VkImage, size : u32) {
+    imageBarrier (cmd,
+                  alias lut,
+                  VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+                  VkImageLayout::VK_IMAGE_LAYOUT_GENERAL,
+                  0u32,
+                  VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                  VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                  VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    brdf.select (cmd);
+    set.select (0u32, cmd);
+
+    let groups = brdf.getGroupSizes ();
+    vkCmdDispatch (cmd, (size + groups [0] - 1u32) / groups [0], (size + groups [1] - 1u32) / groups [1], 1u32);
+
+    imageBarrier (cmd,
+                  alias lut,
+                  VkImageLayout::VK_IMAGE_LAYOUT_GENERAL,
+                  VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
+                  VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT,
+                  VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                  | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+}
+
+/**
+ * Record the barrier of an image of one level and one layer, from a layout to another
+ * @params:
+ *    - srcAccess, srcStage: the accesses to the image the barrier waits for, and their stages
+ *    - dstAccess, dstStage: the accesses to the image waiting for the barrier, and their stages
+ * */
+pub fn imageBarrier (cmd : VkCommandBuffer,
+                     dmut image : VkImage,
+                     oldLayout : VkImageLayout,
+                     newLayout : VkImageLayout,
+                     srcAccess : u32,
+                     dstAccess : u32,
+                     srcStage : u32,
+                     dstStage : u32)
+{
+    let mut barrier = VkImageMemoryBarrier ();
+    barrier.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = alias image;
+    barrier.subresourceRange.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+
+    vkCmdPipelineBarrier (cmd, srcStage, dstStage, 0u32, 0u32, null, 0u32, null, 1u32, &barrier);
+}
+
+/**
+ * Record a memory barrier between two compute passes, the writes of the first read by the second
+ * */
+pub fn computeBarrier (cmd : VkCommandBuffer) {
+    let mut b = VkMemoryBarrier ();
+    b.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    b.srcAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier (cmd,
+                          VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0u32,
+                          1u32,
+                          &b,
+                          0u32,
+                          null,
+                          0u32,
+                          null);
+}

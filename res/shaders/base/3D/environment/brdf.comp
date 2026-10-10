@@ -1,0 +1,110 @@
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The scale (.r) and the bias (.g) of the reflectance facing the eye, for a cosine between the normal and the eye
+// growing along x and a perceptual roughness growing along y
+layout (set = 0, binding = 0, rg16f) uniform writeonly image2D outLut;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          CONSTANTS          ===================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+const float PI = 3.14159265359;
+
+// The directions of the microfacets sampled for each texel
+const uint SAMPLES = 1024;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SAMPLING          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the i-th point of a Hammersley set of n points in the unit square, spread evenly
+ */
+vec2 hammersley (uint i, uint n) {
+    uint bits = bitfieldReverse (i);
+    return vec2 (float (i) / float (n), float (bits) * 2.3283064365386963e-10);
+}
+
+/**
+ * @returns: the unit normal of a microfacet, drawn from the GGX distribution around +Z from a point of the unit square
+ * @params:
+ *    - xi: the point of the unit square
+ *    - a: the roughness squared (the alpha of GGX)
+ */
+vec3 sampleGGX (vec2 xi, float a) {
+    float phi = 2.0 * PI * xi.x;
+    float cosTheta = sqrt ((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt (1.0 - cosTheta * cosTheta);
+
+    return vec3 (cos (phi) * sinTheta, sin (phi) * sinTheta, cosTheta);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * The second sum of the split sum of Karis: the specular BRDF of the composition (GGX, the height-correlated Smith
+ * visibility and the Fresnel of Schlick) integrated over the hemisphere against the cosine, the reflectance facing the
+ * eye F0 taken out of the Fresnel, so the integral is F0 times the scale plus the bias
+ */
+void main () {
+    ivec2 texel = ivec2 (gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize (outLut);
+    if (texel.x >= size.x || texel.y >= size.y) {
+        return;
+    }
+
+    float NdotV = (float (texel.x) + 0.5) / float (size.x);
+    float roughness = (float (texel.y) + 0.5) / float (size.y);
+
+    float a = max (roughness * roughness, 2e-3);
+    float a2 = a * a;
+    vec3 V = vec3 (sqrt (1.0 - NdotV * NdotV), 0.0, NdotV);
+
+    float scale = 0.0;
+    float bias = 0.0;
+    for (uint i = 0 ; i < SAMPLES ; i++) {
+        vec3 H = sampleGGX (hammersley (i, SAMPLES), a);
+        float VdotH = dot (V, H);
+        vec3 L = 2.0 * VdotH * H - V;
+
+        float NdotL = L.z;
+        float NdotH = H.z;
+        if (NdotL > 0.0 && VdotH > 0.0) {
+            // the visibility divided by 4 NdotL NdotV, the sample weighed by NdotL over its density D NdotH / 4 VdotH
+            float smithV = NdotL * sqrt (NdotV * NdotV * (1.0 - a2) + a2);
+            float smithL = NdotV * sqrt (NdotL * NdotL * (1.0 - a2) + a2);
+            float visibility = 0.5 / (smithV + smithL);
+            float weighed = visibility * 4.0 * NdotL * VdotH / max (NdotH, 1e-4);
+
+            float fresnel = pow (1.0 - VdotH, 5.0);
+            scale += (1.0 - fresnel) * weighed;
+            bias += fresnel * weighed;
+        }
+    }
+
+    imageStore (outLut, texel, vec4 (scale / float (SAMPLES), bias / float (SAMPLES), 0.0, 0.0));
+}

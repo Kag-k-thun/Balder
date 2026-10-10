@@ -1,0 +1,164 @@
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The environment as a cube, and its levels
+layout (binding = 1) uniform samplerCube environment;
+
+// The roughness of the level written, its perceptual roughness from 0 (a mirror) to 1
+layout (push_constant) uniform Level {
+    float roughness;
+} pc;
+
+// The faces of a level of the prefiltered environment, the light a surface of the roughness reflects in each direction
+layout (set = 0, binding = 0, rgba16f) uniform writeonly image2DArray outCube;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          CONSTANTS          ===================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+const float PI = 3.14159265359;
+
+// The directions of the microfacets sampled for each texel
+const uint SAMPLES = 512;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          GEOMETRY          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the unit direction through the center of a texel of a face of a cube, each face seen from inside the cube,
+ * its rows going down (the cube maps of Vulkan)
+ * @params:
+ *    - texel: the texel, its face in z
+ *    - size: the number of texels on a side of a face
+ */
+vec3 cubeDirection (ivec3 texel, int size) {
+    vec2 st = (vec2 (texel.xy) + 0.5) / float (size) * 2.0 - 1.0;
+    vec3 d;
+    switch (texel.z) {
+        case 0  : d = vec3 (1.0, -st.y, -st.x); break;
+        case 1  : d = vec3 (-1.0, -st.y, st.x); break;
+        case 2  : d = vec3 (st.x, 1.0, st.y); break;
+        case 3  : d = vec3 (st.x, -1.0, -st.y); break;
+        case 4  : d = vec3 (st.x, -st.y, 1.0); break;
+        default : d = vec3 (-st.x, -st.y, -1.0); break;
+    }
+
+    return normalize (d);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SAMPLING          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the i-th point of a Hammersley set of n points in the unit square, spread evenly
+ */
+vec2 hammersley (uint i, uint n) {
+    uint bits = bitfieldReverse (i);
+    return vec2 (float (i) / float (n), float (bits) * 2.3283064365386963e-10);
+}
+
+/**
+ * @returns: the unit normal of a microfacet, drawn from the GGX distribution around a normal from a point of the unit
+ * square
+ * @params:
+ *    - xi: the point of the unit square
+ *    - N: the normal of the surface
+ *    - a: the roughness squared (the alpha of GGX)
+ */
+vec3 sampleGGX (vec2 xi, vec3 N, float a) {
+    float phi = 2.0 * PI * xi.x;
+    float cosTheta = sqrt ((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt (1.0 - cosTheta * cosTheta);
+
+    vec3 up = abs (N.y) < 0.999 ? vec3 (0.0, 1.0, 0.0) : vec3 (1.0, 0.0, 0.0);
+    vec3 T = normalize (cross (up, N));
+    vec3 B = cross (N, T);
+
+    return normalize ((cos (phi) * T + sin (phi) * B) * sinTheta + N * cosTheta);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * The light a surface of the roughness reflects in the direction of the texel, seen from that direction (the eye, the
+ * normal and the reflection are taken to be the same, the first sum of the split sum of Karis): the light of the
+ * environment along the reflections of the eye by microfacets drawn from the GGX distribution, weighed by their cosine
+ * @info: each sample reads the environment at the level whose texels are as large as the solid angle it stands for, so
+ * a few hundred samples do not miss the small bright lights (filtered importance sampling, Křivánek and Colbert); a
+ * mirror reads the environment at the level of the size of the face written
+ */
+void main () {
+    ivec3 texel = ivec3 (gl_GlobalInvocationID);
+    ivec3 size = imageSize (outCube);
+    if (texel.x >= size.x || texel.y >= size.y || texel.z >= 6) {
+        return;
+    }
+
+    vec3 N = cubeDirection (texel, size.x);
+    float envSize = float (textureSize (environment, 0).x);
+
+    if (pc.roughness <= 0.0) {
+        vec3 mirror = textureLod (environment, N, max (log2 (envSize / float (size.x)), 0.0)).rgb;
+        imageStore (outCube, texel, vec4 (mirror, 1.0));
+        return;
+    }
+
+    // the roughness squared, as in the BRDF of the composition
+    float a = max (pc.roughness * pc.roughness, 2e-3);
+    float a2 = a * a;
+
+    // the solid angle of a texel of the first level of the environment
+    float texelAngle = 4.0 * PI / (6.0 * envSize * envSize);
+
+    vec3 sum = vec3 (0.0);
+    float weight = 0.0;
+    for (uint i = 0 ; i < SAMPLES ; i++) {
+        vec3 H = sampleGGX (hammersley (i, SAMPLES), N, a);
+        float NdotH = max (dot (N, H), 0.0);
+        vec3 L = 2.0 * NdotH * H - N;
+
+        float NdotL = dot (N, L);
+        if (NdotL > 0.0) {
+            // the density of the reflection, D NdotH / (4 VdotH), V and N being the same
+            float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+            float pdf = a2 / (PI * d * d) * 0.25;
+
+            float sampleAngle = 1.0 / (float (SAMPLES) * pdf + 1e-4);
+            float lod = max (0.5 * log2 (sampleAngle / texelAngle) + 1.0, 0.0);
+
+            sum += textureLod (environment, L, lod).rgb * NdotL;
+            weight += NdotL;
+        }
+    }
+
+    imageStore (outCube, texel, vec4 (sum / max (weight, 1e-4), 1.0));
+}

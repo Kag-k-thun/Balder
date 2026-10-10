@@ -1,0 +1,443 @@
+in environment;
+
+pub mod ::bake;
+pub mod ::utils;
+
+use balder::utils;
+use balder::core::{_, application::_};
+use balder::core::config::shader::_;
+use balder::core::memory::image2D;
+use balder::core::shader::_;
+use balder::core::shader::texture;
+use balder::core::shader::texture::hdr;
+use balder::scene::utils::environment::bake;
+
+use ::vulkan::core;
+
+/**
+ * The format of the texels of the cubes, linear and unbounded light
+ * */
+def CUBE_FORMAT = VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT;
+
+/**
+ * The format of the split-sum table of the BRDF, a scale and a bias
+ * */
+def LUT_FORMAT = VkFormat::VK_FORMAT_R16G16_SFLOAT;
+
+/**
+ * The texture of the shaders the images they write are bound to
+ * */
+def STORAGE = "output";
+
+/**
+ * The image based lighting of a scene: the light of an environment, an equirectangular HDR image of the whole sphere
+ * around the scene, reaching every point from every direction, the indirect light of the composition in place of the
+ * ambient colour of the scene (see Scene::environment)
+ * @info:
+ * =====
+ * The environment is precomputed once when it changes, never by the frames (see EnvironmentBake), into cubes the
+ * composition samples:
+ *   - the environment cube (its levels averaged), the background of the scene where nothing is drawn (the skybox)
+ *   - the irradiance, the environment convolved by the cosine around each direction, 32 texels a side: the diffuse light
+ *   - the prefiltered environment, 128 texels a side over 6 levels, each the environment reflected by a surface of a
+ *     roughness from 0 to 1 (GGX importance sampling): the specular light, read at roughness × 5
+ * The specular light is scaled by the split-sum table of the BRDF (Karis), a scale and a bias of the reflectance facing
+ * the eye by the cosine to the eye and the roughness, r16g16 floats computed once when the lighting is configured
+ * (see EnvironmentLighting::LUT_SIZE). The cubes are float images, the table a storage image of an extended format:
+ * the environment lights the scenes of the devices storing them (shaderStorageImageExtendedFormats) only.
+ * ====
+ * */
+@final
+pub class EnvironmentLighting {
+
+    // The project path of the environment, empty while none lights the scene
+    let mut _file : [c8] = "";
+
+    // The image of the environment, decoded once, computed into the cubes again when the lighting is configured again
+    let mut _image : (HdrImage)? = none;
+
+    // The scale of the light of the environment, its light as the image stores it at 1
+    let mut _intensity : f32 = 1.0f;
+
+    // True iif the environment is the background of the scene where nothing is drawn
+    let mut _skybox : bool = true;
+
+    // True iif the device stores the images of the lighting
+    let mut _supported : bool = false;
+
+    prot { // pipeline
+
+        let dmut _shaders : [&RefCount!{&Shader}] = [];
+        let dmut _computeShaders : [&ComputeShader] = [];
+
+        // The cubes computed from the environment, none while no environment lights the scene
+        let dmut _environment : (&TextureCube)? = none;
+        let dmut _irradiance : (&TextureCube)? = none;
+        let dmut _prefiltered : (&TextureCube)? = none;
+
+        // The split-sum table of the BRDF, its view sampled by the composition
+        let dmut _lut : (&Image2D)? = none;
+        let dmut _lutView : (&TextureView)? = none;
+
+        // A black cube of a texel, sampled by the composition in place of the cubes while no environment lights the scene
+        let dmut _black : (&TextureCube)? = none;
+
+        // The window of the scene, none while the lighting is not configured
+        let dmut _window : (&Window)? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A lighting of no environment, configured with its scene
+     * */
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CONFIGURE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load the shaders of the lighting, compute the split-sum table of the BRDF, and the cubes of the environment loaded
+     * before
+     * @assume: called between Window::lockFrame and unlockFrame
+     * */
+    pub fn configure (mut self, dmut win : &Window)
+        throws BalderError
+    {
+        let dmut device = alias win:.getVulkanDevice ();
+        let dmut black = copy TextureCube (alias device, 1u32, 1u32, CUBE_FORMAT, usage-> VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        self._black = (alias black)?;
+        self._window = (alias win)?;
+
+        self._supported = device.isExtendedStorage ();
+        if !self._supported {
+            log::warn #("EnvironmentLighting", "The device does not store r16g16 images, no environment lights the scene");
+            device:.getTransferPass ():.add (callback-> copy |cmd| { black:.getImage ():.clear (cmd); });
+            return;
+        }
+
+        for path in copy [DefaultShaders::ENVIRONMENT_CUBE_3D,
+                          DefaultShaders::ENVIRONMENT_DOWNSAMPLE_3D,
+                          DefaultShaders::ENVIRONMENT_IRRADIANCE_3D,
+                          DefaultShaders::ENVIRONMENT_PREFILTER_3D,
+                          DefaultShaders::ENVIRONMENT_BRDF_3D]
+        {
+            let dmut shader = win:.loadResource!{&ComputeShader} (path);
+            self._shaders ~= [alias shader];
+
+            if let Ok (dmut c : &ComputeShader) = (alias shader:.get ())? {
+                self._computeShaders ~= [alias c];
+            } else {
+                log::error #("EnvironmentLighting", "Malformed shader", path);
+                throw copy BalderError ("Failed to configure the environment lighting");
+            }
+        }
+
+        let size = EnvironmentLighting::LUT_SIZE;
+        let dmut lut = device:.getMemoryAllocator ():.allocImage2D (size,
+                                                                    size,
+                                                                    LUT_FORMAT,
+                                                                    VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+                                                                    cast!u32 (VkImageUsageFlagBits::VK_IMAGE_USAGE_STORAGE_BIT
+                                                                              | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT),
+                                                                    cast!u32 (VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+        let dmut view = copy TextureView (alias device, lut.getVulkanImage (), VkImageViewType::VK_IMAGE_VIEW_TYPE_2D, LUT_FORMAT, size, size);
+        self._lut = (alias lut)?;
+        self._lutView = (alias view)?;
+
+        let b : usize = EnvironmentShader::BRDF;
+        let dmut brdf = alias self._computeShaders [b];
+        let dmut set = brdf:.allocateDescriptorSet (DescriptorContext::GLOBAL);
+        set:.setStorageTexture (STORAGE, view, frame-> 0);
+
+        // the table and the black cube are written before any frame samples them, the transfers running first
+        device:.getTransferPass ():.add (callback-> copy |cmd| {
+                                             black:.getImage ():.clear (cmd);
+                                             utils::recordLut (cmd, alias brdf, set, alias lut:.getVulkanImage (), size);
+                                         },
+                                         clean-> copy || { set:.dispose (); });
+
+        if let Ok (image) = self._image {
+            self:.bake (image);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          ENVIRONMENT          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the project path of the environment, empty while none lights the scene
+     * */
+    @field
+    pub fn file (self)-> [c8] {
+        self._file
+    }
+
+    /**
+     * Light the scene by an environment, or by none: its image decoded, and its cubes computed by the next frame when the
+     * lighting is configured (from the next configuration otherwise), the cubes of the environment before retired
+     * @params:
+     *    - file: the project path to an equirectangular .hdr image, empty for no environment
+     * @throws: if the file cannot be read or is not a Radiance HDR image, the environment before kept
+     * */
+    pub fn load (mut self, file : [c8])
+        throws BalderError
+    {
+        // decoded apart: wrapped in an option, the throwing call would swallow its error
+        let image : (HdrImage)? = if file == "" {
+            none
+        } else {
+            let decoded = HdrImage::fromFile (file);
+            (decoded)?
+        };
+
+        let dmut win = if let Ok (dmut w) = alias self._window {
+            alias w
+        } else {
+            self._file = file;
+            self._image = image;
+            return;
+        };
+
+        // the cubes swapped and computed in the same frame
+        win:.lockFrame ();
+        {
+            self._file = file;
+            self._image = image;
+            self:.retireCubes ();
+            if let Ok (img) = image {
+                self:.bake (img);
+            }
+        } exit {
+            win:.unlockFrame ();
+        }
+
+        win:.redrawPipeline ();
+    }
+
+    /**
+     * Create the cubes of an environment, computed by the next transfer of the device
+     * @assume: the cubes before are retired
+     * */
+    fn bake (mut self, image : HdrImage)
+        throws BalderError
+    {
+        if !self._supported { return; }
+        let dmut win = if let Ok (dmut w) = alias self._window { alias w } else { return; };
+        let dmut device = alias win:.getVulkanDevice ();
+
+        let size = utils::cubeSize (image.width);
+        let dmut env = copy TextureCube (alias device, size, utils::levelCount (size), CUBE_FORMAT);
+        let dmut irr = copy TextureCube (alias device, EnvironmentLighting::IRRADIANCE_SIZE, 1u32, CUBE_FORMAT);
+        let dmut pre = copy TextureCube (alias device,
+                                         EnvironmentLighting::PREFILTERED_SIZE,
+                                         EnvironmentLighting::PREFILTERED_LEVELS,
+                                         CUBE_FORMAT);
+
+        let dmut job = copy EnvironmentBake (alias device, alias self._computeShaders, image, alias env, alias irr, alias pre);
+        device:.getTransferPass ():.add (callback-> &job:.bake, clean-> &job:.release);
+
+        self._environment = (alias env)?;
+        self._irradiance = (alias irr)?;
+        self._prefiltered = (alias pre)?;
+        log::debug #("EnvironmentLighting", "Environment", self._file, "baked into a cube of", size, "texels");
+    }
+
+    /**
+     * Retire the cubes of the environment, with the frames sampling them
+     * */
+    fn retireCubes (mut self) {
+        if let Ok (dmut win) = alias self._window {
+            if let Ok (dmut c) = alias self._environment { win:.retire (alias c); }
+            if let Ok (dmut c) = alias self._irradiance { win:.retire (alias c); }
+            if let Ok (dmut c) = alias self._prefiltered { win:.retire (alias c); }
+        }
+
+        self._environment = none;
+        self._irradiance = none;
+        self._prefiltered = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          PARAMETERS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif an environment lights the scene, its cubes computed on a device storing them
+     * */
+    @field
+    pub fn isLit (self)-> bool {
+        self._environment.hasValue
+    }
+
+    /**
+     * @returns: the scale of the light of the environment
+     * */
+    @field
+    pub fn intensity (self)-> f32 {
+        self._intensity
+    }
+
+    /**
+     * Set the scale of the light of the environment, 1 for its light as the image stores it, 0 for none
+     * */
+    @field
+    pub fn intensity (mut self, intensity : f32) {
+        self._intensity = if intensity > 0.0f { intensity } else { 0.0f };
+    }
+
+    /**
+     * @returns: true iif the environment is the background of the scene where nothing is drawn
+     * */
+    @field
+    pub fn skybox (self)-> bool {
+        self._skybox
+    }
+
+    /**
+     * Draw the environment as the background of the scene where nothing is drawn (the default), or leave it black
+     * */
+    @field
+    pub fn skybox (mut self, skybox : bool) {
+        self._skybox = skybox;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TEXTURES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the environment cube, the black cube while no environment lights the scene, none while the lighting is
+     * not configured
+     * */
+    @field
+    pub fn environment (self)-> (&Texture)? {
+        self.cubeOr (self._environment)
+    }
+
+    /**
+     * @returns: the irradiance of the environment, the black cube while no environment lights the scene, none while the
+     * lighting is not configured
+     * */
+    @field
+    pub fn irradiance (self)-> (&Texture)? {
+        self.cubeOr (self._irradiance)
+    }
+
+    /**
+     * @returns: the prefiltered environment, the black cube while no environment lights the scene, none while the
+     * lighting is not configured
+     * */
+    @field
+    pub fn prefiltered (self)-> (&Texture)? {
+        self.cubeOr (self._prefiltered)
+    }
+
+    /**
+     * @returns: the split-sum table of the BRDF, none on a device not storing it or while the lighting is not configured
+     * */
+    @field
+    pub fn lut (self)-> (&Texture)? {
+        if let Ok (v) = self._lutView { return (v)?; }
+        none
+    }
+
+    /**
+     * @returns: a cube of the environment, the black cube when it is none
+     * */
+    fn cubeOr (self, cube : (&TextureCube)?)-> (&Texture)? {
+        if let Ok (c) = cube { return (c)?; }
+        if let Ok (b) = self._black { return (b)?; }
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+
+        /**
+         * Retire the cubes, the table and the shaders with the frames using them; the environment and the parameters are
+         * kept, the lighting can be configured again
+         * */
+        pub over dispose (mut self) {
+            self:.retireCubes ();
+            if let Ok (dmut win) = alias self._window {
+                if let Ok (dmut b) = alias self._black {
+                    win:.retire (alias b);
+                }
+
+                if let Ok (dmut v) = alias self._lutView {
+                    win:.retire (alias v);
+                }
+
+                if let Ok (dmut l) = alias self._lut {
+                    win:.retire (alias l);
+                }
+
+                for i in 0us .. self._shaders.len {
+                    win:.retire (alias self._shaders [i]);
+                }
+            }
+
+            self._shaders = [];
+            self._computeShaders = [];
+            self._black = none;
+            self._lut = none;
+            self._lutView = none;
+            self._window = none;
+        }
+    }
+}
+
+/**
+ * The sizes of the images of the image based lighting
+ * */
+pub mod EnvironmentLighting {
+
+    /**
+     * The number of texels on a side of a face of the irradiance
+     * */
+    pub def IRRADIANCE_SIZE = 32u32;
+
+    /**
+     * The number of texels on a side of a face of the first level of the prefiltered environment, and its number of
+     * levels, the roughness growing from 0 to 1 over them
+     * */
+    pub def PREFILTERED_SIZE = 128u32;
+    pub def PREFILTERED_LEVELS = 6u32;
+
+    /**
+     * The number of texels on a side of the split-sum table of the BRDF
+     * */
+    pub def LUT_SIZE = 256u32;
+}
