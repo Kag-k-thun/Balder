@@ -7,15 +7,20 @@ in registry;
 pub mod ::schema;
 pub mod ::error;
 pub mod ::reference;
+pub mod ::binding;
+pub mod ::setting;
+pub mod ::widget_node;
+pub mod ::definition;
+pub mod ::library;
+mod ::expander;
 mod ::checker;
+mod ::builder;
 
 use balder::interface::style;
 use balder::interface::loader::parser;
-use balder::interface::loader::registry::{checker, error, schema};
+use balder::interface::loader::registry::{builder, checker, error, expander, library, schema, widget_node};
 use balder::interface::widget;
 use balder::interface::widget::{box, button::_, graph, layout::_, text::_};
-
-use std::syntax::errors;
 
 /**
  * The registry of the widget types, mapping the name of a type to its schema
@@ -23,7 +28,8 @@ use std::syntax::errors;
  * =====
  * Each widget type describes itself next to its class, in its own module; the registry starts with the types of
  * Balder, and an application registers its own. The parsers know no widget type: the tree of nodes of a .gui file is
- * checked against the schemas, then instantiated.
+ * unfolded, its instances of components replaced by the roots of the components, then checked against the schemas,
+ * then instantiated.
  * ====
  * */
 @final
@@ -112,118 +118,77 @@ pub class WidgetRegistry {
     }
 
     /**
-     * Check the widget tree of a document against the schemas of the widget types
+     * Expand the components of a document into the tree of its widgets (doc/gui-v2.md, §8)
      * @params:
      *    - file: the path of the file the document was read from, for the errors
-     * @throws: at the first node, attribute or value refused, naming the file, the line and the column, and at the
-     * first @import, @style or @component, which the registry cannot expand yet
+     * @returns: the tree of the widgets
+     * @throws: at the first instance refused, naming the file, the line and the column, and at the first @import or
+     * @style, which the registry cannot load yet
      * */
-    pub fn check(self, doc: Document, file: [c8])
+    pub fn unfold(self, doc: Document, file: [c8])-> WidgetNode
         throws LoadError
     {
         let root = WidgetRegistry::rootOf(doc, file);
         WidgetRegistry::refuseDirectives(doc, file);
 
-        let dmut nodes = Checker(self._schemas, file);
-        nodes:.check(root);
+        let dmut library = copy Library();
+        library:.load(doc, file);
+
+        let dmut expander = Expander(self._schemas, library);
+        expander:.unfold(root, file)
     }
 
     /**
-     * Create the widgets of a document, checked first
+     * Check a tree of widgets against the schemas of the widget types
+     * @throws: at the first widget, attribute or value refused, naming the file, the line and the column
+     * */
+    pub fn check(self, tree: WidgetNode)
+        throws LoadError
+    {
+        let dmut nodes = Checker(self._schemas);
+        nodes:.check(tree);
+    }
+
+    /**
+     * Check the widget tree of a document against the schemas of the widget types, its components expanded
+     * @params:
+     *    - file: the path of the file the document was read from, for the errors
+     * @throws: at the first instance, widget, attribute or value refused, naming the file, the line and the column
+     * */
+    pub fn check(self, doc: Document, file: [c8])
+        throws LoadError
+    {
+        self.check(self.unfold(doc, file));
+    }
+
+    /**
+     * Create the widgets of a document, its components expanded and its tree checked first
      * @params:
      *    - manager: the manager of the widgets
      *    - file: the path of the file the document was read from, for the errors
      * @returns: the root widget
-     * @throws: when the document is refused by the check
+     * @throws: when the document is refused by the expansion or the check
      * */
     pub fn instantiate(self, dmut manager: &WidgetManager, doc: Document, file: [c8])-> dmut &Widget
         throws LoadError
     {
-        self.check(doc, file);
-        self.build(alias manager, WidgetRegistry::rootOf(doc, file), file)
+        self.instantiate(alias manager, self.unfold(doc, file))
     }
 
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ====================================          BUILDING          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
     /**
-     * Create the widget of a checked node, and its children
+     * Create the widgets of a tree, checked first
+     * @params:
+     *    - manager: the manager of the widgets
+     * @returns: the root widget
+     * @throws: when the tree is refused by the check
      * */
-    fn build(self, dmut manager: &WidgetManager, node: Node, file: [c8])-> dmut &Widget
+    pub fn instantiate(self, dmut manager: &WidgetManager, tree: WidgetNode)-> dmut &Widget
         throws LoadError
     {
-        let schema = if let Ok(s) = self._schemas[node.typeName] {
-            s
-        } else {
-            throw copy LoadError(file, "unknown widget type '" ~ node.typeName ~ "'", node.line, node.col);
-        };
+        self.check(tree);
 
-        let dmut widget = schema.create(alias manager, node.id);
-        {
-            widget:.setClasses(node.classes);
-            if let Ok(v) = node.value {
-                if let Ok(attr) = schema.attribute(schema.defaultAttribute) {
-                    attr.apply(alias widget, v);
-                }
-            }
-
-            for a in node.attributes {
-                if let Ok(attr) = schema.attribute(a.name) {
-                    attr.apply(alias widget, a.value);
-                }
-            }
-
-            let mut index = 0us;
-            for c in node.children {
-                match c {
-                    child: Node => {
-                        if let Ok(inserter) = schema.children {
-                            let dmut w = self.build(alias manager, child, file);
-                            inserter.insert(alias widget, alias w, index);
-                            self.applySlots(schema, alias widget, w, child);
-                            index += 1us;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } catch {
-            e: &SyntaxError => {
-                widget:.dispose();
-                throw copy LoadError(file, "attribute of '" ~ node.typeName ~ "': " ~ e.msg, e.line, e.col);
-            }
-            e: &LoadError => {
-                widget:.dispose();
-                throw e;
-            }
-        }
-
-        alias widget
-    }
-
-    /**
-     * Set the attributes a widget gives its child, those of the child not being its own
-     * @params:
-     *    - schema: the schema of the parent
-     *    - node: the node of the child
-     * */
-    fn applySlots(self, schema: &WidgetSchema, dmut parent: &Widget, child: &Widget, node: Node)
-        throws SyntaxError
-    {
-        let own = self.get(node.typeName);
-        for a in node.attributes {
-            let isOwn = if let Ok(s) = own { s.attribute(a.name).hasValue } else { false };
-            if !isOwn {
-                if let Ok(slot) = schema.slot(a.name) {
-                    slot.apply(alias parent, child, a.value);
-                }
-            }
-        }
+        let dmut widgets = Builder(self._schemas);
+        widgets:.build(alias manager, tree)
     }
 }
 
@@ -247,8 +212,8 @@ mod WidgetRegistry {
     }
 
     /**
-     * Refuse the directives of a document, whose components the registry cannot expand yet
-     * @throws: at the first @import, @style or @component
+     * Refuse the directives of a document that the registry cannot load yet
+     * @throws: at the first @import or @style
      * */
     pub fn refuseDirectives(doc: Document, file: [c8])
         throws LoadError
@@ -259,10 +224,6 @@ mod WidgetRegistry {
 
         if doc.styles.len != 0us {
             throw copy LoadError(file, "'@style' is not supported yet", doc.styles[0].line, doc.styles[0].col);
-        }
-
-        if doc.components.len != 0us {
-            throw copy LoadError(file, "'@component' is not supported yet", doc.components[0].line, doc.components[0].col);
         }
     }
 }
