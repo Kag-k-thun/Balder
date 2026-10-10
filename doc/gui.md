@@ -62,10 +62,12 @@ attribute = ident ":" values ";" ;
   takes the next free cell, row by row.
 - **Every length is in the style.** Sizes, margins, directions, tracks and positions are style properties; the only
   size in a `.gui` file is the `resolution` a `Scene3D` renders at before being scaled to the widget.
-- **The post-process chain of a `Scene3D`** is described by `post: bloom, lut("res:/lut/film.png"), fxaa, invert(off);`:
-  each effect is a kind registered in the post registry of the manager (`WidgetManager::getPostRegistry`, `vignette`,
-  `bloom`, `invert`, `lut` and `fxaa` in Balder, an application registering its own before loading the file), followed
-  by its parameters, numbers and texts (the path of a LUT), `off` adding it disabled. The effects are added to the chain of the scene when the widget is attached (see `doc/render-graph.md`).
+- **The post-process chain of a `Scene3D`** is described by `post: taa, bloom, lut("res:/lut/film.png"), fxaa, invert(off);`:
+  each effect is a kind registered in the post registry of the manager (`WidgetManager::getPostRegistry`, `taa`,
+  `vignette`, `bloom`, `invert`, `lut` and `fxaa` in Balder, an application registering its own before loading the
+  file), followed by its parameters, numbers and texts (the path of a LUT), `off` adding it disabled. The effects are
+  added to the chain of the scene when the widget is attached (see `doc/render-graph.md`), the temporal anti-aliasing
+  running first among the effects in HDR space wherever it is in the list.
 - `@import`, `@style` and `@component` are read but refused at load: components are not implemented yet.
 
 ## The style file

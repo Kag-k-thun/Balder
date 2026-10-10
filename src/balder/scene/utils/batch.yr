@@ -4,19 +4,20 @@ use balder::core::{_, application::_};
 use balder::core::config::shader::_;
 use balder::core::driver::cmd_alloc;
 use balder::core::shader::{_, buffers::_};
-use balder::math::vector;
+use balder::math::{matrix, vector};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
-use balder::scene::utils::{casters, draw_stats};
+use balder::scene::utils::{casters, draw_stats, motion};
 use balder::utils::log;
 
 use ::vulkan::core;
 
 /**
  * The size of the slot of an object in the storage buffer of the 3D shaders: its world (mat4), the progress of its
- * cross-fade (f32), its material (u32) and its world box (two vec4), laid out as std430 aligns them
+ * cross-fade (f32), its material (u32), its world box (two vec4) and its world in the frame before (mat4), laid out as
+ * std430 aligns them
  * */
-pub def OBJECT_STRIDE = 112us;
+pub def OBJECT_STRIDE = 176us;
 
 /**
  * The offset of the world of an object in its slot
@@ -43,6 +44,12 @@ pub def OBJECT_BOX_CENTER = 80us;
  * when the box is empty
  * */
 pub def OBJECT_BOX_EXTENT = 96us;
+
+/**
+ * The offset of the world the frame before drew an object with in its slot, the g-buffer writing the motion of the
+ * object between the two (see MotionTracker)
+ * */
+pub def OBJECT_PREV_WORLD = 112us;
 
 /**
  * The geometry of a mesh placed in the pool of a shader, shared by the instances drawing it
@@ -112,6 +119,9 @@ pub class SceneDraws {
     // The objects of the shader
     let dmut _objects: &ObjectStorage;
 
+    // The worlds of the frame before of the objects of the shader
+    let dmut _motion: &MotionTracker;
+
     // The batch the draws are laid out in
     let dmut _batch: &InstanceBatch;
 
@@ -131,12 +141,14 @@ pub class SceneDraws {
     let mut _freed: bool = false;
 
     pub self (dmut objects: &ObjectStorage,
+              dmut motion: &MotionTracker,
               dmut batch: &InstanceBatch,
               dmut geometry: &SharedGeometry,
               dmut casters: &ShadowCasters,
               slot: u32,
               inPlace: bool)
         with _objects = alias objects
+        , _motion = alias motion
         , _batch = alias batch
         , _geometry = alias geometry
         , _casters = alias casters
@@ -167,6 +179,20 @@ pub class SceneDraws {
      * */
     pub fn setObject {U} (mut self, offset: usize, value: U) {
         self._objects:.setData!{U} (self.slot, offset, value);
+    }
+
+    /**
+     * Place the instance at a world, drawn without motion by the next frame (a new instance)
+     * */
+    pub fn placeWorld(mut self, world: mat4) {
+        self._motion:.place(self.slot, world);
+    }
+
+    /**
+     * Move the instance to a world, the next frame drawing its motion from the world the last frame drew
+     * */
+    pub fn setWorld(mut self, world: mat4) {
+        self._motion:.moveTo(self.slot, world);
     }
 
     /**
@@ -211,6 +237,7 @@ pub class SceneDraws {
             if self._freed { return; }
 
             self._freed = true;
+            self._motion:.forget(self.slot);
             self._objects:.free(self.slot);
             self._geometry:.release();
         }
@@ -269,6 +296,9 @@ pub class ShaderGroup {
     // The worlds, the cross-fades and the materials of the instances
     let dmut _objects: &ObjectStorage;
 
+    // The worlds of the frame before of the instances moving
+    let dmut _motion: &MotionTracker;
+
     // The draws of the instances by material key
     let dmut _batches: [[c8] => &MaterialBatch] = copy [];
 
@@ -290,13 +320,25 @@ pub class ShaderGroup {
      * @params:
      *    - shader: the shader, loaded
      *    - cfg: the configuration of the shader
+     *    - objects: the slots of the instances, followed by the motion of those moving
      * */
-    pub self (dmut shader: &RefCount!{&Shader}, cfg: &RasterShaderConfig)
+    prv self (dmut shader: &RefCount!{&Shader}, cfg: &RasterShaderConfig, dmut objects: &ObjectStorage)
         with _shader = alias shader
         , _camera = shader:.get():.allocateDescriptorSet(DescriptorContext::CAMERA)
         , _geometry = copy GeometryPool(alias shader:.get():.getDevice(), vertexStride(cfg))
-        , _objects = copy ObjectStorage(alias shader:.get():.getDevice(), OBJECT_STRIDE)
+        , _objects = alias objects
+        , _motion = copy MotionTracker(alias objects, OBJECT_WORLD, OBJECT_PREV_WORLD)
         , _casters = copy ShadowCasters(shader:.get():.getDevice().isMultiDraw())
+        throws BalderError
+    {}
+
+    /**
+     * @params:
+     *    - shader: the shader, loaded
+     *    - cfg: the configuration of the shader
+     * */
+    pub self (dmut shader: &RefCount!{&Shader}, cfg: &RasterShaderConfig)
+        with self(alias shader, cfg, copy ObjectStorage(alias shader:.get():.getDevice(), OBJECT_STRIDE))
         throws BalderError
     {}
 
@@ -361,6 +403,7 @@ pub class ShaderGroup {
 
         batch.nodes[node.uid] = alias node;
         copy SceneDraws(alias self._objects,
+                        alias self._motion,
                         alias batch.draws,
                         alias geometry,
                         alias self._casters,
@@ -425,6 +468,14 @@ pub class ShaderGroup {
                 b.draws:.setDistance(uid, (sphere.center - eye).length() - sphere.radius);
             }
         }
+    }
+
+    /**
+     * Write the worlds the last frame drew in the slots of the instances moving, for the frame being submitted (see
+     * MotionTracker::advanceFrame)
+     * */
+    pub fn advanceFrame(mut self) {
+        self._motion:.advanceFrame();
     }
 
     /**

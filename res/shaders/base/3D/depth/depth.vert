@@ -25,6 +25,9 @@ struct Object {
     // pass of the scene (an empty box has a negative extent)
     vec4 boxCenter;
     vec4 boxExtent;
+
+    // The world the frame before drew the object with, the motion of its pixels being written in the g-buffer
+    mat4 previousModel;
 };
 
 layout (std430, set = 0, binding = 0) readonly buffer Objects {

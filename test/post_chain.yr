@@ -4,6 +4,8 @@ use balder::core::error;
 use balder::core::driver::graph;
 use balder::scene::utils::post::_;
 
+use std::math;
+
 use ::vulkan::core;
 
 def COMPUTE      = 0x00000800u32; // VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
@@ -27,7 +29,8 @@ fn sources ()-> PostSources {
                  radiance-> "radiance",
                  output-> "output",
                  depth-> "depth",
-                 normals-> "normals")
+                 normals-> "normals",
+                 velocity-> "velocity")
 }
 
 /**
@@ -65,8 +68,8 @@ fn passOf (chain : &PostChain, name : [c8])-> PostPass {
 }
 
 /**
- * @returns: the graph of a scene, its g-buffer writing the depth and its composition the light, the passes of a chain
- * declared after them in the subpass of the composition, and the screen reading the output
+ * @returns: the graph of a scene, its g-buffer writing the depth and the velocity and its composition the light, the
+ * passes of a chain declared after them in the subpass of the composition, and the screen reading the output
  * */
 fn graphOf (chain : &PostChain)-> dmut &RenderGraph
     throws BalderError
@@ -77,6 +80,7 @@ fn graphOf (chain : &PostChain)-> dmut &RenderGraph
     g:.addSubmission ("compose");
 
     g:.createImage ("depth", ImageDesc (width-> 32u32, height-> 32u32, depth-> true));
+    g:.createImage ("velocity", ImageDesc (format-> VkFormat::VK_FORMAT_R16G16_SFLOAT, width-> 32u32, height-> 32u32));
     g:.createImage ("radiance", ImageDesc (format-> VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT, width-> 32u32, height-> 32u32, storage-> true));
     g:.importImage ("output");
 
@@ -85,7 +89,8 @@ fn graphOf (chain : &PostChain)-> dmut &RenderGraph
                                uses-> copy [ResourceUse (resource-> "output", usage-> Usage::SAMPLED_FRAGMENT)]));
     g:.declarePass (GraphPass (name-> "gbuffer",
                                submission-> "deferred",
-                               uses-> copy [ResourceUse (resource-> "depth", usage-> Usage::DEPTH_ATTACHMENT)]));
+                               uses-> copy [ResourceUse (resource-> "depth", usage-> Usage::DEPTH_ATTACHMENT),
+                                            ResourceUse (resource-> "velocity", usage-> Usage::COLOR_ATTACHMENT)]));
     g:.declarePass (GraphPass (name-> "compose",
                                submission-> "compose",
                                kind-> PassKind::COMPUTE,
@@ -394,6 +399,101 @@ __test the_effects_of_balder_take_their_space {
 }
 
 /**
+ * The temporal anti-aliasing runs first among the effects in HDR space whatever its place in the chain, before the bloom
+ * spreads the samples of the jittered frame, the other effects keeping their order
+ * */
+__test the_temporal_anti_aliasing_runs_first_in_its_space {
+    let dmut chain = PostChain ();
+    chain:.add (copy BloomEffect ());
+    chain:.add (copy VignetteEffect ());
+    chain:.add (copy FxaaEffect ());
+    chain:.add (copy TaaEffect ());
+
+    assert (effectsOf (chain.plan (sources ())) == ["taa", "bloom", "vignette", "tonemap", "fxaa"]);
+    let taa = stageOf (chain.plan (sources ()), "taa");
+    assert (taa.input == "radiance" && taa.space == PostSpace::HDR);
+
+    chain:.reorder ("taa", 2us);
+    assert (effectsOf (chain.plan (sources ())) == ["taa", "bloom", "vignette", "tonemap", "fxaa"]);
+}
+
+/**
+ * The temporal anti-aliasing blends the light with the history, reading the depth and the velocity of the g-buffer,
+ * copies the blend into the history, a persistent image, and sharpens it into the image of its stage
+ * */
+__test the_temporal_anti_aliasing_keeps_a_history {
+    let dmut chain = PostChain ();
+    chain:.add (copy TaaEffect ());
+
+    assert (passNamesOf (chain) == ["post_taa_scene_resolve", "post_taa_scene_history", "post_taa_scene",
+                                    "post_tonemap_scene"]);
+
+    let resolve = passOf (chain, "post_taa_scene_resolve");
+    assert (resolve.textures == ["input", "depth", "velocity", "history"]);
+    assert (resolve.images == ["radiance", "depth", "velocity", "post_taa_scene_history"]);
+    assert (resolve.output == "post_taa_scene_resolved" && resolve.shader == 0us && !resolve.image.persistent);
+    assert (resolve.image.format == VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT && resolve.image.storage);
+
+    let history = passOf (chain, "post_taa_scene_history");
+    assert (history.images == ["post_taa_scene_resolved"] && history.output == "post_taa_scene_history");
+    assert (history.shader == 1us && history.level == 0u32 && history.image.persistent);
+
+    let last = passOf (chain, "post_taa_scene");
+    assert (last.images == ["post_taa_scene_resolved"] && last.output == "post_taa_out_scene");
+    assert (last.shader == 1us && last.level == 1u32 && !last.image.persistent);
+}
+
+/**
+ * The resolve reads the history the frame before stored, before the copy of the blend stores it again
+ * */
+__test the_render_graph_carries_the_history_over_the_frames {
+    let dmut chain = PostChain ();
+    chain:.add (copy TaaEffect ());
+
+    let s = graphOf (chain).compile ();
+    assert (passNames (s, "compose") == ["compose", "post_taa_scene_resolve", "post_taa_scene_history",
+                                         "post_taa_scene", "post_tonemap_scene"]);
+
+    let read = barrierOf (s, "post_taa_scene_resolve", "post_taa_scene_history");
+    assert (read.oldLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+    assert (read.srcStage == COMPUTE && read.srcAccess == SHADER_WRITE);
+    assert (barrierOf (s, "post_taa_scene_history", "post_taa_scene_history").newLayout == VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+}
+
+/**
+ * The jitters are the points of the Halton (2, 3) sequence from its second, centered on the pixel and scaled to a pixel
+ * in normalized device coordinates, the sequence starting again after its samples
+ * */
+__test the_jitters_follow_a_halton_sequence {
+    assert (halton (1u32, 2u32) == 0.5f && halton (2u32, 2u32) == 0.25f && halton (3u32, 2u32) == 0.75f);
+    assert (math::abs (halton (4u32, 3u32) - 4.0f / 9.0f) < 1.0e-6f);
+
+    let first = jitterOf (0u32, 4u32, 3u32);
+    assert (first.x == 0.0f && math::abs (first.y + 1.0f / 9.0f) < 1.0e-6f);
+
+    let second = jitterOf (1u32, 4u32, 3u32);
+    assert (second.x == -0.125f && math::abs (second.y - 1.0f / 9.0f) < 1.0e-6f);
+
+    let again = jitterOf (JITTER_SAMPLES, 4u32, 3u32);
+    assert (again.x == first.x && again.y == first.y);
+
+    let unsized = jitterOf (3u32, 0u32, 0u32);
+    assert (unsized.x == 0.0f && unsized.y == 0.0f);
+}
+
+/**
+ * The frames drawn after a change for the history to converge bring the weight of the frames before it under a step of
+ * an 8 bits colour, a sequence of jitters at least and 256 at most
+ * */
+__test the_history_settles_in_a_number_of_frames {
+    assert (TaaEffect (blend-> 0.1f).settleFrames () == 53u32);
+    assert (TaaEffect (blend-> 0.9f).settleFrames () == JITTER_SAMPLES);
+    assert (TaaEffect (blend-> 1.0f).settleFrames () == JITTER_SAMPLES);
+    assert (TaaEffect (blend-> 0.0f).settleFrames () == 256u32);
+    assert (TaaEffect (blend-> 2.0f).blend == 1.0f && TaaEffect (blend-> -1.0f).blend == 0.0f);
+}
+
+/**
  * The registry creates the anti-aliasing, the bloom and the grading with their numbers and their texts
  * */
 __test the_registry_creates_the_effects_of_balder {
@@ -421,6 +521,19 @@ __test the_registry_creates_the_effects_of_balder {
 
     if let Ok (l : &LutEffect) = registry.create (PostDescription (kind-> "lut")) {
         assert (l.path == NEUTRAL_LUT && l.contribution == 1.0f);
+    } else {
+        assert (false);
+    }
+
+    if let Ok (t : &TaaEffect) = registry.create (PostDescription (kind-> "taa", params-> copy [0.05f, 1.25f, 0.15f])) {
+        assert (t.blend == 0.05f && t.clip == 1.25f && t.sharpness == 0.15f);
+        assert (t.space == PostSpace::HDR && t.runsFirst && t.reads == [PostInput::DEPTH, PostInput::VELOCITY]);
+    } else {
+        assert (false);
+    }
+
+    if let Ok (t : &TaaEffect) = registry.create (PostDescription (kind-> "taa")) {
+        assert (t.blend == 0.1f && t.clip == 1.0f && t.sharpness == 0.25f);
     } else {
         assert (false);
     }
