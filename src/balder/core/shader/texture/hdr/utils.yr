@@ -1,0 +1,206 @@
+in utils;
+
+use balder::core::error;
+use balder::utils::path;
+
+use std::conv;
+use std::fs::{file, path};
+
+/**
+ * The first line of a Radiance HDR file, in its two spellings
+ * */
+def MAGIC = "#?RADIANCE";
+def MAGIC_RGBE = "#?RGBE";
+
+/**
+ * The variable of the header declaring the format of the texels, and the only format decoded (not the XYZE colours)
+ * */
+def FORMAT = "FORMAT=";
+def RGBE_FORMAT = "32-bit_rle_rgbe";
+
+/**
+ * The widths of the scanlines a run-length encoding can encode, the others being flat
+ * */
+def MIN_RLE_WIDTH = 8u32;
+def MAX_RLE_WIDTH = 0x7fffu32;
+
+/**
+ * The bytes of a texel
+ * */
+def TEXEL = 4us;
+
+/**
+ * @returns: the content of a file
+ * @params:
+ *    - file: the project path to the file
+ * @throws: if the file cannot be read
+ * */
+pub fn readFile(file: [c8])-> [u8]
+    throws BalderError
+{
+    let dmut f = File::open(path::projectPath(file));
+    let bytes = f:.readBytesAll();
+    f:.close();
+
+    bytes
+} catch {
+    err => {
+        throw copy BalderError(std::format::format("Failed to read the HDR image {} =>\n\t{}", file, err));
+    }
+}
+
+/**
+ * Decode the content of a .hdr file
+ * @returns: the width and the height of the image, and its RGBE texels row by row from the top
+ * @throws: if the content is not a Radiance HDR image of RGBE texels, or is truncated
+ * */
+pub fn decode(bytes: [u8])-> (u32, u32, [u8])
+    throws BalderError
+{
+    let mut cursor = 0us;
+    let magic = readLine(bytes, ref cursor);
+    if magic != MAGIC && magic != MAGIC_RGBE {
+        throw copy BalderError("Not a Radiance HDR image, its first line is not " ~ MAGIC);
+    }
+
+    // the variables of the header, up to the empty line
+    loop {
+        let line = readLine(bytes, ref cursor);
+        if line.len == 0us { break; }
+        if line.len > FORMAT.len && line[0us .. FORMAT.len] == FORMAT && line[FORMAT.len .. $] != RGBE_FORMAT {
+            throw copy BalderError("Only the RGBE texels of a Radiance HDR image are decoded, not " ~ line[FORMAT.len .. $]);
+        }
+    }
+
+    let (width, height) = readResolution(readLine(bytes, ref cursor));
+    let dmut texels = copy [0u8; cast!usize(width) * cast!usize(height) * TEXEL];
+    for y in 0u32 .. height {
+        let row = cast!usize(y) * cast!usize(width) * TEXEL;
+        readScanline(bytes, ref cursor, alias texels, row, width);
+    }
+
+    (width, height, texels)
+}
+
+/**
+ * @returns: the line of a header starting at a cursor, without its end, the cursor moved past it
+ * @throws: if the header has no end
+ * */
+fn readLine(bytes: [u8], ref mut cursor: usize)-> [c8]
+    throws BalderError
+{
+    let mut line: [c8] = [];
+    while cursor < bytes.len {
+        let b = bytes[cursor];
+        cursor += 1us;
+        if b == 10u8 { return line; } // '\n'
+
+        line = line ~ [cast!c8(b)];
+    }
+
+    throw copy BalderError("Truncated Radiance HDR image, its header has no end");
+}
+
+/**
+ * @returns: the width and the height of an image, read from its resolution line ("-Y height +X width")
+ * @throws: if the line is not a resolution, or its rows do not go from the top to the bottom and its columns from the left
+ * to the right
+ * */
+fn readResolution(line: [c8])-> (u32, u32)
+    throws BalderError
+{
+    let mut words: [[c8]] = [];
+    let mut start = 0us;
+    for i in 0us ... line.len {
+        if i == line.len || line[i] == ' ' {
+            if i > start { words = words ~ [line[start .. i]]; }
+            start = i + 1us;
+        }
+    }
+
+    if words.len != 4us || words[0] != "-Y" || words[2] != "+X" {
+        throw copy BalderError("Unsupported resolution of a Radiance HDR image, '" ~ line ~ "' (only -Y height +X width)");
+    }
+
+    let (width, height) = {
+        (conv::to!{u32} (words[3]), conv::to!{u32} (words[1]))
+    } catch {
+        _: &conv::errors::CastFailure => {
+            throw copy BalderError("Malformed resolution of a Radiance HDR image, '" ~ line ~ "'");
+        }
+    };
+
+    if width == 0u32 || height == 0u32 {
+        throw copy BalderError("Empty Radiance HDR image, '" ~ line ~ "'");
+    }
+
+    (width, height)
+}
+
+/**
+ * Read a scanline at a cursor into the texels of an image, the cursor moved past it: run-length encoded channel by
+ * channel when it starts with the marker of the encoding (2, 2, then its width), flat otherwise
+ * @params:
+ *    - row: the offset of the row in the texels
+ *    - width: the width of the image
+ * @throws: if the scanline is truncated, or its runs overflow it
+ * */
+fn readScanline(bytes: [u8], ref mut cursor: usize, dmut texels: [u8], row: usize, width: u32)
+    throws BalderError
+{
+    let encoded = width >= MIN_RLE_WIDTH && width <= MAX_RLE_WIDTH && cursor + TEXEL <= bytes.len
+        && bytes[cursor] == 2u8 && bytes[cursor + 1us] == 2u8 && (bytes[cursor + 2us] & 0x80u8) == 0u8;
+
+    if !encoded {
+        let size = cast!usize(width) * TEXEL;
+        if cursor + size > bytes.len {
+            throw copy BalderError("Truncated Radiance HDR image");
+        }
+
+        for i in 0us .. size {
+            texels[row + i] = bytes[cursor + i];
+        }
+
+        cursor += size;
+        return;
+    }
+
+    let declared = (cast!u32(bytes[cursor + 2us]) << 8u32) | cast!u32(bytes[cursor + 3us]);
+    if declared != width {
+        throw copy BalderError("Malformed Radiance HDR image, a scanline is not as wide as the image");
+    }
+
+    cursor += TEXEL;
+
+    // each channel in turn, in runs of a byte repeated (count above 128) or of bytes as they are
+    let w = cast!usize(width);
+    for c in 0us .. TEXEL {
+        let mut x = 0us;
+        while x < w {
+            if cursor >= bytes.len {
+                throw copy BalderError("Truncated Radiance HDR image");
+            }
+
+            let count = bytes[cursor];
+            cursor += 1us;
+
+            let repeated = count > 128u8;
+            let n = if repeated { cast!usize(count - 128u8) } else { cast!usize(count) };
+            if n == 0us || x + n > w {
+                throw copy BalderError("Malformed Radiance HDR image, a run overflows its scanline");
+            }
+
+            let needed = if repeated { 1us } else { n };
+            if cursor + needed > bytes.len {
+                throw copy BalderError("Truncated Radiance HDR image");
+            }
+
+            for i in 0us .. n {
+                texels[row + (x + i) * TEXEL + c] = if repeated { bytes[cursor] } else { bytes[cursor + i] };
+            }
+
+            cursor += needed;
+            x += n;
+        }
+    }
+}
