@@ -1,0 +1,185 @@
+in cube;
+
+use balder::core::_;
+use balder::core::driver::device;
+use balder::core::memory::imageCube;
+use balder::core::shader::texture::view;
+
+use ::vulkan::core;
+
+/**
+ * A cube texture, written level by level by compute shaders and sampled as a cube through all its levels (an
+ * environment, the light reaching a point from each direction)
+ * @info: the texture itself is the view of the cube sampled by the shaders, each level having a view of its six faces as
+ * a 2D array, the storage image a compute shader writes (see level)
+ * */
+@final
+pub class ITextureCube over Texture {
+
+    // The vulkan image of the texture
+    let dmut _image: (&ImageCube)? = none;
+
+    // The views of the faces of each level, as 2D arrays
+    let dmut _levels: [&ITextureView] = [];
+
+    // The format of the texels
+    let _format: VkFormat;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create a cube texture, its content undefined until written
+     * @params:
+     *    - size: the number of texels on a side of a face at the first level
+     *    - levels: the number of levels of detail, each half as large as the one before it, down to a texel
+     *    - format: the format of the texels, a format of storage images
+     *    - usage: the usage of the image besides being sampled and written as storage
+     * */
+    pub self (dmut device: &VulkanDevice, size: u32, levels: u32, format: VkFormat, usage: VkImageUsageFlags = 0u32)
+        with super(alias device, size, size)
+        , _format = format
+        throws BalderError
+    {
+        let dmut image = self._device
+            :.getMemoryAllocator()
+            :.allocImageCube(size,
+                             levels,
+                             format,
+                             usage
+                             | VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT
+                             | VkImageUsageFlagBits::VK_IMAGE_USAGE_STORAGE_BIT,
+                             cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+        self._image = (alias image)?;
+
+        self:.createImageViews(image);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    @field
+    pub over format(self)-> VkFormat {
+        self._format
+    }
+
+    /**
+     * @returns: the number of levels of detail of the texture
+     * */
+    @field
+    pub fn levels(self)-> u32 {
+        cast!u32(self._levels.len)
+    }
+
+    /**
+     * @returns: the number of texels on a side of a face of a level
+     * */
+    pub fn levelSize(self, level: u32)-> u32 {
+        let size = self._width >> level;
+        if size == 0u32 { 1u32 } else { size }
+    }
+
+    /**
+     * @returns: the view of the six faces of a level as a 2D array, the storage image a compute shader writes the level
+     * through (image2DArray), its layers in the order of the faces (+X, -X, +Y, -Y, +Z, -Z)
+     * */
+    pub fn level(self, level: u32)-> &Texture {
+        self._levels[level]
+    }
+
+    /**
+     * @returns: the image of the texture, to record its transitions
+     * */
+    pub fn getImage(mut self)-> dmut &ImageCube {
+        if let Ok(dmut img) = alias self._image {
+            return alias img;
+        }
+
+        panic;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the view of the cube sampled by the shaders, and the views of the faces of each level
+     * */
+    fn createImageViews(mut self, img: &ImageCube)
+        throws BalderError
+    {
+        let mut info = VkImageViewCreateInfo();
+        info.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        info.image = img.getVulkanImage();
+        info.viewType = VkImageViewType::VK_IMAGE_VIEW_TYPE_CUBE;
+        info.format = self._format;
+
+        info.subresourceRange.aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT;
+        info.subresourceRange.levelCount = img.getLevels();
+        info.subresourceRange.layerCount = CUBE_FACES;
+        info.components.r = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_R;
+        info.components.g = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_G;
+        info.components.b = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_B;
+        info.components.a = VkComponentSwizzle::VK_COMPONENT_SWIZZLE_A;
+
+        if vkCreateImageView(self._device.getDeviceHandle(), &info, null, &self._imageView) != VkResult::VK_SUCCESS {
+            throw copy BalderError("Failed to create cube view");
+        }
+
+        for l in 0u32 .. img.getLevels() {
+            let size = self.levelSize(l);
+            self._levels ~= [copy ITextureView(alias self._device,
+                                               img.getVulkanImage(),
+                                               VkImageViewType::VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                               self._format,
+                                               size,
+                                               size,
+                                               baseLevel-> l,
+                                               layerCount-> CUBE_FACES)];
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            for dmut v in alias self._levels {
+                v:.dispose();
+            }
+
+            self._levels = [];
+            if self._imageView != null {
+                vkDestroyImageView(self._device.getDeviceHandle(), self._imageView, null);
+                self._imageView = null;
+            }
+
+            if let Ok(dmut img) = alias self._image {
+                img:.dispose();
+                self._image = none;
+            }
+
+            self._width = 0;
+            self._height = 0;
+        }
+    }
+}
