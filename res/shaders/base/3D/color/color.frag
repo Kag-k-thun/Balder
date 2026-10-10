@@ -8,6 +8,10 @@ layout (location = 2) flat in vec2 inFade;
 // The material of the object
 layout (location = 3) flat in uint inMaterial;
 
+// The position in the clip space of the camera, unjittered, at this frame and at the frame before
+layout (location = 4) in vec4 inCurrent;
+layout (location = 5) in vec4 inPrevious;
+
 // The normal, folded by octEncode
 layout (location = 0) out vec2 normals;
 
@@ -20,6 +24,9 @@ layout (location = 3) out vec2 surface;
 
 // The emissive colour, multiplying the emissive colour of the material
 layout (location = 4) out vec4 emissive;
+
+// The motion of the fragment since the frame before, in texture coordinates, the jitter of the projection left out
+layout (location = 5) out vec2 velocity;
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -56,6 +63,16 @@ vec2 octEncode (vec3 n) {
     return n.xy;
 }
 
+/**
+ * @returns: the motion of the fragment since the frame before, in texture coordinates (half the motion in normalized
+ * device coordinates); a point behind the camera in the frame before moves out of the image
+ */
+vec2 motion () {
+    vec2 current = inCurrent.xy / inCurrent.w;
+    vec2 previous = inPrevious.xy / max (inPrevious.w, 1e-6);
+    return (current - previous) * 0.5;
+}
+
 void main() {
     crossFade ();
 
@@ -66,4 +83,5 @@ void main() {
     surface = vec2 (1.0);
     emissive = vec4 (1.0);
     materialID = inMaterial;
+    velocity = motion ();
 }

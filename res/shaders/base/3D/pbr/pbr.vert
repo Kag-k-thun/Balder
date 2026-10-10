@@ -13,6 +13,10 @@ layout(set = 1, binding = 0) uniform Camera {
     mat4 view;
     mat4 viewProj;
     vec3 eyePos;
+    float exposure;
+
+    // The view-projection the frame before drew with
+    mat4 prevViewProj;
 } camera;
 
 // The data of an object, in the slot given by the words of its instances (see the draws of IndexedMesh3D)
@@ -29,6 +33,9 @@ struct Object {
     // pass of the scene (an empty box has a negative extent)
     vec4 boxCenter;
     vec4 boxExtent;
+
+    // The world the frame before drew the object with, the motion of its pixels being written in the g-buffer
+    mat4 previousModel;
 };
 
 layout (std430, set = 0, binding = 0) readonly buffer Objects {
@@ -53,6 +60,11 @@ layout (location = 3) flat out uint outMaterial;
 // The tangent in world space, its handedness in w
 layout (location = 4) out vec4 outTangents;
 
+// The position in the clip space of the camera, unjittered, at this frame and at the frame before, the fragment shader
+// writing the motion between the two
+layout (location = 5) out vec4 outCurrent;
+layout (location = 6) out vec4 outPrevious;
+
 // Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
 out gl_PerVertex {
     invariant vec4 gl_Position;
@@ -63,6 +75,8 @@ void main () {
     Object object = objects [word >> 2];
 
     vec4 viewPos = camera.view * object.model * vec4 (inPosition, 1.0);
+    outCurrent = camera.viewProj * object.model * vec4 (inPosition, 1.0);
+    outPrevious = camera.prevViewProj * object.previousModel * vec4 (inPosition, 1.0);
     gl_Position = camera.proj * viewPos;
     
     // the normals of the object turned into world space, by the inverse transpose of its world so a non uniform scale
