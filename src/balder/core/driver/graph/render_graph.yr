@@ -771,12 +771,49 @@ pub class RenderGraph {
             submissions = submissions ~ [ScheduledSubmission(name-> name, passes-> scheduled[s], waits-> waits, signals-> signals)];
         }
 
+        // the passes of each subpass, and the subpasses each resource is used by
+        let dmut spans = copy [(usize::max, 0us) ; order.len];
+        let dmut users: [[c8] => [usize]] = copy [];
+        for position, i in recorded {
+            let sub = owner[i];
+            let (f, l) = spans[sub];
+            spans[sub] = (if position < f { position } else { f }, if position > l { position } else { l });
+            for res in utils::resourcesOf(passes[i]) {
+                let used = if let Ok(u) = users[res] { u } else { [] };
+                if !utils::contains(used, sub) {
+                    users[res] = used ~ [sub];
+                }
+            }
+        }
+
+        let ordered = utils::orderedSubpasses(order.len, edges);
+
         let mut lifetimes: [ResourceLifetime] = [];
         for n in names {
             let first = if let Ok(f) = firsts[n] { f } else { 0us };
             let last = if let Ok(l) = lasts[n] { l } else { 0us };
             let layout = if let Ok(st) = states[n] { st.layout } else { VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED };
-            lifetimes = lifetimes ~ [ResourceLifetime(name-> n, first-> first, last-> last, layout-> layout)];
+
+            // the subpasses the GPU may run while a subpass using the resource runs widen the span its memory is in use
+            let mut aliasFirst = first;
+            let mut aliasLast = last;
+            if let Ok(used) = users[n] {
+                for t in 0us .. order.len {
+                    let (f, l) = spans[t];
+                    if f > l { continue; }
+                    for u in used if !ordered[u][t] {
+                        aliasFirst = if f < aliasFirst { f } else { aliasFirst };
+                        aliasLast = if l > aliasLast { l } else { aliasLast };
+                    }
+                }
+            }
+
+            lifetimes = lifetimes ~ [ResourceLifetime(name-> n,
+                                                      first-> first,
+                                                      last-> last,
+                                                      aliasFirst-> aliasFirst,
+                                                      aliasLast-> aliasLast,
+                                                      layout-> layout)];
         }
 
         RenderSchedule(submissions-> submissions, edges-> edges, lifetimes-> lifetimes)

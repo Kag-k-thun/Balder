@@ -1,0 +1,144 @@
+in atlas;
+
+use balder::scene::utils::local_shadow::tile;
+
+use std::algorithm::{comparison, sorting};
+
+/**
+ * The tiles of the shadows of the point and spot lights in a shared atlas, allocated again at each tick of the scene
+ * @info: a tile is a square whose side is a power of two from the smallest tile to the largest one, both dividing the
+ * atlas; a spot light has one tile, a point light six of the same side, one for each face of a cube
+ * @info: the side of the tile of a light follows the size of the light on screen, changing only when the size leaves
+ * the range of the side by a share of it (see TILE_HYSTERESIS), so the tiles stay the same while the camera moves and
+ * the recordings drawing them are not done again; the tiles of the lights are then fitted to the atlas, the least
+ * important lights losing texels first, and packed along a Morton curve, largest first, which leaves no hole
+ * */
+
+/**
+ * The share of the side of the tile of a light by which the size of the light on screen passes the range of the side
+ * before the side changes
+ * */
+pub def TILE_HYSTERESIS = 0.2f;
+
+/**
+ * @returns: the side of the tile of a light, the largest power of two under the number of texels wanted, from the
+ * smallest tile to the largest one, the side of the light kept while the number wanted stays near its range
+ * @params:
+ *    - wanted: the number of texels on a side of the tile wanted, the size of the light on screen
+ *    - current: the side of the tile of the light, 0 when it has none
+ *    - minTile: the side of the smallest tile, a power of two
+ *    - maxTile: the side of the largest tile, a power of two
+ * */
+pub fn tileSide(wanted: f32, current: u32, minTile: u32, maxTile: u32)-> u32 {
+    let w = cast!f64(wanted);
+    if current != 0u32 {
+        let c = cast!f64(current);
+        let keep = (w >= c * cast!f64(1.0f - TILE_HYSTERESIS) || current == minTile)
+            && (w < 2.0 * c * cast!f64(1.0f + TILE_HYSTERESIS) || current == maxTile);
+        if keep && current >= minTile && current <= maxTile { return current; }
+    }
+
+    let mut side = minTile;
+    while side < maxTile && cast!f64(side * 2u32) <= w {
+        side *= 2u32;
+    }
+
+    side
+}
+
+/**
+ * @returns: the side of the tiles of each light fitted in an atlas, 0 for a light left out: while the tiles do not fit,
+ * the largest tile is halved, the least important light first among those of the largest side, and the least important
+ * light is left out once every tile is the smallest one
+ * @params:
+ *    - sides: the side of the tiles of each light wanted (see tileSide), the most important light first
+ *    - counts: the number of tiles of each light, 1 for a spot light, 6 for a point light
+ *    - atlas: the number of texels on a side of the atlas
+ *    - minTile: the side of the smallest tile, a power of two dividing the atlas
+ * */
+pub fn fitTiles(sides: [u32], counts: [u32], atlas: u32, minTile: u32)-> [u32] {
+    let dmut result = copy sides;
+    let mut kept = comparison::min(sides.len, counts.len);
+    for i in kept .. result.len {
+        result[i] = 0u32;
+    }
+
+    let capacity = cast!u64(atlas) * cast!u64(atlas);
+    loop {
+        let mut area = 0u64;
+        for i in 0us .. kept {
+            area += cast!u64(result[i]) * cast!u64(result[i]) * cast!u64(counts[i]);
+        }
+
+        if area <= capacity || kept == 0us { break; }
+
+        let mut largest = kept;
+        for i in 0us .. kept {
+            if result[i] > minTile && (largest == kept || result[i] >= result[largest]) {
+                largest = i;
+            }
+        }
+
+        if largest != kept {
+            result[largest] /= 2u32;
+        } else {
+            kept -= 1us;
+            result[kept] = 0u32;
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the place of tiles in an atlas, in the order of their sides: packed along a Morton curve from its top left
+ * corner, the largest first, each tile starting where the tiles before it end; the tiles of side 0 are left out (a
+ * default tile)
+ * @info: the Morton curve visits the cells of the smallest tile quadrant by quadrant, so a tile of the side of a
+ * quadrant covers the cells it visits in a row; the larger tiles placed first, each tile starts at the start of a
+ * quadrant of its side, and the tiles cover the atlas without a hole
+ * @params:
+ *    - sides: the side of each tile, a power of two from minTile to atlas, their areas summing to the area of the atlas
+ *      at most (see fitTiles)
+ *    - atlas: the number of texels on a side of the atlas
+ *    - minTile: the side of the smallest tile, a power of two dividing the atlas
+ * */
+pub fn packTiles(sides: [u32], atlas: u32, minTile: u32)-> [ShadowTile] {
+    let dmut order = copy [i for i in 0us .. sides.len];
+    sorting::sort(alias order, copy |a, b| {
+        if sides[a] != sides[b] { return sides[a] > sides[b]; }
+        a < b
+    });
+
+    let cells = cast!u64(atlas / minTile) * cast!u64(atlas / minTile);
+    let dmut result = copy [ShadowTile(); sides.len];
+    let mut cursor = 0u64;
+    for i in order {
+        let side = sides[i];
+        if side == 0u32 { continue; }
+
+        let covered = cast!u64(side / minTile) * cast!u64(side / minTile);
+        if cursor + covered > cells { continue; }
+
+        let (x, y) = mortonCell(cursor);
+        result[i] = ShadowTile(x-> x * minTile, y-> y * minTile, side-> side);
+        cursor += covered;
+    }
+
+    result
+}
+
+/**
+ * @returns: the column and the row of the cell visited at a step of a Morton curve, the bits of the step interleaved
+ * (the even ones the column, the odd ones the row)
+ * */
+fn mortonCell(step: u64)-> (u32, u32) {
+    let mut x = 0u32;
+    let mut y = 0u32;
+    for bit in 0u32 .. 32u32 {
+        x = x | (cast!u32((step >> cast!u64(2u32 * bit)) & 1u64) << bit);
+        y = y | (cast!u32((step >> cast!u64(2u32 * bit + 1u32)) & 1u64) << bit);
+    }
+
+    (x, y)
+}

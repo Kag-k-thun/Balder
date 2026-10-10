@@ -350,6 +350,100 @@ __test lifetimes_span_the_uses_of_a_frame {
 }
 
 /**
+ * @returns: a graph of two subpasses a and b drawing an image each, b writing an image a third subpass c reads, then
+ * the screen; when ordered, a writes an image b reads, so b awaits a
+ * */
+fn concurrentGraph(ordered: bool)-> dmut &RenderGraph
+    throws BalderError
+{
+    let dmut g = copy RenderGraph("screen");
+    for name in ["screen", "a", "b", "c"] {
+        g:.addSubmission(name);
+    }
+
+    for name in ["x", "link", "y", "z"] {
+        g:.createImage(name, ImageDesc(width-> 32u32, height-> 32u32, storage-> true));
+    }
+
+    g:.importImage("output");
+
+    let aUses = if ordered { copy [uses("x", Usage::STORAGE_WRITE), uses("link", Usage::STORAGE_WRITE)] } else { copy [uses("x", Usage::STORAGE_WRITE)] };
+    let bUses = if ordered { copy [uses("link", Usage::SAMPLED_COMPUTE), uses("y", Usage::STORAGE_WRITE)] } else { copy [uses("y", Usage::STORAGE_WRITE)] };
+
+    g:.declarePass(GraphPass(name-> "screen", submission-> "screen", uses-> copy [uses("output", Usage::SAMPLED_FRAGMENT)]));
+    g:.declarePass(GraphPass(name-> "a", submission-> "a", kind-> PassKind::COMPUTE, uses-> aUses));
+    g:.declarePass(GraphPass(name-> "b", submission-> "b", kind-> PassKind::COMPUTE, uses-> bUses));
+    g:.declarePass(GraphPass(name-> "c",
+                             submission-> "c",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("y", Usage::SAMPLED_COMPUTE), uses("z", Usage::STORAGE_WRITE), uses("output", Usage::STORAGE_WRITE)]));
+
+    alias g
+}
+
+/**
+ * @returns: the images of a schedule placed in memory by the spans their memory is in use, of the same size
+ * */
+fn aliasPlan(s: RenderSchedule)-> [AliasSlot] {
+    let mut spans: [AliasSpan] = [];
+    for l in s.lifetimes if l.name != "output" {
+        spans = spans ~ [AliasSpan(name-> l.name, first-> l.aliasFirst, last-> l.aliasLast, size-> 100us, alignment-> 256us, typeBits-> 1u32)];
+    }
+
+    planSlots(spans)
+}
+
+/**
+ * The memory of an image is in use while the subpasses no dependency orders with those using it run, the GPU running
+ * them at the same time: two images of such subpasses never share their memory, whatever the order of their passes
+ * */
+__test images_of_concurrent_subpasses_do_not_share_their_memory {
+    let s = concurrentGraph(false).compile();
+    assert (submissionNames(s) == ["a", "b", "c", "screen"]);
+
+    for l in s.lifetimes if l.name == "x" {
+        // used by the first pass only, its memory in use while b and c run
+        assert (l.first == 0us && l.last == 0us);
+        assert (l.aliasFirst == 0us && l.aliasLast == 2us);
+    }
+
+    // x is never placed with y nor z
+    for slot in aliasPlan(s) {
+        let mut x = false;
+        let mut other = false;
+        for m in slot.members {
+            if m.name == "x" { x = true; } else { other = true; }
+        }
+
+        assert (!(x && other));
+    }
+}
+
+/**
+ * The images of subpasses a dependency orders share their memory when their passes do not overlap
+ * */
+__test images_of_ordered_subpasses_share_their_memory {
+    let s = concurrentGraph(true).compile();
+    assert (submissionNames(s) == ["a", "b", "c", "screen"]);
+
+    for l in s.lifetimes if l.name == "x" {
+        assert (l.aliasFirst == l.first && l.aliasLast == l.last);
+    }
+
+    let mut shared = false;
+    for slot in aliasPlan(s) {
+        let mut names: [[c8]] = [];
+        for m in slot.members {
+            names = names ~ [m.name];
+        }
+
+        if names.len > 1us && (names[0] == "x" || names[1] == "x") { shared = true; }
+    }
+
+    assert (shared);
+}
+
+/**
  * A transient image written first by a compute pass is transitioned from undefined, its memory being shared,
  * even when the frame leaves it in the layout of the write
  * */

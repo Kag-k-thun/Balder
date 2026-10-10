@@ -60,6 +60,9 @@ struct DirectionLight {
     float padd;
 };
 
+// The shadow index of a point or a spot light casting no shadow
+const uint NO_SHADOW = 0xFFFFFFFFu;
+
 // A point light, shining all around its position up to its range (PointLightContent)
 struct PointLight {
     vec3 position;
@@ -72,6 +75,13 @@ struct PointLight {
     // The intensity of the light, scaling its colour, the illuminance of a surface facing it at a distance d being
     // divided by d²
     float intensity;
+
+    // The index of the shadow of the light in the local shadows, NO_SHADOW when it casts none
+    uint shadow;
+
+    float padd1;
+    float padd2;
+    float padd3;
 };
 
 // A spot light, shining from its position along its direction up to its range, in a cone (SpotLightContent)
@@ -88,9 +98,11 @@ struct SpotLight {
     float cosInner;
     float cosOuter;
 
+    // The index of the shadow of the light in the local shadows, NO_SHADOW when it casts none
+    uint shadow;
+
     float padd1;
     float padd2;
-    float padd3;
 };
 
 struct CameraContent {
@@ -177,6 +189,46 @@ layout (binding = 6) uniform Shadow {
     // The bias of the depth compared to the shadow map, in the depth of the cascades
     float bias;
 } shadow;
+
+// The views of the point and spot lights casting shadows, each in a square tile of an atlas: a lookup gives the fraction
+// of the four texels around a point whose depth is not closer to the light than the depth it is compared to
+layout (binding = 20) uniform sampler2DShadow localShadowMap;
+
+// The number of views of the atlas, and of shadows of the point and spot lights, the sizes of the arrays below
+const uint MAX_LOCAL_VIEWS = 96;
+const uint MAX_LOCAL_SHADOWS = 64;
+
+// A view of the shadow of a point or a spot light, a face of the cube around a point light or the cone of a spot light
+struct LocalView {
+    // From world space to the clip space of the view, its depth in [0, 1] growing away from the light, w the depth of
+    // the point in front of the light
+    mat4 viewProj;
+
+    // .xy: the top left corner of the tile of the view in the atlas, .zw: its size, in coordinates of the atlas
+    vec4 tile;
+
+    // .x: the size of a texel of the view at a depth of one unit in front of the light, in world units
+    vec4 info;
+};
+
+// The shadow of a point or a spot light: its views, six faces of a cube for a point light (+x, -x, +y, -y, +z, -z), one
+// cone for a spot light
+struct LocalShadow {
+    // The index of the first view, and the number of views, 0 when the light is not shadowed by the frame
+    uint first;
+    uint count;
+
+    // The offsets of the point looked up along its normal and toward the light, in texels of the view at its depth
+    float normalOffset;
+    float bias;
+};
+
+// The views drawn in the atlas, and the shadows of the lights, by the index of their shadow (PointLight::shadow,
+// SpotLight::shadow), written at once with the cameras the shadow pipelines drew them with
+layout (binding = 21) uniform LocalShadows {
+    LocalView views [MAX_LOCAL_VIEWS];
+    LocalShadow shadows [MAX_LOCAL_SHADOWS];
+} localShadows;
 
 layout (binding = 7) uniform Camera {
     CameraContent camera;
@@ -474,6 +526,77 @@ float shadowFactor (vec3 world, vec3 normal) {
     return 1.0;
 }
 
+/**
+ * @returns: the face of the shadow of a point light seeing a direction from the light, along the axis of its largest
+ * coordinate: 0 to 5 for +x, -x, +y, -y, +z, -z
+ */
+uint cubeFace (vec3 d) {
+    vec3 a = abs (d);
+    if (a.x >= a.y && a.x >= a.z) {
+        return d.x >= 0.0 ? 0u : 1u;
+    }
+
+    if (a.y >= a.z) {
+        return d.y >= 0.0 ? 2u : 3u;
+    }
+
+    return d.z >= 0.0 ? 4u : 5u;
+}
+
+/**
+ * @returns: the fraction of the light of a point or a spot light reaching a point, 1 when the light is not shadowed by
+ * the frame or the point is out of its views
+ * @info: the point is looked up in the view seeing it, the face of the cube along the direction from the light for a
+ * point light; it is moved along its normal and toward the light by a few texels of the view at its depth, the texels
+ * growing with the distance to the light, so the surface it lies on does not shadow itself (acne); the 3x3 lookups
+ * around it, each filtering four texels, soften the edges of the shadows as for the cascades, inside the tile of the
+ * view (its margin holds the texels they read)
+ * @params:
+ *    - index: the index of the shadow of the light
+ *    - world: the point, in world space
+ *    - normal: the normal of the surface at the point
+ *    - lightPosition: the position of the light, in world space
+ */
+float localShadowFactor (uint index, vec3 world, vec3 normal, vec3 lightPosition) {
+    LocalShadow shadow = localShadows.shadows [index];
+    if (shadow.count == 0u) {
+        return 1.0;
+    }
+
+    vec3 fromLight = world - lightPosition;
+    uint v = shadow.first + (shadow.count > 1u ? cubeFace (fromLight) : 0u);
+    LocalView view = localShadows.views [v];
+
+    float depth = (view.viewProj * vec4 (world, 1.0)).w;
+    if (depth <= 0.0) {
+        return 1.0;
+    }
+
+    float texel = view.info.x * depth;
+    vec3 p = world + normalize (normal) * (texel * shadow.normalOffset) - normalize (fromLight) * (texel * shadow.bias);
+
+    vec4 clip = view.viewProj * vec4 (p, 1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    if (any (lessThan (uv, vec2 (0.0))) || any (greaterThan (uv, vec2 (1.0))) || ndc.z > 1.0) {
+        return 1.0;
+    }
+
+    vec2 texelStep = 1.0 / vec2 (textureSize (localShadowMap, 0));
+    vec2 center = view.tile.xy + uv * view.tile.zw;
+    vec2 low = view.tile.xy + texelStep * 0.5;
+    vec2 high = view.tile.xy + view.tile.zw - texelStep * 0.5;
+
+    float lit = 0.0;
+    for (int x = -1 ; x <= 1 ; x++) {
+        for (int y = -1 ; y <= 1 ; y++) {
+            lit += texture (localShadowMap, vec3 (clamp (center + vec2 (x, y) * texelStep, low, high), ndc.z));
+        }
+    }
+
+    return lit / 9.0;
+}
+
 /*!
  * ====================================================================================================
  * ====================================================================================================
@@ -625,7 +748,12 @@ void main () {
                 }
 
                 vec3 L = toLight / max (d, 1e-4);
-                color += shade (s, L, light.color * light.intensity * attenuation (d, light.range));
+                float lit = 1.0;
+                if (light.shadow != NO_SHADOW && dot (s.N, L) > 0.0) {
+                    lit = localShadowFactor (light.shadow, position, s.N, light.position);
+                }
+
+                color += shade (s, L, light.color * light.intensity * attenuation (d, light.range) * lit);
             }
 
             for (uint i = 0 ; i < spotLights.nbLights ; i++) {
@@ -639,6 +767,10 @@ void main () {
 
                 vec3 L = toLight / max (d, 1e-4);
                 float share = attenuation (d, light.range) * cone (light, L);
+                if (light.shadow != NO_SHADOW && share > 0.0 && dot (s.N, L) > 0.0) {
+                    share *= localShadowFactor (light.shadow, position, s.N, light.position);
+                }
+
                 color += shade (s, L, light.color * light.intensity * share);
             }
 

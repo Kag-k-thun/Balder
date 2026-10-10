@@ -12,6 +12,7 @@ use balder::scene::node::node3D::{camera, light};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
 use balder::scene::utils::_;
+use balder::scene::utils::local_shadow::stats;
 use balder::scene::utils::post::_;
 use balder::scene::utils::post::tonemap::operator;
 
@@ -35,6 +36,8 @@ def LATE_GBUFFER = "late_gbuffer";
 def OUTPUT       = "output";
 def RADIANCE     = "radiance";
 def ATLAS        = "shadow_atlas";
+def LOCAL_SHADOW = "local_shadow";
+def LOCAL_ATLAS  = "local_shadow_atlas";
 def DRAWS        = "draws";
 def LATE_DRAWS   = "late_draws";
 def CULL_STATE   = "cull_state";
@@ -95,6 +98,9 @@ pub class Scene {
 
     // The shadow map of the direction light casting shadows, and the subpass drawing it
     let dmut _shadow : CascadeShadowScene = CascadeShadowScene ();
+
+    // The shadows of the point and spot lights casting shadows, in the tiles of an atlas, and the subpass drawing it
+    let dmut _localShadow : LocalShadowScene = LocalShadowScene ();
     
     prot { // Aspect 
 
@@ -163,8 +169,9 @@ pub class Scene {
     /**
      * Configure the scene: its passes are declared in the render graph of the window, with the images they draw at the
      * size of the generated texture
-     * @info: the size of the shadow map and the distance of the shadows are those of the configuration of the window
-     * (its [shadow] table), the distance changing afterwards through shadowDistance
+     * @info: the size of the shadow map, the distance of the shadows, the size of the atlas of the point and spot lights
+     * and the number of them a frame shadows are those of the configuration of the window (its [shadow] table), the
+     * distance changing afterwards through shadowDistance
      * */
     pub fn configure (mut self, width : u32, height : u32)
         throws BalderError
@@ -185,6 +192,7 @@ pub class Scene {
                 self._tree:.configure (alias self._window, alias self);
                 self._deferred:.configure (self.named (DEFERRED), self._name, alias self._window, self._width, self._height);
                 self._shadow:.configure (alias self._window);
+                self._localShadow:.configure (alias self._window, shadow);
                 self._compose:.configure (self.named (COMPOSE),
                                           self.named (RADIANCE),
                                           alias self._window,
@@ -192,6 +200,7 @@ pub class Scene {
                                           self._height,
                                           self._deferred,
                                           self._shadow.ubo,
+                                          self._localShadow.ubo,
                                           self._ambient);
                 self._occlusion:.configure (alias self._window,
                                             self._name,
@@ -240,8 +249,8 @@ pub class Scene {
      * Declare the buffers and the passes of the scene in the render graph of the window, in the order a frame runs them:
      * the cull pass and the g-buffer drawing the instances it finds, the depth pyramid, the late cull pass and the
      * g-buffer drawing the occluded instances it finds again, the ambient occlusion, then the composition (the shadow map
-     * is declared before it when a light casts shadows); the post-process chain declares its passes after it, in the
-     * subpass of the composition
+     * and the atlas of the point and spot lights are declared before it when lights cast shadows); the post-process chain
+     * declares its passes after it, in the subpass of the composition
      * */
     fn declarePasses (mut self)
         throws BalderError
@@ -299,6 +308,7 @@ pub class Scene {
                                           submission-> self.named (COMPOSE),
                                           kind-> PassKind::COMPUTE,
                                           uses-> reads ~ [ResourceUse (resource-> self.named (ATLAS), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
+                                                          ResourceUse (resource-> self.named (LOCAL_ATLAS), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
                                                           ResourceUse (resource-> self._occlusion.image (self._name), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
                                                           ResourceUse (resource-> self.named (RADIANCE), usage-> Usage::STORAGE_WRITE)],
                                           recording-> (&self:.recordCompose)?));
@@ -743,12 +753,23 @@ pub class Scene {
     }
 
     /**
-     * @returns: true iif a direction light casts shadows
+     * @returns: true iif a direction light casts shadows, through the cascades of a shadow map
      * */
     @field
     pub fn hasShadows (self)-> bool {
         atomic self {
             self._shadow.isCasting
+        }
+    }
+
+    /**
+     * @returns: the counters of the shadows of the point and spot lights at the last tick, and the time the GPU took to
+     * draw their atlas at the last submission measured (the cost of the lights shadowed)
+     * */
+    @field
+    pub fn localShadowStats (self)-> ShadowStats {
+        atomic self {
+            self._localShadow.stats
         }
     }
 
@@ -966,6 +987,7 @@ pub class Scene {
             self._compose:.select (frame,
                                    self._shaderToNode,
                                    self._shadow,
+                                   self._localShadow,
                                    self._occlusion.output,
                                    self._environment,
                                    cmdV);
@@ -1109,9 +1131,17 @@ pub class Scene {
                 
             }
             LightType::POINT => {
+                if light.castShadow {
+                    self:.addLocalShadow (alias light);
+                }
+
                 self._shaderToNode.pointLights:.register (alias light);
             }
             LightType::SPOT => {
+                if light.castShadow {
+                    self:.addLocalShadow (alias light);
+                }
+
                 self._shaderToNode.spotLights:.register (alias light);
             }
             LightType::AREA => {} // area lights are not supported yet
@@ -1149,9 +1179,15 @@ pub class Scene {
             }
             LightType::POINT => {
                 self._shaderToNode.pointLights:.release (alias light);
+                if light.castShadow {
+                    self:.removeLocalShadow (alias light);
+                }
             }
             LightType::SPOT => {
                 self._shaderToNode.spotLights:.release (alias light);
+                if light.castShadow {
+                    self:.removeLocalShadow (alias light);
+                }
             }
             LightType::AREA => {} // area lights are not supported yet
         }                                
@@ -1185,7 +1221,7 @@ pub class Scene {
             pass:.onPrepare ():.connect (&self:.onShadowPrepare);
 
             atomic self {
-                self._shaderToNode:.castShadows (alias pass, self._shadow.ubo, self._shadow.cameraOffsets ());
+                self._shaderToNode:.castShadows (ShadowMap::CASCADES, alias pass, self._shadow.ubo, self._shadow.cameraOffsets ());
             }
 
             self._window:.getVulkanPipeline ():.declarePass (GraphPass (name-> sname,
@@ -1197,7 +1233,7 @@ pub class Scene {
             err => {
                 log::error #("Scene", "Failed to cast the shadows of the light", light.name, err);
                 atomic self {
-                    self._shaderToNode:.stopShadows ();
+                    self._shaderToNode:.stopShadows (ShadowMap::CASCADES);
                 }
 
                 self._shadow:.stop ();
@@ -1215,7 +1251,7 @@ pub class Scene {
         if !self._shadow.isCastBy (light) { return; }
 
         atomic self {
-            self._shaderToNode:.stopShadows ();
+            self._shaderToNode:.stopShadows (ShadowMap::CASCADES);
         }
 
         self._shadow:.stop ();
@@ -1231,7 +1267,7 @@ pub class Scene {
         let dmut subpass = alias self._shadow.subpass;
         let frame = subpass.getCurrentFrame ();
         atomic self {
-            self._shaderToNode:.layoutShadows (frame);
+            self._shaderToNode:.layoutShadows (ShadowMap::CASCADES, frame);
         }
     }
 
@@ -1248,7 +1284,107 @@ pub class Scene {
         atomic self {
             for c in 0u32 .. CASCADES {
                 self._shadow.selectCascade (cmd.getCommandBuffer (), c);
-                self._shaderToNode:.drawShadows (frame, alias cmd, cast!usize (c));
+                self._shaderToNode:.drawShadows (ShadowMap::CASCADES, frame, alias cmd, cast!usize (c));
+            }
+        }
+    }
+
+    /**
+     * Cast the shadows of a point or a spot light, drawn in the tiles of the atlas read by the composition, the index of
+     * its shadow given to the light before it is written in the composition
+     * @info: the atlas is drawn while a point or a spot light casts shadows, its pass declared before the composition in
+     * the render graph
+     * @assume: light is a point or a spot light
+     * */
+    fn addLocalShadow (mut self, dmut light : &Light) {
+        let added = atomic self {
+            self._localShadow:.add (alias light)
+        };
+
+        if !added {
+            log::warn #("Scene", MAX_SHADOWS, "point and spot lights already cast shadows, the light", light.name, "casts none");
+            return;
+        }
+
+        if self._localShadow.isCasting { return; }
+
+        let sname = self.named (LOCAL_SHADOW);
+        let atlas = self.named (LOCAL_ATLAS);
+        {
+            let dmut pass = self._localShadow:.start (sname, atlas);
+            pass:.onPrepare ():.connect (&self:.onLocalShadowPrepare);
+
+            atomic self {
+                self._shaderToNode:.castShadows (ShadowMap::LOCAL, alias pass, self._localShadow.cameras, self._localShadow.cameraOffsets ());
+            }
+
+            self._window:.getVulkanPipeline ():.declarePass (GraphPass (name-> sname,
+                                                                        submission-> sname,
+                                                                        uses-> copy [ResourceUse (resource-> atlas, usage-> Usage::DEPTH_ATTACHMENT)],
+                                                                        recording-> (&self:.recordLocalShadow)?),
+                                                             before-> self.named (COMPOSE));
+        } catch {
+            err => {
+                log::error #("Scene", "Failed to cast the shadows of the light", light.name, err);
+                atomic self {
+                    self._shaderToNode:.stopShadows (ShadowMap::LOCAL);
+                }
+
+                self._localShadow:.stop ();
+            }
+        }
+
+        self._window:.redrawPipeline ();
+    }
+
+    /**
+     * Stop casting the shadows of a point or a spot light, the atlas removed from the render graph once no light casts
+     * shadows
+     * */
+    fn removeLocalShadow (mut self, dmut light : &Light) {
+        let stop = atomic self {
+            self._localShadow:.remove (alias light);
+            self._localShadow.isCasting && !self._localShadow.hasLights
+        };
+
+        if stop {
+            atomic self {
+                self._shaderToNode:.stopShadows (ShadowMap::LOCAL);
+            }
+
+            self._localShadow:.stop ();
+            self._window:.redrawPipeline ();
+        }
+    }
+
+    /**
+     * Slot called when the atlas of the point and spot lights is redrawn, before its render pass begins: the draws of
+     * the casters laid out
+     * */
+    fn onLocalShadowPrepare (mut self) {
+        if !self._tree.camera.hasValue { return; }
+
+        let dmut subpass = alias self._localShadow.subpass;
+        let frame = subpass.getCurrentFrame ();
+        atomic self {
+            self._shaderToNode:.layoutShadows (ShadowMap::LOCAL, frame);
+        }
+    }
+
+    /**
+     * Record the pass of the atlas of the point and spot lights: the casters drawn in each view, in its tile
+     * */
+    fn recordLocalShadow (mut self) {
+        if !self._tree.camera.hasValue { return; }
+
+        let dmut subpass = alias self._localShadow.subpass;
+        let dmut cmd = copy IndexedDrawCommandAllocator (alias subpass);
+        let frame = subpass.getCurrentFrame ();
+
+        atomic self {
+            for v in 0us .. self._localShadow.viewCount {
+                self._localShadow.selectView (cmd.getCommandBuffer (), v);
+                self._shaderToNode:.drawShadows (ShadowMap::LOCAL, frame, alias cmd, v);
             }
         }
     }
@@ -1290,9 +1426,19 @@ pub class Scene {
 
     /**
      * Fit the cascades of the shadow map to the view of the camera, and cull the casters each of them sees when the
-     * cascades or the instances changed, recording the commands again when the device draws without multi-draw
+     * cascades or the instances changed, recording the commands again when the device draws without multi-draw; then
+     * the same for the views of the point and spot lights
      * */
     fn updateShadows (mut self) {
+        self:.updateCascades ();
+        self:.updateLocalShadows ();
+    }
+
+    /**
+     * Fit the cascades of the shadow map to the view of the camera, and cull the casters each of them sees when the
+     * cascades or the instances changed, recording the commands again when the device draws without multi-draw
+     * */
+    fn updateCascades (mut self) {
         let changed = atomic self {
             if !self._shadow.isCasting {
                 false
@@ -1300,13 +1446,39 @@ pub class Scene {
                 let bounds = self._shaderToNode:.casterBounds ();
                 let volumes = self._shadow:.update (cam, bounds, self._shadowDistance);
                 if self._shadow:.cullAgain (self._shaderToNode.visibilityChanges ()) {
-                    self._shaderToNode:.cullShadows (volumes, self._shadow.casterThreshold ())
+                    self._shaderToNode:.cullShadows (ShadowMap::CASCADES, volumes, self._shadow.casterThreshold ())
                 } else { false }
             } else { false }
         };
 
         if changed {
             self._window:.redrawPipeline ();
+        }
+    }
+
+    /**
+     * Allocate the tiles of the point and spot lights the camera sees in their atlas, and cull the casters each of their
+     * views sees when the views or the instances changed: the atlas is recorded again when its tiles changed, every
+     * command when the device draws without multi-draw
+     * */
+    fn updateLocalShadows (mut self) {
+        let (redraw, relayout) = atomic self {
+            if !self._localShadow.isCasting {
+                (false, false)
+            } else if let Ok (cam) = self._tree.camera {
+                let (volumes, relayout) = self._localShadow:.update (cam, cast!f32 (self._height));
+                let redraw = if self._localShadow:.cullAgain (self._shaderToNode.visibilityChanges ()) {
+                    self._shaderToNode:.cullShadows (ShadowMap::LOCAL, volumes, self._localShadow.casterThreshold ())
+                } else { false };
+
+                (redraw, relayout)
+            } else { (false, false) }
+        };
+
+        if redraw {
+            self._window:.redrawPipeline ();
+        } else if relayout {
+            self._window:.redrawPass (self._localShadow.subpass);
         }
     }
 
@@ -1356,6 +1528,7 @@ pub class Scene {
         self._environment:.dispose ();
         self._occlusion:.dispose ();
         self._shadow:.dispose ();
+        self._localShadow:.dispose ();
         self._tree:.dispose ();
         self._shaderToNode:.dispose ();
         self._deferred:.dispose ();
