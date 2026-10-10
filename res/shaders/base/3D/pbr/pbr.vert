@@ -8,6 +8,7 @@ layout (location = 1) in vec3 inNormals;
 layout (location = 2) in vec4 inTangents;
 layout (location = 3) in vec2 inUV;
 
+// The projection is offset by the jitter of the frame (a temporal anti-aliasing), the view-projections are not
 layout(set = 1, binding = 0) uniform Camera {
     mat4 proj;
     mat4 view;
