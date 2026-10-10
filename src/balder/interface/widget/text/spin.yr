@@ -1,0 +1,429 @@
+in spin;
+
+use balder::core::dispose;
+use balder::core::application::signal;
+use balder::interface::style;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::{box, range};
+use balder::interface::widget::text::input;
+use balder::math::vector;
+
+use std::conv;
+
+use ::sdl3::mouse;
+
+use ::std::algorithm::comparison;
+
+// The width of the arrows of a spin box whose style sets none, in pixels
+def DEFAULT_ARROW_WIDTH = 16.0f;
+
+/**
+ * A spin box is an input of a number in a range, typed, moved by a step with its arrows or with the wheel
+ * @info:
+ * =====
+ * The arrows are the parts `::up` and `::down`, on top of each other at the right of the padding box, as wide as the
+ * width of `::up` (16 pixels by default), the text being laid out on their left, each in the states `:hover` under the
+ * cursor and `:pressed` while the left button holds it. The text typed is read when the input
+ * loses the focus, snapped to the range, then written again with the decimals of the spin box.
+ * ====
+ * */
+pub class SpinBox over InputText {
+
+    // The bounds of the value, and its step
+    let mut _range: ValueRange = ValueRange(step-> 1.0f);
+
+    // The value as it was set, snapped to the range when it is read
+    let mut _value: f32 = 0.0f;
+
+    // The number of digits written after the decimal point
+    let mut _decimals: u32 = 0u32;
+
+    prot { // parts
+        let dmut _up: &Box;
+        let dmut _down: &Box;
+
+        // The width of the margin boxes of the arrows, in pixels
+        let mut _arrowWidth: f32 = 0.0f;
+
+        // The arrow under the cursor, 1 for up, -1 for down, 0 for none
+        let mut _hoverArrow: i32 = 0;
+
+        // The arrow held by the left button, 1 for up, -1 for down, 0 for none
+        let mut _pressedArrow: i32 = 0;
+    }
+
+    prot { // signals
+        let dmut _changed: (&Signal!{f32})? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "SpinBox", true, 32us)
+        , _up = copy Box(alias manager, "")
+        , _down = copy Box(alias manager, "")
+    {
+        self._up:.setOwnerPart("up");
+        self._down:.setOwnerPart("down");
+        self:.writeValue();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          VALUE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the bounds of the value and its step, the value being snapped to them
+     * */
+    pub fn setRange(mut self, range: ValueRange) {
+        self._range = range;
+        self:.writeValue();
+    }
+
+    /**
+     * Set the value, snapped to the range, without emitting the signal of the spin box
+     * */
+    pub fn setValue(mut self, value: f32) {
+        self._value = value;
+        self:.writeValue();
+    }
+
+    /**
+     * Set the number of digits written after the decimal point
+     * */
+    pub fn setDecimals(mut self, decimals: u32) {
+        self._decimals = decimals;
+        self:.writeValue();
+    }
+
+    /**
+     * @returns: the bounds of the value and its step
+     * */
+    pub fn getRange(self)-> ValueRange {
+        self._range
+    }
+
+    /**
+     * @returns: the value, snapped to the range
+     * */
+    pub fn getValue(self)-> f32 {
+        self._range.snap(self._value)
+    }
+
+    /**
+     * Set the value the user chose, written in the input, emitting the signal of the spin box when it changed
+     * */
+    fn setValueByUser(mut self, value: f32) {
+        let old = self.getValue();
+        self._value = self._range.snap(value);
+        self:.writeValue();
+
+        if self._value != old {
+            if let Ok(dmut s) = alias self._changed {
+                s:.emit(self._value);
+            }
+        }
+    }
+
+    /**
+     * Write the value in the input, with the decimals of the spin box
+     * */
+    fn writeValue(mut self) {
+        self:.setText(to![c8] (self.getValue(), prec-> self._decimals));
+    }
+
+    /**
+     * @returns: the number typed in the input, none if it is not one
+     * */
+    fn readValue(self)-> (f32)? {
+        (std::conv::to!{f32} (self._text))?
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          STYLE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    prot over onApplyStyle(mut self) {
+        self.__super__:.onApplyStyle();
+        self:.restyleArrows();
+    }
+
+    /**
+     * Give the arrows the styles of the parts ::up and ::down in their states: hover under the cursor, pressed while the
+     * left button holds them
+     * */
+    fn restyleArrows(mut self) {
+        self._up:.setStyle(self:.getArrowStyle("up", 1));
+        self._down:.setStyle(self:.getArrowStyle("down", -1));
+    }
+
+    /**
+     * @returns: the style of an arrow in its states
+     * @params:
+     *    - part: the part of the arrow, up or down
+     *    - arrow: 1 for up, -1 for down
+     * */
+    fn getArrowStyle(mut self, part: [c8], arrow: i32)-> &Style {
+        let mut states: [[c8]] = [];
+        if self._hoverArrow == arrow { states ~= ["hover"]; }
+        if self._pressedArrow == arrow { states ~= ["pressed"]; }
+        if states.len == 0us { return self.getStyle().getSubStyle(part); }
+
+        let path = self.getStylePath();
+        self._manager:.getStyleManager().computePart(path, self._currentStyle, part, states-> states)
+    }
+
+    /**
+     * Follow the arrow under the cursor and the arrow held, restyling the arrows when one of them changes
+     * */
+    fn setArrows(mut self, hover: i32, pressed: i32) {
+        if hover == self._hoverArrow && pressed == self._pressedArrow { return; }
+
+        self._hoverArrow = hover;
+        self._pressedArrow = pressed;
+        self:.restyleArrows();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          SIZE COMPUTATION          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The arrows at the right of the padding box, and the text in the content box left on their left
+     * */
+    over onUpdateSize(mut self) {
+        self._arrowWidth = self:.measureArrowWidth(self._absoluteSize);
+        self._absoluteSize.x = max(0.0f, self._absoluteSize.x - self._arrowWidth);
+        self.__super__:.onUpdateSize();
+
+        let half = self._absolutePostBorderSize.y / 2.0f;
+        let x = self._absolutePostBorderPosition.x + self._absolutePostBorderSize.x - self._arrowWidth;
+        self._up:.setSize(makeVec2(x, self._absolutePostBorderPosition.y), makeVec2(self._arrowWidth, half),
+                          self._depth + 1, self._absolutePostBorderSize);
+        self._down:.setSize(makeVec2(x, self._absolutePostBorderPosition.y + half), makeVec2(self._arrowWidth, half),
+                            self._depth + 1, self._absolutePostBorderSize);
+
+        let (sciPos, sciSize) = self.getScissors(self._absolutePostBorderPosition, self._absolutePostBorderSize);
+        self._up:.setScissors(sciPos, sciSize);
+        self._down:.setScissors(sciPos, sciSize);
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        max(self.__super__.getMaxDepth(), max(self._up.getMaxDepth(), self._down.getMaxDepth()))
+    }
+
+    /**
+     * The content of a spin box is its text followed by its arrows
+     * */
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        let (minWidth, maxWidth) = self.__super__:.measureContentWidths();
+        let arrows = self:.measureArrowWidth(makeVec2(INDEFINITE_SIZE, INDEFINITE_SIZE));
+        (minWidth + arrows, maxWidth + arrows)
+    }
+
+    /**
+     * @returns: the width of the margin boxes of the arrows, the width of the part up, 16 pixels when its style sets
+     * none
+     * @params:
+     *    - container: the content box of the spin box, a component being INDEFINITE_SIZE when it is unknown
+     * */
+    fn measureArrowWidth(mut self, container: vec2)-> f32 {
+        self._up:.measurePartSize(container, makeVec2(DEFAULT_ARROW_WIDTH, 0.0f)).x
+    }
+
+    /**
+     * @returns: 1 for a position over the arrow up, -1 over the arrow down, 0 elsewhere
+     * @params:
+     *    - pos: the position of the cursor, relative to the margin box of the spin box
+     * */
+    fn arrowUnder(self, pos: vec2)-> i32 {
+        let cursor = self._absoluteFullPosition + pos * self._absoluteFullSize;
+        let x = self._absolutePostBorderPosition.x + self._absolutePostBorderSize.x - self._arrowWidth;
+        if cursor.x < x || cursor.x > x + self._arrowWidth { return 0; }
+
+        let top = self._absolutePostBorderPosition.y;
+        let half = self._absolutePostBorderSize.y / 2.0f;
+        if cursor.y < top || cursor.y > top + 2.0f * half { return 0; }
+
+        if cursor.y < top + half { 1 } else { -1 }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          ATTACH/DETACH          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self._up:.onAttach((self)?);
+        self._down:.onAttach((self)?);
+    }
+
+    over onHide(mut self) {
+        self.__super__:.onHide();
+        self._up:.hide();
+        self._down:.hide();
+    }
+
+    over onShow(mut self) {
+        self.__super__:.onShow();
+        self._up:.show();
+        self._down:.show();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Over an arrow the cursor is the default one, the text cursor elsewhere
+     * */
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        self.__super__:.onHover(pos);
+
+        let arrow = self.arrowUnder(pos);
+        self:.setArrows(arrow, self._pressedArrow);
+        if arrow != 0 {
+            self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT);
+        }
+
+        (alias self)?
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        self.__super__:.onLoseHoverFocus();
+        self:.setArrows(0, self._pressedArrow);
+    }
+
+    /**
+     * A click of the left button on an arrow moves the value by a step, elsewhere it places the caret
+     * */
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        let arrow = self.arrowUnder(pos);
+        if button == SDL_BUTTON_LEFT && arrow != 0 {
+            self:.setArrows(arrow, arrow);
+            self:.setValueByUser(self._range.moveBy(self.readValue() ?? self.getValue(), arrow));
+            return (alias self)?;
+        }
+
+        self.__super__:.onClick(pos, button)
+    }
+
+    pub over onClickEnd(mut self, button: u8)-> dmut (&Widget)? {
+        if button == SDL_BUTTON_LEFT {
+            self:.setArrows(self._hoverArrow, 0);
+        }
+
+        self.__super__:.onClickEnd(button)
+    }
+
+    /**
+     * The wheel moves the value by a step
+     * */
+    pub over onScroll(mut self, _: vec2, _: i32, amountY: i32)-> bool {
+        if amountY == 0 { return false; }
+
+        self:.setValueByUser(self._range.moveBy(self.readValue() ?? self.getValue(), if amountY > 0 { 1 } else { -1 }));
+        true
+    }
+
+    /**
+     * The text typed is read when the input loses the focus, the value being written again
+     * */
+    pub over onLoseFocus(mut self) {
+        self:.setValueByUser(self.readValue() ?? self.getValue());
+        self.__super__:.onLoseFocus();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted when the user changes the value, with the new value
+     * */
+    pub fn changed(mut self)-> dmut &Signal!{f32} {
+        if let Ok(dmut s) = alias self._changed {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{f32} ();
+        self._changed = (alias s)?;
+
+        alias s
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self._up:.dispose();
+            self._down:.dispose();
+            self.__super__:.dispose();
+        }
+    }
+}
+
+/**
+ * The spin boxes in a .gui file
+ * */
+pub mod SpinBox {
+
+    /**
+     * @returns: the schema of the spin boxes, their value being their default attribute
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("SpinBox",
+                          |dmut m, id|-> dmut &Widget => copy SpinBox(alias m, id),
+                          attributes-> copy [copy Setter!{&SpinBox, f32}("value", |dmut s, v| => { s:.setValue(v); }),
+                                             copy Setter!{&SpinBox, f32}("min", |dmut s, v| => {
+                                                 s:.setRange(ValueRange(lower-> v, upper-> s.getRange().upper, step-> s.getRange().step));
+                                             }),
+                                             copy Setter!{&SpinBox, f32}("max", |dmut s, v| => {
+                                                 s:.setRange(ValueRange(lower-> s.getRange().lower, upper-> v, step-> s.getRange().step));
+                                             }),
+                                             copy Setter!{&SpinBox, f32}("step", |dmut s, v| => {
+                                                 s:.setRange(ValueRange(lower-> s.getRange().lower, upper-> s.getRange().upper, step-> v));
+                                             }),
+                                             copy Setter!{&SpinBox, u32}("decimals", |dmut s, d| => { s:.setDecimals(d); })],
+                          defaultAttribute-> "value",
+                          signals-> copy [copy Emitter!{&SpinBox, f32}("on-change", |dmut s|-> dmut &Signal!{f32} => alias s:.changed())],
+                          parts-> copy ["label", "selection", "cursor", "up", "down"],
+                          partStates-> copy ["up" => copy ["hover", "pressed"], "down" => copy ["hover", "pressed"]])
+    }
+}
