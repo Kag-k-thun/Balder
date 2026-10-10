@@ -53,11 +53,18 @@ pipeline:.declarePass (GraphPass (name-> "gbuffer",
 | `importImage (name, texture)` | the declarer, one image per frame in flight | memory barriers and layout transitions |
 | `importBuffer (name)` | the declarer | memory barriers, the buffer itself is not needed: a name can stand for the buffers of several batches |
 | `createImage (name, ImageDesc (...))` | the graph, for one frame | memory barriers and layout transitions, starting from `undefined` each frame |
+| `createImage (name, ImageDesc (persistent-> true, ...))` | the graph, one image for every frame (a history) | memory barriers and layout transitions, starting each frame in the layout the frame before left it |
 
 The graph allocates a transient image while an enabled pass uses it. `getTexture (name)` returns its texture for the
 frames recorded from now on; a pass binds it when it is recorded, its texture changing when the memory is shared
 differently. The framebuffers of a `DrawSubpass::toImages` are created by the graph once its attachments are
 allocated, in the order of the attachments of its first raster pass.
+
+A persistent image keeps its content from a frame to the next: one image (`OutputTexture::shared`) every frame slot
+reads and writes, never sharing its memory, allocated again when its description changes, its content undefined until
+a pass writes it. Its first use in a frame waits for its last use in the frame before, which the frames submit in the
+same queue: the passes using it are in one subpass, `compile` refusing a graph where two subpasses use it. `--graph`
+draws it bold.
 
 ### Usages
 
@@ -130,7 +137,7 @@ flowchart LR
         shadow_map[shadow]
     end
     subgraph compose
-        composition[compose] --> bloom[post_bloom: 6 down, 5 up, 1 added] --> vignette[post_vignette] --> tonemap[post_tonemap] --> lut[post_lut] --> fxaa[post_fxaa]
+        composition[compose] --> taa[post_taa: resolve, history, sharpen] --> bloom[post_bloom: 6 down, 5 up, 1 added] --> vignette[post_vignette] --> tonemap[post_tonemap] --> lut[post_lut]
     end
     subgraph screen
         widgets[screen]
@@ -147,10 +154,12 @@ flowchart LR
 | `draws`, `late_draws` | imported buffers | the cull passes | the g-buffers (indirect, vertices) |
 | `cull_state` | imported buffers | both cull passes | both cull passes |
 | `hzb` | imported buffer (the depth pyramid) | the pyramid | the late cull pass |
-| `gbuffer_*` (6 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials) |
+| `gbuffer_*` (7 images: normals, base colour and occlusion, materials, metalness and roughness, emissive colour, velocity, depth) | transient | both g-buffers | the pyramid (depth), the composition (positions rebuilt from the depth, the texels of the maps multiplying the factors of the materials, all but the velocity), the post effects reading them (the anti-aliasing: depth and velocity) |
 | `shadow_atlas` | transient | the shadow map | the composition (optional) |
 | `radiance` | transient (`R16G16B16A16_SFLOAT`, storage) | the composition (the light the camera sees, linear and unbounded) | the first pass of the post-process chain |
 | `post_<effect>_out` | transient (`R16G16B16A16_SFLOAT` before the tone mapping, `R8G8B8A8_UNORM` after it, storage) | the last pass of an effect of the post-process chain, but the last effect | the first pass of the next effect |
+| `post_taa_resolved` | transient (`R16G16B16A16_SFLOAT`, storage) | the resolve of the anti-aliasing (the frame blended with the history) | the copy into the history, the sharpening |
+| `post_taa_history` | persistent (`R16G16B16A16_SFLOAT`, storage) | the copy of the blend | the resolve of the next frame |
 | `post_bloom_mip<k>`, `post_bloom_up<k>` | transient (`R16G16B16A16_SFLOAT`, storage, 2^k times smaller) | the downsampling and the upsampling passes of the bloom | the next pass of the bloom |
 | `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the last pass of the post-process chain, the tone mapping without effects in display space | the screen |
 
@@ -160,8 +169,10 @@ The passes between the composition and the screen are the `PostChain` of the sce
 list of `PostEffect`s: fullscreen compute passes, each effect reading the image the effect before it wrote and writing
 its own. An effect declares the space of the colours it works on, `HDR` (the light, before the tone mapping) or
 `DISPLAY` (the colours of the screen, encoded in sRGB, after it), the images of the g-buffer it reads besides (`DEPTH`,
-`NORMALS`), its compute shaders and the size of its parameters. The tone mapping is the effect the chain always holds: the effects
-in HDR space run before it and those in display space after it, each in the order of the chain.
+`NORMALS`, `VELOCITY`), its compute shaders and the size of its parameters. The tone mapping is the effect the chain always holds: the effects
+in HDR space run before it and those in display space after it, each in the order of the chain, but the effects
+declaring `runsFirst` (the anti-aliasing), which run before the others of their space wherever they are in the chain.
+An effect is told when its passes start or stop running (`setRunning`), as the chain declares them again.
 
 ```
 let dmut chain = scene:.getPostChain ();
@@ -203,12 +214,29 @@ The parameters change without recording the frames again (`updateParams`).
 
 | Kind | Space | Parameters (`.gui` order) | Passes |
 |---|---|---|---|
+| `taa` | HDR, first | blend (0.1), clip (1), sharpness (0.25) | 3 |
 | `vignette` | HDR | intensity (0.5), radius (0.4), softness (0.6) | 1 |
 | `bloom` | HDR | threshold (1), knee (0.5), intensity (0.05), radius (1), levels (6) | 2 × levels |
 | `invert` | display | | 1 |
 | `lut` | display | `"path"` (`res:/lut/neutral.png`), contribution (1) | 1 |
 | `fxaa` | display | subpix (0.75), edgeThreshold (0.166), edgeThresholdMin (0.0833) | 1 |
 
+- **Temporal anti-aliasing** (`TaaEffect`): the projection of the camera is offset each frame by a fraction of a pixel,
+  the points of a Halton (2, 3) sequence of 8 (`Camera::setJitter`, the view-projection culling and moving the
+  instances staying unjittered), and each frame is blended with the frames before it, so a still image converges to the
+  average of the samples covering each pixel. The g-buffer writes the motion of each pixel since the frame before
+  (`gbuffer_velocity`, in texture coordinates), from the view-projection the camera drew the frame before with and the
+  world each instance moving was drawn at (`MotionTracker`, the slot of an instance holding its world of the frame
+  before). The resolve (`post_taa_resolve`) reprojects the history along the motion of the closest pixel around each
+  pixel, sampled by a Catmull-Rom filter, clips it to `clip` standard deviations of the 3x3 neighbourhood in YCoCg so
+  what moved leaves no ghost, and blends it with the frame by the weight `blend`, the colours tone mapped against the
+  fireflies; the blend is copied into the history (`post_taa_history`, a persistent image) and sharpened into the
+  image of the stage. It runs first among the effects in HDR space: a bloom before it would spread the samples of the
+  jittered frame. The frames being drawn on request, the anti-aliasing draws them continuously after a change until
+  the history converges (`settleFrames`), then stops; the jitter and the matrices of the frame before are written while
+  each frame is submitted (`Window::connectFrameSubmit`, `setFrameData`), without requesting another one. The history
+  is forgotten on a resize, a change of camera or `reset` (a cut). A lower `blend` flickers less on a still image and
+  ghosts more in motion; a wider `clip` keeps the small highlights the clipping would cut.
 - **Bloom** (`BloomEffect`): the light brighter than the threshold, exposed by the camera (1 is white on the screen),
   through a soft knee, is downsampled into `levels` levels, each half the size of the one before it, by the 13 taps
   of Jorge Jimenez, the boxes of the first level weighed by the average of Karis against fireflies
@@ -225,7 +253,7 @@ The parameters change without recording the frames again (`updateParams`).
   mapping, the edges found from their luma; it smooths everything drawn, so it runs after the effects changing the
   colours (put it after a grading).
 
-A `Scene3D` of a `.gui` file describes its chain with `post: bloom, vignette(0.6, 0.35), lut("res:/lut/film.png"), fxaa,
+A `Scene3D` of a `.gui` file describes its chain with `post: taa, bloom, vignette(0.6, 0.35), lut("res:/lut/film.png"),
 invert(off);`, the kinds of effects created by the `PostRegistry` of the widget manager (see `doc/gui.md`). The demo
-describes a bloom, a vignette, a filmic grading, FXAA and a disabled inversion in `res/config/app.gui`, `B`, `V`, `L`,
-`F` and `I` toggling them.
+describes a temporal anti-aliasing, a bloom, a vignette, a filmic grading, a disabled FXAA and a disabled inversion in
+`res/config/app.gui`, `M`, `B`, `V`, `L`, `F` and `I` toggling them.
