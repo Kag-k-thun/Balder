@@ -2,8 +2,7 @@
 
 A `.gui` file says which widgets exist, what they say and how they behave. A `.style` file says how they look and
 where they go. Both share one lexer and one grammar of values. This page describes the language as Balder reads it
-today; [gui-v2.md](gui-v2.md) is the design it comes from, and still describes parts that are not implemented yet
-(signals).
+today; [gui-v2.md](gui-v2.md) is the design it comes from.
 
 The second half of the page, from [Widget types](#widget-types) on, is generated from the widget registry and the
 property table by `gyllir run reference` in `tools/`, and a test fails when it no longer matches the code.
@@ -19,8 +18,9 @@ self.gui:.loadGUIFile ("res:/dialog/message.gui")?;
   the fonts of its `@font-face` blocks and computes the styles of the widgets already loaded again. A sheet refused
   adds no rule.
 - `loadGUIFile` reads a `.gui` file and the files it imports, unfolds its [components](#components), checks every
-  node against the widget types, then creates the widgets and makes the root the content of the manager. The sheets
-  the components name with `@style` are loaded the first time a file names them.
+  node against the widget types and every `on-…` attribute against the [slots](#signals) of the activity, then
+  creates the widgets, connects their signals and makes the root the content of the manager. The sheets the
+  components name with `@style` are loaded the first time a file names them.
 - `loadComponents` reads only the components of a file and of those it imports, a file holding only components being
   a library of widgets, and `instantiate` creates an instance of a component from code (see
   [Instances written by code](#instances-written-by-code)).
@@ -41,8 +41,8 @@ self.gui:.loadGUIFile ("res:/dialog/message.gui")?;
 LinearLayout #FL .root {
     Label #QUESTION .question "HELLO?";
     LinearLayout #F2 .inner {
-        PushButton #YES .yes "Yes";
-        PushButton #NO .no "No";
+        PushButton #YES .yes "Yes" { on-click: yes; }
+        PushButton #NO .no "No" { on-click: no; }
     }
 }
 ```
@@ -180,6 +180,51 @@ self.gui:.instantiate ("FieldRow", "Phone", parent-> "BODY/FORM", id-> "PHONE", 
 the root of the interface when it is `""`, as if it were written there. The value is the text of the default value,
 and `attributes` the block of the instance in the syntax of the `.gui` files. A path already taken, a parent that takes
 no more children and an instance refused are errors.
+
+### Signals
+
+The code registers its handlers under names, the slots, and an `on-…` attribute says which slot a signal of the widget
+calls. The loader checks and connects them, so no handler is connected by looking a widget up first.
+
+```
+over onStart (mut self) {
+    self:.slot ("quit", &self:.onQuitClicked);                     // fn onQuitClicked (mut self, button: u8)
+    self:.slot ("describe", &self:.onDescribe);                    // fn onDescribe (mut self, text: [c8], button: u8)
+    self:.behavior ("form", copy FormBehavior (alias self.gui));   // its slots are form::submit, form::reset, …
+    self.gui:.loadGUIFile ("res:/gui/gallery.gui")?;
+}
+```
+
+```
+PushButton #QUIT "Quit" { on-click: quit; }
+PushButton "Label" { on-click: describe ("Label: a text in UTF-8"); }
+PushButton "Submit" { on-click: form::submit; }
+FieldRow #NAME "Name" { on-validate: form::name-set; }
+```
+
+- **The signals are registered by the widget types**, each with the type of its payload: every widget emits
+  `on-click` with the mouse button (`u8`), `on-focus` and `on-blur` when it gains and loses the focus; the others are
+  listed under [Widget types](#widget-types).
+- **The slots are registered by the activity**: `Activity.slot (name, delegate)` records the types of the parameters
+  of the delegate, which runs in the thread of the activity. The loader looks no slot up anywhere else.
+- **A behavior groups slots under a name.** A class over `Behavior` registers its slots in its constructor
+  (`self:.slot ("submit", &self:.onSubmit);`) and the activity mounts it with `Activity.behavior (name, behavior)`. A
+  slot name is then a path, `form::submit`, which is looked up only where it leads: `submit` does not find it.
+  `Activity.slot ("view::reset", …)` registers a slot by its path, the behaviors missing on the way being created.
+- **A slot takes the bound arguments, then the payload.** `describe ("Label: …")` binds constants of the
+  [value grammar](#values) (strings, numbers, `true` and `false`) to the first parameters of the slot, and the signal
+  gives the last one. A slot binding every parameter suits a signal without payload. A parameter of a type no value
+  decodes to (a `vec2`) can only be given by a payload.
+- **The connection is checked at load**, before any widget is created. A slot that does not exist, a slot whose
+  parameters are not the bound arguments then the payload, and a bound argument of the wrong kind are errors naming
+  the file, the line, the signal and the slot:
+  `gallery.gui:12:30: the slot 'quit' takes (u8), the attribute 'on-validate' of 'InputText' gives ([c8])`.
+- **`none` leaves a signal unconnected.** A component forwards a signal of an inner widget through a parameter
+  defaulting to `none`: `@component FieldRow ($label, $on-validate: none)`, with `on-validate: $on-validate;` on its
+  input, lets `FieldRow #AGE "Age" { on-validate: age-set; }` reach it. An error about the slot is reported at the
+  instance.
+- **The connections belong to the widgets**, dropped with them. `connect` stays available for the widgets created by
+  code, and `instantiate` connects the `on-…` attributes of the instances it creates.
 
 ## The style file
 
@@ -321,6 +366,7 @@ kind of value it expects.
 | tuple | values separated by spaces | `padding: 6 14` `border: 2 $edge` `cell: 1 0` |
 | list | values separated by commas | `"DejaVu Sans Mono", monospace` |
 | constant | `$name` | `$accent` |
+| slot | a slot name, a path of names, optionally with bound arguments, or `none` | `quit` `form::submit` `describe ("…")` |
 
 Shorthands follow the order of CSS: one value for every side, two for vertical then horizontal, three for top,
 horizontal then bottom, four clockwise from the top. A longhand after a shorthand overrides its side:
