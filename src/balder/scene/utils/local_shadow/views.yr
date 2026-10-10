@@ -1,0 +1,192 @@
+in views;
+
+use balder::math::{bounds, matrix, utils, vector};
+use balder::scene::utils::cascade::fit;
+use balder::scene::utils::local_shadow::view;
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The views of the shadows of the point and spot lights, seen from the light through perspective projections
+ * @info: a point light is seen through the six faces of a cube around it, each a square view of a quarter turn along an
+ * axis of the world; a spot light through the square view enclosing its cone; each view is drawn in a tile of the
+ * atlas of the shadows (see atlas)
+ * @info: a view sees a little more than its volume, so the volume keeps TILE_MARGIN texels on each side of the tile:
+ * the lookups of the composition read the texels around the point shaded, which stay inside the tile
+ * @info: a projection writes the depth in [0, 1] (the depth range of Vulkan), from the near plane of the light (a share
+ * of its range, see NEAR_SHARE) to its range, the view looking along its z axis
+ * */
+
+/**
+ * The texels kept on each side of a tile around the volume its view sees
+ * */
+pub def TILE_MARGIN = 2u32;
+
+/**
+ * The number of views of the shadow of a point light, the faces of a cube
+ * */
+pub def FACES = 6u32;
+
+/**
+ * The share of the range of a light at which its views start, their near plane, and the closest near plane
+ * @info: a larger near plane spreads the precision of the depth over the range; the casters closer to the light do not
+ * cast shadows
+ * */
+pub def NEAR_SHARE = 0.01f;
+pub def MIN_NEAR = 0.02f;
+
+/**
+ * The largest angle between the axis of the cone of a spot light and the edge its shadow sees, in degrees, the light
+ * of a wider cone being unshadowed past it
+ * */
+pub def MAX_SPOT_ANGLE = 80.0f;
+
+/**
+ * @returns: the direction a face of the shadow of a point light looks along: +x, -x, +y, -y, +z, -z
+ * @params:
+ *    - face: the index of the face, less than FACES
+ * */
+pub fn faceDirection(face: u32)-> vec3 {
+    let sign = if (face & 1u32) == 0u32 { 1.0f } else { -1.0f };
+    match face >> 1u32 {
+        0u32 => { makeVec3(sign, 0.0f, 0.0f) }
+        1u32 => { makeVec3(0.0f, sign, 0.0f) }
+        _    => { makeVec3(0.0f, 0.0f, sign) }
+    }
+}
+
+/**
+ * @returns: the face of the shadow of a point light seeing a direction from the light, along the axis of its largest
+ * coordinate (the lookup of the composition)
+ * */
+pub fn faceOf(direction: vec3)-> u32 {
+    let a = makeVec3(math::abs(direction.x), math::abs(direction.y), math::abs(direction.z));
+    if a.x >= a.y && a.x >= a.z {
+        return if direction.x >= 0.0f { 0u32 } else { 1u32 };
+    }
+
+    if a.y >= a.z {
+        return if direction.y >= 0.0f { 2u32 } else { 3u32 };
+    }
+
+    if direction.z >= 0.0f { 4u32 } else { 5u32 }
+}
+
+/**
+ * @returns: the near plane of the views of a light, a share of its range
+ * */
+pub fn nearPlane(range: f32)-> f32 {
+    comparison::max(range * NEAR_SHARE, MIN_NEAR)
+}
+
+/**
+ * @returns: the share of a tile its volume covers, the tile keeping TILE_MARGIN texels on each side of it
+ * @params:
+ *    - side: the number of texels on a side of the tile, larger than twice the margin
+ * */
+pub fn coverage(side: u32)-> f32 {
+    cast!f32(side - 2u32 * TILE_MARGIN) / cast!f32(side)
+}
+
+/**
+ * @returns: the perspective projection of a view looking along its z axis, the depth written in [0, 1] from the near
+ * plane to the far one
+ * @params:
+ *    - focal: the scale of the coordinates seen at a depth of one unit, 1 / tan of half the field of view
+ *    - near: the distance of the near plane
+ *    - far: the distance of the far plane
+ * */
+pub fn perspectiveDepth(focal: f32, near: f32, far: f32)-> mat4 {
+    let a = far / (far - near);
+
+    mat4(a1-> focal,
+         b2-> focal,
+         c3-> a, c4-> -a * near,
+         d3-> 1.0f, d4-> 0.0f)
+}
+
+/**
+ * @returns: the view of a light at a position looking along a direction, from world space to its view, its z axis
+ * being the direction
+ * */
+pub fn lightAt(position: vec3, direction: vec3)-> mat4 {
+    let r = fit::lightView(direction);
+    let t = r * makeVec4(-position, 1.0f);
+
+    mat4(a1-> r.a1, a2-> r.a2, a3-> r.a3, a4-> t.x,
+         b1-> r.b1, b2-> r.b2, b3-> r.b3, b4-> t.y,
+         c1-> r.c1, c2-> r.c2, c3-> r.c3, c4-> t.z)
+}
+
+/**
+ * @returns: the six views of the shadow of a point light, in the order of their faces (see faceDirection), each seeing
+ * a quarter turn along its axis in a tile, its margin around it
+ * @params:
+ *    - position: the position of the light in world space
+ *    - range: the range of the light
+ *    - side: the number of texels on a side of the tiles of the faces
+ * */
+pub fn pointViews(position: vec3, range: f32, side: u32)-> [ShadowView] {
+    let focal = coverage(side);
+    let proj = perspectiveDepth(focal, nearPlane(range), range);
+
+    let dmut result = copy [ShadowView(); FACES];
+    for f in 0u32 .. FACES {
+        let view = lightAt(position, faceDirection(f));
+        result[f] = ShadowView(viewProj-> proj * view, texel-> texelScale(focal, side));
+    }
+
+    result
+}
+
+/**
+ * @returns: the view of the shadow of a spot light, seeing its cone in a tile, its margin around it
+ * @params:
+ *    - position: the position of the light in world space
+ *    - direction: the unit direction the light shines along
+ *    - outerAngle: the angle between the axis of the cone and the edge of its light, in degrees, clamped to
+ *      MAX_SPOT_ANGLE
+ *    - range: the range of the light
+ *    - side: the number of texels on a side of the tile
+ * */
+pub fn spotView(position: vec3, direction: vec3, outerAngle: f32, range: f32, side: u32)-> ShadowView {
+    let angle = utils::radian(clamp(outerAngle, 1.0f, MAX_SPOT_ANGLE));
+    let focal = coverage(side) / math::tan(angle);
+    let proj = perspectiveDepth(focal, nearPlane(range), range);
+
+    ShadowView(viewProj-> proj * lightAt(position, direction), texel-> texelScale(focal, side))
+}
+
+/**
+ * @returns: the smallest sphere enclosing the cone of a spot light, cut by the sphere of its range
+ * @params:
+ *    - position: the position of the light in world space
+ *    - direction: the unit direction the light shines along
+ *    - outerAngle: the angle between the axis of the cone and the edge of its light, in degrees, clamped to a quarter
+ *      turn
+ *    - range: the range of the light
+ * */
+pub fn spotBounds(position: vec3, direction: vec3, outerAngle: f32, range: f32)-> Sphere {
+    let angle = utils::radian(clamp(outerAngle, 0.0f, 90.0f));
+    let axis = direction.normalized();
+
+    // a wide cone is enclosed by the sphere of the disc of its end, a narrow one by the sphere through its apex and the
+    // edge of that disc
+    if angle > math::PI / 4.0f {
+        return Sphere(position + axis * (range * math::cos(angle)), range * math::sin(angle));
+    }
+
+    let radius = range / (2.0f * math::cos(angle));
+    Sphere(position + axis * radius, radius)
+}
+
+/**
+ * @returns: the size of a texel of a view at a depth of one unit, in world units
+ * @params:
+ *    - focal: the scale of the projection of the view (see perspectiveDepth)
+ *    - side: the number of texels on a side of the tile of the view
+ * */
+fn texelScale(focal: f32, side: u32)-> f32 {
+    2.0f / (focal * cast!f32(side))
+}
