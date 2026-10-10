@@ -1,0 +1,481 @@
+in taa;
+
+use balder::core::_;
+use balder::core::application::window;
+use balder::core::config::shader;
+use balder::core::driver::graph;
+use balder::core::shader::buffers::ubo;
+use balder::math::vector;
+use balder::scene::node::node3D::camera;
+use balder::scene::utils::post::{effect, input, pass, space, stage};
+
+use std::math;
+
+use ::vulkan::core;
+
+/**
+ * The size of the parameters of the anti-aliasing, the weight of the frame, the width of the clipping box, the strength
+ * of the sharpening and the reset of the history (the params block of its shaders)
+ * */
+def TAA_SIZE = 16us;
+
+/**
+ * The offset of the reset of the history in the parameters, 1 for the frame drawing its own samples only
+ * */
+def RESET_OFFSET = 12us;
+
+/**
+ * The shaders of the anti-aliasing, by their place among its shaders
+ * */
+def RESOLVE = 0us; // the blend of the frame with the history reprojected along the motion of its pixels
+def SHARPEN = 1us; // the copy of the blend, sharpened at the level 1
+
+/**
+ * The textures of the resolve besides the light of the frame and the images of the g-buffer
+ * */
+def HISTORY = "history";
+
+/**
+ * The number of jitters of the projection, the points of a Halton (2, 3) sequence covering a pixel
+ * */
+pub def JITTER_SAMPLES = 8u32;
+
+/**
+ * The weight under which the frames drawn before a change are forgotten by the history, a step of an 8 bits colour
+ * */
+def FORGOTTEN = 1.0f / 256.0f;
+
+/**
+ * A temporal anti-aliasing, in HDR space: the projection of the camera is jittered by a fraction of a pixel each frame,
+ * and each frame is blended with the frames before it, so a still image converges to the average of the samples covering
+ * each pixel
+ * @info:
+ * =====
+ * The anti-aliasing reaches back into the g-buffer, which writes the motion of each pixel since the frame before (see
+ * MotionTracker and Camera::advanceFrame), and into the camera, whose projection it jitters (see Camera::setJitter):
+ *   - the resolve reprojects the history, a persistent image of the render graph holding the blend of the frame before,
+ *     along the motion of the closest pixel around each pixel, sampled by a Catmull-Rom filter; the history is clipped
+ *     to the variance of the 3x3 neighbourhood of the pixel in YCoCg, so what moved or changed does not leave a ghost,
+ *     and blended with the frame by an exponential weight, the samples tone mapped against the fireflies
+ *   - the blend is copied into the history, and sharpened into the image of the stage
+ * The history is forgotten when the images are allocated again (a resize), when the camera changes or on reset (a cut).
+ * The frames being drawn on request, the anti-aliasing draws them continuously after each change until the history
+ * converges, then stops (see Window::beginContinuous). It runs first among the effects in HDR space, whatever its
+ * place in the chain (see PostEffect::runsFirst): a bloom before it would spread the samples of the jittered frame, its
+ * glow flickering with the jitter of the highlights, too smooth for the clipping of the history to hold it.
+ * ====
+ * */
+@final
+pub class TaaEffect over PostEffect {
+
+    // The weight of the frame in its blend with the history
+    let mut _blend : f32;
+
+    // The width of the box the history is clipped to, in standard deviations of the neighbourhood
+    let mut _clip : f32;
+
+    // The strength of the sharpening of the blend
+    let mut _sharpness : f32;
+
+    // True while the passes of the anti-aliasing are declared in the render graph
+    let mut _running : bool = false;
+
+    // True when the next frame forgets the history
+    let mut _reset : bool = true;
+
+    // The frames still drawn continuously for the history to converge
+    let mut _remaining : u32 = 0u32;
+
+    // True while the frames are drawn continuously for the history
+    let mut _continuous : bool = false;
+
+    // The jitter of the frame, its place in the sequence
+    let mut _sample : u32 = 0u32;
+
+    // The size of the images the anti-aliasing runs on
+    let mut _width : u32 = 0u32;
+    let mut _height : u32 = 0u32;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - name: the name of the effect in its chain
+     *    - blend: the weight of the frame in its blend with the history, from 0 (the history alone, smooth but slow to
+     *             converge) to 1 (the frame alone, no anti-aliasing)
+     *    - clip: the width of the box the history is clipped to, in standard deviations of the neighbourhood of the
+     *            pixel, the smaller the fewer ghosts but the more flickering
+     *    - sharpness: the strength of the sharpening of the blend, 0 for none
+     * */
+    pub self (name : [c8] = "taa", blend : f32 = 0.1f, clip : f32 = 1.0f, sharpness : f32 = 0.25f)
+        with super (name,
+                    PostSpace::HDR,
+                    shaders (),
+                    reads-> copy [PostInput::DEPTH, PostInput::VELOCITY],
+                    paramsSize-> TAA_SIZE,
+                    readsCamera-> true,
+                    runsFirst-> true)
+        , _blend = clamp01 (blend)
+        , _clip = clip
+        , _sharpness = sharpness
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CONFIGURE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load the shaders of the anti-aliasing, the frames of the window jittering the camera from then on
+     * */
+    pub over configure (mut self, dmut win : &Window)
+        throws BalderError
+    {
+        self.__super__:.configure (alias win);
+        win:.connectFrameSubmit (&self:.onFrameSubmit);
+    }
+
+    /**
+     * Allocate the descriptor set of a pass, the history being forgotten as its images are declared again
+     * */
+    pub over prepare (mut self, pass : PostPass)
+        throws BalderError
+    {
+        self.__super__:.prepare (pass);
+        atomic self {
+            self._width = pass.image.width;
+            self._height = pass.image.height;
+            self._reset = true;
+        }
+    }
+
+    /**
+     * Jitter the camera of the scene, the history being forgotten when it is another camera (a cut)
+     * */
+    pub over setCamera (mut self, dmut cam : &Camera) {
+        atomic self {
+            if let Ok (dmut old) = alias self._camera {
+                if old !is cam {
+                    old:.setJitter (makeVec2 (0.0f, 0.0f));
+                    self._reset = true;
+                }
+            }
+        }
+
+        self.__super__:.setCamera (alias cam);
+    }
+
+    /**
+     * Jitter the camera while the passes run, and stop when they do not anymore
+     * */
+    pub over setRunning (mut self, running : bool) {
+        atomic self {
+            self._running = running;
+            self._reset = true;
+            if !running {
+                self:.stopJitter ();
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          PARAMETERS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the weight of the frame in its blend with the history
+     * */
+    @field
+    pub fn blend (self)-> f32 {
+        self._blend
+    }
+
+    /**
+     * Set the weight of the frame in its blend with the history, from 0 (the history alone) to 1 (the frame alone)
+     * */
+    @field
+    pub fn blend (mut self, blend : f32) {
+        self._blend = clamp01 (blend);
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the width of the box the history is clipped to, in standard deviations of the neighbourhood
+     * */
+    @field
+    pub fn clip (self)-> f32 {
+        self._clip
+    }
+
+    /**
+     * Set the width of the box the history is clipped to, in standard deviations of the neighbourhood of the pixel
+     * */
+    @field
+    pub fn clip (mut self, clip : f32) {
+        self._clip = clip;
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the strength of the sharpening of the blend
+     * */
+    @field
+    pub fn sharpness (self)-> f32 {
+        self._sharpness
+    }
+
+    /**
+     * Set the strength of the sharpening of the blend, 0 for none
+     * */
+    @field
+    pub fn sharpness (mut self, sharpness : f32) {
+        self._sharpness = sharpness;
+        self:.updateParams ();
+    }
+
+    /**
+     * @returns: the number of frames drawn after a change for the history to converge, its weight under the step of an 8
+     * bits colour, a sequence of jitters at least
+     * */
+    pub fn settleFrames (self)-> u32 {
+        if self._blend >= 1.0f { return JITTER_SAMPLES; }
+        if self._blend <= 0.0f { return 256u32; }
+
+        let frames = cast!u32 (math::ceil (math::log (FORGOTTEN) / math::log (1.0f - self._blend)));
+        if frames < JITTER_SAMPLES { JITTER_SAMPLES } else if frames > 256u32 { 256u32 } else { frames }
+    }
+
+    /**
+     * Forget the history, the next frame drawing its own samples only (a cut of the camera)
+     * */
+    pub fn reset (mut self) {
+        atomic self {
+            self._reset = true;
+        }
+
+        if let Ok (dmut win) = alias self._window {
+            win:.requestFrame ();
+        }
+    }
+
+    prot over writeParams (self, dmut ubo : &UniformBufferObject) {
+        ubo:.setData (0us, self._blend);
+        ubo:.setData (4us, self._clip);
+        ubo:.setData (8us, self._sharpness);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PASSES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the passes of the anti-aliasing: `<pass>_resolve` blending the light of the stage before it with the
+     * history into `<pass>_resolved`, `<pass>_history` copying the blend into the history `<pass>_history`, a persistent
+     * image, and the pass of the stage sharpening the blend into the image of the stage
+     * */
+    pub over passes (self, stage : PostStage, width : u32, height : u32)-> [PostPass] {
+        let input : [c8] = PostBindings::INPUT;
+        let mut textures : [[c8]] = copy [input];
+        for r in self.reads {
+            let name : [c8] = r;
+            textures = textures ~ [name];
+        }
+
+        let resolved = stage.pass ~ "_resolved";
+        let history = historyName (stage);
+        let blend = ImageDesc (format-> VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT, width-> width, height-> height, storage-> true);
+
+        copy [PostPass (effect-> self.name,
+                        name-> stage.pass ~ "_resolve",
+                        index-> 0us,
+                        shader-> RESOLVE,
+                        textures-> textures ~ [HISTORY],
+                        images-> [stage.input] ~ stage.reads ~ [history],
+                        output-> resolved,
+                        image-> blend),
+              PostPass (effect-> self.name,
+                        name-> history,
+                        index-> 1us,
+                        shader-> SHARPEN,
+                        level-> 0u32,
+                        textures-> copy [input],
+                        images-> copy [resolved],
+                        output-> history,
+                        image-> ImageDesc (format-> blend.format, width-> width, height-> height, storage-> true, persistent-> true)),
+              PostPass (effect-> self.name,
+                        name-> stage.pass,
+                        index-> 2us,
+                        shader-> SHARPEN,
+                        level-> 1u32,
+                        textures-> copy [input],
+                        images-> copy [resolved],
+                        output-> stage.output,
+                        image-> stage.image (width, height),
+                        imported-> stage.last)]
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FRAMES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Slot called before each frame is submitted: the camera jittered by the next point of the sequence, the reset of the
+     * history written for the frame, and the frames drawn continuously after a change until the history converges
+     * @params:
+     *    - requested: true when something requested the frame, a change the history has to converge to
+     * */
+    fn onFrameSubmit (mut self, requested : bool) {
+        atomic self {
+            if !self._running { return; }
+
+            if requested || self._reset {
+                self._remaining = self.settleFrames ();
+            } else if self._remaining != 0u32 {
+                self._remaining -= 1u32;
+            }
+
+            self:.drawContinuously (self._remaining != 0u32);
+
+            self._sample = (self._sample + 1u32) % JITTER_SAMPLES;
+            if let Ok (dmut cam) = alias self._camera {
+                cam:.setJitter (jitterOf (self._sample, self._width, self._height));
+            }
+
+            if let Ok (dmut ubo) = alias self._params {
+                ubo:.setFrameData (RESET_OFFSET, if self._reset { 1u32 } else { 0u32 });
+            }
+
+            self._reset = false;
+        }
+    }
+
+    /**
+     * Draw the frames continuously while the history converges, on request otherwise
+     * */
+    fn drawContinuously (mut self, continuous : bool) {
+        if continuous == self._continuous { return; }
+
+        self._continuous = continuous;
+        if let Ok (dmut win) = alias self._window {
+            if continuous {
+                win:.beginContinuous ();
+            } else {
+                win:.endContinuous ();
+            }
+        }
+    }
+
+    /**
+     * Stop jittering the camera and drawing the frames for the history
+     * */
+    fn stopJitter (mut self) {
+        self._remaining = 0u32;
+        self:.drawContinuously (false);
+        if let Ok (dmut cam) = alias self._camera {
+            cam:.setJitter (makeVec2 (0.0f, 0.0f));
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+
+        /**
+         * Stop jittering the camera, the frames of the window not calling the anti-aliasing anymore
+         * */
+        pub over dispose (mut self) {
+            if let Ok (dmut win) = alias self._window {
+                win:.disconnectFrameSubmit (&self:.onFrameSubmit);
+            }
+
+            atomic self {
+                self._running = false;
+                self:.stopJitter ();
+            }
+
+            self.__super__:.dispose ();
+        }
+    }
+}
+
+/**
+ * @returns: the radical inverse of an index in a base, the point of the index in the Halton sequence of that base, in
+ * (0, 1) from the index 1
+ * */
+pub fn halton (index : u32, base : u32)-> f32 {
+    let mut result = 0.0f;
+    let mut fraction = 1.0f;
+    let mut i = index;
+    while i > 0u32 {
+        fraction = fraction / cast!f32 (base);
+        result = result + fraction * cast!f32 (i % base);
+        i = i / base;
+    }
+
+    result
+}
+
+/**
+ * @returns: the jitter of a sample of the sequence, in normalized device coordinates: the point of the Halton (2, 3)
+ * sequence centered on the pixel, a pixel being 2 / the size of the image
+ * @params:
+ *    - sample: the place of the sample in the sequence, from 0
+ *    - width, height: the size of the image
+ * */
+pub fn jitterOf (sample : u32, width : u32, height : u32)-> vec2 {
+    if width == 0u32 || height == 0u32 { return makeVec2 (0.0f, 0.0f); }
+
+    let index = (sample % JITTER_SAMPLES) + 1u32;
+    makeVec2 ((halton (index, 2u32) - 0.5f) * 2.0f / cast!f32 (width),
+              (halton (index, 3u32) - 0.5f) * 2.0f / cast!f32 (height))
+}
+
+/**
+ * @returns: the configurations of the shaders of the anti-aliasing, in the order of their places
+ * */
+fn shaders ()-> [[c8]] {
+    let resolve : [c8] = DefaultShaders::TAA_RESOLVE_3D;
+    let sharpen : [c8] = DefaultShaders::TAA_SHARPEN_3D;
+    copy [resolve, sharpen]
+}
+
+/**
+ * @returns: the name of the history of a stage
+ * */
+fn historyName (stage : PostStage)-> [c8] {
+    stage.pass ~ "_history"
+}
+
+/**
+ * @returns: a weight clamped into [0, 1]
+ * */
+fn clamp01 (x : f32)-> f32 {
+    if x < 0.0f { 0.0f } else if x > 1.0f { 1.0f } else { x }
+}

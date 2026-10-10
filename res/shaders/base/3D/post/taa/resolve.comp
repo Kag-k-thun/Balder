@@ -1,0 +1,229 @@
+#version 450 core
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The light the camera sees at each texel, linear and unbounded, drawn with the jitter of the frame
+layout (binding = 1) uniform sampler2D inputTex;
+
+// The depth of the g-buffer, 1 where nothing is drawn
+layout (binding = 2) uniform sampler2D depthTex;
+
+// The motion of each texel since the frame before, in texture coordinates (see the g-buffer)
+layout (binding = 3) uniform sampler2D velocityTex;
+
+// The blend of the frame before, linear light
+layout (binding = 4) uniform sampler2D historyTex;
+
+// The anti-aliasing (balder::scene::utils::post::taa::TaaEffect)
+layout (binding = 5) uniform Params {
+    // The weight of the frame in its blend with the history
+    float blend;
+
+    // The width of the box the history is clipped to, in standard deviations of the neighbourhood
+    float clip;
+
+    // The strength of the sharpening (see the sharpening shader)
+    float sharpness;
+
+    // 1 when the frame forgets the history (a resize, a cut of the camera)
+    uint reset;
+} params;
+
+// The camera, its exposure after its position
+layout (binding = 6) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+
+    // The exposure in stops, the light scaled by 2^exposure before it is tone mapped
+    float exposure;
+} camera;
+
+// The blend of the frame with the history, linear light, copied into the history and sharpened by the passes after it
+layout (set = 0, binding = 0, rgba16f) uniform writeonly image2D outTex;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          SPACES          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: a colour in YCoCg, its luma apart from its chroma, so the box it is clipped to follows the luma
+ */
+vec3 toYCoCg (vec3 c) {
+    return vec3 (0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+                 0.5 * c.r - 0.5 * c.b,
+                 -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+/**
+ * @returns: a colour of YCoCg in RGB
+ */
+vec3 toRGB (vec3 c) {
+    float t = c.x - c.z;
+    return vec3 (t + c.y, c.x + c.z, t - c.y);
+}
+
+/**
+ * @returns: the light exposed, tone mapped by c / (1 + max (c)) (Brian Karis), so a firefly weighs as much as a white
+ * pixel in the neighbourhood and in the blend; undone by expand
+ */
+vec3 compress (vec3 c) {
+    return c / (1.0 + max (c.r, max (c.g, c.b)));
+}
+
+/**
+ * @returns: the light of a colour compressed
+ */
+vec3 expand (vec3 c) {
+    return c / max (1.0 - max (c.r, max (c.g, c.b)), 1e-4);
+}
+
+/**
+ * @returns: the light of a texel, exposed, compressed, in YCoCg
+ */
+vec3 sampleAt (ivec2 texel, ivec2 size, float exposure) {
+    vec3 light = texelFetch (inputTex, clamp (texel, ivec2 (0), size - 1), 0).rgb;
+    return toYCoCg (compress (max (light, vec3 (0.0)) * exposure));
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          HISTORY          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the motion of a texel, the motion of the closest texel around it, so the edges of what moves keep its motion
+ */
+vec2 motionAt (ivec2 texel, ivec2 size) {
+    ivec2 closest = texel;
+    float depth = 2.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            ivec2 t = clamp (texel + ivec2 (x, y), ivec2 (0), size - 1);
+            float d = texelFetch (depthTex, t, 0).r;
+            if (d < depth) {
+                depth = d;
+                closest = t;
+            }
+        }
+    }
+
+    return texelFetch (velocityTex, closest, 0).xy;
+}
+
+/**
+ * @returns: the history at a point, filtered by a Catmull-Rom spline over the 4x4 texels around it, the four corners
+ * left out (five bilinear taps, Jorge Jimenez), sharper than a bilinear tap
+ */
+vec3 historyAt (vec2 uv, vec2 size) {
+    vec2 position = uv * size;
+    vec2 texel1 = floor (position - 0.5) + 0.5;
+    vec2 f = position - texel1;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    // the two middle taps of each axis are one bilinear tap between them
+    vec2 w12 = w1 + w2;
+    vec2 at0 = (texel1 - 1.0) / size;
+    vec2 at3 = (texel1 + 2.0) / size;
+    vec2 at12 = (texel1 + w2 / w12) / size;
+
+    vec3 result = texture (historyTex, vec2 (at12.x, at0.y)).rgb * (w12.x * w0.y)
+                + texture (historyTex, vec2 (at0.x, at12.y)).rgb * (w0.x * w12.y)
+                + texture (historyTex, at12).rgb * (w12.x * w12.y)
+                + texture (historyTex, vec2 (at3.x, at12.y)).rgb * (w3.x * w12.y)
+                + texture (historyTex, vec2 (at12.x, at3.y)).rgb * (w12.x * w3.y);
+
+    float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max (result / weight, vec3 (0.0));
+}
+
+/**
+ * @returns: a colour clipped to a box, moved toward the center of the box along the line between them until it is in
+ * it, so it keeps its hue as far as it can
+ */
+vec3 clipToBox (vec3 c, vec3 lo, vec3 hi) {
+    vec3 center = 0.5 * (hi + lo);
+    vec3 extent = 0.5 * (hi - lo) + 1e-5;
+    vec3 offset = c - center;
+    vec3 units = abs (offset / extent);
+    float m = max (units.x, max (units.y, units.z));
+
+    return m > 1.0 ? center + offset / m : c;
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+void main () {
+    ivec2 texelCoord = ivec2 (gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize (outTex);
+    if (texelCoord.x >= size.x || texelCoord.y >= size.y) {
+        return;
+    }
+
+    float exposure = exp2 (camera.exposure);
+    vec4 light = texelFetch (inputTex, texelCoord, 0);
+
+    // the mean and the variance of the 3x3 neighbourhood
+    vec3 center = vec3 (0.0);
+    vec3 m1 = vec3 (0.0);
+    vec3 m2 = vec3 (0.0);
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec3 s = sampleAt (texelCoord + ivec2 (x, y), size, exposure);
+            if (x == 0 && y == 0) {
+                center = s;
+            }
+
+            m1 += s;
+            m2 += s * s;
+        }
+    }
+
+    vec2 uv = (vec2 (texelCoord) + 0.5) / vec2 (size);
+    vec2 previous = uv - motionAt (texelCoord, size);
+
+    vec3 result = center;
+    bool seen = all (greaterThanEqual (previous, vec2 (0.0))) && all (lessThanEqual (previous, vec2 (1.0)));
+    if (params.reset == 0u && seen) {
+        vec3 mean = m1 / 9.0;
+        vec3 deviation = sqrt (max (m2 / 9.0 - mean * mean, vec3 (0.0)));
+
+        vec3 history = toYCoCg (compress (historyAt (previous, vec2 (size)) * exposure));
+        history = clipToBox (history, mean - params.clip * deviation, mean + params.clip * deviation);
+
+        result = mix (history, center, params.blend);
+    }
+
+    vec3 radiance = expand (toRGB (result)) / exposure;
+    if (any (isnan (radiance)) || any (isinf (radiance))) {
+        radiance = light.rgb;
+    }
+
+    imageStore (outTex, texelCoord, vec4 (radiance, light.a));
+}
