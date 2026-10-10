@@ -827,7 +827,8 @@ instance's file decides where things are, and the component is free to move its 
 A markup component has no code: it is expanded at load time. A tab-like widget whose header opens and closes its body
 needs code. For that, a component can take as its root the Ymir class registered under its own name. The class gets the
 attributes it registers and names its slots ([§9](#9-signals)), and the component gives its default inner structure,
-connected to those slots.
+connected to those slots. BAL-66 kept the slots on the activity: the class connects the widgets it finds by their ids
+itself, the sketch below naming its slot as the design first proposed.
 
 `res/widgets/collapsible.gui`:
 
@@ -989,19 +990,23 @@ PushButton .entry "Label" {
 - **Signals are registered by the widgets**, like attributes, under an `on-` name: `on-click` (`clicked`),
   `on-double-click`, `on-focus`, `on-blur` (`unfocused`), `on-validate` (`textValidated`), `on-menu-open`,
   `on-menu-close`. The registry records each payload type: `u8` for a click, `[c8]` for a validated text.
-- **Slots are registered by the code, under a name.** `Activity.slot (name, delegate)` files the delegate with the
-  activity's `SlotEmitter`, so the handler still runs on the activity's thread, as with `connect (self.box, …)` today.
-  Names are free-form. `::` is allowed in them, so `form::submit` works as a namespace, but it is a name, not a path the
-  loader looks up.
+- **Slots are registered by the activity, under a name.** `Activity.slot (name, delegate)` records the delegate, and
+  the loader connects it with the activity's `SlotEmitter`, so the handler still runs on the activity's thread, as with
+  `connect (self.box, …)` today.
+- **Behaviors group slots under a path** (BAL-66). A class over `Behavior` registers its slots in its constructor and
+  the activity mounts it, `self:.behavior ("form", copy FormBehavior (…))`: `form::submit` is the slot `submit` of the
+  behavior `form`, a path the loader follows, and `self:.slot ("view::reset", …)` creates the behaviors missing on the
+  way.
 - **The connection is checked at load.** Registering a slot records the types of its parameters with `typeinfo`. A slot
   name that does not exist, or a slot whose parameters do not match the signal, is a load error naming the file, the
   line, the signal and the slot. It is not a button that silently does nothing.
 - **Bound arguments.** A slot reference may carry constant arguments, `describe ("…")`, written with the value grammar.
   The slot receives them first, then the signal's payload. One slot then serves many widgets, and the per-widget
   classes like `EntrySlot` disappear.
-- **Lookup is lexical.** A name is looked up first in the slots of the nearest code-backed component around the widget
-  (`toggle` in `Collapsible`, [§8](#8-components)), then in the activity's. A component library therefore cannot be
-  broken by an application slot of the same name.
+- **The activity is the only place slots are looked up** (BAL-66). The lexical lookup first proposed here, the slots
+  of the nearest code-backed component (`toggle` in `Collapsible`, [§8](#8-components)) before the activity's, was left
+  out: a code-backed component connects its inner widgets itself, and a library keeps its slots apart from the
+  application's under a behavior of its own name.
 - **Components forward signals as parameters.** `$on-validate: none` in `FieldRow`, used as `on-validate: $on-validate;`
   on its input, lets `FieldRow #AGE "Age" { on-validate: age-set; }` reach the inner widget. `none` leaves a signal
   unconnected.
@@ -1111,9 +1116,9 @@ Each has a recommendation.
 - **BAL-65** components ([§8](#8-components)), done: the expansion of the instances, their parameters and slots, the
   ids scoped to them, `@import` and `@style`, the cycles, the code-backed roots, and `instantiate` from code; the
   gallery's form is made of `FieldRow` instances.
-- **Signals** ([§9](#9-signals)) have no work item yet either: slot registration on `Activity` and on widgets, signal
-  schemas in the registry, connection and checking at load. A new item under BAL-25, after BAL-23. Components can come
-  before or after it.
+- **BAL-66** signals ([§9](#9-signals)), done: the signals and their payloads in the schemas, the slots and behaviors
+  of the activity, the check and the connection at load with the bound arguments, and the forwarding through the
+  parameters of the components; the gallery, the form and the message dialog connect every handler from their files.
 
 Sources: `interface/loader.yr`, `interface/style/parser.yr`, `interface/widget/alignement.yr`, `interface/widget.yr`,
 `interface/drawer.yr`, `core/application/window.yr`, `core/application/signal.yr`, `res/` and `example/` on Balder

@@ -1,8 +1,11 @@
 in checker;
 
-use balder::interface::loader::registry::{error, schema, setting, widget_node};
+use balder::interface::loader::parser;
+use balder::interface::loader::registry::{behavior, error, handler, schema, setting, widget_node};
 
 use std::syntax::errors;
+
+use ::core::types::info;
 
 /**
  * Checker of a tree of widgets, its components expanded, against the schemas of the widget types, before any widget is
@@ -11,7 +14,9 @@ use std::syntax::errors;
  * =====
  * A widget is refused when its type is unknown, when it sets an attribute that neither its type nor its parent gives
  * it, when a value is not of the kind of its attribute, when it lacks an attribute its parent requires, when its type
- * does not accept its children, and when its id makes it reachable by the same find path as another widget. The
+ * does not accept its children, and when its id makes it reachable by the same find path as another widget. An `on-…`
+ * attribute names a slot of the behavior the tree is loaded with, whose parameters take the arguments it binds then the
+ * payload of the signal; without behavior only the syntax of the slot reference is checked. The
  * anonymous widgets add no segment to the paths, and the widgets an instance put in the slots of its component are
  * reached under the instance. An error about a value given to a parameter of a component is reported where the value
  * was given.
@@ -22,6 +27,9 @@ pub record Checker {
     // The schemas of the widget types, by name
     let _schemas: [[c8] => &WidgetSchema];
 
+    // The slots the `on-…` attributes name, none to check only the syntax of their values
+    let _behavior: (&Behavior)?;
+
     // The location of the named widgets, by their find path
     let mut _paths: [[c8] => mut ([c8], usize, usize)] = copy [];
 
@@ -31,9 +39,11 @@ pub record Checker {
     /**
      * @params:
      *    - schemas: the schemas of the widget types, by name
+     *    - behavior: the slots the `on-…` attributes name, none to check only the syntax of their values
      * */
-    pub self (schemas: [[c8] => &WidgetSchema])
+    pub self (schemas: [[c8] => &WidgetSchema], behavior: (&Behavior)? = none)
         with _schemas = schemas
+        , _behavior = behavior
     {}
 
     /**
@@ -198,8 +208,8 @@ pub record Checker {
     }
 
     /**
-     * Check the attributes of a widget, against those of its type, then those its parent gives its children, an
-     * attribute of an instance that is not a parameter of its component being one its parent gives it
+     * Check the attributes of a widget, against those of its type, then its signals, then those its parent gives its
+     * children, an attribute of an instance that is not a parameter of its component being one its parent gives it
      * @params:
      *    - parent: the schema of the parent of the widget, none for the root
      * */
@@ -210,9 +220,15 @@ pub record Checker {
         for a in node.attributes {
             let what = "attribute '" ~ a.name ~ "' of '" ~ a.typeName ~ "'";
             let attr: (&Attribute)? = if a.forParent { none } else { schema.attribute(a.name) };
+            let signal: (&SignalAttribute)? = if a.forParent || attr.hasValue { none } else { schema.signal(a.name) };
             let slot = Checker::slotOf(parent, a.name);
-            if !attr.hasValue && !slot.hasValue {
+            if !attr.hasValue && !signal.hasValue && !slot.hasValue {
                 throw copy LoadError(a.file, "unknown " ~ what ~ under, a.line, a.col);
+            }
+
+            if let Ok(s) = signal {
+                self.checkSignal(a, s);
+                continue;
             }
 
             {
@@ -234,6 +250,52 @@ pub record Checker {
                     throw copy LoadError(node.file, "a child of '" ~ p.typeName ~ "' needs the attribute '" ~ s.name ~ "'",
                                          node.line, node.col);
                 }
+            }
+        }
+    }
+
+    /**
+     * Check an `on-…` attribute: the slot it names, the types of its parameters against the arguments it binds then
+     * the payload of the signal, and those arguments against their types; only the syntax of the slot reference
+     * without behavior
+     * */
+    fn checkSignal(self, a: Setting, signal: &SignalAttribute)
+        throws LoadError
+    {
+        let what = "attribute '" ~ a.name ~ "' of '" ~ a.typeName ~ "'";
+        let target = {
+            SlotRef(a.value)
+        } catch {
+            e: &SyntaxError => { throw Checker::valueError(a, what, e); }
+        };
+
+        if target.isNone() { return; }
+        let behavior = if let Ok(b) = self._behavior { b } else { return; };
+        let handler = if let Ok(h) = behavior.find(target.name) {
+            h
+        } else {
+            throw Checker::slotError(a, "no slot '" ~ target.name ~ "' for the " ~ what);
+        };
+
+        if !Checker::fits(handler.params, target.args.len, signal.payload) {
+            let after = if target.args.len == 0us {
+                ""
+            } else if target.args.len == 1us {
+                " after 1 bound argument"
+            } else {
+                std::format::format(" after {} bound arguments", target.args.len)
+            };
+
+            let reason = std::format::format("the slot '{}' takes {}, the {} gives {}{}", target.name, handler.signature(), what,
+                                             signature(signal.payload), after);
+            throw Checker::slotError(a, reason);
+        }
+
+        {
+            handler.bind(target.args);
+        } catch {
+            e: &SyntaxError => {
+                throw Checker::valueError(a, "argument of the slot '" ~ target.name ~ "' for the " ~ what, e);
             }
         }
     }
@@ -269,6 +331,30 @@ mod Checker {
         }
 
         copy LoadError(a.file, what ~ ": " ~ e.msg, e.line, e.col)
+    }
+
+    /**
+     * @returns: the error of a slot that does not fit an `on-…` attribute: where the value of the parameter it uses was
+     * given, or at the attribute
+     * */
+    pub fn slotError(a: Setting, reason: [c8])-> &LoadError {
+        if let Ok(b) = a.binding {
+            return copy LoadError(b.file, "parameter '$" ~ b.param ~ "' of '" ~ b.component ~ "': " ~ reason, b.line, b.col);
+        }
+
+        copy LoadError(a.file, reason, a.line, a.col)
+    }
+
+    /**
+     * @returns: true iif a slot of parameters params takes count bound arguments then a payload
+     * */
+    pub fn fits(params: [TypeInfo], count: usize, payload: [TypeInfo])-> bool {
+        if params.len != count + payload.len { return false; }
+        for i, t in payload {
+            if params[count + i] != t { return false; }
+        }
+
+        true
     }
 
     /**
