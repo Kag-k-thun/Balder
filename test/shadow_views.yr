@@ -1,0 +1,145 @@
+in shadow_views;
+
+use balder::math::{bounds, matrix, utils, vector};
+use balder::scene::utils::local_shadow::views;
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * @returns: true iif two values are equal, give or take the rounding errors
+ * */
+fn near(a: f32, b: f32)-> bool {
+    math::abs(a - b) < 0.001f
+}
+
+/**
+ * @returns: a point in the normalized device coordinates of a view
+ * */
+fn project(viewProj: mat4, p: vec3)-> vec3 {
+    let c = viewProj * makeVec4(p, 1.0f);
+    c.xyz / c.w
+}
+
+/**
+ * @returns: true iif a point of normalized device coordinates is in the share of the tile its volume covers, its depth
+ * in [0, 1]
+ * */
+fn covered(ndc: vec3, side: u32)-> bool {
+    let c = coverage(side) + 0.0001f;
+    math::abs(ndc.x) <= c && math::abs(ndc.y) <= c && ndc.z >= -0.0001f && ndc.z <= 1.0001f
+}
+
+__test each_face_of_a_point_light_sees_along_its_axis {
+    for f in 0u32 .. FACES {
+        let d = faceDirection(f);
+        assert (near(d.length(), 1.0f));
+        assert (faceOf(d) == f);
+        assert (faceOf(d * 3.0f + makeVec3(0.1f, -0.2f, 0.15f)) == f);
+    }
+}
+
+/**
+ * The depth of a view grows from 0 at the near plane of the light to 1 at its range, the axis of a face at the center
+ * of its tile
+ * */
+__test the_depth_of_a_face_spans_the_range_of_the_light {
+    let position = makeVec3(1.0f, 2.0f, -3.0f);
+    let range = 8.0f;
+    let faces = pointViews(position, range, 512u32);
+    assert (faces.len == cast!usize(FACES));
+
+    for f, v in faces {
+        let axis = faceDirection(cast!u32(f));
+        let close = project(v.viewProj, position + axis * nearPlane(range));
+        let far = project(v.viewProj, position + axis * range);
+        let middle = project(v.viewProj, position + axis * 3.0f);
+
+        assert (near(close.z, 0.0f) && near(far.z, 1.0f));
+        assert (middle.z > 0.0f && middle.z < 1.0f);
+        assert (near(middle.x, 0.0f) && near(middle.y, 0.0f));
+    }
+}
+
+/**
+ * Every direction around a point light is seen by the face along its largest coordinate, inside the share of the tile
+ * the margin leaves, the corners of the cube on its edge
+ * */
+__test every_direction_is_seen_by_its_face_inside_the_margin {
+    let position = makeVec3(-2.0f, 0.5f, 4.0f);
+    let side = 256u32;
+    let faces = pointViews(position, 10.0f, side);
+
+    for x in -2 .. 3 {
+        for y in -2 .. 3 {
+            for z in -2 .. 3 {
+                let d = makeVec3(cast!f32(x), cast!f32(y), cast!f32(z));
+                if d.length() == 0.0f { continue; }
+
+                let p = position + d.normalized() * 5.0f;
+                let ndc = project(faces[faceOf(d)].viewProj, p);
+                assert (covered(ndc, side));
+            }
+        }
+    }
+
+    // a corner of the cube is on the edge of the covered share
+    let corner = project(faces[0].viewProj, position + makeVec3(1.0f, 1.0f, 1.0f) * 2.0f);
+    assert (near(math::abs(corner.x), coverage(side)) && near(math::abs(corner.y), coverage(side)));
+}
+
+/**
+ * The cone of a spot light is seen inside the share of its tile the margin leaves, its edge on the edge of the share
+ * */
+__test the_cone_of_a_spot_light_is_seen_inside_the_margin {
+    let position = makeVec3(6.0f, 6.0f, 2.0f);
+    let direction = makeVec3(0.0f, -1.0f, -0.2f).normalized();
+    let side = 512u32;
+    let v = spotView(position, direction, 25.0f, 15.0f, side);
+
+    let axis = project(v.viewProj, position + direction * 7.0f);
+    assert (near(axis.x, 0.0f) && near(axis.y, 0.0f));
+
+    // a point on the edge of the cone, turned from the axis by the outer angle
+    let across = direction.cross(makeVec3(1.0f, 0.0f, 0.0f)).normalized();
+    let angle = radian(25.0f);
+    let edge = position + (direction * math::cos(angle) + across * math::sin(angle)) * 10.0f;
+    let ndc = project(v.viewProj, edge);
+    assert (covered(ndc, side));
+    assert (near(comparison::max(math::abs(ndc.x), math::abs(ndc.y)), coverage(side)));
+}
+
+/**
+ * A texel of a view covers its size times the depth: two points a texel apart at a depth of one unit are 2 / side apart
+ * in the coordinates of the view
+ * */
+__test the_texel_of_a_view_grows_with_the_depth {
+    let side = 256u32;
+    let v = pointViews(vec3(), 10.0f, side)[0];
+    for depth in [1.0f, 4.0f] {
+        let a = project(v.viewProj, makeVec3(depth, 0.0f, 0.0f));
+        let b = project(v.viewProj, makeVec3(depth, 0.0f, v.texel * depth));
+        let c = project(v.viewProj, makeVec3(depth, v.texel * depth, 0.0f));
+        let step = comparison::max((b - a).xy.length(), (c - a).xy.length());
+        assert (near(step, 2.0f / cast!f32(side)));
+    }
+}
+
+/**
+ * The sphere of a spot light encloses its apex, its end and the edge of its end, narrow or wide
+ * */
+__test the_sphere_of_a_spot_light_encloses_its_cone {
+    let position = makeVec3(1.0f, 2.0f, 3.0f);
+    let direction = makeVec3(0.0f, 0.0f, -1.0f);
+    for outer in [10.0f, 45.0f, 70.0f, 90.0f] {
+        let s = spotBounds(position, direction, outer, 6.0f);
+        let a = radian(outer);
+        let rim = position + makeVec3(math::sin(a), 0.0f, -math::cos(a)) * 6.0f;
+        for p in [position, position + direction * 6.0f, rim] {
+            assert ((p - s.center).length() <= s.radius + 0.001f);
+        }
+
+        // no larger than the sphere of the range
+        assert (s.radius <= 6.0f + 0.001f);
+    }
+}
