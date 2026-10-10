@@ -1,0 +1,701 @@
+in dropdown;
+
+use balder::utils;
+use balder::core::dispose;
+use balder::core::application::signal;
+use balder::interface::style;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::box;
+use balder::interface::widget::button::menu;
+use balder::interface::widget::text::label;
+use balder::math::vector;
+
+use ::sdl3::mouse;
+
+use ::std::algorithm::comparison;
+
+// The width of the scrollbar of the list of a dropdown whose style sets none, in pixels
+def DEFAULT_SCROLLBAR_WIDTH = 8.0f;
+
+/**
+ * An item of the list of a dropdown: a label drawing the background and the border of its style
+ * */
+class DropdownItem over Label {
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "")
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("item");
+    }
+}
+
+/**
+ * The list a dropdown opens in its menu layout, the part `::popup` of the dropdown: its items on top of each other,
+ * scrolled with the wheel or the part `::scrollbar` when they are higher than the list
+ * */
+class DropdownList over Widget {
+
+    // The dropdown whose items the list shows
+    let dmut _owner: &Dropdown;
+
+    // The items, in order
+    let dmut _items: [&DropdownItem] = [];
+
+    // The scrollbar, shown while the items are higher than the list
+    let dmut _scrollbar: &Box;
+
+    // The item under the cursor, usize::max for none
+    let mut _hover: usize = usize::max;
+
+    // The item the left button was pressed on, usize::max for none
+    let mut _pressed: usize = usize::max;
+
+    prot { // scrolling
+
+        // The height of the margin box of the list at most, the room left by the menu layout, in pixels
+        let mut _room: f32 = f32::max;
+
+        // The height of the items on top of each other, in pixels
+        let mut _itemsHeight: f32 = 0.0f;
+
+        // The part of the items scrolled over, in pixels
+        let mut _scroll: f32 = 0.0f;
+
+        // True until the list is laid out after its room was set, the selected item being scrolled to then
+        let mut _revealSelected: bool = false;
+
+        // True iif the scrollbar is dragged
+        let mut _grabbed: bool = false;
+
+        // True iif the cursor is over the thumb of the scrollbar
+        let mut _overThumb: bool = false;
+
+        // The distance from the top of the thumb of the scrollbar to the cursor that grabbed it, in pixels
+        let mut _grabOffset: f32 = 0.0f;
+    }
+
+    pub self (dmut manager: &WidgetManager, dmut owner: &Dropdown)
+        with super(alias manager, "", "Dropdown")
+        , _owner = alias owner
+        , _scrollbar = copy Box(alias manager, "")
+    {
+        self:.setOwnerPart("popup");
+        self._scrollbar:.setOwnerPart("scrollbar");
+    }
+
+    /**
+     * Show other items
+     * @params:
+     *    - texts: the text of each item, in order
+     * */
+    pub fn setItems(mut self, texts: [[c8]]) {
+        for dmut i in alias self._items {
+            i:.dispose();
+        }
+
+        self._items = [];
+        for t in texts {
+            let dmut item = copy DropdownItem(alias self._manager);
+            item:.setText(t);
+            self._items ~= [alias item];
+        }
+
+        self._hover = usize::max;
+        self._scroll = 0.0f;
+    }
+
+    /**
+     * Limit the height of the list to the room the menu layout leaves it, its max-height applying under it, the selected
+     * item being scrolled to when it is laid out next
+     * @params:
+     *    - room: the height of the margin box of the list at most, in pixels
+     * */
+    pub fn setRoom(mut self, room: f32) {
+        self._room = room;
+        self._revealSelected = true;
+    }
+
+    /**
+     * @returns: true iif the items are higher than the list, which scrolls over them
+     * */
+    pub fn isOverflowing(self)-> bool {
+        self._itemsHeight > self._absoluteSize.y
+    }
+
+    /**
+     * Give each item the style of the part ::item of the dropdown in its states, hover under the cursor and selected for
+     * the item of the dropdown, and the scrollbar the style of the part ::scrollbar in its states, hover under the cursor
+     * and pressed while it is dragged
+     * */
+    fn restyleParts(mut self) {
+        let selected = self._owner.getSelected();
+        for i, dmut item in alias self._items {
+            let mut states: [[c8]] = [];
+            if let Ok(s) = selected && s == i { states ~= ["selected"]; }
+            if i == self._hover { states ~= ["hover"]; }
+            item:.setStyle(self._owner:.getPartStyle("item", states));
+        }
+
+        let mut states: [[c8]] = [];
+        if self._overThumb { states ~= ["hover"]; }
+        if self._grabbed { states ~= ["pressed"]; }
+        self._scrollbar:.setStyle(self._owner:.getPartStyle("scrollbar", states));
+    }
+
+    /**
+     * Follow the cursor and the scrollbar being dragged, restyling the parts when the item under the cursor, the thumb
+     * being under it or dragged change
+     * @params:
+     *    - hover: the item under the cursor, usize::max for none
+     *    - overThumb: true iif the cursor is over the thumb of the scrollbar
+     *    - grabbed: true iif the scrollbar is dragged
+     * */
+    fn setPointer(mut self, hover: usize, overThumb: bool, grabbed: bool) {
+        if hover == self._hover && overThumb == self._overThumb && grabbed == self._grabbed { return; }
+
+        self._hover = hover;
+        self._overThumb = overThumb;
+        self._grabbed = grabbed;
+        self:.restyleParts();
+    }
+
+    /**
+     * @returns: true iif a position is over the thumb of the scrollbar of a list that scrolls
+     * @params:
+     *    - pos: the position of the cursor, relative to the margin box of the list
+     * */
+    fn isOverThumb(self, pos: vec2)-> bool {
+        if !self.isOverflowing() { return false; }
+
+        let cursor = self._absoluteFullPosition + pos * self._absoluteFullSize;
+        let thumb = self._scrollbar.getAbsolutePosition();
+        let size = self._scrollbar.getAbsoluteSize();
+        cursor.x >= thumb.x && cursor.x < thumb.x + size.x && cursor.y >= thumb.y && cursor.y < thumb.y + size.y
+    }
+
+    /**
+     * @returns: the index of the item under a position, usize::max for none
+     * @params:
+     *    - pos: the position of the cursor, relative to the margin box of the list
+     * */
+    fn itemUnder(self, pos: vec2)-> usize {
+        let cursor = self._absoluteFullPosition + pos * self._absoluteFullSize;
+        if cursor.y < self._absolutePosition.y || cursor.y >= self._absolutePosition.y + self._absoluteSize.y {
+            return usize::max;
+        }
+
+        if self.isOverflowing() && cursor.x >= self._absolutePosition.x + self._absoluteSize.x - self.getScrollbarWidth() {
+            return usize::max;
+        }
+
+        for i, item in self._items {
+            let top = item.getAbsolutePosition().y;
+            if cursor.y >= top && cursor.y < top + item.getAbsoluteSize().y {
+                return i;
+            }
+        }
+
+        usize::max
+    }
+
+    /**
+     * @returns: the width of the scrollbar, the width of its style, 8 pixels when it sets none
+     * */
+    fn getScrollbarWidth(self)-> f32 {
+        (self._scrollbar.getStyle().width._1).resolve(self._absoluteSize.x) ?? DEFAULT_SCROLLBAR_WIDTH
+    }
+
+    /**
+     * Scroll the items, the part scrolled over kept within them, and lay them out again
+     * @params:
+     *    - scroll: the part of the items to scroll over, in pixels
+     * */
+    fn scrollTo(mut self, scroll: f32) {
+        self._scroll = clamp(scroll, 0.0f, max(0.0f, self._itemsHeight - self._absoluteSize.y));
+        self:.placeItems();
+    }
+
+    /**
+     * Scroll so that the selected item is in the list, the list being laid out
+     * */
+    fn scrollToSelected(mut self) {
+        if let Ok(s) = self._owner.getSelected() && s < self._items.len {
+            let top = self._items[s].getAbsolutePosition().y - self._absolutePosition.y + self._scroll;
+            let bottom = top + self._items[s].getAbsoluteSize().y;
+            if top < self._scroll {
+                self:.scrollTo(top);
+            } else if bottom > self._scroll + self._absoluteSize.y {
+                self:.scrollTo(bottom - self._absoluteSize.y);
+            }
+        }
+    }
+
+    /**
+     * Place the items on top of each other from the part scrolled over, as wide as the list less the scrollbar when
+     * they are higher than it, and the thumb of the scrollbar as high as the part of the items shown
+     * */
+    fn placeItems(mut self) {
+        let overflow = self.isOverflowing();
+        let bar = if overflow { min(self.getScrollbarWidth(), self._absoluteSize.x) } else { 0.0f };
+        let width = self._absoluteSize.x - bar;
+
+        let mut y = self._absolutePosition.y - self._scroll;
+        for dmut item in alias self._items {
+            let height = item:.measureIntrinsicHeights(width)._1;
+            item:.setSize(makeVec2(self._absolutePosition.x, y), makeVec2(width, height), self._depth + 1,
+                          self._absoluteSize);
+            y += height;
+        }
+
+        if overflow {
+            let visible = self._absoluteSize.y / self._itemsHeight;
+            self._scrollbar:.setSize(makeVec2(self._absolutePosition.x + width,
+                                              self._absolutePosition.y + self._scroll / self._itemsHeight * self._absoluteSize.y),
+                                     makeVec2(bar, visible * self._absoluteSize.y), self.getItemsDepth(), self._absoluteSize);
+            self._scrollbar:.show();
+        } else {
+            self._scrollbar:.hide();
+        }
+
+        self:.onUpdateScissors();
+    }
+
+    /**
+     * @returns: the deepest depth of the items
+     * */
+    fn getItemsDepth(self)-> u32 {
+        let mut depth = self._depth;
+        for item in self._items {
+            depth = max(depth, item.getMaxDepth());
+        }
+
+        depth
+    }
+
+    prot over onApplyStyle(mut self) {
+        self:.restyleParts();
+    }
+
+    over onUpdateSize(mut self) {
+        self:.scrollTo(self._scroll);
+        if self._revealSelected {
+            self._revealSelected = false;
+            self:.scrollToSelected();
+        }
+    }
+
+    over onUpdateScissors(mut self) {
+        let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
+        for dmut item in alias self._items {
+            item:.setScissors(sciPos, sciSize);
+        }
+
+        self._scrollbar:.setScissors(sciPos, sciSize);
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        self._scrollbar.getMaxDepth()
+    }
+
+    /**
+     * The content of the list is its items on top of each other, at least as wide as the dropdown, and at most as high
+     * as the room the menu layout leaves it
+     * */
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        let unknown = makeVec2(INDEFINITE_SIZE, INDEFINITE_SIZE);
+        let owner = self._owner.getAbsoluteSize().x - self._owner.getMarginSize(unknown).x - self.getFrame(unknown).x;
+
+        let mut width = max(0.0f, owner);
+        for dmut item in alias self._items {
+            width = max(width, item:.measureIntrinsicWidths()._1);
+        }
+
+        (width, width)
+    }
+
+    prot over measureContentHeights(mut self, width: f32)-> (f32, f32) {
+        let mut height = 0.0f;
+        for dmut item in alias self._items {
+            height += item:.measureIntrinsicHeights(width)._1;
+        }
+
+        self._itemsHeight = height;
+
+        let unknown = makeVec2(INDEFINITE_SIZE, INDEFINITE_SIZE);
+        let room = max(0.0f, self._room - self.getFrame(unknown).y - self.getMarginSize(unknown).y);
+        let shown = min(height, room);
+        (shown, shown)
+    }
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self._hover = usize::max;
+        self._pressed = usize::max;
+        self._grabbed = false;
+        self._overThumb = false;
+        self._scroll = 0.0f;
+        for dmut item in alias self._items {
+            item:.onAttach((self)?);
+        }
+
+        self._scrollbar:.onAttach((self)?);
+        self:.restyleParts();
+    }
+
+    over onHide(mut self) {
+        for dmut item in alias self._items {
+            item:.hide();
+        }
+
+        self._scrollbar:.hide();
+    }
+
+    over onShow(mut self) {
+        for dmut item in alias self._items {
+            item:.show();
+        }
+
+        if self.isOverflowing() {
+            self._scrollbar:.show();
+        }
+    }
+
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        self:.setPointer(self.itemUnder(pos), self.isOverThumb(pos), self._grabbed);
+        (alias self)?
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        self:.setPointer(usize::max, false, self._grabbed);
+    }
+
+    /**
+     * The left button grabs the scrollbar, or presses an item
+     * */
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if button == SDL_BUTTON_LEFT {
+            let cursor = self._absoluteFullPosition + pos * self._absoluteFullSize;
+            let barLeft = self._absolutePosition.x + self._absoluteSize.x - self.getScrollbarWidth();
+            if self.isOverflowing() && cursor.x >= barLeft {
+                let thumb = self._scrollbar.getAbsolutePosition().y;
+                let inThumb = cursor.y >= thumb && cursor.y < thumb + self._scrollbar.getAbsoluteSize().y;
+
+                // a click beside the thumb moves its centre under the cursor
+                self._grabOffset = if inThumb { cursor.y - thumb } else { self._scrollbar.getAbsoluteSize().y / 2.0f };
+                self:.setPointer(self._hover, true, true);
+                self:.dragScrollbar(cursor.y);
+                self._pressed = usize::max;
+            } else {
+                self._pressed = self.itemUnder(pos);
+            }
+        }
+
+        (alias self)?
+    }
+
+    /**
+     * The left button released on the item it was pressed on selects it
+     * */
+    pub over onClickEnd(mut self, button: u8)-> dmut (&Widget)? {
+        if button == SDL_BUTTON_LEFT && self._pressed < self._items.len && self._pressed == self._hover {
+            let index = self._pressed;
+            self._pressed = usize::max;
+            self._owner:.selectByUser(index);
+        }
+
+        (alias self)?
+    }
+
+    pub over onSliding(mut self, pos: vec2, _: vec2, _: u8) {
+        if self._grabbed {
+            self:.dragScrollbar((self._absoluteFullPosition + pos * self._absoluteFullSize).y);
+        }
+    }
+
+    pub over onSlidingEnd(mut self, _: u8) {
+        self:.setPointer(self._hover, self._overThumb, false);
+    }
+
+    pub over isFocusableLeftClick(self)-> bool {
+        self._grabbed
+    }
+
+    pub over loseFocusOnReleaseLeft(self)-> bool {
+        true
+    }
+
+    pub over onLoseFocus(mut self) {
+        self:.setPointer(self._hover, self._overThumb, false);
+    }
+
+    /**
+     * The wheel scrolls the items by the height of an item
+     * */
+    pub over onScroll(mut self, pos: vec2, _: i32, amountY: i32)-> bool {
+        if amountY != 0 && self.isOverflowing() && self._items.len != 0us {
+            let step = self._itemsHeight / cast!f32(cast!u64(self._items.len));
+            self:.scrollTo(self._scroll + (if amountY > 0 { -step } else { step }));
+            self:.onHover(pos);
+        }
+
+        true
+    }
+
+    /**
+     * Scroll so that the thumb of the scrollbar follows the cursor that grabbed it
+     * @params:
+     *    - cursor: the vertical position of the cursor, in pixels
+     * */
+    fn dragScrollbar(mut self, cursor: f32) {
+        let top = cursor - self._grabOffset - self._absolutePosition.y;
+        self:.scrollTo(top / self._absoluteSize.y * self._itemsHeight);
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            for dmut item in alias self._items {
+                item:.dispose();
+            }
+
+            self._scrollbar:.dispose();
+            self.__super__:.dispose();
+        }
+    }
+}
+
+/**
+ * A dropdown is a button showing the selected item of a list, opening the list in its menu layout to select another
+ * @info:
+ * =====
+ * The list is the part `::popup`, opened under the dropdown, or above it when its items do not fit under it and there is
+ * more room above, at least as wide as the dropdown. It is at most as high as the room on that side and as its
+ * max-height, and scrolls over its items when they are higher, with the wheel or the part `::scrollbar`, in the states
+ * `:hover` under the cursor and `:pressed` while it is dragged. Its items are the part `::item`, in the states `:hover`
+ * under the cursor and `:selected` for the selected one. Like a menu button,
+ * a dropdown opens its list only inside a menu layout.
+ * ====
+ * */
+pub class Dropdown over MenuButton {
+
+    // The text of each item, in order
+    let mut _items: [[c8]] = [];
+
+    // The selected item as it was set, none when it is past the items
+    let mut _selected: usize = usize::max;
+
+    // The list of the items, opened as the popup of the button
+    let dmut _list: (&DropdownList)? = none;
+
+    prot { // signals
+        let dmut _changed: (&Signal!{usize})? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "Dropdown")
+    {
+        let dmut list = copy DropdownList(alias manager, alias self);
+        self._list = (alias list)?;
+        self:.setMenu(alias list);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          ITEMS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the items of the dropdown, the selected one being kept when there are enough
+     * @params:
+     *    - items: the text of each item, in order
+     * */
+    pub fn setItems(mut self, items: [[c8]]) {
+        self._items = items;
+        if let Ok(dmut l) = alias self._list {
+            l:.setItems(items);
+        }
+
+        self:.showSelected();
+    }
+
+    /**
+     * Select an item, without emitting the signal of the dropdown
+     * @params:
+     *    - index: the index of the item, none past the items
+     * */
+    pub fn setSelected(mut self, index: usize) {
+        self._selected = index;
+        self:.showSelected();
+    }
+
+    /**
+     * @returns: the text of each item, in order
+     * */
+    pub fn getItems(self)-> [[c8]] {
+        self._items
+    }
+
+    /**
+     * @returns: the index of the selected item, none when no item is selected
+     * */
+    pub fn getSelected(self)-> (usize)? {
+        if self._selected < self._items.len {
+            return (self._selected)?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the style of a part of the list in some of its states, ::item or ::scrollbar
+     * @params:
+     *    - part: the name of the part
+     *    - states: the states the part is in
+     * */
+    pub fn getPartStyle(mut self, part: [c8], states: [[c8]])-> &Style {
+        let path = self.getStylePath();
+        self._manager:.getStyleManager().computePart(path, self._currentStyle, part, states-> states)
+    }
+
+    /**
+     * Open the list in the menu layout, under the dropdown, or above it when its items do not fit under it and there is
+     * more room above, at most as high as the room on that side, its left side on the left side of the dropdown
+     * */
+    over openMenu(mut self) {
+        self:.closeMenu();
+        if let Ok(dmut list) = alias self._list {
+            if let Ok(dmut menuCtx) = alias self._menuContext {
+                let area = menuCtx.getAbsoluteInnerPosition();
+                let areaSize = menuCtx.getAbsoluteInnerSize();
+                let top = self._absolutePostMarginPosition.y;
+                let bottom = top + self._absolutePostMarginSize.y;
+                let x = self._absolutePostMarginPosition.x - area.x;
+
+                // opened under the dropdown, the list is attached and measured at the height of its items
+                list:.setRoom(f32::max);
+                self._menuId = menuCtx:.openMenu(alias list, x-> x, y-> bottom - area.y, fromMenuBar-> true, by-> (self)?);
+
+                let below = max(0.0f, area.y + areaSize.y - bottom);
+                let above = max(0.0f, top - area.y);
+                let (opensAbove, room) = Dropdown::fitList(self:.measureList(areaSize), below, above);
+
+                list:.setRoom(room);
+                if opensAbove {
+                    menuCtx:.moveMenu(self._menuId, x, top - area.y - self:.measureList(areaSize));
+                } else {
+                    self._manager:.updateWidgets();
+                }
+            } else {
+                log::error #("Dropdown", "The list cannot be opened outside a menu layout");
+            }
+        }
+    }
+
+    /**
+     * @returns: the height of the margin box of the open list, sized to its content in the menu layout
+     * @params:
+     *    - container: the content box of the menu layout
+     * */
+    fn measureList(mut self, container: vec2)-> f32 {
+        if let Ok(dmut list) = alias self._list {
+            let width = list:.measureWidth(container, stretch-> false);
+            return list:.measureHeight(width, container, stretch-> false) + list.getMarginSize(container).y;
+        }
+
+        0.0f
+    }
+
+    /**
+     * Select the item the user clicked in the list, closing it, and emit the signal of the dropdown when it changed
+     * */
+    pub fn selectByUser(mut self, index: usize) {
+        self:.closeMenu();
+        if let Ok(s) = self.getSelected() && s == index { return; }
+
+        self:.setSelected(index);
+        if let Ok(dmut c) = alias self._changed {
+            c:.emit(index);
+        }
+    }
+
+    /**
+     * Show the text of the selected item on the button, none when no item is selected
+     * */
+    fn showSelected(mut self) {
+        if let Ok(s) = self.getSelected() {
+            self:.setText(self._items[s]);
+        } else {
+            self:.setText("");
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted when the user selects another item, with its index
+     * */
+    pub fn changed(mut self)-> dmut &Signal!{usize} {
+        if let Ok(dmut c) = alias self._changed {
+            return alias c;
+        }
+
+        let dmut c = copy Signal!{usize} ();
+        self._changed = (alias c)?;
+
+        alias c
+    }
+}
+
+/**
+ * The dropdowns in a .gui file
+ * */
+pub mod Dropdown {
+
+    /**
+     * @returns: the schema of the dropdowns, their items being their default attribute
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("Dropdown",
+                          |dmut m, id|-> dmut &Widget => copy Dropdown(alias m, id),
+                          attributes-> copy [copy Setter!{&Dropdown, [[c8]]}("items", |dmut d, i| => { d:.setItems(i); }),
+                                             copy Setter!{&Dropdown, usize}("selected", |dmut d, s| => { d:.setSelected(s); })],
+                          defaultAttribute-> "items",
+                          signals-> copy [copy Emitter!{&Dropdown, usize}("on-change", |dmut d|-> dmut &Signal!{usize} => alias d:.changed())],
+                          parts-> copy ["label", "popup", "item", "scrollbar"],
+                          partStates-> copy ["item" => copy ["hover", "selected"], "scrollbar" => copy ["hover", "pressed"]])
+    }
+
+    /**
+     * @returns: where the list of a dropdown opens: under it when its height fits in the room under it, above it when
+     * it does not and there is more room above, and the height it is limited to, the room on that side
+     * @params:
+     *    - height: the height of the list sized to its items
+     *    - below: the room under the dropdown
+     *    - above: the room above the dropdown
+     * */
+    pub fn fitList(height: f32, below: f32, above: f32)-> (bool, f32) {
+        if height <= below || above <= below {
+            return (false, below);
+        }
+
+        (true, above)
+    }
+}
