@@ -226,6 +226,47 @@ FieldRow #NAME "Name" { on-validate: form::name-set; }
 - **The connections belong to the widgets**, dropped with them. `connect` stays available for the widgets created by
   code, and `instantiate` connects the `on-…` attributes of the instances it creates.
 
+### Controls
+
+```
+CheckBox #SHADOWS "Shadows" { checked: true; on-toggle: toggled; }        // fn toggled (mut self, checked: bool)
+RadioButton "Low" { group: "quality"; }
+RadioButton "High" { group: "quality"; checked: true; }
+Slider #VOLUME 40 { max: 100; step: 1; on-change: volume; }             // fn volume (mut self, value: f32)
+SpinBox #COUNT 3 { min: 1; max: 12; decimals: 0; on-change: count; }
+ProgressBar #LEVEL 0.25 { max: 1; }
+Dropdown #THEME "Dark", "Light" { selected: 0; on-change: theme; }      // fn theme (mut self, index: usize)
+Separator;
+Image "res:/images/logo.png";
+```
+
+- **A toggle is checked by a click.** `CheckBox` and `RadioButton` draw a `::box` on the left of their `::label`,
+  16 pixels when its style sets no size, and a `::mark` in the content box of the box, filling it unless sized. They
+  are in the state `:checked` while checked, so `CheckBox:checked::mark` colours the mark. `on-toggle` gives the new
+  state when the user changes it, not when `checked:` or the code sets it.
+- **A radio button is only unchecked by another one.** A click checks it, and unchecks the radio buttons of the same
+  `group` in the interface, which emit `on-toggle` with `false`. A radio button without a group is never unchecked by
+  another one. The last radio button of a group attached checked stays checked.
+- **A slider, a spin box and a progress bar show a value between `min` and `max`** (0 and 100 by default), a whole
+  number of `step` from `min` (any value without one, 1 for a spin box), the value given by any attribute order. A
+  slider drags its `::thumb` along its `::track`, the part under the value being its `::fill`; its style property
+  `direction` lays it along a row (the lowest value on the left) or a column (the lowest value at the bottom). The wheel
+  moves a slider or a spin box by a step, a hundredth of the range without one. A spin box reads the text typed when it
+  loses the focus, and writes the value again with its `decimals`; its arrows are `::up` and `::down`, in the states
+  `:hover` and `:pressed`. `on-change` gives the value the user chose.
+- **A dropdown opens its list in its menu layout**, as a menu button its popup, so it works only inside a `MenuLayout`.
+  The list is its `::popup`, at least as wide as the dropdown, its items its `::item` in the states `:hover` and
+  `:selected`. It opens under the dropdown, or above it when its items do not fit under it and there is more room above,
+  at most as high as the room on that side and as the `max-height` of `::popup`. Higher items are scrolled with the
+  wheel or the `::scrollbar` (8 pixels wide unless its style sets a width), shown only then, in the states `:hover`
+  under the cursor and `:pressed` while dragged. The selected item is scrolled to when the list opens. `on-change` gives
+  the index of the item the user selected.
+- **A separator is a rule** a pixel thick across its `direction`, a row (horizontal) by default, drawn with its
+  background colour. An auto size stretches it along the layout it is in.
+- **An image shows a picture** as the background image of its inline style, so that `image-fill`, `image-keep-ratio`
+  and `image-color` apply to it. Sized to its content it is as wide as the picture and as high as the picture scaled
+  to its width; its min-content width is 0.
+
 ## The style file
 
 ```
@@ -260,7 +301,8 @@ compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part {
   (`.sidebar PushButton`), `>` a direct child, and `,` separates selectors sharing one block.
 - **A type**, `#id`, `.class` and `:state` all have to hold. `*` or no type selects every type. The name of a
   component selects the roots of its instances, as their type does.
-- **States** are registered by the widget types: `:hover`, `:focus`, `:check` for every widget.
+- **States** are registered by the widget types: `:hover`, `:focus` and `:pressed` (held by a mouse button) for every
+  widget, and `:checked` for the check boxes and the radio buttons.
 - **Parts** style a piece of a widget, `PushButton::label`, and end their selector. A part with states of its own takes
   them after it: `TabLayout::tab:selected` is the selected tab, `TabLayout:hover::tab` every tab of a hovered layout.
 - **Checked at load**: a type, a state, a part or a state of a part that none of the types a compound can select
@@ -428,8 +470,30 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** none
+- **Properties:** none
+
+### `CheckBox`
+
+- **Attributes:** `text`: a string; `checked`: true or false
+- **Default attribute:** `text`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-toggle` (bool)
+- **States:** `hover`, `focus`, `pressed`, `checked`
+- **Parts:** `label`, `box`, `mark`
+- **Properties:** none
+
+### `Dropdown`
+
+- **Attributes:** `items`: strings separated by commas; `selected`: an integer of 0 or more
+- **Default attribute:** `items`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-change` (usize)
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `label`, `popup`, `item` (states `hover`, `selected`), `scrollbar` (states `hover`, `pressed`)
 - **Properties:** none
 
 ### `FloatingLayout`
@@ -439,7 +503,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** any number
 - **Attributes of the children:** `capture-events`: true or false
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** none
 - **Properties:** none
 
@@ -450,7 +514,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** `cpu`, `gpu`, `memory`
 - **Properties:** none
 
@@ -461,9 +525,20 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** any number
 - **Attributes of the children:** `cell`: two integers of 0 or more
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** none
 - **Properties:** `columns`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content; `rows`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content
+
+### `Image`
+
+- **Attributes:** `src`: a string
+- **Default attribute:** `src`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** none
 
 ### `InputText`
 
@@ -472,7 +547,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-validate` ([c8])
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** `label`, `selection`, `cursor`
 - **Properties:** none
 
@@ -483,7 +558,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** none
 - **Properties:** none
 
@@ -494,8 +569,8 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** any number
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
-- **Parts:** `scrollbar`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `scrollbar` (states `hover`, `pressed`)
 - **Properties:** `direction`: row or column; `overflow`: hidden or scroll; `scroll-speed`: a number of 0 or more
 
 ### `MenuButton`
@@ -505,7 +580,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** its popup, optional
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** `label`
 - **Properties:** `popup-align`: left, center or right, then top, center or bottom
 
@@ -516,9 +591,20 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** its bar then its content
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-menu-open`, `on-menu-close`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** none
 - **Properties:** none
+
+### `ProgressBar`
+
+- **Attributes:** `value`: a number; `min`: a number; `max`: a number
+- **Default attribute:** `value`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `fill`
+- **Properties:** `direction`: row or column
 
 ### `PushButton`
 
@@ -527,8 +613,19 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-double-click`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** `label`
+- **Properties:** none
+
+### `RadioButton`
+
+- **Attributes:** `text`: a string; `checked`: true or false; `group`: a string
+- **Default attribute:** `text`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-toggle` (bool)
+- **States:** `hover`, `focus`, `pressed`, `checked`
+- **Parts:** `label`, `box`, `mark`
 - **Properties:** none
 
 ### `Scene3D`
@@ -538,8 +635,41 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** none
+- **Properties:** none
+
+### `Separator`
+
+- **Attributes:** none
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** `direction`: row or column
+
+### `Slider`
+
+- **Attributes:** `value`: a number; `min`: a number; `max`: a number; `step`: a number
+- **Default attribute:** `value`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-change` (f32)
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `track`, `fill`, `thumb`
+- **Properties:** `direction`: row or column
+
+### `SpinBox`
+
+- **Attributes:** `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more
+- **Default attribute:** `value`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-change` (f32)
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `label`, `selection`, `cursor`, `up` (states `hover`, `pressed`), `down` (states `hover`, `pressed`)
 - **Properties:** none
 
 ### `Splitter`
@@ -549,7 +679,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** any number
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** `grip` (states `hover`), `bbox`
 - **Properties:** `direction`: row or column
 
@@ -560,7 +690,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** at least 1
 - **Attributes of the children:** `tab`: a string, required
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
-- **States:** `hover`, `focus`, `check`
+- **States:** `hover`, `focus`, `pressed`
 - **Parts:** `tab` (states `hover`, `selected`)
 - **Properties:** none
 

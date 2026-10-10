@@ -396,9 +396,9 @@ sheet gets constants, imports, inheritance and conditions.
 - **Compound selectors are glued**, in CSS order: `PushButton.yes:hover::label` instead of
   `PushButton :hover ::label .yes`. A space now means a descendant (`.sidebar PushButton`), `>` a direct child, `,` a
   list of selectors sharing one block. `#id` selects one widget.
-- **States are named, not positional.** `:hover`, `:focus`, `:check` today, registered by the widgets so `:pressed` or
-  `:disabled` come without touching the parser. Several states in one compound all have to hold, as in CSS; today they
-  are alternatives.
+- **States are named, not positional.** `:hover`, `:focus`, `:pressed`, and `:checked` on the toggles (BAL-41),
+  registered by the widgets so `:disabled` comes without touching the parser. Several states in one compound all have
+  to hold, as in CSS; today they are alternatives.
 - **Parts** (`::label`, `::grip`, `::bbox`, `::tab`, `::selection`, `::cursor`) are registered by their widget the same
   way. A part that has states of its own takes them after it, as CSS's `::part(tab):hover`:
   `TabLayout::tab:selected` is the selected tab, `TabLayout:hover::tab` every tab of a hovered layout. A part ends its
@@ -662,10 +662,10 @@ next popup opened.
 | `left`, `top`, `right`, `bottom` | every widget, read by a `FloatingLayout` | a length | unset, at the top left corner |
 
 - **A layout scrolls itself.** `overflow: scroll` keeps the bases of the children instead of shrinking them, and the
-  layout scrolls over them with the wheel or by dragging its scrollbar, styled as its part `LinearLayout::scrollbar`.
-  The `ScrollLayout` wrapper is gone, so restyling `overflow` changes no widget of the tree. Its min-content along its
-  axis is 0 (BAL-74): it shrinks to the space its parent gives it, and adds nothing to the minimum of its ancestors,
-  where CSS would need a `min-height: 0` on each of them.
+  layout scrolls over them with the wheel or by dragging its scrollbar, styled as its part `LinearLayout::scrollbar`, in
+  the states `:hover` and `:pressed` (BAL-41). The `ScrollLayout` wrapper is gone, so restyling `overflow` changes no
+  widget of the tree. Its min-content along its axis is 0 (BAL-74): it shrinks to the space its parent gives it, and
+  adds nothing to the minimum of its ancestors, where CSS would need a `min-height: 0` on each of them.
 - **Tracks are sized as in CSS**: lengths, percentages and content sizes first, then the `auto` tracks grow from their
   min-content to their max-content sharing the free space, then the shares in `fr` take what is left, the `auto`
   tracks stretching to it when there is none. A share may be smaller than its content (`minmax(0, 1fr)`), and a track
