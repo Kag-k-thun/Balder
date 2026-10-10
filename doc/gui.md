@@ -373,7 +373,7 @@ Any colour may be followed by `/` and an opacity, a number from 0 to 1 or a perc
 
 ## Widget types
 
-The attributes of a type are set in the block of a node, `max-length: 64;`, its default attribute by the value after the selector, `Label "Name";`. The attributes of the children are set on a child by its parent's type, `tab: "Form";`. The properties are style properties the type reads beyond the common ones.
+The attributes of a type are set in the block of a node, `max-length: 64;`, its default attribute by the value after the selector, `Label "Name";`. The attributes of the children are set on a child by its parent's type, `tab: "Form";`. The signals are connected to the slots the code registers, `on-click: submit;`, the slot taking the arguments bound to it then the payload of the signal. The properties are style properties the type reads beyond the common ones.
 
 ### `Box`
 
@@ -381,6 +381,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** none
 - **Properties:** none
@@ -391,6 +392,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** `capture-events`: true or false
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** none
 - **Properties:** none
@@ -401,6 +403,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** `cpu`, `gpu`, `memory`
 - **Properties:** none
@@ -411,6 +414,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** `cell`: two integers of 0 or more
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** none
 - **Properties:** `columns`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content; `rows`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content
@@ -421,6 +425,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-validate` ([c8])
 - **States:** `hover`, `focus`, `check`
 - **Parts:** `label`, `selection`, `cursor`
 - **Properties:** none
@@ -431,6 +436,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** none
 - **Properties:** none
@@ -441,6 +447,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** `scrollbar`
 - **Properties:** `direction`: row or column; `overflow`: hidden or scroll; `scroll-speed`: a number of 0 or more
@@ -451,6 +458,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** `text`
 - **Children:** its popup, optional
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** `label`
 - **Properties:** `popup-align`: left, center or right, then top, center or bottom
@@ -461,6 +469,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** its bar then its content
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-menu-open`, `on-menu-close`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** none
 - **Properties:** none
@@ -471,6 +480,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-double-click`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** `label`
 - **Properties:** none
@@ -481,6 +491,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** none
 - **Properties:** none
@@ -491,6 +502,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** `grip` (states `hover`), `bbox`
 - **Properties:** `direction`: row or column
@@ -501,6 +513,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** none
 - **Children:** at least 1
 - **Attributes of the children:** `tab`: a string, required
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `check`
 - **Parts:** `tab` (states `hover`, `selected`)
 - **Properties:** none
