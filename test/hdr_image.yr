@@ -1,0 +1,117 @@
+in hdr_image;
+
+use balder::core::error;
+use balder::core::shader::texture::hdr;
+
+/**
+ * @returns: the bytes of a text
+ * */
+fn bytesOf(text: [c8])-> [u8] {
+    let mut result: [u8] = [];
+    for c in text {
+        result = result ~ [cast!u8(c)];
+    }
+
+    result
+}
+
+/**
+ * @returns: the header of a Radiance HDR image of RGBE texels, its resolution line included
+ * */
+fn headerOf(width: u32, height: u32)-> [u8] {
+    bytesOf("#?RADIANCE\n# written by a test\nFORMAT=32-bit_rle_rgbe\nEXPOSURE=1\n\n")
+        ~ bytesOf(std::format::format("-Y {} +X {}\n", height, width))
+}
+
+/**
+ * @returns: the error decoding bytes throws, empty when they decode
+ * */
+fn errorOf(bytes: [u8])-> [c8] {
+    {
+        HdrImage(bytes);
+        ""
+    } catch {
+        e: &BalderError => { e.msg }
+    }
+}
+
+/**
+ * The texels of a flat image are read as they are, row by row from the top, their mantissas scaled by their exponent
+ * */
+__test a_flat_image_is_read_as_it_is {
+    let texels = copy [128u8, 64u8, 32u8, 129u8, 1u8, 2u8, 3u8, 0u8,
+                       255u8, 0u8, 0u8, 136u8, 0u8, 128u8, 0u8, 130u8];
+    let image = HdrImage(headerOf(2u32, 2u32) ~ texels);
+
+    assert (image.width == 2u32 && image.height == 2u32);
+    assert (image.texels == texels);
+
+    // an exponent of 129 scales the mantissas by 2^(129 - 136)
+    assert (image.radiance(0u32, 0u32) == [1.0f, 0.5f, 0.25f]);
+
+    // an exponent of 0 is black, whatever its mantissas
+    assert (image.radiance(1u32, 0u32) == [0.0f, 0.0f, 0.0f]);
+    assert (image.radiance(0u32, 1u32) == [255.0f, 0.0f, 0.0f]);
+    assert (image.radiance(1u32, 1u32) == [0.0f, 2.0f, 0.0f]);
+}
+
+/**
+ * A scanline of 8 texels or more starting with its marker is run-length encoded channel by channel, in runs of a byte
+ * repeated and of bytes as they are
+ * */
+__test a_scanline_is_run_length_encoded_channel_by_channel {
+    let line = copy [2u8, 2u8, 0u8, 8u8,
+                     136u8, 128u8,                                  // red: 128 repeated 8 times
+                     8u8, 0u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8,   // green: 8 bytes as they are
+                     132u8, 0u8, 132u8, 64u8,                       // blue: 0 then 64, 4 times each
+                     2u8, 129u8, 130u8, 134u8, 129u8];              // exponent: 2 bytes, then 129 repeated 6 times
+    let image = HdrImage(headerOf(8u32, 2u32) ~ line ~ line);
+
+    assert (image.width == 8u32 && image.height == 2u32);
+    for y in 0u32 .. 2u32 {
+        for x in 0u32 .. 8u32 {
+            let i = cast!usize((y * 8u32 + x) * 4u32);
+            assert (image.texels[i] == 128u8);
+            assert (image.texels[i + 1us] == cast!u8(x));
+            assert (image.texels[i + 2us] == (if x < 4u32 { 0u8 } else { 64u8 }));
+            assert (image.texels[i + 3us] == (if x == 1u32 { 130u8 } else { 129u8 }));
+        }
+    }
+}
+
+/**
+ * The environments of the resources are run-length encoded images of 1024 × 512 texels, decoded from their file
+ * */
+__test an_environment_of_the_resources_is_decoded {
+    let image = HdrImage::fromFile("res:/environments/studio_small_09_1k.hdr");
+    assert (image.width == 1024u32 && image.height == 512u32);
+    assert (image.texels.len == 1024us * 512us * 4us);
+
+    // the light of a studio is unbounded, brighter than white somewhere
+    let mut brightest = 0.0f;
+    for y in 0u32 .. image.height {
+        for x in 0u32 .. image.width {
+            let r = image.radiance(x, y);
+            if r[0] > brightest { brightest = r[0]; }
+        }
+    }
+
+    assert (brightest > 1.0f);
+}
+
+/**
+ * Not a Radiance HDR image, another format of texels, another orientation, a truncated image or an overflowing run are
+ * refused
+ * */
+__test a_malformed_image_is_refused {
+    assert (errorOf(bytesOf("P6\n2 2\n255\n")).len != 0us);
+    assert (errorOf(bytesOf("#?RADIANCE\nFORMAT=32-bit_rle_xyze\n\n-Y 1 +X 1\n") ~ copy [0u8, 0u8, 0u8, 0u8]).len != 0us);
+    assert (errorOf(bytesOf("#?RADIANCE\n\n+Y 1 +X 1\n") ~ copy [0u8, 0u8, 0u8, 0u8]).len != 0us);
+    assert (errorOf(bytesOf("#?RADIANCE\n\n-Y 1 +X two\n")).len != 0us);
+    assert (errorOf(headerOf(2u32, 2u32) ~ copy [0u8, 0u8, 0u8, 0u8]).len != 0us);
+    assert (errorOf(headerOf(8u32, 1u32) ~ copy [2u8, 2u8, 0u8, 8u8, 137u8, 0u8]).len != 0us);
+    assert (errorOf(bytesOf("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n")).len != 0us);
+
+    // a header without format is a header of RGBE texels
+    assert (errorOf(bytesOf("#?RGBE\n\n-Y 1 +X 1\n") ~ copy [0u8, 0u8, 0u8, 0u8]).len == 0us);
+}
