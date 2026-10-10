@@ -24,6 +24,11 @@ struct Object {
     // The widths of the ring the shape is drawn as (top, bottom, left, right), in CSS pixels, the whole shape being
     // drawn when they are all 0
     vec4 edges;
+
+    // The rectangle the shape is drawn in, its corners in CSS pixels, and the radii of its corners clockwise from the
+    // top left one
+    vec4 box;
+    vec4 radii;
     int level;
 };
 

@@ -23,6 +23,11 @@ struct Object {
     // The widths of the ring the shape is drawn as (top, bottom, left, right), in CSS pixels, the whole shape being
     // drawn when they are all 0
     vec4 edges;
+
+    // The rectangle the shape is drawn in, its corners in CSS pixels, and the radii of its corners clockwise from the
+    // top left one
+    vec4 box;
+    vec4 radii;
     int level;
 };
 
@@ -38,6 +43,14 @@ layout (location = 1) flat out vec4 outColor;
 // The scissors of the shape, its offset and extent in framebuffer pixels
 layout (location = 2) flat out ivec4 outScissors;
 
+// The rectangle the shape is drawn in, its corners in CSS pixels, and the radii of its corners clockwise from the top
+// left one
+layout (location = 3) flat out vec4 outBox;
+layout (location = 4) flat out vec4 outRadii;
+
+// The number of framebuffer pixels in a CSS pixel
+layout (location = 5) flat out vec2 outRatio;
+
 out gl_PerVertex {
     vec4 gl_Position;
 };
@@ -52,12 +65,22 @@ ivec4 framebufferScissors (vec4 scissors) {
 void main () {
     Object world = objects [gl_InstanceIndex];
 
+    // the quad is grown by a framebuffer pixel past each side, so that the fragment shader decides alone which pixels
+    // the box of the shape covers, an edge on the centre of a pixel being moved past it by the rounding of the position,
+    // and its coordinates in the texture with it (0 to 1 across the quad)
+    vec2 margin = 1.0 / window.ratio;
+    vec2 translation = world.translation - margin;
+    vec2 scale = world.scale + 2.0 * margin;
+
     vec2 rotatedCenter = (position.xy) + 1;
-    vec2 scaledCenter = rotatedCenter * (world.scale / window.dimension);
-    vec2 pos = scaledCenter + ((world.translation / (window.dimension / 2)) - 1);
+    vec2 scaledCenter = rotatedCenter * (scale / window.dimension);
+    vec2 pos = scaledCenter + ((translation / (window.dimension / 2)) - 1);
 
     gl_Position =  vec4 (pos, 1 - (world.level * 0.0001), 1);
-    a_uv = textureUV;
+    a_uv = textureUV + (textureUV * 2.0 - 1.0) * margin / max (world.scale, vec2 (1.0e-6));
     outColor = world.color;
     outScissors = framebufferScissors (world.scissors);
+    outBox = world.box;
+    outRadii = world.radii;
+    outRatio = window.ratio;
 }
