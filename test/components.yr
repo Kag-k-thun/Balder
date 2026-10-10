@@ -1,0 +1,501 @@
+in components;
+
+use balder::core::error;
+use balder::interface;
+use balder::interface::loader;
+use balder::interface::loader::{parser, registry::_, registry::error, registry::setting, registry::widget_node};
+use balder::interface::style;
+use balder::interface::style::manager;
+
+use std::syntax::errors;
+
+/**
+ * FieldRow, the component of doc/gui-v2.md, §8, on the lines 1 to 6 of the contents using it
+ * */
+def FIELD_ROW = "@component FieldRow ($label, $max-length: 64, $only-numbers: false) {\n"
+    ~ "    LinearLayout .field-row {\n"
+    ~ "        Label .field $label;\n"
+    ~ "        InputText #INPUT .input { max-length: $max-length; only-numbers: $only-numbers; }\n"
+    ~ "    }\n"
+    ~ "}\n";
+
+/**
+ * Panel, a component with a named slot and the unnamed one, on the lines 1 to 6 of the contents using it
+ * */
+def PANEL = "@component Panel ($title) {\n"
+    ~ "    LinearLayout .panel {\n"
+    ~ "        LinearLayout #BAR .panel-bar { Label .panel-title $title; @slot tools; }\n"
+    ~ "        LinearLayout #BODY .panel-body { @slot; }\n"
+    ~ "    }\n"
+    ~ "}\n";
+
+/**
+ * @returns: the tree of the widgets of a .gui content, unfolded by a registry
+ * @params:
+ *    - file: the name of the content, the scope of its components and the base of its imports
+ * */
+fn unfold(dmut registry: &WidgetRegistry, content: [c8], file: [c8] = "test.gui")-> WidgetNode
+    throws BalderError
+{
+    let doc = {
+        let dmut reader = GuiReader(content);
+        reader:.read()
+    } catch {
+        e: &SyntaxError => { throw copy LoadError(file, e.msg, e.line, e.col); }
+    };
+
+    registry:.unfold(doc, file)
+}
+
+/**
+ * @returns: the tree of the widgets of a .gui content, unfolded and checked by the registry of the built-in types
+ * */
+fn tree(content: [c8])-> WidgetNode
+    throws BalderError
+{
+    let dmut registry = WidgetRegistry();
+    let t = unfold(alias registry, content);
+    registry.check(t);
+    t
+}
+
+/**
+ * @returns: the error of the unfolding or of the check of a .gui content, none when it is accepted
+ * */
+fn failure(content: [c8])-> (&LoadError)?
+    throws BalderError
+{
+    {
+        tree(content);
+        none
+    } catch {
+        e: &LoadError   => { (e)? }
+        e: &BalderError => { throw e; }
+    }
+}
+
+/**
+ * @returns: the error of the unfolding or of the check of a .gui file, none when it is accepted
+ * */
+fn fileFailure(path: [c8])-> (&LoadError)?
+    throws BalderError
+{
+    {
+        let dmut registry = WidgetRegistry();
+        registry:.check(readGuiFile(path), path);
+        none
+    } catch {
+        e: &LoadError   => { (e)? }
+        e: &BalderError => { throw e; }
+    }
+}
+
+/**
+ * @returns: true iif a content is refused with reason, at line and col
+ * */
+fn refuses(content: [c8], reason: [c8], line: usize, col: usize)-> bool
+    throws BalderError
+{
+    if let Ok(e) = failure(content) {
+        return e.reason == reason && e.line == line && e.col == col && e.file == "test.gui";
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif a .gui file is refused with reason, at line and col of file
+ * */
+fn fileRefuses(path: [c8], file: [c8], reason: [c8], line: usize, col: usize)-> bool
+    throws BalderError
+{
+    if let Ok(e) = fileFailure(path) {
+        return e.reason == reason && e.line == line && e.col == col && e.file == file;
+    }
+
+    false
+}
+
+/**
+ * @returns: the attribute name of a widget, none if it does not set it
+ * */
+fn attribute(node: WidgetNode, name: [c8])-> (Setting)? {
+    for a in node.attributes {
+        if a.name == name { return (a)?; }
+    }
+
+    none
+}
+
+/**
+ * @returns: the source of the value of the attribute name of a widget, "" if it does not set it
+ * */
+fn source(node: WidgetNode, name: [c8])-> [c8] {
+    if let Ok(a) = attribute(node, name) {
+        return a.value.getSource();
+    }
+
+    ""
+}
+
+/**
+ * @returns: the text of the default value of a widget, "" if it has none
+ * */
+fn text(node: WidgetNode)-> [c8]
+    throws SyntaxError
+{
+    if let Ok(v) = node.value {
+        return v.value.toText();
+    }
+
+    ""
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ==================================          PARAMETERS          ===================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test the_parameters_are_substituted {
+    let form = tree(FIELD_ROW ~ "LinearLayout #FORM {\n"
+                    ~ "    FieldRow #NAME \"Name\";\n"
+                    ~ "    FieldRow #AGE \"Age\" { max-length: 3; only-numbers: true; }\n"
+                    ~ "}\n");
+
+    assert (form.children.len == 2us);
+    let name = form.children[0], age = form.children[1];
+
+    // the instance is the root of the component
+    assert (name.typeName == "LinearLayout" && name.id == "NAME" && name.classes == ["field-row"]);
+    assert (name.components == ["FieldRow"]);
+    assert (name.children.len == 2us);
+
+    // the first parameter is the default value of the instance, the others take their default
+    assert (name.children[0].typeName == "Label" && text(name.children[0]) == "Name");
+    assert (name.children[1].id == "INPUT");
+    assert (source(name.children[1], "max-length") == "64" && source(name.children[1], "only-numbers") == "false");
+
+    assert (text(age.children[0]) == "Age");
+    assert (source(age.children[1], "max-length") == "3" && source(age.children[1], "only-numbers") == "true");
+
+    // the values given by the instance are not attributes of its root
+    assert (!attribute(age, "max-length").hasValue && !attribute(age, "label").hasValue);
+}
+
+__test a_tuple_parameter_is_spliced {
+    let grid = tree("@component Cell ($at: 0 0) { Box .cell { cell: $at; } }\nGridLayout { Cell; Cell { at: 1 0; } }");
+    assert (grid.children.len == 2us);
+
+    if let Ok(cell) = attribute(grid.children[1], "cell") {
+        let items = cell.value.toTuple();
+        assert (items.len == 2us && items[0].getSource() == "1" && items[1].getSource() == "0");
+    } else {
+        assert (false);
+    }
+}
+
+__test the_parameters_an_instance_has_to_give {
+    assert (refuses(FIELD_ROW ~ "LinearLayout { FieldRow #X; }", "'FieldRow' needs the parameter '$label'", 7us, 16us));
+    assert (refuses(FIELD_ROW ~ "FieldRow \"A\" { label: \"B\"; }",
+                    "parameter '$label' of 'FieldRow' set twice, by the default value and in the block", 7us, 16us));
+    assert (refuses("@component Empty () { Box; }\nEmpty \"a\";", "'Empty' takes no default value", 2us, 7us));
+}
+
+__test a_value_of_the_wrong_kind_is_refused_where_it_is_given {
+    // at the value given by the instance
+    assert (refuses(FIELD_ROW ~ "FieldRow \"A\" { max-length: \"x\"; }",
+                    "parameter '$max-length' of 'FieldRow' for the attribute 'max-length' of 'InputText' under 'LinearLayout': expected an integer, found '\"x\"'",
+                    7us, 28us));
+    assert (refuses(FIELD_ROW ~ "FieldRow 12;",
+                    "parameter '$label' of 'FieldRow' for the attribute 'text' of 'Label': expected a string, found '12'", 7us, 10us));
+
+    // at the default of the parameter
+    assert (refuses("@component Input ($n: \"a\") { InputText { max-length: $n; } }\nInput;",
+                    "parameter '$n' of 'Input' for the attribute 'max-length' of 'InputText': expected an integer, found '\"a\"'",
+                    1us, 23us));
+
+    // a value given by an instance inside a component, to a parameter of the component around it
+    assert (refuses(FIELD_ROW ~ "@component Port ($size) { FieldRow \"Port\" { max-length: $size; } }\nPort { size: \"5\"; }",
+                    "parameter '$size' of 'Port' for the attribute 'max-length' of 'InputText' under 'LinearLayout': expected an integer, found '\"5\"'",
+                    8us, 14us));
+}
+
+__test the_attributes_of_an_instance_are_given_by_its_parent {
+    let tabs = tree(FIELD_ROW ~ "TabLayout { FieldRow #A \"A\" { tab: \"First\"; } }");
+    if let Ok(tab) = attribute(tabs.children[0], "tab") {
+        assert (tab.forParent && tab.typeName == "FieldRow");
+    } else {
+        assert (false);
+    }
+
+    assert (refuses(FIELD_ROW ~ "TabLayout { FieldRow #A \"A\"; }", "a child of 'TabLayout' needs the attribute 'tab'", 7us, 13us));
+    assert (refuses(FIELD_ROW ~ "LinearLayout { FieldRow \"A\" { color: red; } }",
+                    "unknown attribute 'color' of 'FieldRow' under 'LinearLayout'", 7us, 31us));
+
+    // an attribute of the root is not one of the instance
+    assert (refuses("@component Title ($size: 1) { Label .title; }\nTitle { text: \"a\"; }",
+                    "unknown attribute 'text' of 'Title'", 2us, 9us));
+}
+
+__test the_root_takes_the_id_and_the_classes_of_the_instance {
+    let main = tree("@component Frame () { LinearLayout #ROOT .frame; }\nFrame #MAIN .wide .dark;");
+    assert (main.id == "MAIN" && main.classes == ["frame", "wide", "dark"] && main.components == ["Frame"]);
+
+    let root = tree("@component Frame () { LinearLayout #ROOT .frame; }\nFrame;");
+    assert (root.id == "ROOT" && root.classes == ["frame"]);
+
+    // a component whose root is an instance of another is selected by both names
+    let card = tree("@component Frame () { LinearLayout .frame; }\n@component Card () { Frame .card; }\nCard .big;");
+    assert (card.typeName == "LinearLayout" && card.components == ["Frame", "Card"]);
+    assert (card.classes == ["frame", "card", "big"] && card.instances.len == 2us);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          SLOTS          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test the_children_of_an_instance_fill_its_slots {
+    let inspector = tree(PANEL ~ "Panel #INSPECTOR \"Inspector\" {\n"
+                         ~ "    PushButton #PIN \"Pin\" { slot: tools; }\n"
+                         ~ "    Label #SELECTION \"Nothing\";\n"
+                         ~ "}\n");
+
+    let bar = inspector.children[0], body = inspector.children[1];
+    assert (bar.id == "BAR" && bar.children.len == 2us && bar.children[1].id == "PIN");
+    assert (body.id == "BODY" && body.children.len == 1us && body.children[0].id == "SELECTION");
+
+    // the slotted widgets belong to the instance, and lose their slot attribute
+    let instance = inspector.instances[0];
+    assert (bar.children[1].owner == instance && body.children[0].owner == instance);
+    assert (bar.children[0].owner == 0us && bar.owner == 0us);
+    assert (!attribute(bar.children[1], "slot").hasValue);
+
+    // a slot left empty
+    let empty = tree(PANEL ~ "Panel \"Empty\";");
+    assert (empty.children[0].children.len == 1us && empty.children[1].children.len == 0us);
+}
+
+__test the_slots_an_instance_cannot_fill {
+    assert (refuses(PANEL ~ "Panel \"A\" { Box { slot: nope; } }", "'Panel' has no slot 'nope'", 7us, 13us));
+    assert (refuses(PANEL ~ "Panel \"A\" { Box { slot: \"tools\"; } }",
+                    "attribute 'slot' of 'Box': expected a name, found '\"tools\"'", 7us, 25us));
+    assert (refuses(FIELD_ROW ~ "FieldRow \"A\" { Box; }", "'FieldRow' takes no children", 7us, 16us));
+    assert (refuses("@component Bar () { LinearLayout { @slot tools; } }\nBar { Box; }",
+                    "'Bar' has no unnamed slot, a child names one of its slots with 'slot:'", 2us, 7us));
+
+    // the container of the slot still checks its children
+    assert (refuses("@component Popup () { MenuButton \"File\" { @slot; } }\nPopup { Box; Box; }",
+                    "'MenuButton' takes only its popup", 2us, 14us));
+}
+
+__test a_slot_in_the_block_of_an_instance_passes_its_children_on {
+    let card = tree("@component Frame () { LinearLayout .frame { @slot; } }\n"
+                    ~ "@component Card () { LinearLayout .card { Frame #FRAME { @slot; } } }\n"
+                    ~ "Card #C { Label #X \"x\"; }");
+
+    let frame = card.children[0];
+    assert (frame.id == "FRAME" && frame.children.len == 1us && frame.children[0].id == "X");
+
+    // found under the card, whose child it is in the file, not under the frame
+    assert (frame.children[0].owner == card.instances[0] && frame.instances[0] != card.instances[0]);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===================================          SCOPED IDS          ===================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test the_ids_are_scoped_to_their_instance {
+    // FORM/NAME/INPUT and FORM/AGE/INPUT
+    assert (!failure(FIELD_ROW ~ "LinearLayout #FORM { FieldRow #NAME \"Name\"; FieldRow #AGE \"Age\"; }").hasValue);
+
+    // an anonymous instance adds no segment, as an anonymous widget
+    assert (refuses(FIELD_ROW ~ "LinearLayout #FORM { FieldRow \"Name\"; FieldRow \"Age\"; }",
+                    "'#INPUT' is reachable by the path 'FORM/INPUT' of the widget at line 4, column 9", 4us, 9us));
+}
+
+__test the_slotted_widgets_are_found_under_their_instance {
+    // PIN is P/PIN, not P/BAR/PIN, and SELECTION is P/SELECTION, not P/BODY/SELECTION
+    assert (refuses(PANEL ~ "Panel #P \"T\" { PushButton #PIN \"Pin\" { slot: tools; } Label #PIN \"x\"; }",
+                    "'#PIN' is reachable by the path 'P/PIN' of the widget at line 7, column 16", 7us, 55us));
+
+    // so a slotted widget named like a widget of the component is reachable by the same path
+    assert (refuses(PANEL ~ "Panel #P \"T\" { Label #BODY \"x\"; }",
+                    "'#BODY' is reachable by the path 'P/BODY' of the widget at line 4, column 9", 7us, 16us));
+
+    // the instance can name its slotted widgets like the widgets around it
+    assert (!failure(PANEL ~ "LinearLayout { Panel #P \"T\" { Label #X \"x\"; } Label #X \"y\"; }").hasValue);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          CYCLES          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test a_cycle_between_components_is_refused {
+    assert (refuses("@component A () { LinearLayout { B; } }\n@component B () { A; }\nA;",
+                    "component 'A' used in its own expansion: A -> B -> A", 2us, 19us));
+    assert (refuses("@component A () { LinearLayout { A; } }\nA;", "component 'A' used in its own expansion: A -> A", 1us, 34us));
+}
+
+__test the_root_of_a_component_may_be_the_type_of_its_name {
+    // the type registered under the name of the component, given its inner structure by the component
+    let framed = tree("@component LinearLayout ($title) { LinearLayout .framed { Label .title $title; } }\nLinearLayout #F \"Title\";");
+    assert (framed.typeName == "LinearLayout" && framed.components == ["LinearLayout"] && framed.classes == ["framed"]);
+    assert (text(framed.children[0]) == "Title");
+
+    assert (refuses("@component Collapsible () { Collapsible; }\nCollapsible;", "unknown widget type 'Collapsible'", 1us, 29us));
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          IMPORTS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test the_components_of_an_imported_file {
+    let dmut registry = WidgetRegistry();
+    let form = registry:.unfold(readGuiFile("test/gui/form.gui"), "test/gui/form.gui");
+    registry.check(form);
+
+    assert (form.children.len == 2us && form.children[1].components == ["FieldRow"]);
+    assert (form.children[1].file == "test/gui/form.gui" && form.children[1].children[1].file == "test/gui/widgets/field-row.gui");
+    assert (registry.getLibrary().getStyles() == ["test/gui/widgets/field-row.style"]);
+}
+
+__test the_imports_of_an_imported_file_are_brought_in {
+    // settings imports panel, which imports field-row, then field-row again
+    let dmut registry = WidgetRegistry();
+    let settings = registry:.unfold(readGuiFile("test/gui/settings.gui"), "test/gui/settings.gui");
+    registry.check(settings);
+
+    assert (settings.components == ["Panel"] && settings.children.len == 3us);
+    assert (settings.children[1].id == "FILTER" && settings.children[2].id == "PORT");
+    assert (registry.getLibrary().getStyles() == ["test/gui/widgets/field-row.style", "test/gui/widgets/panel.style"]);
+}
+
+__test the_imports_refused {
+    assert (fileRefuses("test/gui/unimported.gui", "test/gui/unimported.gui", "unknown widget type 'FieldRow'", 2us, 5us));
+    assert (fileRefuses("test/gui/missing.gui", "test/gui/missing.gui", "cannot read the imported file 'test/gui/nothing.gui'", 1us, 1us));
+    assert (fileRefuses("test/gui/clash.gui", "test/gui/clash.gui",
+                        "component 'FieldRow' of 'test/gui/clash.gui' is already declared by 'test/gui/widgets/field-row.gui'", 3us, 1us));
+    assert (fileRefuses("test/gui/cycle/a.gui", "test/gui/cycle/b.gui",
+                        "'test/gui/cycle/a.gui' imports itself: test/gui/cycle/a.gui -> test/gui/cycle/b.gui -> test/gui/cycle/a.gui",
+                        1us, 1us));
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          STYLES          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the rules of a sheet, decoded against the types and the components a registry knows
+ * */
+fn decode(registry: &WidgetRegistry, content: [c8])-> StyleSheet
+    throws BalderError
+{
+    let dmut reader = StyleReader(content);
+    let dmut constants = copy Constants();
+    {
+        SheetDecoder(registry, "test.style").decode(reader:.read(alias constants))
+    } catch {
+        e: &SyntaxError => { throw copy LoadError("test.style", e.msg, e.line, e.col); }
+        e: &LoadError   => { throw e; }
+    }
+}
+
+/**
+ * @returns: true iif a sheet is refused by the decoding against a registry
+ * */
+fn refusesSheet(registry: &WidgetRegistry, content: [c8])-> bool
+    throws BalderError
+{
+    {
+        decode(registry, content);
+        false
+    } catch {
+        _: &LoadError   => { true }
+        e: &BalderError => { throw e; }
+    }
+}
+
+__test a_component_is_selected_as_a_type {
+    let dmut registry = WidgetRegistry();
+    assert (refusesSheet(registry, "FieldRow { radius: 3; }"));
+
+    unfold(alias registry, FIELD_ROW ~ "FieldRow \"A\";");
+    let dmut styles = copy StyleManager();
+    styles:.addSheet(decode(registry, "FieldRow { radius: 3; }\nFieldRow:hover > Label { radius: 4; }"));
+
+    // checked against the type of its root
+    assert (!refusesSheet(registry, "FieldRow { direction: row; }"));
+    assert (refusesSheet(registry, "FieldRow::label { radius: 1; }"));
+
+    let row = Element("LinearLayout", components-> copy ["FieldRow"], classes-> copy ["field-row"]);
+    assert (styles.compute(copy [row], copy Style()).radius == (true, 3u32));
+    assert (!styles.compute(copy [Element("LinearLayout")], copy Style()).radius._0);
+
+    let hovered = Element("LinearLayout", components-> copy ["FieldRow"], states-> copy ["hover"]);
+    assert (styles.compute(copy [Element("Label"), hovered], copy Style()).radius == (true, 4u32));
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ===================================          FROM CODE          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test an_instance_written_by_code {
+    let dmut registry = WidgetRegistry();
+    unfold(alias registry, FIELD_ROW ~ "LinearLayout #FORM { FieldRow #NAME \"Name\"; }");
+
+    let phone = registry:.unfoldInstance("FieldRow #PHONE " ~ WidgetManager::quoted("Phone \"mobile\"") ~ " { max-length: 20; }", "code");
+    assert (phone.id == "PHONE" && phone.components == ["FieldRow"] && phone.file == "code");
+    assert (text(phone.children[0]) == "Phone \"mobile\"" && source(phone.children[1], "max-length") == "20");
+
+    // checked under the widget receiving it
+    let tab: (&WidgetSchema)? = registry.get("TabLayout");
+    let refused = {
+        registry.check(phone, parent-> tab);
+        false
+    } catch {
+        e: &LoadError => { e.reason == "a child of 'TabLayout' needs the attribute 'tab'" }
+    };
+
+    assert (refused);
+
+    let unknown = {
+        registry:.unfoldInstance("Nope;", "code");
+        ""
+    } catch {
+        e: &LoadError => { e.reason }
+    };
+
+    assert (unknown == "unknown component 'Nope'");
+}
+
+__test the_text_of_a_value_given_by_code {
+    assert (WidgetManager::quoted("Phone") == "\"Phone\"");
+    assert (WidgetManager::quoted("a \"b\" \\ c\n") == "\"a \\\"b\\\" \\\\ c\\n\"");
+}

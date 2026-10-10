@@ -15,7 +15,7 @@ length lives in the style sheet and means what it reads like, components, signal
 | What replaces `(class: "x", orientation: horizontal)`? | `Type #id .class "default value" { attr: value; children }`. Ids are optional. | Proposed |
 | Inline styles in `.gui`? | No. Every visual property is reachable from a selector, `#id` included. | Open |
 | Variables? | `$name: value;` constants at the top of a sheet, shared through `@import`. Text and font properties are inherited, which removes most of the repetition on its own. | Open |
-| Reusable groups of widgets? | `@component Name ($param, …) { root }` in a `.gui`, used like any widget type, with `@slot` for the children of an instance. A component can take a Ymir class as its root to get behaviour. | Proposed |
+| Reusable groups of widgets? | `@component Name ($param, …) { root }` in a `.gui`, used like any widget type, with `@slot` for the children of an instance. A component can take a Ymir class as its root to get behaviour. | Done (BAL-65) |
 | Connecting signals? | `on-click: quit;` in the `.gui` names a slot that the code registered under that name. The loader connects and type-checks every signal at load, and again on reload. | Proposed |
 | How does a new widget plug in? | It registers its attributes, default attribute, signals, child slots, states and parts. The parsers never name a widget type. | Proposed |
 
@@ -1071,11 +1071,12 @@ Each has a recommendation.
 7. **How a component names its Ymir class.** [§8](#8-components) lets a component use the registered class of its own
    name as its root. The explicit alternative is `@component Collapsible : CollapsibleWidget ($title) { … }`, which
    costs a second name but lets one class serve several components. *Recommendation: the same-name rule*, adding the
-   explicit form only once a class needs two structures.
+   explicit form only once a class needs two structures. *Adopted in BAL-65*: only the root may be of the type of the
+   component's name, any other use of the component in its own expansion being a cycle.
 8. **Where slotted widgets are found.** A slotted widget really lives inside the component's tree
    (`INSPECTOR/…/SELECTION`). Finding it directly under the instance (`INSPECTOR/SELECTION`) hides that, so the
    component can change its inner structure without breaking the code that uses it. *Recommendation: under the
-   instance.*
+   instance.* *Adopted in BAL-65.*
 9. **A missing slot: error or warning?** An error catches typos at once. A warning lets someone edit a `.gui` before
    the code has the slot, and keeps a hot reload from refusing a file over one button. *Recommendation: an error at
    load*, and on hot reload a refused file that keeps the previous tree, with the error logged.
@@ -1107,8 +1108,9 @@ Each has a recommendation.
   reference is [gui.md](gui.md).
 - **BAL-20** hot reload, which a single generic parser makes much simpler. Reloading a component file expands its
   instances again.
-- **Components** ([§8](#8-components)) have no work item yet. They need the registry of BAL-23 and add expansion,
-  scoping and `@import`/`@style` on top, so they would be a new item under BAL-25, after BAL-23.
+- **BAL-65** components ([§8](#8-components)), done: the expansion of the instances, their parameters and slots, the
+  ids scoped to them, `@import` and `@style`, the cycles, the code-backed roots, and `instantiate` from code; the
+  gallery's form is made of `FieldRow` instances.
 - **Signals** ([§9](#9-signals)) have no work item yet either: slot registration on `Activity` and on widgets, signal
   schemas in the registry, connection and checking at load. A new item under BAL-25, after BAL-23. Components can come
   before or after it.

@@ -5,7 +5,7 @@ use balder::interface::font::family;
 use balder::interface::loader;
 use balder::interface::loader::parser;
 use balder::interface::loader::registry;
-use balder::interface::loader::registry::{error, schema};
+use balder::interface::loader::registry::{error, schema, widget_node};
 use balder::interface::style;
 use balder::interface::style::manager;
 use balder::interface::widget::alignement;
@@ -18,11 +18,12 @@ use std::fs::_;
  * describes and the styles its sheets compute for them, written as text and compared to test/golden/<name>.txt
  * @info:
  * =====
- * A widget is a line `Type #id .class "default value" { attribute: value; }`, its children indented under it. The
- * lines under a widget are the properties of its computed style that a sheet set, a property inherited unchanged from
- * the parent being left out, then the properties of its parts (`::label prop: value`) and of the states of its parts
+ * A widget is a line `Type #id .class "default value" { attribute: value; }`, its children indented under it, the
+ * root of an instance of a component being preceded by the name of the component between brackets. The lines under a
+ * widget are the properties of its computed style that a sheet set, a property inherited unchanged from the parent
+ * being left out, then the properties of its parts (`::label prop: value`) and of the states of its parts
  * (`::tab:selected prop: value`). Under `:hover`, `:focus` and `:check` are the lines that differ while the widget is
- * in that state.
+ * in that state. The sheets of the components (@style) are loaded under the sheet of the file.
  *
  * When the text differs from the golden file, it is written next to it, in <name>.txt.actual, to be compared and
  * copied over the golden file once the change is the one intended.
@@ -48,9 +49,9 @@ enum Inherited
 fn render(gui: [c8], sheet: [c8])-> [c8]
     throws BalderError
 {
-    let registry = WidgetRegistry();
-    let doc = readGuiFile(gui);
-    registry.check(doc, gui);
+    let dmut registry = WidgetRegistry();
+    let tree = registry:.unfold(readGuiFile(gui), gui);
+    registry.check(tree);
 
     let dmut styles = copy StyleManager();
     let dmut loader = SheetLoader(registry);
@@ -58,11 +59,14 @@ fn render(gui: [c8], sheet: [c8])-> [c8]
         styles:.addSheet(s);
     }
 
-    if let Ok(root) = doc.root {
-        return renderNode(registry, styles, root, [], copy Style(), "");
+    for path in registry.getLibrary().getStyles() {
+        let dmut components = SheetLoader(registry);
+        for s in components:.load(path) {
+            styles:.addSheet(s, origin-> SheetOrigin::COMPONENT);
+        }
     }
 
-    ""
+    renderNode(registry, styles, tree, [], copy Style(), "")
 }
 
 /**
@@ -72,12 +76,12 @@ fn render(gui: [c8], sheet: [c8])-> [c8]
  *    - parent: the computed style of the parent
  *    - indent: the indentation of the node
  * */
-fn renderNode(registry: &WidgetRegistry, styles: &StyleManager, node: Node, ancestors: [Element], parent: &Style, indent: [c8])-> [c8] {
+fn renderNode(registry: &WidgetRegistry, styles: &StyleManager, node: WidgetNode, ancestors: [Element], parent: &Style, indent: [c8])-> [c8] {
     let mut result = indent ~ head(node) ~ "\n";
     let inner = indent ~ "    ";
 
     let schema = if let Ok(s) = registry.get(node.typeName) { s } else { return result; };
-    let own = Element(node.typeName, id-> node.id, classes-> node.classes);
+    let own = Element(node.typeName, components-> node.components, id-> node.id, classes-> node.classes);
     let base = styles.compute(copy [own] ~ ancestors, parent, parts-> schema.parts);
     let baseLines = styleLines(styles, schema, base, parent, copy [own] ~ ancestors);
     for l in baseLines {
@@ -85,7 +89,8 @@ fn renderNode(registry: &WidgetRegistry, styles: &StyleManager, node: Node, ance
     }
 
     for state in schema.states {
-        let tested = Element(node.typeName, id-> node.id, classes-> node.classes, states-> copy [state]);
+        let tested = Element(node.typeName, components-> node.components, id-> node.id, classes-> node.classes,
+                             states-> copy [state]);
         let style = styles.compute(copy [tested] ~ ancestors, parent, parts-> schema.parts);
         let changed = without(styleLines(styles, schema, style, parent, copy [tested] ~ ancestors), baseLines);
         if changed.len != 0us {
@@ -96,23 +101,23 @@ fn renderNode(registry: &WidgetRegistry, styles: &StyleManager, node: Node, ance
         }
     }
 
-    for c in node.children {
-        match c {
-            child: Node => {
-                result = result ~ renderNode(registry, styles, child, copy [own] ~ ancestors, base, inner);
-            }
-            _ => {}
-        }
+    for child in node.children {
+        result = result ~ renderNode(registry, styles, child, copy [own] ~ ancestors, base, inner);
     }
 
     result
 }
 
 /**
- * @returns: the head of a node, as written in a .gui file, without its children
+ * @returns: the head of a node, as written in a .gui file, without its children, after the components whose instance it
+ * is between brackets
  * */
-fn head(node: Node)-> [c8] {
+fn head(node: WidgetNode)-> [c8] {
     let mut result = node.typeName;
+    for c in node.components {
+        result = "[" ~ c ~ "] " ~ result;
+    }
+
     if node.id != "" {
         result = result ~ " #" ~ node.id;
     }
@@ -122,7 +127,7 @@ fn head(node: Node)-> [c8] {
     }
 
     if let Ok(v) = node.value {
-        result = result ~ " " ~ v.getSource();
+        result = result ~ " " ~ v.value.getSource();
     }
 
     if node.attributes.len != 0us {

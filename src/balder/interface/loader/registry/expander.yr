@@ -1,0 +1,488 @@
+in expander;
+
+use balder::interface::loader::parser;
+use balder::interface::loader::registry::{binding, definition, error, library, schema, setting, widget_node};
+
+use std::syntax::errors;
+
+/**
+ * What the nodes of a component are expanded in: the file they are written in, the parameters bound by its instance,
+ * and the widgets the instance puts in each of its slots
+ * */
+record Context {
+
+    // The file the nodes are written in
+    pub let file: [c8];
+
+    // The values of the parameters of the component, substituted in the values of its nodes
+    pub let params: &Constants;
+
+    // Where the value of each parameter was given, by its name
+    pub let bindings: [[c8] => Binding];
+
+    // The widgets the instance puts in each slot, by the name of the slot, "" for the unnamed one
+    pub let slots: [[c8] => [WidgetNode]];
+
+    // The components being expanded, the outermost first
+    pub let chain: [[c8]];
+
+    pub self (file: [c8], params: &Constants, bindings: [[c8] => Binding], slots: [[c8] => [WidgetNode]], chain: [[c8]])
+        with file = file
+        , params = params
+        , bindings = bindings
+        , slots = slots
+        , chain = chain
+    {}
+}
+
+/**
+ * Expander of the components of a tree of nodes into a tree of widgets (doc/gui-v2.md, §8)
+ * @info:
+ * =====
+ * A node whose type names a component the file can use is an instance of it, replaced by the root of the component:
+ * - the default value of the instance sets the first parameter, and its attributes named like parameters set them;
+ *   the other parameters take their default, a parameter without one being required. The values are substituted
+ *   where the parameters are written, and checked there against the kind of their attribute when the tree is checked,
+ *   an error being reported where the value was given;
+ * - the other attributes of the instance are given by its parent (`tab: "Form";`);
+ * - the root takes the id of the instance, and its classes after its own; it is selected by the name of the component
+ *   as by its type;
+ * - the children of the instance go to the `@slot` named by their `slot:` attribute, the others to the unnamed one. A
+ *   `@slot` written in the block of an instance passes on the children of the slot of the component around it, to the
+ *   unnamed slot of the instance.
+ *
+ * The root of a component may be of the widget type registered under the name of the component: the component then
+ * gives the inner structure of a widget written in code. Any other use of a component in its own expansion is a cycle,
+ * an error naming the chain of the components.
+ * ====
+ * */
+pub record Expander {
+
+    // The schemas of the widget types, by name
+    let _schemas: [[c8] => &WidgetSchema];
+
+    // The components the files can use
+    let _library: &Library;
+
+    // The number of instances expanded
+    let mut _instances: usize = 0us;
+
+    /**
+     * @params:
+     *    - schemas: the schemas of the widget types, by name
+     *    - library: the components the files can use
+     * */
+    pub self (schemas: [[c8] => &WidgetSchema], library: &Library)
+        with _schemas = schemas
+        , _library = library
+    {}
+
+    /**
+     * Expand a tree of nodes
+     * @params:
+     *    - file: the path of the file the nodes were read from
+     * @returns: the tree of the widgets
+     * @throws: at the first instance refused, or the first node of an unknown type
+     * */
+    pub fn unfold(mut self, root: Node, file: [c8])-> WidgetNode
+        throws LoadError
+    {
+        let ctx = Context(file, copy Constants(), copy [], copy [], []);
+        self:.expandNode(root, ctx, "", 0us)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          NODES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Expand a node, the node of a widget or an instance
+     * @params:
+     *    - rootOf: the component the node is the root of, "" for any other node
+     *    - owner: the number of the instance putting the node in a slot, 0 for none
+     * */
+    fn expandNode(mut self, node: Node, ctx: Context, rootOf: [c8], owner: usize)-> WidgetNode
+        throws LoadError
+    {
+        if node.typeName != rootOf {
+            if let Ok(found) = self._library.find(ctx.file, node.typeName) {
+                return self:.expandInstance(node, found, ctx, owner);
+            }
+        }
+
+        if !self._schemas[node.typeName].hasValue {
+            throw copy LoadError(ctx.file, "unknown widget type '" ~ node.typeName ~ "'", node.line, node.col);
+        }
+
+        let value: (Setting)? = if let Ok(v) = node.value {
+            let s = self.setting("", v, node.typeName, ctx, v.getLine(), v.getColumn());
+            (s)?
+        } else {
+            none
+        };
+
+        let mut attributes: [Setting] = [];
+        for a in node.attributes {
+            attributes ~= [self.setting(a.name, a.value, node.typeName, ctx, a.line, a.col)];
+        }
+
+        let mut children: [WidgetNode] = [];
+        for m in node.children {
+            match m {
+                child: Node => {
+                    children ~= [self:.expandNode(child, ctx, "", 0us)];
+                }
+                mark: SlotMark => {
+                    if let Ok(given) = ctx.slots[mark.name] {
+                        children ~= given;
+                    }
+                }
+            }
+        }
+
+        WidgetNode(typeName-> node.typeName, id-> node.id, classes-> node.classes, value-> value,
+                   attributes-> attributes, children-> children, owner-> owner, file-> ctx.file,
+                   line-> node.line, col-> node.col)
+    }
+
+    /**
+     * Expand an instance of a component into the root of the component
+     * @params:
+     *    - def: the component
+     *    - ctx: the context the instance is written in
+     *    - owner: the number of the instance putting this one in a slot, 0 for none
+     * */
+    fn expandInstance(mut self, node: Node, definition: Definition, ctx: Context, owner: usize)-> WidgetNode
+        throws LoadError
+    {
+        let name = definition.component.name;
+        if Expander::contains(ctx.chain, name) {
+            throw copy LoadError(ctx.file, "component '" ~ name ~ "' used in its own expansion: " ~ Expander::join(ctx.chain ~ [name]),
+                                 node.line, node.col);
+        }
+
+        let dmut values = copy Constants();
+        let mut bindings: [[c8] => mut Binding] = copy [];
+        let mut forParent: [Setting] = [];
+        let params = definition.component.params;
+
+        if let Ok(v) = node.value {
+            if params.len == 0us {
+                throw copy LoadError(ctx.file, "'" ~ name ~ "' takes no default value", v.getLine(), v.getColumn());
+            }
+
+            bindings[params[0].name] = self.bind(alias values, name, params[0].name, v, ctx);
+        }
+
+        for a in node.attributes {
+            if let Ok(p) = Expander::paramOf(params, a.name) {
+                if bindings[p.name].hasValue {
+                    throw copy LoadError(ctx.file, "parameter '$" ~ p.name ~ "' of '" ~ name ~ "' set twice, by the default value and in the block",
+                                         a.line, a.col);
+                }
+
+                bindings[p.name] = self.bind(alias values, name, p.name, a.value, ctx);
+            } else {
+                let s = self.setting(a.name, a.value, name, ctx, a.line, a.col);
+                forParent ~= [Setting(s.name, s.value, s.typeName, s.file, s.line, s.col, forParent-> true, binding-> s.binding)];
+            }
+        }
+
+        for p in params {
+            if !bindings[p.name].hasValue {
+                if let Ok(v) = p.value {
+                    Expander::define(alias values, p.name, v, definition.file);
+                    bindings[p.name] = Binding(name, p.name, definition.file, v.getLine(), v.getColumn());
+                } else {
+                    throw copy LoadError(ctx.file, "'" ~ name ~ "' needs the parameter '$" ~ p.name ~ "'", node.line, node.col);
+                }
+            }
+        }
+
+        self._instances += 1us;
+        let index = self._instances;
+        let slots = self:.fillSlots(node, definition, ctx, index);
+
+        let inner = Context(definition.file, values, bindings, slots, ctx.chain ~ [name]);
+        let root = self:.expandNode(definition.component.root, inner, name, 0us);
+        for s in forParent {
+            for r in root.attributes {
+                if r.name == s.name {
+                    throw copy LoadError(ctx.file, "attribute '" ~ s.name ~ "' of '" ~ name ~ "' set twice, by the instance and by the root of the component",
+                                         s.line, s.col);
+                }
+            }
+        }
+
+        WidgetNode(typeName-> root.typeName,
+                   id-> if node.id != "" { node.id } else { root.id },
+                   classes-> root.classes ~ node.classes,
+                   components-> root.components ~ [name],
+                   value-> root.value,
+                   attributes-> root.attributes ~ forParent,
+                   children-> root.children,
+                   instances-> root.instances ~ [index],
+                   owner-> owner,
+                   file-> ctx.file,
+                   line-> node.line,
+                   col-> node.col)
+    }
+
+    /**
+     * Expand the children of an instance, each one in the slot of the component it names
+     * @params:
+     *    - node: the instance
+     *    - def: the component
+     *    - ctx: the context the instance is written in
+     *    - index: the number of the instance
+     * @returns: the widgets of each slot, by the name of the slot
+     * */
+    fn fillSlots(mut self, node: Node, definition: Definition, ctx: Context, index: usize)-> [[c8] => [WidgetNode]]
+        throws LoadError
+    {
+        let name = definition.component.name;
+        let declared = Expander::slotsOf(definition.component.root);
+        let mut slots: [[c8] => mut [WidgetNode]] = copy [];
+        for m in node.children {
+            match m {
+                child: Node => {
+                    let (slot, rest) = Expander::slotOf(child, ctx.file);
+                    Expander::checkSlot(declared, slot, name, ctx.file, child);
+                    let w = self:.expandNode(rest, ctx, "", index);
+                    slots[slot] = if let Ok(s) = slots[slot] { s ~ [w] } else { copy [w] };
+                }
+                mark: SlotMark => {
+                    if !Expander::contains(declared, "") {
+                        throw copy LoadError(ctx.file, "'" ~ name ~ "' has no unnamed slot to pass the slot on to", mark.line, mark.col);
+                    }
+
+                    if let Ok(given) = ctx.slots[mark.name] {
+                        slots[""] = if let Ok(s) = slots[""] { s ~ given } else { given };
+                    }
+                }
+            }
+        }
+
+        slots
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          VALUES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: an attribute of a node, its parameters substituted
+     * @params:
+     *    - typeName: the type or the component the attribute is written on
+     *    - ctx: the context the attribute is written in
+     *    - line, col: where the attribute is
+     * */
+    fn setting(self, name: [c8], v: &Value, typeName: [c8], ctx: Context, line: usize, col: usize)-> Setting
+        throws LoadError
+    {
+        let value = Expander::resolve(ctx.params, v, ctx.file);
+        let param = Expander::firstParam(v);
+        let binding: (Binding)? = if let Ok(b) = ctx.bindings[param] { (b)? } else { none };
+        Setting(name, value, typeName, ctx.file, line, col, binding-> binding)
+    }
+
+    /**
+     * Set a parameter of an instance to a value
+     * @params:
+     *    - values: the values of the parameters of the instance
+     *    - component: the component of the instance
+     *    - param: the parameter
+     *    - v: the value, as written in the instance
+     *    - ctx: the context the instance is written in
+     * @returns: where the value of the parameter was given, in the instance, or where the parameter of the component
+     * around it that the value uses was
+     * */
+    fn bind(self, dmut values: &Constants, component: [c8], param: [c8], v: &Value, ctx: Context)-> Binding
+        throws LoadError
+    {
+        Expander::define(alias values, param, Expander::resolve(ctx.params, v, ctx.file), ctx.file);
+        if let Ok(b) = ctx.bindings[Expander::firstParam(v)] {
+            return b;
+        }
+
+        Binding(component, param, ctx.file, v.getLine(), v.getColumn())
+    }
+}
+
+/**
+ * The helpers of the expander
+ * */
+mod Expander {
+
+    /**
+     * @returns: the value with the parameters it uses substituted
+     * @params:
+     *    - file: the file the value is written in, for the errors
+     * */
+    pub fn resolve(params: &Constants, v: &Value, file: [c8])-> &Value
+        throws LoadError
+    {
+        {
+            params.resolve(v)
+        } catch {
+            e: &SyntaxError => { throw copy LoadError(file, e.msg, e.line, e.col); }
+        }
+    }
+
+    /**
+     * Define the value of a parameter
+     * @params:
+     *    - file: the file the value is written in, for the errors
+     * */
+    pub fn define(dmut values: &Constants, name: [c8], v: &Value, file: [c8])
+        throws LoadError
+    {
+        {
+            values:.define(name, v);
+        } catch {
+            e: &SyntaxError => { throw copy LoadError(file, e.msg, e.line, e.col); }
+        }
+    }
+
+    /**
+     * @returns: the name of the first parameter a value uses, "" if it uses none
+     * */
+    pub fn firstParam(v: &Value)-> [c8] {
+        match v {
+            c: &Constant => { return c.name; }
+            t: &Tuple => {
+                for item in t.items {
+                    let p = Expander::firstParam(item);
+                    if p != "" { return p; }
+                }
+            }
+            l: &List => {
+                for item in l.items {
+                    let p = Expander::firstParam(item);
+                    if p != "" { return p; }
+                }
+            }
+            a: &Alpha => {
+                let p = Expander::firstParam(a.base);
+                if p != "" { return p; }
+                return Expander::firstParam(a.alpha);
+            }
+            c: &Call => {
+                for arg in c.args {
+                    let p = Expander::firstParam(arg);
+                    if p != "" { return p; }
+                }
+            }
+            _ => {}
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: the parameter named name, none if there is none
+     * */
+    pub fn paramOf(params: [Param], name: [c8])-> (Param)? {
+        for p in params {
+            if p.name == name { return (p)?; }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the names of the slots of a node and of its descendants, "" for the unnamed one
+     * */
+    pub fn slotsOf(node: Node)-> [[c8]] {
+        let mut result: [[c8]] = [];
+        for m in node.children {
+            match m {
+                child: Node    => { result ~= Expander::slotsOf(child); }
+                mark: SlotMark => { result ~= [mark.name]; }
+            }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the slot a child of an instance names with `slot: name;`, "" for the unnamed one, and the child without
+     * that attribute
+     * @params:
+     *    - file: the file the child is written in, for the errors
+     * */
+    pub fn slotOf(child: Node, file: [c8])-> ([c8], Node)
+        throws LoadError
+    {
+        let mut slot = "";
+        let mut rest: [Declaration] = [];
+        for a in child.attributes {
+            if a.name == "slot" {
+                slot = {
+                    a.value.toName()
+                } catch {
+                    e: &SyntaxError => { throw copy LoadError(file, "attribute 'slot' of '" ~ child.typeName ~ "': " ~ e.msg, e.line, e.col); }
+                };
+            } else {
+                rest ~= [a];
+            }
+        }
+
+        (slot, Node(child.typeName, child.id, child.classes, child.value, rest, child.children, child.loc))
+    }
+
+    /**
+     * Check that a component has the slot a child of its instance names
+     * @params:
+     *    - declared: the slots of the component
+     *    - slot: the slot the child names, "" for the unnamed one
+     *    - component: the name of the component
+     *    - file: the file the child is written in
+     * */
+    pub fn checkSlot(declared: [[c8]], slot: [c8], component: [c8], file: [c8], child: Node)
+        throws LoadError
+    {
+        if Expander::contains(declared, slot) { return; }
+
+        let reason = if declared.len == 0us {
+            "'" ~ component ~ "' takes no children"
+        } else if slot == "" {
+            "'" ~ component ~ "' has no unnamed slot, a child names one of its slots with 'slot:'"
+        } else {
+            "'" ~ component ~ "' has no slot '" ~ slot ~ "'"
+        };
+
+        throw copy LoadError(file, reason, child.line, child.col);
+    }
+
+    /**
+     * @returns: true iif name is one of the names
+     * */
+    pub fn contains(names: [[c8]], name: [c8])-> bool {
+        for n in names {
+            if n == name { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the names of a chain of components, separated by arrows
+     * */
+    pub fn join(chain: [[c8]])-> [c8] {
+        let mut result = "";
+        for i, n in chain {
+            result = if i == 0us { n } else { result ~ " -> " ~ n };
+        }
+
+        result
+    }
+}
