@@ -1,0 +1,186 @@
+in persistent_pool;
+
+use balder::core::error;
+use balder::core::driver::device;
+use balder::core::shader::texture;
+use balder::utils::log;
+
+use ::vulkan::core;
+
+/**
+ * The persistent images of a render graph: one image each, the same for every frame slot, kept while a pass of the
+ * frames uses it with the same description
+ * @info: a new image is transitioned by the transfers of the next frame into the layout the frames leave it in, the
+ * layout its first use in a frame starts from; its content is undefined until a pass writes it
+ * */
+@final
+pub class PersistentPool {
+
+    // The device the images are allocated on
+    let dmut _device: &VulkanDevice;
+
+    // The textures of the images, by name
+    let dmut _textures: [[c8] => &OutputTexture] = copy [];
+
+    // The description each texture was created with
+    let dmut _descs: [[c8] => ImageDesc] = copy [];
+
+    pub self (dmut device: &VulkanDevice)
+        with _device = alias device
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the texture of the persistent image 'name', none if no pass of the schedule realized last uses it
+     * */
+    pub fn getTexture(mut self, name: [c8])-> dmut (&OutputTexture)? {
+        if let Ok(dmut t) = alias self._textures[name] {
+            return (alias t)?;
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          ALLOCATION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Allocate the persistent images a schedule uses, keeping those whose description did not change, the images it no
+     * longer uses retired
+     * @params:
+     *    - schedule: the compiled render graph
+     *    - graph: the render graph, declaring the images
+     * @returns: the names of the images whose texture changed
+     * */
+    pub fn realize(mut self, schedule: RenderSchedule, graph: &RenderGraph)-> [[c8]]
+        throws BalderError
+    {
+        let mut changed: [[c8]] = [];
+        let dmut textures: [[c8] => &OutputTexture] = copy [];
+        let dmut descs: [[c8] => ImageDesc] = copy [];
+
+        for l in schedule.lifetimes {
+            let r = if let Ok(r) = graph.getResource(l.name) { r } else { continue; };
+            if !r.persistent { continue; }
+
+            if let Ok(dmut old) = alias self._textures[r.name] {
+                if let Ok(d) = self._descs[r.name] {
+                    if sameDesc(d, r.desc) {
+                        textures[r.name] = alias old;
+                        descs[r.name] = d;
+                        continue;
+                    }
+                }
+            }
+
+            let dmut tex = copy OutputTexture::shared(alias self._device,
+                                                      r.desc.format,
+                                                      r.desc.width,
+                                                      r.desc.height,
+                                                      forStorage-> r.desc.storage,
+                                                      depth-> r.desc.depth);
+            self:.initialize(alias tex, r.desc.depth, l.layout);
+
+            log::debug #("PersistentPool", "Allocate the persistent image", r.name);
+            textures[r.name] = alias tex;
+            descs[r.name] = r.desc;
+            changed = changed ~ [r.name];
+        }
+
+        self:.retireReplaced(textures);
+        self._textures = alias textures;
+        self._descs = alias descs;
+
+        changed
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Dispose every image
+     * @assume: nothing uses them anymore (the device is idle)
+     * */
+    pub fn dispose(mut self) {
+        for _, dmut t in alias self._textures {
+            t:.dispose();
+        }
+
+        self._textures = copy [];
+        self._descs = copy [];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Transition a new image into the layout the frames leave it in, by the transfers of the next frame, which the
+     * subpasses of the frame wait for
+     * */
+    fn initialize(mut self, dmut tex: &OutputTexture, depth: bool, layout: VkImageLayout) {
+        let dmut img = alias tex:.getImages()[0];
+        let aspect = if depth { VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT } else { VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT };
+
+        self._device
+            :.getTransferPass()
+            :.add(callback-> copy |cmd| {
+                      let mut barrier = VkImageMemoryBarrier();
+                      barrier.sType = VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                      barrier.oldLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED;
+                      barrier.newLayout = layout;
+                      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                      barrier.image = alias img:.getVulkanImage();
+                      barrier.subresourceRange.aspectMask = aspect;
+                      barrier.subresourceRange.levelCount = 1;
+                      barrier.subresourceRange.layerCount = 1;
+
+                      vkCmdPipelineBarrier(cmd,
+                                           VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                           VkPipelineStageFlagBits::VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                           0, 0, null, 0, null, 1, &barrier);
+                  });
+    }
+
+    /**
+     * Retire the textures that are not kept, the recordings in flight still reading them
+     * */
+    fn retireReplaced(mut self, kept: [[c8] => &OutputTexture]) {
+        for n, dmut t in alias self._textures {
+            if let Ok(k) = kept[n] {
+                if k is t { continue; }
+            }
+
+            self._device:.retire(&t:.dispose);
+        }
+    }
+}
+
+/**
+ * @returns: true iif two descriptions describe the same image
+ * */
+fn sameDesc(a: ImageDesc, b: ImageDesc)-> bool {
+    a.format == b.format && a.width == b.width && a.height == b.height && a.depth == b.depth && a.storage == b.storage
+}

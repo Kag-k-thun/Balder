@@ -67,6 +67,8 @@ record ResourceState {
  * earlier when nothing orders them
  * @info: a disabled pass is not recorded, and its uses do not exist; an optional use of a resource no pass wrote before
  * it in the frame, or of a resource not declared, is dropped
+ * @info: a persistent image starts a frame as the frame before it left it, its first use waiting for its last use in
+ * the frame before by a barrier, so the passes using it are recorded in one subpass, submitted in one queue
  * */
 @final
 pub class RenderGraph {
@@ -192,12 +194,18 @@ pub class RenderGraph {
     }
 
     /**
-     * Declare an image the graph owns, its content lasting one frame
+     * Declare an image the graph owns, its content lasting one frame, or kept from a frame to the next when its
+     * description is persistent
      * */
     pub fn createImage(mut self, name: [c8], desc: ImageDesc)
         throws BalderError
     {
-        self:.declare(GraphResource(name-> name, image-> true, depth-> desc.depth, transient-> true, desc-> desc));
+        self:.declare(GraphResource(name-> name,
+                                    image-> true,
+                                    depth-> desc.depth,
+                                    transient-> !desc.persistent,
+                                    persistent-> desc.persistent,
+                                    desc-> desc));
     }
 
     /**
@@ -365,12 +373,15 @@ pub class RenderGraph {
      *    - if a pass uses a resource that is not declared, or uses it in a way its kind or the resource cannot
      *    - if a pass reads a transient image no pass wrote before it, and the use is not optional
      *    - if two subpasses depend on each other
+     *    - if passes of two subpasses use a persistent image
      *    - if the pass of the screen is not declared
      * */
     pub fn compile(self)-> RenderSchedule
         throws BalderError
     {
         let passes = self.activePasses();
+        self.checkPersistent(passes);
+
         let deps = self.dependencies(passes);
         let (order, submissions) = self.orderSubmissions(passes, deps);
         let edges = self.edges(passes, deps, order, submissions);
@@ -437,6 +448,31 @@ pub class RenderGraph {
         }
 
         result
+    }
+
+    /**
+     * Check that the passes using each persistent image are recorded in one subpass, the barrier of its first use in a
+     * frame waiting for its last use in the frame before, which the frames submit in the same queue
+     * @throws: if passes of two subpasses use a persistent image
+     * */
+    fn checkPersistent(self, passes: [GraphPass])
+        throws BalderError
+    {
+        let dmut owners: [[c8] => [c8]] = copy [];
+        for p in passes {
+            for res in utils::resourcesOf(p) {
+                let persistent = if let Ok(r) = self._resources[res] { r.persistent } else { false };
+                if !persistent { continue; }
+
+                if let Ok(owner) = owners[res] {
+                    if owner != p.submission {
+                        throw copy BalderError("The persistent image " ~ res ~ " is used by the subpasses " ~ owner ~ " and " ~ p.submission);
+                    }
+                } else {
+                    owners[res] = copy p.submission;
+                }
+            }
+        }
     }
 
     /**
@@ -671,6 +707,25 @@ pub class RenderGraph {
             }
         }
 
+        // a persistent image starts the frame written and read as the frame before it left it
+        let dmut ends: [[c8] => ResourceState] = copy [];
+        for i in recorded {
+            for res in utils::resourcesOf(passes[i]) {
+                if let Ok(r) = self._resources[res] {
+                    if !r.persistent { continue; }
+
+                    let before = if let Ok(st) = ends[res] { st } else if let Ok(st) = states[res] { st } else { ResourceState() };
+                    ends[res] = advance(before, r, utils::accessOf(passes[i], res), owner[i]);
+                }
+            }
+        }
+
+        for res, end in ends {
+            let dmut state = end;
+            state.used = false;
+            states[res] = state;
+        }
+
         let dmut firsts: [[c8] => usize] = copy [];
         let dmut lasts: [[c8] => usize] = copy [];
         let mut names: [[c8]] = [];
@@ -691,29 +746,13 @@ pub class RenderGraph {
 
                 let decl = if let Ok(r) = self._resources[res] { r } else { GraphResource(name-> res) };
                 let acc = utils::accessOf(p, res);
-                let dmut state = if let Ok(st) = states[res] { st } else { ResourceState() };
+                let state = if let Ok(st) = states[res] { st } else { ResourceState() };
 
                 if let Ok(b) = self.barrierOf(decl, acc, state, s) {
                     barriers = barriers ~ [b];
                 }
 
-                if decl.image {
-                    state.layout = if decl.depth { acc.depthLayout } else { acc.colorLayout };
-                }
-
-                state.used = true;
-                if acc.writes {
-                    state.writer = s;
-                    state.writeStage = acc.stage;
-                    state.writeAccess = acc.access;
-                    state.readers = [];
-                    state.readStages = [];
-                } else {
-                    state.readers = state.readers ~ [s];
-                    state.readStages = state.readStages ~ [acc.stage];
-                }
-
-                states[res] = state;
+                states[res] = advance(state, decl, acc, s);
             }
 
             let added = scheduled[s] ~ [ScheduledPass(name-> p.name, kind-> p.kind, barriers-> barriers, recording-> p.recording)];
@@ -736,7 +775,8 @@ pub class RenderGraph {
         for n in names {
             let first = if let Ok(f) = firsts[n] { f } else { 0us };
             let last = if let Ok(l) = lasts[n] { l } else { 0us };
-            lifetimes = lifetimes ~ [ResourceLifetime(name-> n, first-> first, last-> last)];
+            let layout = if let Ok(st) = states[n] { st.layout } else { VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED };
+            lifetimes = lifetimes ~ [ResourceLifetime(name-> n, first-> first, last-> last, layout-> layout)];
         }
 
         RenderSchedule(submissions-> submissions, edges-> edges, lifetimes-> lifetimes)
@@ -821,4 +861,33 @@ pub class RenderGraph {
         self._resources[res.name] = res;
     }
 
+}
+
+/**
+ * @returns: the state of a resource after a pass used it
+ * @params:
+ *    - state: the state before the pass
+ *    - res: the resource
+ *    - acc: the use, all the uses of the pass merged
+ *    - submission: the subpass of the pass
+ * */
+fn advance(state: ResourceState, res: GraphResource, acc: UsageAccess, submission: usize)-> ResourceState {
+    let dmut result = state;
+    if res.image {
+        result.layout = if res.depth { acc.depthLayout } else { acc.colorLayout };
+    }
+
+    result.used = true;
+    if acc.writes {
+        result.writer = submission;
+        result.writeStage = acc.stage;
+        result.writeAccess = acc.access;
+        result.readers = [];
+        result.readStages = [];
+    } else {
+        result.readers = result.readers ~ [submission];
+        result.readStages = result.readStages ~ [acc.stage];
+    }
+
+    result
 }
