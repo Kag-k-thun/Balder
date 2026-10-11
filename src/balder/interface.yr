@@ -17,7 +17,7 @@ use balder::interface::_;
 use balder::interface::loader::registry;
 use balder::interface::loader::registry::behavior;
 use balder::interface::style::conditions;
-use balder::interface::widget::layout;
+use balder::interface::widget::{focus, layout};
 use balder::math::vector;
 use balder::scene::utils::post::registry;
 
@@ -25,7 +25,7 @@ use std::math;
 use std::fs::path;
 use std::time::dur;
 
-use ::sdl3::mouse;
+use ::sdl3::{keycode, mouse};
 
 
 // The passes of a layout at most, a pass laying the widgets out again when the space available to a widget changed the
@@ -96,6 +96,9 @@ pub class WidgetManager {
         // The widget receiving text inputs
         let dmut _focus : (&Widget)? = none;
 
+        // The widget the Tab key moves the focus on from when no widget has it, the last one focused or clicked
+        let dmut _anchor : (&Widget)? = none;
+
         // The widget being clicked
         let dmut _clickedW : [(&Widget)? ; 3] = [none ; 3];
 
@@ -131,6 +134,7 @@ pub class WidgetManager {
         input:.mouseMotion ():.connect (alias self._box, &self:.onMouseMotion);
         input:.mouseWheel ():.connect (alias self._box, &self:.onMouseWheel);
         input:.mouseFocus ():.connect (alias self._box, &self:.onMouseFocus);
+        input:.keyPressed ():.connect (alias self._box, &self:.onKeyPressed);
         input:.windowResized ():.connect (alias self._box, &self:.onWindowResize);
         input:.windowScaleChanged ():.connect (alias self._box, &self:.onWindowScaleChange);
 
@@ -613,6 +617,7 @@ pub class WidgetManager {
             input:.mouseMotion ():.disconnect (&self:.onMouseMotion);
             input:.mouseWheel ():.disconnect (&self:.onMouseWheel);
             input:.mouseFocus ():.disconnect (&self:.onMouseFocus);
+            input:.keyPressed ():.disconnect (&self:.onKeyPressed);
             input:.windowResized ():.disconnect (&self:.onWindowResize);
             input:.windowScaleChanged ():.disconnect (&self:.onWindowScaleChange);
 
@@ -846,6 +851,7 @@ pub class WidgetManager {
                 if relPos.x >= 0.0f && relPos.x <= 1.0f && relPos.y >= 0.0f && relPos.y <= 1.0f {
                     if let Ok (dmut f) = alias w:.onClick (relPos, SDL_BUTTON_LEFT) {
                         self._clickedW [0] = (alias f)?;
+                        self._anchor = (alias f)?;
                         if f.isFocusableLeftClick () {
                             self:.setFocus ((alias f)?);
                         } else {
@@ -915,6 +921,7 @@ pub class WidgetManager {
                 if relPos.x >= 0.0f && relPos.x <= 1.0f && relPos.y >= 0.0f && relPos.y <= 1.0f {
                     if let Ok (dmut f) = alias w:.onClick (relPos, SDL_BUTTON_RIGHT) {
                         self._clickedW [1] = (alias f)?;
+                        self._anchor = (alias f)?;
                         if f.isFocusableRightClick () {
                             self:.setFocus ((alias f)?);
                         } else {
@@ -967,6 +974,7 @@ pub class WidgetManager {
                 if relPos.x >= 0.0f && relPos.x <= 1.0f && relPos.y >= 0.0f && relPos.y <= 1.0f {
                     if let Ok (dmut f) = alias w:.onClick (relPos, SDL_BUTTON_MIDDLE) {
                         self._clickedW [2] = (alias f)?;
+                        self._anchor = (alias f)?;
 
                         if f.isFocusableMiddleClick () {
                             self:.setFocus ((alias f)?);
@@ -1020,9 +1028,109 @@ pub class WidgetManager {
             new:.setFocus (true);
             new:.emitFocused ();
             new:.onGainFocus ();
+            self._anchor = (alias new)?;
         }
 
         self._focus = alias w;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          KEYBOARD SLOTS          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Slot activated when a key is pressed or repeated: the widget having the focus uses it first, then Tab and Shift-Tab
+     * move the focus
+     * */
+    fn onKeyPressed (mut self, key : SDL_Keycode, mods : SDL_Keymod) {
+        if let Ok (dmut f) = alias self._focus && f.isAttached () {
+            if f:.onKeyPressed (key, mods) { return; }
+        }
+
+        if key == SDLK_TAB && (mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI)) == 0u16 {
+            self:.moveFocus (backward-> (mods & SDL_KMOD_SHIFT) != 0u16);
+        }
+    }
+
+    /**
+     * Move the focus to the next widget in the order of the Tab key, after the widget having the focus, or the last one
+     * focused or clicked, among the widgets of the menu opened last when one is open
+     * @params:
+     *    - backward: true to move it to the previous widget
+     * */
+    pub fn moveFocus (mut self, backward : bool) {
+        let dmut scope = if let Ok (dmut s) = alias self:.getFocusScope () { alias s } else { return; };
+
+        let anchor = self.getFocusAnchor ();
+        let dmut widgets = self:.getFocusCandidates (alias scope, anchor);
+
+        let mut indices : [i32] = [];
+        let mut current : (usize)? = none;
+        for i, w in widgets {
+            if let Ok (a) = anchor && a is w { current = (i)?; }
+            indices ~= [if w.isTabStop () { w.getTabIndex () } else { -1 }];
+        }
+
+        if let Ok (next) = nextTabStop (indices, current, backward-> backward) {
+            self:.setFocus ((alias widgets [next])?);
+        }
+    }
+
+    /**
+     * @returns: the widget the Tab key moves the focus on from: the one having the focus, or the last one focused or
+     * clicked, none when it is no longer attached
+     * */
+    fn getFocusAnchor (self)-> (&Widget)? {
+        if let Ok (f) = self._focus && f.isAttached () { return (f)?; }
+        if let Ok (a) = self._anchor && a.isAttached () { return (a)?; }
+
+        none
+    }
+
+    /**
+     * @returns: the widget the Tab key moves the focus within: the menu opened last, the root widget when no menu is open
+     * */
+    fn getFocusScope (mut self)-> dmut (&Widget)? {
+        if let Ok (dmut root) = alias self._content {
+            if let Ok (dmut l) = alias WidgetManager::findTrappingLayout (alias root) {
+                if let Ok (dmut trap) = alias l:.getFocusTrap () {
+                    return (alias trap)?;
+                }
+            }
+
+            return (alias root)?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the widgets drawn among a widget and its descendants that the Tab key focuses, and the anchor it moves
+     * the focus on from, in the order of the tree
+     * @params:
+     *    - w: the widget
+     *    - anchor: the widget the Tab key moves the focus on from
+     * */
+    fn getFocusCandidates (mut self, dmut w : &Widget, anchor : (&Widget)?)-> dmut [&Widget] {
+        let dmut res : [&Widget] = [];
+        if !w.isDrawn () { return alias res; }
+
+        let isAnchor = if let Ok (a) = anchor { a is w } else { false };
+        if isAnchor || w.isTabStop () {
+            res ~= [alias w];
+        }
+
+        if let dmut l : &Layout = alias w {
+            for dmut c in alias l:.getChildren () {
+                res ~= self:.getFocusCandidates (alias c, anchor);
+            }
+        }
+
+        alias res
     }
 
 }
@@ -1031,6 +1139,32 @@ pub class WidgetManager {
  * The helpers of the manager
  * */
 pub mod WidgetManager {
+
+    /**
+     * @returns: the layout drawn among a widget and its descendants that keeps the focus in one of its children (a menu
+     * layout with a menu open), the innermost one when that child holds another, none when no layout does
+     * */
+    pub fn findTrappingLayout (dmut w : &Widget)-> dmut (&Layout)? {
+        if !w.isDrawn () { return none; }
+
+        if let dmut l : &Layout = alias w {
+            if let Ok (dmut trap) = alias l:.getFocusTrap () {
+                if let Ok (dmut inner) = alias WidgetManager::findTrappingLayout (alias trap) {
+                    return (alias inner)?;
+                }
+
+                return (alias l)?;
+            }
+
+            for dmut c in alias l:.getChildren () {
+                if let Ok (dmut t) = alias WidgetManager::findTrappingLayout (alias c) {
+                    return (alias t)?;
+                }
+            }
+        }
+
+        none
+    }
 
     /**
      * @returns: a text as a string of the .gui files, between double quotes, its quotes, backslashes, line breaks and
