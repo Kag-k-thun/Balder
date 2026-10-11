@@ -237,6 +237,8 @@ SpinBox #COUNT 3 { min: 1; max: 12; decimals: 0; on-change: count; }
 ProgressBar #LEVEL 0.25 { max: 1; }
 Dropdown #THEME "Dark", "Light" { selected: 0; on-change: theme; }      // fn theme (mut self, index: usize)
 ListView #FILES { multiple: true; on-select: picked; on-activate: open; }  // fn picked (mut self, rows: [usize])
+TreeView #FOLDERS { on-select: browsed; on-activate: reached; }         // fn browsed (mut self, nodes: [[usize]])
+TableView #SONGS { multiple: true; on-select: listed; on-activate: play; }  // fn play (mut self, row: usize)
 Separator;
 Image "res:/images/logo.png";
 ```
@@ -274,8 +276,36 @@ Image "res:/images/logo.png";
   alone. With `multiple: true`, Ctrl (or Command) toggles the row clicked, Shift selects the rows from the one clicked
   last without Shift, and Ctrl-Shift adds them. `on-select` gives the selected rows in increasing order when the user
   changes them; `setSelected`, `clearSelection` and a model that changes do not emit it. `on-activate` gives the current
-  row when Enter is pressed on it (`fn open (mut self, row: usize)`). A list fits in any height, its min-content being
-  0, as a linear layout that scrolls: a list in a layout that shrinks its children needs a `min-height`.
+  row when Enter is pressed on it, or the row double clicked (`fn open (mut self, row: usize)`). A list fits in any
+  height, its min-content being 0, as a linear layout that scrolls: a list in a layout that shrinks its children needs a
+  `min-height`.
+- **A tree view shows the nodes of a model as rows**, a node expanded showing its children under it. A node is named by
+  its path, the index of each of its ancestors among the children of the one before then its own, `[]` being the root,
+  never shown, whose children are the first level. `setModel` takes a class over `TreeModel`, whose `len (node)` (the
+  number of children) and `text (node)` the tree reads on demand, for the root and the nodes expanded and for the rows
+  shown only (`TextTreeModel` holds `TreeItem`s, a text and its children). Every node starts collapsed; `expandNode`
+  expands a node and its ancestors, `collapseNode` collapses it, forgetting the nodes expanded under it. The rows,
+  recycled as in a list view, are its `::row` in the same states, a node having children being preceded by its
+  `::marker`, ▸ collapsed and ▾ in the state `:expanded`, in the states of its row as well. A level indents the rows by
+  the width of the margin box of the marker, set by its style, so that the leaves line up with the text of their
+  siblings having children. A click on the marker, or a double click on the row, expands or collapses the node; the
+  rows are selected as in a list view, the rows under a node collapsed being unselected. `on-select` gives the paths of
+  the selected nodes in the order of the rows, `on-activate` the path of the current node when Enter is pressed on it,
+  or of a leaf double clicked (`fn reached (mut self, node: [usize])`).
+- **A table view shows the rows of a model in columns**, under their headers. `setModel` takes a class over
+  `TableModel`, whose `len`, `columns`, `header (column)` and `text (row, column)` the table reads on demand, for the
+  rows shown only (`TextTableModel` holds the headers and the texts of the cells). The headers are its `::header`, in
+  the states `:hover` and `:ascending` or `:descending` for the column the rows are sorted by, whose header is followed
+  by ▲ or ▼. The rows are its `::row`, in the states of a list view, and their cells its `::cell`, in the states of
+  their row. A click on a header sorts the rows by its column, in increasing order then, on a second click, in
+  decreasing order, the selection moving with its rows; `sortBy` and `clearSort` do it by code. The rows equal keep
+  their order, and the cells are compared by `compare (a, b, column)`, their texts as people read them unless the model
+  knows better: case left aside and the numbers by their value, "Row 9" before "Row 10". The columns share the width of
+  the table until a column is resized by dragging the right edge of its header (the cursor showing it) or
+  `setColumnWidths` sets them, their widths being kept from then on. Rows wider than the table scroll horizontally with
+  Shift and the wheel, or a second `::scrollbar` in the bottom padding, as thick as its `height`. `on-select` gives the
+  selected rows of the model in increasing order, whatever their order in the table, and `on-activate` the row of the
+  model Enter is pressed on, or the row double clicked.
 - **A separator is a rule** a pixel thick across its `direction`, a row (horizontal) by default, drawn with its
   background colour. An auto size stretches it along the layout it is in.
 - **An image shows a picture** as the background image of its inline style, so that `image-fill`, `image-keep-ratio`
@@ -295,8 +325,8 @@ LinearLayout #FORM {
 
 - **Tab moves the focus** to the next widget taking it from the keyboard, Shift-Tab to the previous one, wrapping
   around: the input texts and the spin boxes, the push buttons, menu buttons, check boxes, radio buttons and dropdowns,
-  the sliders, the list views and the tab layouts, whose headers come before the content of their selected tab. The widgets not drawn
-  (`display: none`, the content of a tab not selected) are left out. Without a focused widget, Tab moves on from the
+  the sliders, the list, tree and table views, and the tab layouts, whose headers come before the content of their
+  selected tab. The widgets not drawn (`display: none`, the content of a tab not selected) are left out. Without a focused widget, Tab moves on from the
   widget clicked or focused last.
 - **`tab-index` changes the order**, an attribute of every widget: the widgets of a positive index come first, by
   increasing index, then those of the index 0, the default one, in the order of the tree. Tab never focuses a widget of
@@ -310,6 +340,8 @@ LinearLayout #FORM {
   | `MenuButton` | Enter and Space open its menu, the focus moving to the first widget of the menu |
   | `Dropdown` | Up and Down select the item before or after the selected one, emitting `on-change`; Enter and Space open the list, which takes the focus: Up, Down, Home and End move the item under the keyboard, Enter and Space select it |
   | `ListView` | Up and Down move the current row by a row, Page Up and Page Down by the rows shown, Home and End to the first and the last row, selecting it alone; in a multiple list Shift selects the rows from the one clicked last instead, and Ctrl moves without selecting; Space selects the current row, Ctrl-Space toggles it, Ctrl-A selects every row of a multiple list. The current row is scrolled to, and `on-select` is emitted when the selection changes; Enter emits `on-activate` with the current row |
+  | `TreeView` | the keys of a list view; Right expands the current node, or moves to its first child when it is expanded, and Left collapses it, or moves to its parent when it is collapsed |
+  | `TableView` | the keys of a list view, over the rows in the order they are shown |
   | `Slider` | the arrows move the value by a step, up for Up and Right; Page Up and Page Down by ten steps; Home and End to `min` and `max` |
   | `SpinBox` | Up and Down move the value by a step, Page Up and Page Down by ten steps, from the number typed; Left and Right move the caret |
   | `TabLayout` | Left and Right select the tab before or after the selected one, wrapping around; Home and End the first and the last one |
@@ -763,6 +795,28 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** `tab` (states `hover`, `selected`)
+- **Properties:** none
+
+### `TableView`
+
+- **Attributes:** `tab-index`: an integer; `multiple`: true or false
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([usize]), `on-activate` (usize)
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `header` (states `hover`, `ascending`, `descending`), `row` (states `hover`, `selected`, `current`), `cell` (states `hover`, `selected`, `current`), `scrollbar` (states `hover`, `pressed`)
+- **Properties:** none
+
+### `TreeView`
+
+- **Attributes:** `tab-index`: an integer; `multiple`: true or false
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([[usize]]), `on-activate` ([usize])
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `row` (states `hover`, `selected`, `current`), `marker` (states `hover`, `selected`, `current`, `expanded`), `scrollbar` (states `hover`, `pressed`)
 - **Properties:** none
 
 ## Style properties

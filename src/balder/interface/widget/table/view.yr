@@ -1,0 +1,954 @@
+in view;
+
+use balder::core::dispose;
+use balder::core::application::signal;
+use balder::interface::style;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::list::rows_view;
+use balder::interface::widget::table::{columns, model, order};
+use balder::interface::widget::text::label;
+use balder::math::vector;
+
+use std::algorithm::sorting;
+
+use ::sdl3::mouse;
+
+use ::std::algorithm::comparison;
+
+// The text the height of the headers and of the rows is measured with, a single line of their font
+def PROBE_TEXT = "Mg";
+
+// The text following the header of the column the rows are sorted by, in increasing and in decreasing order
+def ASCENDING_MARKER = " ▲";
+def DESCENDING_MARKER = " ▼";
+
+// The distance from the right edge of a header the cursor grabs it at to resize its column, in pixels
+def GRIP = 4.0f;
+
+/**
+ * A cell of a table view: a label on a single line drawing the background and the border of the part ::cell
+ * */
+class TableCell over Label {
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "")
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("cell");
+        self:.forceNoWrap(true);
+    }
+}
+
+/**
+ * A header of a table view: a label on a single line drawing the background and the border of the part ::header
+ * */
+class TableHeader over Label {
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "")
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("header");
+        self:.forceNoWrap(true);
+    }
+}
+
+/**
+ * A row of a table view: the background and the border of the part ::row, its cells side by side in its content box,
+ * each as wide as its column and cut to it
+ * */
+class TableRow over Widget {
+
+    // The cells, one per column
+    let dmut _cells: [&TableCell] = [];
+
+    // The width of each column, in pixels
+    let mut _widths: [f32] = [];
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "", "TableRow")
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("row");
+    }
+
+    /**
+     * Show the cells of a row, the cells missing being created and those past the columns disposed
+     * @params:
+     *    - texts: the text of each cell
+     *    - widths: the width of each column, in pixels
+     * */
+    pub fn setCells(mut self, texts: [[c8]], widths: [f32]) {
+        while self._cells.len < texts.len {
+            let dmut cell = copy TableCell(alias self._manager);
+            if self._attached { cell:.onAttach((self)?); }
+            if !self.isDrawn() { cell:.hide(); }
+            self._cells ~= [alias cell];
+        }
+
+        while self._cells.len > texts.len {
+            self._cells[self._cells.len - 1us]:.dispose();
+            self._cells = alias self._cells[0us .. self._cells.len - 1us];
+        }
+
+        for i, t in texts {
+            self._cells[i]:.setText(t);
+        }
+
+        self._widths = widths;
+        self:.placeCells();
+    }
+
+    /**
+     * Give the cells the style of the part ::cell in the states of the row
+     * */
+    pub fn setCellStyle(mut self, style: &Style) {
+        for dmut c in alias self._cells {
+            c:.setStyle(style);
+        }
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        let mut depth = self._depth;
+        for c in self._cells {
+            depth = max(depth, c.getMaxDepth());
+        }
+
+        depth
+    }
+
+    /**
+     * The content of a row is as high as its highest cell
+     * */
+    prot over measureContentHeights(mut self, _: f32)-> (f32, f32) {
+        let mut height = 0.0f;
+        for i, dmut c in alias self._cells {
+            let w = if i < self._widths.len { self._widths[i] } else { 0.0f };
+            height = max(height, c:.measureIntrinsicHeights(w)._1);
+        }
+
+        (height, height)
+    }
+
+    over onUpdateSize(mut self) {
+        self:.placeCells();
+    }
+
+    over onUpdateScissors(mut self) {
+        self:.placeCells();
+    }
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        for dmut c in alias self._cells {
+            c:.onAttach((self)?);
+        }
+    }
+
+    over onHide(mut self) {
+        for dmut c in alias self._cells {
+            c:.hide();
+        }
+    }
+
+    over onShow(mut self) {
+        for dmut c in alias self._cells {
+            c:.show();
+        }
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            for dmut c in alias self._cells {
+                c:.dispose();
+            }
+
+            self._cells = [];
+            self.__super__:.dispose();
+        }
+    }
+
+    /**
+     * Place the cells side by side from the left of the content box, each as wide as its column and cut to it
+     * */
+    fn placeCells(mut self) {
+        if !self._attached { return; }
+
+        let mut x = self._absolutePosition.x;
+        for i in 0us .. self._cells.len {
+            let w = if i < self._widths.len { self._widths[i] } else { 0.0f };
+            let pos = makeVec2(x, self._absolutePosition.y);
+            let size = makeVec2(w, self._absoluteSize.y);
+            let (sciPos, sciSize) = self.getScissors(pos, size);
+
+            let dmut c = alias self._cells[i];
+            c:.setSize(pos, size, self._depth, self._absoluteSize);
+            c:.setScissors(sciPos, sciSize);
+            x += w;
+        }
+    }
+}
+
+/**
+ * A table of rows read on demand from a model, in columns under their headers, sorted by a column, a single row, or
+ * several, being selected by the user
+ * @info:
+ * =====
+ * The rows and the columns are given by the code, through a `TableModel` the view reads on demand: it asks the headers of
+ * the columns, and the text of the cells of the rows it shows only. Only the rows shown exist, recycled as the table
+ * scrolls, so that a million rows cost no more than the dozen shown.
+ *
+ * The headers are the part `::header`, on top of the table, in the states `:hover` under the cursor, and `:ascending` or
+ * `:descending` for the column the rows are sorted by, its header followed by ▲ or ▼. The rows are the part `::row`, in
+ * the states `:hover`, `:selected` and `:current` of a list view, their cells the part `::cell` in the states of their
+ * row, all of the height of a single line of their style. The columns share the width of the table until one is
+ * resized, then keep their widths, the rows scrolling horizontally when they are wider than the table.
+ *
+ * A click on a header sorts the rows by its column, in increasing order, a second click in decreasing order; the rows
+ * keep their selection as they move. Dragging the right edge of a header resizes its column. The rows are selected as in
+ * a list view, by the clicks and the keys. `on-select` gives the selected rows of the model, in increasing order, when
+ * the user changes them, and `on-activate` gives the row of the model Enter is pressed on, or the row double clicked.
+ * ====
+ * */
+pub class TableView over RowsView {
+
+    // The model whose rows the table shows, none for an empty table
+    let dmut _model: (&TableModel)? = none;
+
+    // The widths of the columns
+    let dmut _columns: &TableColumns = copy TableColumns();
+
+    prot { // the order of the rows
+
+        // The row of the model each row of the table shows, empty while the rows are in the order of the model
+        let mut _order: [usize] = [];
+
+        // The row of the table showing each row of the model, empty while the rows are in the order of the model
+        let mut _places: [usize] = [];
+
+        // The column the rows are sorted by, none while they are in the order of the model
+        let mut _sortColumn: (usize)? = none;
+
+        // True iif the rows are sorted in decreasing order
+        let mut _descending: bool = false;
+    }
+
+    prot { // the headers
+
+        // The headers, one per column
+        let dmut _headers: [&TableHeader] = [];
+
+        // A row and a header never drawn, measuring the height of the rows and of the headers
+        let dmut _probe: &TableRow;
+        let dmut _headerProbe: &TableHeader;
+
+        // The left of the content box of a row from the left of its margin box, the cells starting there, in pixels
+        let mut _rowInset: f32 = 0.0f;
+
+        // The width of the margin box of a row less its content box, in pixels
+        let mut _rowFrame: f32 = 0.0f;
+
+        // The column whose header is under the cursor, none when the cursor is over no header
+        let mut _hoverHeader: (usize)? = none;
+
+        // True iif the cursor is over the right edge of a header, shown as a resize cursor
+        let mut _overEdge: bool = false;
+
+        // The column resized, none while no edge is dragged
+        let mut _resized: (usize)? = none;
+
+        // The position of the cursor and the width of the column when the edge was grabbed
+        let mut _resizeFrom: (f32, f32) = (0.0f, 0.0f);
+    }
+
+    prot { // signals
+        let dmut _selected: (&Signal!{[usize]})? = none;
+        let dmut _activated: (&Signal!{usize})? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "TableView")
+        , _probe = copy TableRow(alias manager)
+        , _headerProbe = copy TableHeader(alias manager)
+    {
+        self._probe:.setCells(copy [PROBE_TEXT], copy [0.0f]);
+        self._headerProbe:.setText(PROBE_TEXT);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          MODEL          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Show the rows of a model, in its order, the table reading it again each time it changes; the selection is cleared
+     * @params:
+     *    - model: the model
+     * */
+    pub fn setModel(mut self, dmut model: &TableModel) {
+        if let Ok(dmut old) = alias self._model {
+            old:.unwatch(&self:.refresh);
+        }
+
+        model:.watch(&self:.refresh);
+        self._model = (alias model)?;
+        self._sortColumn = none;
+        self._selection:.clear();
+        self._offset = 0.0;
+        self._offsetX = 0.0f;
+        self:.refresh();
+    }
+
+    /**
+     * @returns: the model whose rows the table shows, none for an empty table
+     * */
+    pub fn getModel(mut self)-> dmut (&TableModel)? {
+        alias self._model
+    }
+
+    /**
+     * Read the model again, after its rows or its columns changed: the rows are sorted again, the rows past those of the
+     * model are unselected, and the rows shown take their texts again
+     * */
+    pub fn refresh(mut self) {
+        self:.ensureHeaders(self.getColumnCount());
+        self:.sortRows();
+        self:.reloadRows();
+    }
+
+    /**
+     * @returns: the number of rows of the model, 0 without a model
+     * */
+    pub fn getCount(self)-> usize {
+        if let Ok(m) = self._model {
+            return m.len();
+        }
+
+        0us
+    }
+
+    /**
+     * @returns: the number of columns of the model, 0 without a model
+     * */
+    pub fn getColumnCount(self)-> usize {
+        if let Ok(m) = self._model {
+            return m.columns();
+        }
+
+        0us
+    }
+
+    pub over getRowCount(self)-> usize {
+        self.getCount()
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          COLUMNS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the width of every column, kept from then on, the rows scrolling horizontally when they are wider than the
+     * table
+     * @params:
+     *    - widths: the width of each column, in pixels
+     * */
+    pub fn setColumnWidths(mut self, widths: [f32]) {
+        self._columns:.setWidths(widths);
+        if self._attached { self:.computeSize(); }
+    }
+
+    /**
+     * @returns: the width of each column, in pixels
+     * */
+    pub fn getColumnWidths(self)-> [f32] {
+        self._columns.getWidths()
+    }
+
+    /**
+     * Let the columns share the width of the table again
+     * */
+    pub fn resetColumnWidths(mut self) {
+        self._columns:.reset();
+        if self._attached { self:.computeSize(); }
+    }
+
+    /**
+     * Sort the rows by a column, the selected rows and the current row moving with their rows
+     * @params:
+     *    - column: the column, those past the columns being left out
+     *    - descending: true to sort them in decreasing order
+     * */
+    pub fn sortBy(mut self, column: usize, descending: bool = false) {
+        if column >= self.getColumnCount() { return; }
+
+        let selected = self.getSelected();
+        let current = self.getCurrent();
+        self._sortColumn = (column)?;
+        self._descending = descending;
+        self:.sortRows();
+        self:.reselect(selected, current);
+    }
+
+    /**
+     * Show the rows in the order of the model again
+     * */
+    pub fn clearSort(mut self) {
+        let selected = self.getSelected();
+        let current = self.getCurrent();
+        self._sortColumn = none;
+        self:.sortRows();
+        self:.reselect(selected, current);
+    }
+
+    /**
+     * @returns: the column the rows are sorted by, none while they are in the order of the model
+     * */
+    pub fn getSortColumn(self)-> (usize)? {
+        self._sortColumn
+    }
+
+    /**
+     * @returns: true iif the rows are sorted in decreasing order
+     * */
+    pub fn isDescending(self)-> bool {
+        self._descending
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SELECTION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Select some rows of the model, without emitting on-select, the last one becoming the current row, scrolled to; a
+     * single table selects the last one only
+     * @params:
+     *    - rows: the rows of the model to select, those past its rows being left out
+     * */
+    pub fn setSelected(mut self, rows: [usize]) {
+        let mut shown: [usize] = [];
+        for r in rows {
+            if r < self.getCount() { shown ~= [self.toTableRow(r)]; }
+        }
+
+        self._selection:.select(shown);
+        self:.showCurrent();
+    }
+
+    /**
+     * @returns: the selected rows of the model, in increasing order
+     * */
+    pub fn getSelected(self)-> [usize] {
+        let mut rows: [usize] = [];
+        for r in self._selection.getSelected() {
+            rows ~= [self.toModelRow(r)];
+        }
+
+        let dmut sorted = copy rows;
+        sort(alias sorted);
+        sorted
+    }
+
+    /**
+     * @returns: the row of the model of the current row, the one the keys move from, none before a row is clicked or
+     * moved to
+     * */
+    pub fn getCurrent(self)-> (usize)? {
+        if let Ok(c) = self._selection.getCurrent() {
+            return (self.toModelRow(c))?;
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted when the user changes the selected rows, with the selected rows of the model in
+     * increasing order
+     * */
+    pub fn selected(mut self)-> dmut &Signal!{[usize]} {
+        if let Ok(dmut s) = alias self._selected {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{[usize]} ();
+        self._selected = (alias s)?;
+
+        alias s
+    }
+
+    /**
+     * @returns: the signal emitted when Enter is pressed on the current row, or when a row is double clicked, with the
+     * row of the model
+     * */
+    pub fn activated(mut self)-> dmut &Signal!{usize} {
+        if let Ok(dmut s) = alias self._activated {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{usize} ();
+        self._activated = (alias s)?;
+
+        alias s
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          ROWS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The headers take the top of the table, and the columns share the width of the rows until their widths are set
+     * */
+    over onUpdateSize(mut self) {
+        self._headerProbe:.setStyle(self._currentStyle.getSubStyle("header"));
+        self._headerHeight = if self._headers.len == 0us { 0.0f } else {
+            self._headerProbe:.measureIntrinsicHeights(self._absoluteSize.x)._1
+        };
+
+        // the frame of a row, around the cells
+        self._probe:.setStyle(self._currentStyle.getSubStyle("row"));
+        self._probe:.setCellStyle(self._currentStyle.getSubStyle("cell"));
+        self._probe:.setSize(vec2(), makeVec2(self._absoluteSize.x, 1.0f), 0u32);
+        self._rowInset = self._probe.getAbsolutePosition().x;
+        self._rowFrame = self._absoluteSize.x - self._probe.getAbsoluteSize().x;
+
+        // the columns share the width of the rows less the scrollbar they show when they are higher than the table
+        let height = self:.measureRowHeight(self._absoluteSize.x);
+        let total = cast!f32(cast!u64(self.getCount())) * height;
+        let bar = if total > self._absoluteSize.y - self._headerHeight { self._scrollbar.getOverlap(self, false) } else { 0.0f };
+        self._columns:.layout(self.getColumnCount(), self._absoluteSize.x - bar - self._rowFrame);
+
+        self.__super__:.onUpdateSize();
+    }
+
+    over onUpdateScissors(mut self) {
+        self.__super__:.onUpdateScissors();
+        self:.placeHeaders();
+    }
+
+    prot over onApplyStyle(mut self) {
+        self.__super__:.onApplyStyle();
+        self:.restyleHeaders();
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        let mut depth = self.__super__.getMaxDepth();
+        for h in self._headers {
+            depth = max(depth, h.getMaxDepth());
+        }
+
+        depth
+    }
+
+    prot over getContentWidth(self)-> f32 {
+        self._rowFrame + self._columns.getTotal()
+    }
+
+    prot over createRow(mut self)-> dmut &Widget {
+        copy TableRow(alias self._manager)
+    }
+
+    prot over fillRow(mut self, dmut row: &Widget, item: usize) {
+        if let Ok(dmut r: &TableRow) = (alias row)? {
+            let mut texts: [[c8]] = [];
+            if let Ok(m) = self._model {
+                let modelRow = self.toModelRow(item);
+                for c in 0us .. m.columns() {
+                    texts ~= [m.text(modelRow, c)];
+                }
+            }
+
+            r:.setCells(texts, self._columns.getWidths());
+        }
+    }
+
+    /**
+     * The cells take the states of their row
+     * */
+    prot over styleRow(mut self, dmut row: &Widget, item: usize) {
+        self.__super__:.styleRow(alias row, item);
+        if let Ok(dmut r: &TableRow) = (alias row)? {
+            r:.setCellStyle(self:.getPartStyle("cell", item));
+        }
+    }
+
+    /**
+     * @returns: the height of the margin box of a row, around a single line of the style of the part ::cell
+     * */
+    prot over measureRowHeight(mut self, width: f32)-> f32 {
+        self._probe:.setStyle(self._currentStyle.getSubStyle("row"));
+        self._probe:.setCellStyle(self._currentStyle.getSubStyle("cell"));
+        self._probe:.measureIntrinsicHeights(width)._1
+    }
+
+    prot over onRowsPlaced(mut self) {
+        self:.placeHeaders();
+    }
+
+    prot over emitSelected(mut self) {
+        if let Ok(dmut s) = alias self._selected {
+            s:.emit(self.getSelected());
+        }
+    }
+
+    prot over emitActivated(mut self, row: usize) {
+        if let Ok(dmut s) = alias self._activated {
+            s:.emit(self.toModelRow(row));
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The headers take the hover state under the cursor, and the cursor resizes over their right edge
+     * */
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        self.__super__:.onHover(pos);
+
+        let (column, edge) = if let Ok(x) = self.headerX(self.toPixels(pos)) {
+            (self._columns.columnAt(x), self._columns.edgeAt(x, GRIP).hasValue)
+        } else { (none, false) };
+
+        if column != self._hoverHeader {
+            self._hoverHeader = column;
+            self:.restyleHeaders();
+        }
+
+        self:.setOverEdge(edge || self._resized.hasValue);
+        (alias self)?
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        self.__super__:.onLoseHoverFocus();
+        if self._hoverHeader.hasValue {
+            self._hoverHeader = none;
+            self:.restyleHeaders();
+        }
+
+        if !self._resized.hasValue { self:.setOverEdge(false); }
+    }
+
+    /**
+     * The left button on the right edge of a header grabs it to resize its column, and on a header sorts the rows by its
+     * column, in decreasing order when they already are in increasing order
+     * */
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if button != SDL_BUTTON_LEFT { return self.__super__:.onClick(pos, button); }
+
+        let inner = self.toPixels(pos);
+        let x = if let Ok(x) = self.headerX(inner) { x } else { return self.__super__:.onClick(pos, button); };
+        if let Ok(edge) = self._columns.edgeAt(x, GRIP) {
+            self._resized = (edge)?;
+            self._resizeFrom = (inner.x, (self._columns.getWidths())[edge]);
+        } else if let Ok(column) = self._columns.columnAt(x) {
+            let descending = if let Ok(c) = self._sortColumn && c == column { !self._descending } else { false };
+            self:.sortBy(column, descending-> descending);
+        }
+
+        (alias self)?
+    }
+
+    pub over onSliding(mut self, pos: vec2, speed: vec2, button: u8) {
+        if let Ok(column) = self._resized {
+            let width = self._resizeFrom._1 + self.toPixels(pos).x - self._resizeFrom._0;
+            self._columns:.setWidth(column, width);
+            self:.computeSize();
+        } else {
+            self.__super__:.onSliding(pos, speed, button);
+        }
+    }
+
+    pub over onSlidingEnd(mut self, button: u8) {
+        if self._resized.hasValue {
+            self._resized = none;
+            self:.setOverEdge(false);
+        }
+
+        self.__super__:.onSlidingEnd(button);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          MISC          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self._hoverHeader = none;
+        for dmut h in alias self._headers {
+            h:.onAttach((self)?);
+        }
+    }
+
+    over onHide(mut self) {
+        self.__super__:.onHide();
+        for dmut h in alias self._headers {
+            h:.hide();
+        }
+    }
+
+    over onShow(mut self) {
+        self.__super__:.onShow();
+        for dmut h in alias self._headers {
+            h:.show();
+        }
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            if let Ok(dmut m) = alias self._model {
+                m:.unwatch(&self:.refresh);
+            }
+
+            for dmut h in alias self._headers {
+                h:.dispose();
+            }
+
+            self._headers = [];
+            self._probe:.dispose();
+            self._headerProbe:.dispose();
+            self.__super__:.dispose();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Sort the rows by the column they are sorted by, in the order of the model when there is none
+     * */
+    fn sortRows(mut self) {
+        if let Ok(c) = self._sortColumn && c < self.getColumnCount() {
+            self._order = sortRows(self.getCount(), &self.compareRows, descending-> self._descending);
+            self._places = invertOrder(self._order);
+        } else {
+            self._sortColumn = none;
+            self._order = [];
+            self._places = [];
+        }
+    }
+
+    /**
+     * Select rows of the model again once the rows of the table moved, the current row selected last so that it stays
+     * the current row, and scroll to it
+     * @params:
+     *    - selected: the selected rows of the model
+     *    - current: the row of the model of the current row
+     * */
+    fn reselect(mut self, selected: [usize], current: (usize)?) {
+        let mut rows: [usize] = [];
+        let mut last: (usize)? = none;
+        for r in selected {
+            if let Ok(c) = current && c == r {
+                last = (self.toTableRow(r))?;
+            } else {
+                rows ~= [self.toTableRow(r)];
+            }
+        }
+
+        if let Ok(l) = last { rows ~= [l]; }
+        self._selection:.select(rows);
+        self:.restyleHeaders();
+        self:.showCurrent();
+    }
+
+    /**
+     * @returns: the comparison of two rows of the model by the column the rows are sorted by
+     * */
+    fn compareRows(self, a: usize, b: usize)-> i32 {
+        if let Ok(m) = self._model {
+            return m.compare(a, b, self._sortColumn ?? 0us);
+        }
+
+        0
+    }
+
+    /**
+     * @returns: the row of the model a row of the table shows
+     * */
+    fn toModelRow(self, row: usize)-> usize {
+        if row < self._order.len { self._order[row] } else { row }
+    }
+
+    /**
+     * @returns: the row of the table showing a row of the model
+     * */
+    fn toTableRow(self, row: usize)-> usize {
+        if row < self._places.len { self._places[row] } else { row }
+    }
+
+    /**
+     * Create the headers missing for a number of columns, and dispose of those past them
+     * */
+    fn ensureHeaders(mut self, count: usize) {
+        while self._headers.len < count {
+            let dmut header = copy TableHeader(alias self._manager);
+            if self._attached { header:.onAttach((self)?); }
+            if !self.isDrawn() { header:.hide(); }
+            self._headers ~= [alias header];
+        }
+
+        while self._headers.len > count {
+            self._headers[self._headers.len - 1us]:.dispose();
+            self._headers = alias self._headers[0us .. self._headers.len - 1us];
+        }
+    }
+
+    /**
+     * Place the headers on top of the table, above the cells of their columns, following the rows as they scroll
+     * horizontally, and give them their texts, the header of the column the rows are sorted by followed by its marker
+     * */
+    fn placeHeaders(mut self) {
+        let x = self._absolutePosition.x - self._offsetX + self._rowInset;
+        let top = makeVec2(self._absoluteSize.x, self._headerHeight);
+        let widths = self._columns.getWidths();
+        for i in 0us .. self._headers.len {
+            let w = if i < widths.len { widths[i] } else { 0.0f };
+            let pos = makeVec2(x + self._columns.startOf(i), self._absolutePosition.y);
+            let size = makeVec2(w, self._headerHeight);
+            let (sciPos, sciSize) = clip(self.getScissors(self._absolutePosition, top), pos, size);
+
+            let text = self.getHeaderText(i);
+            let dmut h = alias self._headers[i];
+            h:.setText(text);
+            h:.setSize(pos, size, self._depth + 1, self._absoluteSize);
+            h:.setScissors(sciPos, sciSize);
+        }
+
+        self:.restyleHeaders();
+    }
+
+    /**
+     * Give each header the style of the part ::header in its states: hover under the cursor, ascending or descending for
+     * the column the rows are sorted by
+     * */
+    fn restyleHeaders(mut self) {
+        for i in 0us .. self._headers.len {
+            let mut states: [[c8]] = [];
+            if let Ok(h) = self._hoverHeader && h == i { states ~= ["hover"]; }
+            if let Ok(c) = self._sortColumn && c == i {
+                states ~= [if self._descending { "descending" } else { "ascending" }];
+            }
+
+            let style = self:.getStatesStyle("header", states);
+            self._headers[i]:.setStyle(style);
+        }
+    }
+
+    /**
+     * @returns: the header of a column, followed by the marker of the order when the rows are sorted by it
+     * */
+    fn getHeaderText(self, column: usize)-> [c8] {
+        let text = if let Ok(m) = self._model { m.header(column) } else { "" };
+        if let Ok(c) = self._sortColumn && c == column {
+            return text ~ (if self._descending { DESCENDING_MARKER } else { ASCENDING_MARKER });
+        }
+
+        text
+    }
+
+    /**
+     * @returns: the position of the cursor from the left of the first column when it is over the headers, none otherwise
+     * @params:
+     *    - inner: the position of the cursor, in pixels from the top left corner of the inner box
+     * */
+    fn headerX(self, inner: vec2)-> (f32)? {
+        if inner.y < 0.0f || inner.y >= self._headerHeight || inner.x < 0.0f || inner.x >= self._rowsWidth {
+            return none;
+        }
+
+        (inner.x + self._offsetX - self._rowInset)?
+    }
+
+    /**
+     * Show the cursor resizing the columns over the right edge of a header, the default cursor elsewhere
+     * */
+    fn setOverEdge(mut self, over: bool) {
+        if over == self._overEdge { return; }
+
+        self._overEdge = over;
+        let cursor = if over { SDL_SystemCursor::SDL_SYSTEM_CURSOR_EW_RESIZE } else { SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT };
+        self._manager:.getCursorManager():.setCursor(cursor);
+    }
+}
+
+/**
+ * The table views in a .gui file, their rows and their columns being given by the code
+ * */
+pub mod TableView {
+
+    /**
+     * @returns: the schema of the table views
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("TableView",
+                          |dmut m, id|-> dmut &Widget => copy TableView(alias m, id),
+                          attributes-> copy [copy Setter!{&TableView, bool}("multiple", |dmut t, m| => { t:.setMultiple(m); })],
+                          signals-> copy [copy Emitter!{&TableView, [usize]}("on-select", |dmut t|-> dmut &Signal!{[usize]} => alias t:.selected()),
+                                          copy Emitter!{&TableView, usize}("on-activate", |dmut t|-> dmut &Signal!{usize} => alias t:.activated())],
+                          parts-> copy ["header", "row", "cell", "scrollbar"],
+                          partStates-> copy ["header" => copy ["hover", "ascending", "descending"],
+                                             "row" => copy ["hover", "selected", "current"],
+                                             "cell" => copy ["hover", "selected", "current"],
+                                             "scrollbar" => copy ["hover", "pressed"]])
+    }
+}
+
+/**
+ * @returns: scissors cut to a box
+ * @params:
+ *    - scissors: the position and the size of the scissors
+ *    - pos, size: the box
+ * */
+fn clip(scissors: (vec2, vec2), pos: vec2, size: vec2)-> (vec2, vec2) {
+    let (sciPos, sciSize) = scissors;
+    let start = makeVec2(max(sciPos.x, pos.x), max(sciPos.y, pos.y));
+    let end = makeVec2(min(sciPos.x + sciSize.x, pos.x + size.x), min(sciPos.y + sciSize.y, pos.y + size.y));
+    (start, makeVec2(max(0.0f, end.x - start.x), max(0.0f, end.y - start.y)))
+}

@@ -1,0 +1,584 @@
+in view;
+
+use balder::core::dispose;
+use balder::core::application::signal;
+use balder::interface::style;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::list::rows_view;
+use balder::interface::widget::text::label;
+use balder::interface::widget::tree::{expansion, model};
+use balder::math::vector;
+
+use ::sdl3::keycode;
+
+use ::std::algorithm::comparison;
+
+// The text the height of a row is measured with, a single line of the font of the rows
+def PROBE_TEXT = "Mg";
+
+// The text of the marker of a node collapsed, and of a node expanded
+def COLLAPSED_MARKER = "▸";
+def EXPANDED_MARKER = "▾";
+
+/**
+ * The marker of a row of a tree view showing a node having children: a label drawing the background and the border of
+ * the part ::marker
+ * */
+class TreeMarker over Label {
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "")
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("marker");
+        self:.forceNoWrap(true);
+        self:.setText(COLLAPSED_MARKER);
+    }
+}
+
+/**
+ * A row of a tree view: a label on a single line drawing the background and the border of the part ::row, its text
+ * indented by the level of its node, after the marker of a node having children
+ * */
+class TreeRow over Label {
+
+    // The marker, shown for a node having children
+    let dmut _marker: &TreeMarker;
+
+    // The level of the node, 0 for the children of the root
+    let mut _level: usize = 0us;
+
+    // The width of a level, that of the marker, in pixels
+    let mut _indent: f32 = 0.0f;
+
+    // True iif the node has children, its marker being shown
+    let mut _hasMarker: bool = false;
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "")
+        , _marker = copy TreeMarker(alias manager)
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("row");
+        self:.forceNoWrap(true);
+        self._marker:.hide();
+    }
+
+    /**
+     * Show a node
+     * @params:
+     *    - text: the text of the node
+     *    - level: the level of the node, 0 for the children of the root
+     *    - hasChildren: true iif the node has children, its marker being shown
+     *    - expanded: true iif the node is expanded
+     *    - indent: the width of a level, in pixels
+     * */
+    pub fn setNode(mut self, text: [c8], level: usize, hasChildren: bool, expanded: bool, indent: f32) {
+        self._level = level;
+        self._indent = indent;
+        self._hasMarker = hasChildren;
+        self._marker:.setText(if expanded { EXPANDED_MARKER } else { COLLAPSED_MARKER });
+        self:.setText(text);
+        self:.placeMarker();
+    }
+
+    /**
+     * Give the marker the style of the part ::marker in its states
+     * */
+    pub fn setMarkerStyle(mut self, style: &Style) {
+        self._marker:.setStyle(style);
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        max(self._depth, self._marker.getMaxDepth())
+    }
+
+    /**
+     * The text starts after the marker, indented by the level of the node
+     * */
+    over onUpdateSize(mut self) {
+        self.__super__:.onUpdateSize();
+        if self._absoluteSize.x > 0.0f {
+            let offset = cast!f32(cast!u64(self._level + 1us)) * self._indent / self._absoluteSize.x;
+            self._relTextPos = makeVec2(self._relTextPos.x + offset, self._relTextPos.y);
+        }
+
+        self:.placeMarker();
+    }
+
+    over onUpdateScissors(mut self) {
+        self._marker:.setScissors(self._scissorPos, self._scissorSize);
+    }
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self._marker:.onAttach((self)?);
+    }
+
+    over onHide(mut self) {
+        self._marker:.hide();
+    }
+
+    over onShow(mut self) {
+        if self._hasMarker { self._marker:.show(); } else { self._marker:.hide(); }
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self._marker:.dispose();
+            self.__super__:.dispose();
+        }
+    }
+
+    /**
+     * Place the marker before the text, as wide as a level and as high as the content of the row, shown for a node
+     * having children while the row is drawn
+     * */
+    fn placeMarker(mut self) {
+        if !self._attached { return; }
+
+        let x = self._absolutePosition.x + cast!f32(cast!u64(self._level)) * self._indent;
+        self._marker:.setSize(makeVec2(x, self._absolutePosition.y), makeVec2(self._indent, self._absoluteSize.y),
+                              self._depth, self._absoluteSize);
+        self._marker:.setScissors(self._scissorPos, self._scissorSize);
+        if self._hasMarker && self.isDrawn() { self._marker:.show(); } else { self._marker:.hide(); }
+    }
+}
+
+/**
+ * A tree of nodes read on demand from a model, shown as rows a node expanded shows its children under, a single row,
+ * or several, being selected by the user
+ * @info:
+ * =====
+ * The nodes are given by the code, through a `TreeModel` the view reads on demand: it asks the number of children of
+ * the root and of the nodes expanded, and the text of the rows it shows only. A node is named by its path, the index of
+ * each of its ancestors among the children of the one before, then its own. Only the rows shown exist, recycled as the
+ * tree scrolls, and only the nodes expanded are kept (TreeExpansion), so that a level of a million nodes costs no more
+ * than the dozen shown.
+ *
+ * The rows are the part `::row`, all of the height of a single line of their style, in the states `:hover`, `:selected`
+ * and `:current` of a list view. A node having children is preceded by the part `::marker`, ▸ when it is collapsed, ▾
+ * in the state `:expanded`, in the states of its row as well. The marker is as wide as its style says, a level of the
+ * tree indenting the rows by that width, so that the leaves line up with the text of their siblings having children.
+ *
+ * A click on the marker expands or collapses its node, and a double click on a row having children does as well. The
+ * keys select as in a list view; Right expands the current node, or moves to its first child when it is expanded, and
+ * Left collapses it, or moves to its parent when it is collapsed. `on-select` gives the paths of the selected nodes, in
+ * the order of the rows, when the user changes them, a node collapsed unselecting the nodes under it, and `on-activate`
+ * gives the path of the current node when Enter is pressed on it, or of a leaf double clicked.
+ * ====
+ * */
+pub class TreeView over RowsView {
+
+    // The model whose nodes the tree shows, none for an empty tree
+    let dmut _model: (&TreeModel)? = none;
+
+    // The nodes expanded, and the rows they show
+    let dmut _expansion: &TreeExpansion = copy TreeExpansion();
+
+    // A row and a marker never drawn, measuring the height of the rows and the width of a level
+    let dmut _probe: &TreeRow;
+    let dmut _markerProbe: &TreeMarker;
+
+    // The width of a level of the tree, that of the marker, in pixels
+    let mut _indent: f32 = 0.0f;
+
+    prot { // signals
+        let dmut _selected: (&Signal!{[[usize]]})? = none;
+        let dmut _activated: (&Signal!{[usize]})? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "TreeView")
+        , _probe = copy TreeRow(alias manager)
+        , _markerProbe = copy TreeMarker(alias manager)
+    {
+        self._probe:.setText(PROBE_TEXT);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          MODEL          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Show the nodes of a model, every node collapsed, the tree reading it again each time it changes; the selection is
+     * cleared
+     * @params:
+     *    - model: the model
+     * */
+    pub fn setModel(mut self, dmut model: &TreeModel) {
+        if let Ok(dmut old) = alias self._model {
+            old:.unwatch(&self:.refresh);
+        }
+
+        model:.watch(&self:.refresh);
+        self._model = (alias model)?;
+        self._expansion:.reset(model.len([]));
+        self._selection:.clear();
+        self._offset = 0.0;
+        self:.reloadRows();
+    }
+
+    /**
+     * @returns: the model whose nodes the tree shows, none for an empty tree
+     * */
+    pub fn getModel(mut self)-> dmut (&TreeModel)? {
+        alias self._model
+    }
+
+    /**
+     * Read the model again, after its nodes changed: the nodes expanded stay so while they have children, the rows past
+     * the nodes shown are unselected, and the rows shown take their texts again
+     * */
+    pub fn refresh(mut self) {
+        self._expansion:.update(&self.countChildren);
+        self:.reloadRows();
+    }
+
+    pub over getRowCount(self)-> usize {
+        self._expansion.getRowCount()
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          EXPANDING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Expand a node, and its ancestors, its children being shown under it
+     * @params:
+     *    - node: the path of the node
+     * */
+    pub fn expandNode(mut self, node: [usize]) {
+        for depth in 1us .. node.len + 1us {
+            self:.setExpanded(node[0us .. depth], true, user-> false);
+        }
+    }
+
+    /**
+     * Collapse a node, the nodes under it being unselected and collapsed, without emitting on-select
+     * @params:
+     *    - node: the path of the node
+     * */
+    pub fn collapseNode(mut self, node: [usize]) {
+        self:.setExpanded(node, false, user-> false);
+    }
+
+    /**
+     * @returns: true iif a node is expanded
+     * @params:
+     *    - node: the path of the node
+     * */
+    pub fn isExpanded(self, node: [usize])-> bool {
+        node.len != 0us && self._expansion.isExpanded(node)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SELECTION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Select some nodes, their ancestors being expanded, without emitting on-select, the last one becoming the current
+     * node, scrolled to; a single tree selects the last one only
+     * @params:
+     *    - nodes: the paths of the nodes to select, those naming no node being left out
+     * */
+    pub fn setSelected(mut self, nodes: [[usize]]) {
+        let mut rows: [usize] = [];
+        for n in nodes {
+            if n.len != 0us {
+                self:.expandNode(n[0us .. n.len - 1us]);
+                if let Ok(r) = self._expansion.rowOf(n) { rows ~= [r]; }
+            }
+        }
+
+        self._selection:.select(rows);
+        self:.showCurrent();
+    }
+
+    /**
+     * @returns: the paths of the selected nodes, in the order of the rows
+     * */
+    pub fn getSelected(self)-> [[usize]] {
+        let mut result: [[usize]] = [];
+        for r in self._selection.getSelected() {
+            result ~= [self._expansion.pathOf(r)];
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the path of the current node, the one the keys move from, none before a row is clicked or moved to
+     * */
+    pub fn getCurrent(self)-> ([usize])? {
+        if let Ok(c) = self._selection.getCurrent() {
+            return (self._expansion.pathOf(c))?;
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted when the user changes the selected nodes, with their paths in the order of the rows
+     * */
+    pub fn selected(mut self)-> dmut &Signal!{[[usize]]} {
+        if let Ok(dmut s) = alias self._selected {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{[[usize]]} ();
+        self._selected = (alias s)?;
+
+        alias s
+    }
+
+    /**
+     * @returns: the signal emitted when Enter is pressed on the current node, or when a leaf is double clicked, with the
+     * path of that node
+     * */
+    pub fn activated(mut self)-> dmut &Signal!{[usize]} {
+        if let Ok(dmut s) = alias self._activated {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{[usize]} ();
+        self._activated = (alias s)?;
+
+        alias s
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          ROWS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    over onUpdateSize(mut self) {
+        self._markerProbe:.setStyle(self._currentStyle.getSubStyle("marker"));
+        self._indent = self._markerProbe:.measureIntrinsicWidths()._1;
+        self.__super__:.onUpdateSize();
+    }
+
+    prot over createRow(mut self)-> dmut &Widget {
+        copy TreeRow(alias self._manager)
+    }
+
+    prot over fillRow(mut self, dmut row: &Widget, item: usize) {
+        if let Ok(dmut r: &TreeRow) = (alias row)? {
+            let path = self._expansion.pathOf(item);
+            let (text, children) = if let Ok(m) = self._model { (m.text(path), m.len(path)) } else { ("", 0us) };
+            r:.setNode(text, path.len - 1us, children != 0us, self._expansion.isExpanded(path), self._indent);
+        }
+    }
+
+    /**
+     * The marker takes the states of its row, and :expanded for a node expanded
+     * */
+    prot over styleRow(mut self, dmut row: &Widget, item: usize) {
+        self.__super__:.styleRow(alias row, item);
+        if let Ok(dmut r: &TreeRow) = (alias row)? {
+            let expanded = self._expansion.isExpanded(self._expansion.pathOf(item));
+            r:.setMarkerStyle(self:.getPartStyle("marker", item, extra-> if expanded { copy ["expanded"] } else { [] }));
+        }
+    }
+
+    /**
+     * @returns: the height of the margin box of a row, a single line of the style of the part ::row laid out in a width
+     * */
+    prot over measureRowHeight(mut self, width: f32)-> f32 {
+        self._probe:.setStyle(self._currentStyle.getSubStyle("row"));
+        self._probe:.measureIntrinsicHeights(width)._1
+    }
+
+    /**
+     * A click on the marker of a node having children expands or collapses it
+     * */
+    prot over clickRow(mut self, row: usize, pos: vec2)-> bool {
+        let path = self._expansion.pathOf(row);
+        let start = cast!f32(cast!u64(path.len - 1us)) * self._indent;
+        if pos.x < start || pos.x >= start + self._indent || self.countChildren(path) == 0us { return false; }
+
+        self:.setExpanded(path, !self._expansion.isExpanded(path), user-> true);
+        true
+    }
+
+    prot over emitSelected(mut self) {
+        if let Ok(dmut s) = alias self._selected {
+            s:.emit(self.getSelected());
+        }
+    }
+
+    prot over emitActivated(mut self, row: usize) {
+        if let Ok(dmut s) = alias self._activated {
+            s:.emit(self._expansion.pathOf(row));
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          EVENTS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A double click on a node having children expands or collapses it, a leaf being activated
+     * */
+    pub over onDoubleClick(mut self, pos: vec2)-> dmut (&Widget)? {
+        if let Ok(row) = self.rowUnder(pos) {
+            let path = self._expansion.pathOf(row);
+            if self.countChildren(path) != 0us {
+                self:.setExpanded(path, !self._expansion.isExpanded(path), user-> true);
+                return (alias self)?;
+            }
+        }
+
+        self.__super__:.onDoubleClick(pos)
+    }
+
+    /**
+     * Right expands the current node, or moves to its first child, and Left collapses it, or moves to its parent; the
+     * other keys select as in a list view
+     * */
+    pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
+        if key != SDLK_LEFT && key != SDLK_RIGHT { return self.__super__:.onKeyPressed(key, mods); }
+        if (mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI | SDL_KMOD_SHIFT)) != 0u16 { return false; }
+
+        let current = if let Ok(c) = self._selection.getCurrent() { c } else { return false; };
+        let path = self._expansion.pathOf(current);
+        let expanded = self._expansion.isExpanded(path);
+        if key == SDLK_RIGHT {
+            if expanded {
+                self:.moveTo(current + 1us);
+            } else {
+                self:.setExpanded(path, true, user-> true);
+            }
+        } else if expanded {
+            self:.setExpanded(path, false, user-> true);
+        } else if path.len > 1us {
+            if let Ok(parent) = self._expansion.rowOf(path[0us .. path.len - 1us]) {
+                self:.moveTo(parent);
+            }
+        }
+
+        true
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          MISC          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            if let Ok(dmut m) = alias self._model {
+                m:.unwatch(&self:.refresh);
+            }
+
+            self._probe:.dispose();
+            self._markerProbe:.dispose();
+            self.__super__:.dispose();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Expand or collapse a node, the rows under it being inserted in the selection or removed from it
+     * @params:
+     *    - node: the path of the node
+     *    - expanded: true to expand it, false to collapse it
+     *    - user: true iif the user expands or collapses it, on-select being emitted when collapsing it unselects rows
+     * */
+    fn setExpanded(mut self, node: [usize], expanded: bool, user: bool) {
+        if expanded {
+            if let Ok(rows) = self._expansion:.expandNode(node, self.countChildren(node)) {
+                self._selection:.insertRows(rows._0, rows._1);
+                self:.reloadRows();
+            }
+        } else if let Ok(rows) = self._expansion:.collapseNode(node) {
+            let changed = self._selection:.removeRows(rows._0, rows._1);
+            self:.reloadRows();
+            if changed && user { self:.emitSelected(); }
+        }
+    }
+
+    /**
+     * Select a row alone, the row becoming the current row, scrolled to
+     * */
+    fn moveTo(mut self, row: usize) {
+        let changed = self._selection:.selectAlone(row);
+        self:.showCurrent();
+        if changed { self:.emitSelected(); }
+    }
+
+    /**
+     * @returns: the number of children of a node of the model, 0 without a model
+     * */
+    fn countChildren(self, node: [usize])-> usize {
+        if let Ok(m) = self._model { m.len(node) } else { 0us }
+    }
+}
+
+/**
+ * The tree views in a .gui file, their nodes being given by the code
+ * */
+pub mod TreeView {
+
+    /**
+     * @returns: the schema of the tree views
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("TreeView",
+                          |dmut m, id|-> dmut &Widget => copy TreeView(alias m, id),
+                          attributes-> copy [copy Setter!{&TreeView, bool}("multiple", |dmut t, m| => { t:.setMultiple(m); })],
+                          signals-> copy [copy Emitter!{&TreeView, [[usize]]}("on-select", |dmut t|-> dmut &Signal!{[[usize]]} => alias t:.selected()),
+                                          copy Emitter!{&TreeView, [usize]}("on-activate", |dmut t|-> dmut &Signal!{[usize]} => alias t:.activated())],
+                          parts-> copy ["row", "marker", "scrollbar"],
+                          partStates-> copy ["row" => copy ["hover", "selected", "current"],
+                                             "marker" => copy ["hover", "selected", "current", "expanded"],
+                                             "scrollbar" => copy ["hover", "pressed"]])
+    }
+}
