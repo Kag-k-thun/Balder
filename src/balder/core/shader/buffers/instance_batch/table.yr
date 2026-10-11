@@ -1,0 +1,287 @@
+in table;
+
+use balder::core::shader::buffers::instance_draw;
+use balder::core::shader::buffers::instance_batch::utils;
+
+use std::algorithm::comparison;
+
+use ::vulkan::core;
+
+/**
+ * The draws of the objects of an instance batch on the CPU, and the objects each frame in flight laid out, from which the
+ * commands and the words of a frame are built (see InstanceBatch)
+ * @info: the objects are held side by side, each at a place, an object removed being replaced by the last one, so a
+ * build walks arrays and finds an object by its uniq id once only
+ * @info: a frame builds the draws of the objects its last recording laid out, as many of each as laid out, and no other;
+ * the draws drawing nothing (a culled object...) are left out of the build before the draws are grouped
+ * */
+@final
+pub class InstanceTable {
+
+    // The uniq id of the object at each place
+    let dmut _owners: [usize] = [];
+
+    // The draws of the object at each place
+    let dmut _draws: [[InstanceDraw]] = [];
+
+    // The distance to the camera of the object at each place, the closest instances being drawn first
+    let dmut _distances: [f32] = [];
+
+    // The place of each object, by uniq id
+    let dmut _places: [usize => usize] = copy [];
+
+    // The number of draws of the object at each place laid out by the last recording of each frame, 0 when it was not
+    let dmut _laid: [[u32]] = [];
+
+    // The number of draws laid out by the last recording of each frame
+    let dmut _counts: [u32] = [];
+
+    // True when the draws of an object a frame laid out changed since the frame was last built
+    let dmut _stale: [bool] = [];
+
+    /**
+     * @params:
+     *    - nbFrames: the number of frames in flight
+     * */
+    pub self (nbFrames: u32) {
+        let dmut laid: [[u32]] = [];
+        for _ in 0u32 .. nbFrames {
+            laid ~= [[]];
+        }
+
+        self._laid = alias laid;
+        self._counts = copy [0u32; nbFrames];
+        self._stale = copy [false; nbFrames];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of objects in the table
+     * */
+    @field
+    pub fn len(self)-> usize {
+        self._owners.len
+    }
+
+    /**
+     * @returns: true iif an object is in the table
+     * */
+    pub fn contains(self, owner: usize)-> bool {
+        owner in self._places
+    }
+
+    /**
+     * @returns: the number of draws the last recording of a frame laid out
+     * */
+    pub fn getCount(self, frame: u32)-> u32 {
+        self._counts[frame]
+    }
+
+    /**
+     * @returns: true iif the draws of an object the last recording of a frame laid out changed since the frame was last
+     * built
+     * */
+    pub fn isStale(self, frame: u32)-> bool {
+        self._stale[frame]
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          LAYOUT          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start the layout of the objects of a frame, those of its previous recording being dropped
+     * */
+    pub fn begin(mut self, frame: u32) {
+        let dmut laid = alias self._laid[frame];
+        for i in 0us .. laid.len {
+            laid[i] = 0u32;
+        }
+
+        self._counts[frame] = 0u32;
+    }
+
+    /**
+     * Lay out the draws of an object with the ones laid out since begin, the object entering the table unless it is in it
+     * @params:
+     *    - frame: the frame being recorded
+     *    - owner: the uniq id of the object
+     *    - draws: the draws of the object, the frame building as many until its next layout
+     * */
+    pub fn add(mut self, frame: u32, owner: usize, draws: [InstanceDraw]) {
+        let place = if let Ok(p) = self._places[owner] {
+            self._draws[p] = copy draws;
+            p
+        } else {
+            self:.append(owner, draws)
+        };
+
+        self._laid[frame][place] = cast!u32(draws.len);
+        self._counts[frame] = self._counts[frame] + cast!u32(draws.len);
+    }
+
+    /**
+     * Mark a frame built, its draws not stale until an object it laid out changes
+     * */
+    pub fn built(mut self, frame: u32) {
+        self._stale[frame] = false;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          MODIFICATION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Modify the draws of an object, the frames laying it out being stale
+     * @params:
+     *    - owner: the uniq id of the object
+     *    - draws: the draws of the object, as many as laid out
+     * @returns: false when the object is not in the table, nothing being modified
+     * */
+    pub fn update(mut self, owner: usize, draws: [InstanceDraw])-> bool {
+        if let Ok(place) = self._places[owner] {
+            self._draws[place] = copy draws;
+            self:.markStale(place);
+            return true;
+        }
+
+        false
+    }
+
+    /**
+     * Set the distance of an object to the camera, the frames laying it out being stale when it changed
+     * @returns: true iif the distance changed
+     * */
+    pub fn setDistance(mut self, owner: usize, distance: f32)-> bool {
+        if let Ok(place) = self._places[owner] {
+            if self._distances[place] == distance { return false; }
+
+            self._distances[place] = distance;
+            self:.markStale(place);
+            return true;
+        }
+
+        false
+    }
+
+    /**
+     * Remove an object, the frames laying it out being stale and built without it, the last object taking its place
+     * @info: the number of draws laid out by each frame is kept, the frames building fewer draws than laid out
+     * */
+    pub fn remove(mut self, owner: usize) {
+        let place = if let Ok(p) = self._places[owner] { p } else { return; };
+
+        self:.markStale(place);
+
+        let last = self._owners.len - 1us;
+        if place != last {
+            let moved = self._owners[last];
+            self._owners[place] = moved;
+            self._draws[place] = alias self._draws[last];
+            self._distances[place] = self._distances[last];
+            for f in 0us .. self._laid.len {
+                self._laid[f][place] = self._laid[f][last];
+            }
+
+            self._places[moved] = place;
+        }
+
+        self._owners = alias self._owners[0us .. last];
+        self._draws = alias self._draws[0us .. last];
+        self._distances = alias self._distances[0us .. last];
+        for f in 0us .. self._laid.len {
+            self._laid[f] = alias self._laid[f][0us .. last];
+        }
+
+        self._places:.remove(owner);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          BUILD          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the commands and the words of the draws a frame laid out (see groupInstances), the draws drawing nothing
+     * left out
+     * */
+    pub fn build(self, frame: u32)-> ([VkDrawIndexedIndirectCommand], [u32]) {
+        let laid = self._laid[frame];
+
+        let mut nb = 0us;
+        for place in 0us .. laid.len {
+            let ds = self._draws[place];
+            for i in 0us .. min(cast!usize(laid[place]), ds.len) {
+                if ds[i].indexCount != 0u32 { nb += 1us; }
+            }
+        }
+
+        let dmut draws: [(f32, InstanceDraw)] = copy [(0.0f, InstanceDraw()); nb];
+        let mut current = 0us;
+        for place in 0us .. laid.len {
+            let ds = self._draws[place];
+            for i in 0us .. min(cast!usize(laid[place]), ds.len) {
+                if ds[i].indexCount != 0u32 {
+                    draws[current] = (self._distances[place], ds[i]);
+                    current += 1us;
+                }
+            }
+        }
+
+        groupInstances(draws)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Place a new object after the last one, laid out by no frame
+     * @returns: its place
+     * */
+    fn append(mut self, owner: usize, draws: [InstanceDraw])-> usize {
+        let place = self._owners.len;
+        self._owners ~= [owner];
+        self._draws ~= [copy draws];
+        self._distances ~= [0.0f];
+        for f in 0us .. self._laid.len {
+            self._laid[f] ~= [0u32];
+        }
+
+        self._places[owner] = place;
+        place
+    }
+
+    /**
+     * Mark stale the frames laying out the object at a place
+     * */
+    fn markStale(mut self, place: usize) {
+        for f in 0us .. self._laid.len {
+            if self._laid[f][place] != 0u32 {
+                self._stale[f] = true;
+            }
+        }
+    }
+}

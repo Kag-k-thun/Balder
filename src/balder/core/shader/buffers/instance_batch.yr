@@ -1,11 +1,12 @@
 in instance_batch;
 
 pub mod ::utils;
+pub mod ::table;
 
 use balder::core::{dispose, error, memory::_};
 use balder::core::driver::device;
 use balder::core::shader::buffers::instance_draw;
-use balder::core::shader::buffers::instance_batch::utils;
+use balder::core::shader::buffers::instance_batch::{table, utils};
 use balder::utils::log;
 
 use std::algorithm::comparison;
@@ -84,17 +85,9 @@ pub class InstanceBatch {
     // True when the last recording of each frame laid out its objects to be culled on the GPU
     let mut _frameCulled: [mut bool] = [];
 
-    // The draws of each object, by uniq id
-    let dmut _draws: [usize => [InstanceDraw]] = copy [];
-
-    // The distance of each object to the camera, the closest instances being drawn first
-    let dmut _distances: [usize => f32] = copy [];
-
-    // The objects laid out by the last recording of each frame, with the number of their draws laid out
-    let dmut _owners: [[usize => u32]] = [];
-
-    // The number of commands laid out by the last recording of each frame, as many as the draws of its objects
-    let mut _counts: [mut u32] = [];
+    // The draws of the objects, their distances to the camera, and the objects laid out by the last recording of each
+    // frame with the number of their draws laid out, as many commands
+    let dmut _table: &InstanceTable;
 
     // The commands of each frame
     let dmut _commands: [[VkDrawIndexedIndirectCommand]] = [];
@@ -104,9 +97,6 @@ pub class InstanceBatch {
 
     // The number of commands drawing something and of instances, at the last build of a frame
     let mut _drawn: (u32, u32) = (0u32, 0u32);
-
-    // True when the draws of an object of a frame changed since its commands were last built
-    let mut _stale: [mut bool] = [];
 
     // The buffer of indirect commands read by each frame
     let dmut _commandCopies: [(&Buffer)?] = [];
@@ -158,15 +148,13 @@ pub class InstanceBatch {
         , _inPlace = device.isMultiDraw()
         , _dirtyCommands = FrameRanges(device.getNbFrames())
         , _dirtyWords = FrameRanges(device.getNbFrames())
+        , _table = copy InstanceTable(device.getNbFrames())
     {
         let nbFrames = device.getNbFrames();
-        self._counts = copy [0u32; nbFrames];
-        self._stale = copy [false; nbFrames];
         self._frameCulled = copy [false; nbFrames];
 
         let dmut commands: [[VkDrawIndexedIndirectCommand]] = [];
         let dmut words: [[u32]]                            = [];
-        let dmut owners: [[usize => u32]]                  = [];
         let dmut commandCopies: [(&Buffer)?]               = [];
         let dmut wordCopies: [(&Buffer)?]                  = [];
         let dmut culledCommands: [(&Buffer)?]              = [];
@@ -175,10 +163,8 @@ pub class InstanceBatch {
         let dmut readbacks: [(&Buffer)?]                   = [];
         let dmut visibilities: [(&Buffer)?]                = [];
         for _ in 0u32 .. nbFrames {
-            let dmut owner: [usize => u32] = copy [];
             commands ~= [[]];
             words ~= [[]];
-            owners ~= [alias owner];
             commandCopies ~= [none];
             wordCopies ~= [none];
             culledCommands ~= [none];
@@ -190,7 +176,6 @@ pub class InstanceBatch {
 
         self._commands = alias commands;
         self._words = alias words;
-        self._owners = alias owners;
         self._commandCopies = alias commandCopies;
         self._wordCopies = alias wordCopies;
         self._culledCommands = alias culledCommands;
@@ -225,9 +210,7 @@ pub class InstanceBatch {
      * */
     pub fn begin(mut self, frame: u32) {
         atomic self {
-            let dmut owner: [usize => u32] = copy [];
-            self._counts[frame] = 0u32;
-            self._owners[frame] = alias owner;
+            self._table:.begin(frame);
         }
     }
 
@@ -240,9 +223,7 @@ pub class InstanceBatch {
      * */
     pub fn add(mut self, frame: u32, owner: usize, draws: [InstanceDraw]) {
         atomic self {
-            self._draws[owner] = copy draws;
-            self._owners[frame][owner] = cast!u32(draws.len);
-            self._counts[frame] = self._counts[frame] + cast!u32(draws.len);
+            self._table:.add(frame, owner, draws);
         }
     }
 
@@ -257,7 +238,7 @@ pub class InstanceBatch {
         atomic self {
             self._frameCulled[frame] = self._culled;
 
-            let count = cast!usize(self._counts[frame]);
+            let count = cast!usize(self._table.getCount(frame));
             let nbWords = if self._culled { count * CANDIDATE_WORDS } else { count };
             if count > self._commands[frame].len {
                 let extra = max(count - self._commands[frame].len, max(self._commands[frame].len, 16us));
@@ -277,7 +258,7 @@ pub class InstanceBatch {
 
             self:.build(frame);
 
-            return self._counts[frame];
+            return self._table.getCount(frame);
         }
     }
 
@@ -303,10 +284,7 @@ pub class InstanceBatch {
      * */
     pub fn update(mut self, owner: usize, draws: [InstanceDraw]) {
         atomic self {
-            if owner !in self._draws { return; }
-
-            self._draws[owner] = copy draws;
-            self:.markStale(owner);
+            if !self._table:.update(owner, draws) { return; }
         }
 
         self._device:.requestFrame();
@@ -318,13 +296,7 @@ pub class InstanceBatch {
      * */
     pub fn setDistance(mut self, owner: usize, distance: f32) {
         atomic self {
-            if owner !in self._draws { return; }
-            if let Ok(d) = self._distances[owner] {
-                if d == distance { return; }
-            }
-
-            self._distances[owner] = distance;
-            self:.markStale(owner);
+            self._table:.setDistance(owner, distance);
         }
     }
 
@@ -334,11 +306,7 @@ pub class InstanceBatch {
      * */
     pub fn remove(mut self, owner: usize) {
         atomic self {
-            if owner !in self._draws { return; }
-
-            self:.markStale(owner);
-            self._draws:.remove(owner);
-            self._distances:.remove(owner);
+            self._table:.remove(owner);
         }
     }
 
@@ -364,7 +332,7 @@ pub class InstanceBatch {
      * */
     pub fn getCount(self, frame: u32)-> u32 {
         atomic self {
-            self._counts[frame]
+            self._table.getCount(frame)
         }
     }
 
@@ -526,7 +494,7 @@ pub class InstanceBatch {
                 self:.readBack(frame);
             }
 
-            if self._stale[frame] && self._inPlace {
+            if self._table.isStale(frame) && self._inPlace {
                 self:.build(frame);
             }
 
@@ -561,20 +529,8 @@ pub class InstanceBatch {
      * @atomic
      * */
     fn build(mut self, frame: u32) {
-        let count = self._counts[frame];
-        let dmut draws: [(f32, InstanceDraw)] = copy [(0.0f, InstanceDraw()); count];
-        let mut nb = 0us;
-        for owner, laid in self._owners[frame] {
-            if let Ok(ds) = self._draws[owner] {
-                let distance = if let Ok(d) = self._distances[owner] { d } else { 0.0f };
-                for i in 0us .. min(cast!usize(laid), ds.len) {
-                    draws[nb] = (distance, ds[i]);
-                    nb += 1us;
-                }
-            }
-        }
-
-        let (commands, words) = groupInstances(draws[0us .. nb]);
+        let count = self._table.getCount(frame);
+        let (commands, words) = self._table.build(frame);
         for i in 0u32 .. count {
             let c = if cast!usize(i) < commands.len { commands[i] } else { VkDrawIndexedIndirectCommand() };
             self:.writeCommand(frame, i, c);
@@ -594,7 +550,7 @@ pub class InstanceBatch {
             self._drawn = (cast!u32(commands.len), cast!u32(words.len));
         }
 
-        self._stale[frame] = false;
+        self._table:.built(frame);
     }
 
     /**
@@ -684,18 +640,6 @@ pub class InstanceBatch {
         }
 
         (alias larger)?
-    }
-
-    /**
-     * Mark stale the frames laying out an object, their commands to build again at their submission
-     * @atomic
-     * */
-    fn markStale(mut self, owner: usize) {
-        for f in 0us .. self._owners.len {
-            if owner in self._owners[f] {
-                self._stale[f] = true;
-            }
-        }
     }
 
     /**
@@ -838,9 +782,6 @@ pub class InstanceBatch {
                 self._visibilities = [];
                 self._commands = [];
                 self._words = [];
-                self._owners = [];
-                self._draws = copy [];
-                self._distances = copy [];
             }
 
             self._device:.getMemoryAllocator():.forgetInFlight(self.uid);
