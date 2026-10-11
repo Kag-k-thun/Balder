@@ -141,36 +141,39 @@ pub class MemoryAllocator {
      */
 
     /**
-     * Map the address of a memory segment and return its address
+     * @returns: the address of a memory segment in host memory, its memory block mapped at its first use and kept
+     * mapped until the block is freed, null when the block cannot be mapped
+     * @info: every host visible memory is host coherent, the writes through the address need no flush
      * */
     pub fn getMapAddress(mut self, memAlloc: MemoryAllocation)-> dmut *void {
         atomic self {
-            if let Ok(dmut ptr) = alias self._mapped[memAlloc.index] {
-                return alias (ptr + cast!usize(memAlloc.offset));
-            }
+            let dmut ptr = self:.mapBlock(memAlloc.index, memAlloc.mem, memAlloc.fullSize);
+            if ptr == null { return null; }
 
-            let dmut ptr: *void = null;
-            if (vkMapMemory(self._device.getDeviceHandle(), memAlloc.mem, 0, cast!u64(memAlloc.fullSize), 0, &ptr)
-                == VkResult::VK_SUCCESS) {
-                self._mapped[memAlloc.index] = alias ptr;
-                return alias (ptr + cast!usize(memAlloc.offset));
-            } else {
-                self._mapped:.remove(memAlloc.index);
-                return null;
-            }
+            return alias (ptr + cast!usize(memAlloc.offset));
         }
     }
 
     /**
-     * Unmap a memory address
+     * @returns: the address of a memory block in host memory, mapped at its first use, null when it cannot be mapped
+     * @assume: the allocator is locked
+     * @params:
+     *    - index: the uniq id of the block
+     *    - mem: the memory of the block
+     *    - size: the size of the block in bytes
      * */
-    pub fn unmap(mut self, memAlloc: MemoryAllocation) {
-        atomic self {
-            if memAlloc.index in self._mapped {
-                vkUnmapMemory(self._device.getDeviceHandle(), memAlloc.mem);
-                self._mapped:.remove(memAlloc.index);
-            }
+    fn mapBlock(mut self, index: usize, mem: VkDeviceMemory, size: usize)-> dmut *void {
+        if let Ok(dmut ptr) = alias self._mapped[index] {
+            return alias ptr;
         }
+
+        let dmut ptr: *void = null;
+        if vkMapMemory(self._device.getDeviceHandle(), mem, 0, cast!u64(size), 0, &ptr) != VkResult::VK_SUCCESS {
+            return null;
+        }
+
+        self._mapped[index] = alias ptr;
+        alias ptr
     }
 
     /*!
@@ -208,25 +211,15 @@ pub class MemoryAllocator {
         atomic self {
             for uid, interval in self._dynamicBufferToUpdate {
                 if let Ok(dmut list) = alias self._dynamicAllocations[uid] {
-                    if uid in self._mapped {
-                        vkUnmapMemory(self._device.getDeviceHandle(), list:.getMemory());
-                        self._mapped:.remove(uid);
-                    }
-
                     if let Ok(dmut local) = alias self._dynamicLocalBuffers[uid] {
+                        let dmut ptr = self:.mapBlock(uid, list:.getMemory(), list.getSize());
+                        if ptr == null {
+                            log::error #("Memory", "failed to map data in dynamic buffer update");
+                            continue;
+                        }
+
                         for range in interval[] {
-                            let dmut ptr: *void = null;
-                            if (vkMapMemory(self._device.getDeviceHandle(),
-                                            list:.getMemory(),
-                                            cast!u64(range.start),
-                                            cast!u64(range.end - range.start),
-                                            0,
-                                            alias &ptr) == VkResult::VK_SUCCESS) {
-                                memcpy(ptr, cast!{*void} (local.ptr + range.start), range.end - range.start);
-                                vkUnmapMemory(self._device.getDeviceHandle(), list:.getMemory());
-                            } else {
-                                log::error #("Memory", "failed to map data in dynamic buffer update");
-                            }
+                            memcpy(ptr + range.start, cast!{*void} (local.ptr + range.start), range.end - range.start);
                         }
                     }
                 }
