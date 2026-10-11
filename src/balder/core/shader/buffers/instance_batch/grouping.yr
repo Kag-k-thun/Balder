@@ -1,0 +1,174 @@
+in grouping;
+
+use balder::core::shader::buffers::instance_draw;
+use balder::core::shader::buffers::instance_batch::utils;
+
+use std::algorithm::{comparison, sorting};
+
+use ::vulkan::core;
+
+/**
+ * The grouping of the draws of an instance batch into instanced commands (see group), in buffers kept from a
+ * build to the next, so a build allocates nothing once the buffers hold the largest batch
+ * @warning: the commands, the words and the candidates returned are views of the buffers, valid until the next grouping
+ * */
+@final
+pub class DrawGrouping {
+
+    // The draws drawing something, sorted by range then by distance
+    let dmut _entries: [(f32, InstanceDraw)] = [];
+
+    // The ranges: the distance of their closest instance, their first entry and their number of entries
+    let dmut _ranges: [(f32, usize, usize)] = [];
+
+    // The commands, one per range
+    let dmut _commands: [VkDrawIndexedIndirectCommand] = [];
+
+    // The words of the instances, the instances of a command side by side
+    let dmut _words: [u32] = [];
+
+    // The candidates of a cull pass (see cullCandidates)
+    let dmut _candidates: [u32] = [];
+
+    pub self () {}
+
+    /**
+     * Group the draws of the same range of indices into instanced commands, the closest instances drawn first
+     * @params:
+     *    - draws: the draws, each with the distance of its object to the camera; the draws of no index are dropped
+     * @returns:
+     *    - .0: the commands, one per range, ordered by their closest instance
+     *    - .1: the words of the instances, those of a command following each other from its first instance, closest first
+     * */
+    pub fn group(mut self, draws: [(f32, InstanceDraw)])-> ([VkDrawIndexedIndirectCommand], [u32]) {
+        let mut nb = 0us;
+        for d in draws {
+            let (_, draw) = d;
+            if draw.indexCount != 0u32 { nb += 1us; }
+        }
+
+        if self._entries.len < nb {
+            self._entries = copy [(0.0f, InstanceDraw()); max(nb, 2us * self._entries.len)];
+        }
+
+        let mut current = 0us;
+        for d in draws {
+            let (_, draw) = d;
+            if draw.indexCount != 0u32 {
+                self._entries[current] = d;
+                current += 1us;
+            }
+        }
+
+        let dmut entries = alias self._entries[0us .. nb];
+
+        // the draws of a range side by side, closest first
+        sort(alias entries, |a, b| {
+            let (da, x) = a;
+            let (db, y) = b;
+            if x.firstIndex != y.firstIndex { return x.firstIndex < y.firstIndex; }
+            if x.vertexOffset != y.vertexOffset { return x.vertexOffset < y.vertexOffset; }
+            if x.indexCount != y.indexCount { return x.indexCount < y.indexCount; }
+            if da != db { return da < db; }
+            x.word < y.word
+        });
+
+        let mut nbGroups = 0us;
+        for i, e in entries {
+            let (_, draw) = e;
+            if i == 0us || !sameRange((entries[i - 1us])._1, draw) { nbGroups += 1us; }
+        }
+
+        if self._ranges.len < nbGroups {
+            self._ranges = copy [(0.0f, 0us, 0us); max(nbGroups, 2us * self._ranges.len)];
+        }
+
+        let dmut ranges = alias self._ranges[0us .. nbGroups];
+        let mut g = 0us;
+        for i, e in entries {
+            let (distance, draw) = e;
+            if i == 0us || !sameRange((entries[i - 1us])._1, draw) {
+                ranges[g] = (distance, i, 1us);
+                g += 1us;
+            } else {
+                let (d, first, n) = ranges[g - 1us];
+                ranges[g - 1us] = (d, first, n + 1us);
+            }
+        }
+
+        sort(alias ranges, |a, b| {
+            if a._0 != b._0 { return a._0 < b._0; }
+            a._1 < b._1
+        });
+
+        if self._commands.len < nbGroups {
+            self._commands = copy [VkDrawIndexedIndirectCommand(); max(nbGroups, 2us * self._commands.len)];
+        }
+
+        if self._words.len < nb {
+            self._words = copy [0u32; max(nb, 2us * self._words.len)];
+        }
+
+        let mut first = 0u32;
+        for k, r in ranges {
+            let (_, range) = entries[r._1];
+            let mut command = VkDrawIndexedIndirectCommand();
+            command.indexCount = range.indexCount;
+            command.instanceCount = cast!u32(r._2);
+            command.firstIndex = range.firstIndex;
+            command.vertexOffset = range.vertexOffset;
+            command.firstInstance = first;
+            self._commands[k] = command;
+
+            for i in 0us .. r._2 {
+                let (_, draw) = entries[r._1 + i];
+                self._words[cast!usize(first) + i] = draw.word;
+            }
+
+            first += cast!u32(r._2);
+        }
+
+        (self._commands[0us .. nbGroups], self._words[0us .. nb])
+    }
+
+    /**
+     * Pair the words of the instances of grouped commands with the index of their command, the candidates of a cull pass
+     * that draws again the instances it sees, in the command of their range
+     * @params:
+     *    - commands: the commands, as group returns them
+     *    - words: the words of their instances, as group returns them
+     *    - count: the number of candidates, as many as the draws laid out, those past the words drawing nothing
+     * @returns: 2 * count words, the word of each candidate followed by the index of its command (NO_COMMAND when it draws
+     * nothing), the candidates of a command following each other from its first instance
+     * */
+    pub fn candidates(mut self, commands: [VkDrawIndexedIndirectCommand], words: [u32], count: usize)-> [u32] {
+        if self._candidates.len < 2us * count {
+            self._candidates = copy [0u32; max(2us * count, 2us * self._candidates.len)];
+        }
+
+        let dmut candidates = alias self._candidates[0us .. 2us * count];
+        for i in 0us .. count {
+            candidates[2us * i] = 0u32;
+            candidates[2us * i + 1us] = NO_COMMAND;
+        }
+
+        for k, c in commands {
+            for i in c.firstInstance .. c.firstInstance + c.instanceCount {
+                let index = cast!usize(i);
+                if index >= count || index >= words.len { break; }
+
+                candidates[2us * index] = words[index];
+                candidates[2us * index + 1us] = cast!u32(k);
+            }
+        }
+
+        candidates
+    }
+}
+
+/**
+ * @returns: true iif two draws draw the same range of indices of the same geometry
+ * */
+fn sameRange(a: InstanceDraw, b: InstanceDraw)-> bool {
+    a.firstIndex == b.firstIndex && a.vertexOffset == b.vertexOffset && a.indexCount == b.indexCount
+}

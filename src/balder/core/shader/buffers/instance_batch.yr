@@ -2,11 +2,12 @@ in instance_batch;
 
 pub mod ::utils;
 pub mod ::table;
+pub mod ::grouping;
 
 use balder::core::{dispose, error, memory::_};
 use balder::core::driver::device;
 use balder::core::shader::buffers::instance_draw;
-use balder::core::shader::buffers::instance_batch::{table, utils};
+use balder::core::shader::buffers::instance_batch::{grouping, table, utils};
 use balder::utils::log;
 
 use std::algorithm::comparison;
@@ -59,7 +60,7 @@ def TEMPLATE_COUNTERS = 2us;
  * words, built again at its submission when the draws of its objects changed; a frame never draws the objects laid out
  * by the recording of another, nor commands placing geometry the buffers it bound do not hold
  * @info: when culled on the GPU, the commands built are the templates of a cull pass, each holding the range of its
- * instances in the words, and the words its candidates, each with the index of its template (see cullCandidates); the
+ * instances in the words, and the words its candidates, each with the index of its template (see DrawGrouping::candidates); the
  * pass writes the instances it sees and the commands drawing them in buffers of the GPU, with their number in a counter
  * buffer read by a draw indirect count call, the CPU reading the counters back once the submission of the frame is over
  * @info: the cull pass runs in two phases when the instances hidden behind others are culled (occlusion): the first one
@@ -88,6 +89,9 @@ pub class InstanceBatch {
     // The draws of the objects, their distances to the camera, and the objects laid out by the last recording of each
     // frame with the number of their draws laid out, as many commands
     let dmut _table: &InstanceTable;
+
+    // The grouping of the draws into commands, its buffers kept from a build to the next (the rendering thread only)
+    let dmut _grouping: &DrawGrouping = copy DrawGrouping();
 
     // The commands of each frame
     let dmut _commands: [[VkDrawIndexedIndirectCommand]] = [];
@@ -511,13 +515,13 @@ pub class InstanceBatch {
 
             if self._table.isStale(frame) && self._inPlace {
                 self._table:.built(frame);
-                (self._table.collect(frame))?
+                (self._table:.collect(frame))?
             } else {
                 none
             }
         };
 
-        let grouped = if let Ok(draws) = stale { (groupInstances(draws))? } else { none };
+        let grouped = if let Ok(draws) = stale { (self._grouping:.group(draws))? } else { none };
 
         atomic self {
             // disposed meanwhile
@@ -557,7 +561,7 @@ pub class InstanceBatch {
      * @atomic
      * */
     fn build(mut self, frame: u32) {
-        let (commands, words) = self._table.build(frame);
+        let (commands, words) = self._grouping:.group(self._table:.collect(frame));
         self._table:.built(frame);
         self:.writeBuilt(frame, commands, words);
     }
@@ -575,7 +579,7 @@ pub class InstanceBatch {
 
         if self._frameCulled[frame] {
             // the counters of the cull pass give the commands and the instances drawn
-            for i, w in cullCandidates(commands, words, cast!usize(count)) {
+            for i, w in self._grouping:.candidates(commands, words, cast!usize(count)) {
                 self:.writeWord(frame, cast!u32(i), w);
             }
         } else {
