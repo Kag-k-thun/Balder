@@ -10,8 +10,8 @@ property table by `gyllir run reference` in `tools/`, and a test fails when it n
 ## Loading the files
 
 ```
-self.gui:.loadStyleFile ("res:/dialog/default.style")?;
-self.gui:.loadGUIFile ("res:/dialog/message.gui")?;
+self.gui:.loadStyleFile ("res:/config/app.style")?;
+self.gui:.loadGUIFile ("res:/config/app.gui")?;
 ```
 
 - `loadStyleFile` reads a sheet after the sheets it imports, decodes every rule against the widget types, registers
@@ -38,11 +38,12 @@ self.gui:.loadGUIFile ("res:/dialog/message.gui")?;
 ## The structure file
 
 ```
-LinearLayout #FL .root {
-    Label #QUESTION .question "HELLO?";
-    LinearLayout #F2 .inner {
-        PushButton #YES .yes "Yes" { on-click: yes; }
-        PushButton #NO .no "No" { on-click: no; }
+LinearLayout #DIALOG .dialog .dialog-message {
+    Label #QUESTION .dialog-question "";
+    LinearLayout .dialog-buttons {
+        Box .dialog-fill;
+        PushButton #NO .dialog-cancel "No" { on-click: no; }
+        PushButton #YES .dialog-accept "Yes" { on-click: yes; }
     }
 }
 ```
@@ -350,14 +351,61 @@ LinearLayout #FORM {
 - **A group of radio buttons is a single stop**: Tab focuses its checked radio button only, every one of them when none
   is checked.
 - **An open menu keeps the focus**: Tab, Shift-Tab, Up and Down move it among the widgets of the menu opened last (the
-  list of a dropdown is one), and Escape closes that menu, the focus going back to the widget that opened it. A dialog
-  is a window of its own, the window behind it taking no input while it is open.
+  list of a dropdown is one), and Escape closes that menu, the focus going back to the widget that opened it.
+- **An overlay keeps the focus too**: Tab and Shift-Tab move it among the widgets of the top
+  [overlay](#dialogs-and-overlays), and Escape, when no menu is open in it, dismisses it. Without an overlay, an Escape
+  nothing uses emits `WidgetManager.escaped`, which closes the window of a dialog.
 - **The focused widget is in the state `:focus`**, which the sheets style as a focus ring, a shadow moving nothing:
   `PushButton.submit:focus { shadow: 0 0 0 2 #388bfd; }`, `CheckBox:focus::box { border-color: #388bfd; }`. A linear
   layout that scrolls shows the widget given the focus.
 - **A widget type of the application** takes the focus from the keyboard by overriding `isFocusableByKeyboard`, and
   uses keys by overriding `onKeyPressed (key, mods)`, returning true when it used the key. A layout keeping the focus in
   a child overrides `getFocusTrap` and `dismissFocusTrap`, and a layout that scrolls `reveal`.
+
+### Dialogs and overlays
+
+```
+fn onClearClicked (mut self, button: u8) {
+    let dmut d = copy ConfirmDialog ("Clear every field of the form?", accept-> "Clear");
+    d:.answered ():.connect (self.box, &self:.onClearAnswered);    // fn onClearAnswered (mut self, accepted: bool)
+    d:.open (DialogMode::OVERLAY, alias self.gui)?;                 // or DialogMode::WINDOW
+}
+```
+
+- **A dialog asks something and emits the answer**, it never waits for it: `open` returns at once, and the signal
+  `answered` of the dialog runs the slots connected to it in the thread of their activity once the user answers. A
+  dialog answers once, closing before it emits. Closing its window, pressing Escape or its cancelling button dismisses
+  it, which answers it as cancelled.
+- **`DialogMode::OVERLAY` shows it over the interface of the caller**: the manager opens an `Overlay`, a backdrop filling
+  the window with the dialog centred over it at the size of its content, fitted in it. The content and the overlays
+  under it keep being drawn and ticked but receive nothing: the top overlay takes the mouse, a click on the backdrop
+  goes to no widget, and Tab moves the focus among its widgets. The slots of the dialog run in the thread of the
+  caller. `WidgetManager.openOverlay (widget)` and `closeOverlay (overlay)` open and close one for any widget, and its
+  `on-dismiss` is emitted by Escape.
+- **`DialogMode::WINDOW` shows it in a window of its own**, opened by the application with the configuration of the
+  dialog (`res:/dialog/*.toml`), its title given to the dialog (`title->`); the other windows keep their input. Its
+  slots run in the thread of that window, its answer in the thread of the caller as well.
+- **The dialogs of Balder**, in `balder::interface::dialog`:
+
+  | Dialog | Answers |
+  |---|---|
+  | `MessageDialog (message)` | a question answered by Yes or No: `MessageDialogStatus::YES`, `NO`, or `CANCEL` when dismissed |
+  | `ConfirmDialog (question, accept-> "Clear", cancel-> "Cancel")` | an action confirmed by the button named after it, Enter accepting it: `true`, or `false` when cancelled |
+  | `FileDialog (FileDialogMode::OPEN, directory-> "res", filters-> copy ["png"])` | the absolute path of a file to open, of a file to save (`SAVE`) or of a directory (`DIRECTORY`), or `none` when cancelled |
+  | `ColorDialog (color-> c)` | a colour (`vec4`, its channels from 0 to 1) set by the sliders and the spin boxes of its channels and its opacity, or by its code typed as in a sheet (`#3380e6`, `steelblue / 50%`), or `none` when cancelled |
+
+- **A file dialog browses the directories in a table**, the directories first: a double click or Enter on a directory
+  enters it, on a file chooses it; Up goes to the parent, and the path typed above the table goes to that directory.
+  The name typed under the table is read from the directory shown, `..` going up, an absolute path as it is: a
+  directory is entered, a file to open must exist, a file to save must be in a directory that exists. The filters keep
+  the files of their extensions, whatever the case, and the check box shows the entries whose name starts with a dot.
+- **A dialog of the application** derives from `Dialog`, a `Behavior` registering the slots its `.gui` file names, and
+  gives its constructor that file and the configuration of its window. It fills its widgets in `onShow`, finding them
+  by `find` from its root, implements `dismiss`, and calls `close` before emitting its own signal.
+- **The look of the dialogs** is `res:/dialog/dialog.style`, which their `.gui` files load at the origin of the
+  components (`@style`): every sheet of the application wins over it. Their widgets have classes of their own
+  (`.dialog`, `.dialog-question`, `.dialog-accept`, `.dialog-cancel`, `.dialog-entries`, …), so that the rules of the
+  application select them by these names only, and `Overlay { background-color: … }` sets the backdrop.
 
 ## The style file
 
@@ -694,6 +742,17 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Children:** its bar then its content
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-menu-open`, `on-menu-close`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** none
+
+### `Overlay`
+
+- **Attributes:** `tab-index`: an integer
+- **Default attribute:** none
+- **Children:** its content
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-dismiss`
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** none
 - **Properties:** none

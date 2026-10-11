@@ -1,26 +1,241 @@
 in dialog;
 
-use ::core::concurrency::sync::semaphore;
-
-use balder::core::application;
-
+pub mod ::mode;
+pub mod ::activity;
 pub mod ::message;
+pub mod ::confirm;
+pub mod ::file;
+pub mod ::color;
+
+use balder::core::_;
+use balder::core::application::activity;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget::layout::overlay;
 
 /**
- * A dialog window is a popup window used to ask user for information before work can continue in other windows
+ * A dialog asks the user something, in a window of its own or in an overlay over the interface of the caller, and
+ * emits the answer by a signal, run in the thread of the activity that connected to it: nothing waits for it
+ * @info:
+ * =====
+ * A dialog is a behavior: the slots the `on-…` attributes of its .gui file name are its own, registered by its
+ * constructor. open loads the .gui file in the interface showing the dialog, the window of an activity the application
+ * opens (DialogMode::WINDOW) or an overlay over the interface of the caller (DialogMode::OVERLAY), where its slots run
+ * in the thread of the caller, then onShow fills it. A dialog answers once, closing then emitting its signal; dismiss
+ * answers it as cancelled, when its window is closed, when Escape is pressed and nothing else uses it, or when its
+ * cancelling button is clicked.
+ * ====
+ * @example:
+ * ===
+ * let dmut d = copy ConfirmDialog ("Clear the form?", accept-> "Clear");
+ * d:.answered ():.connect (self.box, &self:.onClearAnswered);   // fn onClearAnswered (mut self, accepted: bool)
+ * d:.open (DialogMode::OVERLAY, alias self.gui)?;
+ * ===
  * */
-@{abstract}
-pub class DialogWindow {
+@abstract
+pub class Dialog over Behavior {
 
-    let dmut _sem : &Semaphore = copy Semaphore ();
-    let dmut _app : &Application;
+    // The .gui file of the dialog, its root being the content of its window or of its overlay
+    let _guiFile: [c8];
 
-    pub self (dmut app : &Application)
-        with _app = alias app
+    // The configuration of the window of the dialog, shown in a window of its own
+    let _windowFile: [c8];
+
+    // The title of the window of the dialog
+    let mut _title: [c8];
+
+    prot { // where the dialog is shown, none while it is closed
+
+        // The interface showing the dialog
+        let dmut _gui: (&WidgetManager)? = none;
+
+        // The root widget of the dialog
+        let dmut _root: (&Widget)? = none;
+
+        // The overlay holding the root, in the mode OVERLAY
+        let dmut _overlay: (&Overlay)? = none;
+
+        // The activity whose window shows the dialog, in the mode WINDOW
+        let dmut _activity: (&DialogActivity)? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - guiFile: the .gui file of the dialog
+     *    - windowFile: the configuration of its window, shown in a window of its own
+     *    - title: the title of its window
+     * */
+    prot self (guiFile: [c8], windowFile: [c8], title: [c8])
+        with _guiFile = guiFile
+        , _windowFile = windowFile
+        , _title = title
     {}
 
-    pub fn execute (mut self);
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          OPEN/CLOSE          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Open the dialog, in a window of its own or over the interface of the caller; open returns at once, the answer
+     * being emitted by the signal of the dialog
+     * @params:
+     *    - mode: where the dialog is shown
+     *    - gui: the interface of the caller, the overlay being opened over it, the window by its application
+     * @throws: when the dialog is open already, when its .gui file cannot be loaded over the interface, or when its
+     * window cannot be opened
+     * */
+    pub fn open(mut self, mode: DialogMode, dmut gui: &WidgetManager)
+        throws BalderError
+    {
+        if self.isOpen {
+            throw copy BalderError("the dialog is open already");
+        }
+
+        match mode {
+            DialogMode::OVERLAY => {
+                let dmut root = gui:.loadGUIFile(self._guiFile, self, set-> false);
+                let dmut overlay = gui:.openOverlay(alias root);
+                overlay:.dismissed():.connect(alias gui:.getSlotEmitter(), &self:.dismiss);
+
+                self._overlay = (alias overlay)?;
+                self:.show(alias gui, alias root);
+            }
+            DialogMode::WINDOW => {
+                let dmut app = gui:.getWindow():.getApplication();
+                let dmut act = app:.open!{&DialogActivity}(copy BalderConfig(self._windowFile));
+
+                self._activity = (alias act)?;
+                act:.host(alias self);
+            }
+        }
+    }
+
+    /**
+     * Show the dialog as the content of the interface of its window, once the activity showing it is started
+     * @throws: when its .gui file cannot be loaded
+     * */
+    pub fn showIn(mut self, dmut gui: &WidgetManager)
+        throws BalderError
+    {
+        let dmut root = gui:.loadGUIFile(self._guiFile, self);
+        self:.show(alias gui, alias root);
+    }
+
+    /**
+     * Close the dialog without answering, its overlay or its window closing
+     * */
+    pub fn close(mut self) {
+        if let Ok(dmut o) = alias self._overlay {
+            if let Ok(dmut g) = alias self._gui {
+                g:.closeOverlay(o);
+            }
+        }
+
+        if let Ok(dmut a) = alias self._activity {
+            a:.closeWindow();
+        }
+
+        self._gui = none;
+        self._root = none;
+        self._overlay = none;
+        self._activity = none;
+    }
+
+    /**
+     * Answer the dialog as cancelled, then close it: its window is closed, Escape is pressed, its cancelling button is
+     * clicked
+     * */
+    pub fn dismiss(mut self);
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the dialog is open, not answered yet
+     * */
+    @field
+    pub fn isOpen(self)-> bool {
+        self._overlay.hasValue || self._activity.hasValue
+    }
+
+    /**
+     * @returns: the title of the window of the dialog
+     * */
+    pub fn getTitle(self)-> [c8] {
+        self._title
+    }
+
+    /**
+     * Set the title of the window of the dialog, for its next opening
+     * */
+    pub fn setTitle(mut self, title: [c8]) {
+        self._title = title;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CHILDREN          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Fill the widgets of the dialog once its .gui file is loaded where it is shown
+     * */
+    prot fn onShow(mut self) {}
+
+    /**
+     * @returns: the widget of the dialog at a path from its root, none when there is none or the dialog is closed
+     * */
+    prot fn find(mut self, path: [c8])-> dmut (&Widget)? {
+        if let Ok(dmut r) = alias self._root {
+            return r:.find(path);
+        }
+
+        none
+    }
+
+    /**
+     * Give the focus to the widget of the dialog at a path from its root
+     * */
+    prot fn focus(mut self, path: [c8]) {
+        if let Ok(dmut g) = alias self._gui {
+            g:.setFocus(alias self:.find(path));
+        }
+    }
+
+    /**
+     * Record where the dialog is shown, then fill it
+     * */
+    fn show(mut self, dmut gui: &WidgetManager, dmut root: &Widget) {
+        self._gui = (alias gui)?;
+        self._root = (alias root)?;
+        self:.onShow();
+    }
 }
 
-
+pub def DialogMode : mode::DialogMode;
+pub def DialogActivity : activity::DialogActivity;
 pub def MessageDialog : message::MessageDialog;
+pub def MessageDialogStatus : message::MessageDialogStatus;
+pub def ConfirmDialog : confirm::ConfirmDialog;
+pub def FileDialog : file::FileDialog;
+pub def FileDialogMode : file::mode::FileDialogMode;
+pub def ColorDialog : color::ColorDialog;
