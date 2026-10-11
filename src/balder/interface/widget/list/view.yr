@@ -2,30 +2,12 @@ in view;
 
 use balder::core::dispose;
 use balder::core::application::signal;
-use balder::interface::style;
 use balder::interface::loader::registry::schema;
-use balder::interface::widget::scrollbar;
-use balder::interface::widget::list::{model, rows, selection};
+use balder::interface::widget::list::{model, rows_view};
 use balder::interface::widget::text::label;
-use balder::math::vector;
-
-use ::sdl3::{keyboard, keycode, mouse};
-
-use ::std::algorithm::comparison;
-
-// The number of rows a notch of the wheel scrolls by
-def WHEEL_ROWS = 3.0;
 
 // The text the height of a row is measured with, a single line of the font of the rows
 def PROBE_TEXT = "Mg";
-
-/**
- * The states of a row a style sheet selects, as bits of the key of the styles of the rows
- * */
-enum RowState : u8
-| HOVER    = 1u8
-| SELECTED = 2u8
-| CURRENT  = 4u8;
 
 /**
  * A row of a list view: a label on a single line drawing the background and the border of the part ::row
@@ -47,9 +29,9 @@ class ListRow over Label {
  * @info:
  * =====
  * The items are given by the code, through a `ListModel` the view reads on demand: it asks the text of the rows it shows
- * only, and only the rows shown exist, recycled as the list scrolls. The rows are the part `::row`, all of the height of
- * a single line of their style, in the states `:hover` under the cursor, `:selected` for the selected rows and `:current`
- * for the row the keys move from. A list higher than the view scrolls over its rows with the wheel or the part
+ * only, and only the rows shown exist, recycled as the list scrolls (RowsView). The rows are the part `::row`, all of the
+ * height of a single line of their style, in the states `:hover` under the cursor, `:selected` for the selected rows and
+ * `:current` for the row the keys move from. A list higher than the view scrolls over its rows with the wheel or the part
  * `::scrollbar`, in the states `:hover` under the cursor and `:pressed` while it is dragged, drawn in the right padding,
  * the rows narrowing to leave it the room the padding does not.
  *
@@ -58,48 +40,13 @@ class ListRow over Label {
  * code does, and `on-activate` gives the current row when Enter is pressed on it. Its size is not measured from its rows: a list is given a size by its style or by the layout stretching it.
  * ====
  * */
-pub class ListView over Widget {
+pub class ListView over RowsView {
 
     // The model whose items the list shows, none for an empty list
     let dmut _model: (&ListModel)? = none;
 
-    // The selected rows and the current row
-    let dmut _selection: &ListSelection = copy ListSelection();
-
-    // The scrollbar, shown when the rows are higher than the list
-    let dmut _scrollbar: &Scrollbar;
-
-    prot { // the rows
-
-        // The rows drawn, the item i being drawn by the row i modulo their number, so that a row keeps its item while the
-        // list scrolls past it
-        let dmut _rows: [&ListRow] = [];
-
-        // A row never drawn, measuring the height of the rows
-        let dmut _probe: &ListRow;
-
-        // The height of the margin box of a row, in pixels
-        let mut _rowHeight: f32 = 0.0f;
-
-        // The first item shown and the number of items shown
-        let mut _first: usize = 0us;
-        let mut _shown: usize = 0us;
-
-        // The part of the rows scrolled over, in pixels
-        let mut _offset: f64 = 0.0;
-
-        // The item under the cursor, none when the cursor is over no row
-        let mut _hover: (usize)? = none;
-    }
-
-    prot { // the styles of the rows
-
-        // The style of the rows in each combination of their states (RowState), computed when a row first needs it
-        let mut _rowStyles: [u8 => mut &Style] = copy [];
-
-        // The style of the list the styles of the rows were computed with
-        let mut _rowStylesOf: (&Style)? = none;
-    }
+    // A row never drawn, measuring the height of the rows
+    let dmut _probe: &ListRow;
 
     prot { // signals
         let dmut _selected: (&Signal!{[usize]})? = none;
@@ -116,7 +63,6 @@ pub class ListView over Widget {
 
     pub self (dmut manager: &WidgetManager, id: [c8])
         with super(alias manager, id, "ListView")
-        , _scrollbar = copy Scrollbar(alias manager)
         , _probe = copy ListRow(alias manager)
     {
         self._probe:.setText(PROBE_TEXT);
@@ -159,10 +105,7 @@ pub class ListView over Widget {
      * their texts again
      * */
     pub fn refresh(mut self) {
-        self._selection:.setCount(self.getCount());
-        if self._attached {
-            self:.relayout();
-        }
+        self:.reloadRows();
     }
 
     /**
@@ -176,6 +119,10 @@ pub class ListView over Widget {
         0us
     }
 
+    pub over getRowCount(self)-> usize {
+        self.getCount()
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -183,22 +130,6 @@ pub class ListView over Widget {
      * ====================================================================================================
      * ====================================================================================================
      */
-
-    /**
-     * Allow the user to select several rows, or a single one, a single list keeping one of the selected rows
-     * */
-    pub fn setMultiple(mut self, multiple: bool) {
-        if self._selection:.setMultiple(multiple) {
-            self:.restyleRows();
-        }
-    }
-
-    /**
-     * @returns: true iif the user can select several rows
-     * */
-    pub fn isMultiple(self)-> bool {
-        self._selection.isMultiple()
-    }
 
     /**
      * Select some rows, without emitting on-select, the last one becoming the current row, scrolled to; a single list
@@ -209,15 +140,6 @@ pub class ListView over Widget {
     pub fn setSelected(mut self, rows: [usize]) {
         self._selection:.select(rows);
         self:.showCurrent();
-    }
-
-    /**
-     * Unselect every row, without emitting on-select
-     * */
-    pub fn clearSelection(mut self) {
-        if self._selection:.clear() {
-            self:.restyleRows();
-        }
     }
 
     /**
@@ -232,18 +154,6 @@ pub class ListView over Widget {
      * */
     pub fn getCurrent(self)-> (usize)? {
         self._selection.getCurrent()
-    }
-
-    /**
-     * Scroll the least so that a row is shown whole
-     * @params:
-     *    - row: the row, below the number of items
-     * */
-    pub fn scrollToRow(mut self, row: usize) {
-        if row >= self.getCount() { return; }
-
-        self._offset = offsetShowing(row, self._rowHeight, self._offset, self._absoluteSize.y);
-        self:.placeRows();
     }
 
     /*!
@@ -285,162 +195,39 @@ pub class ListView over Widget {
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * ===================================          DRAW SIZE          ====================================
+     * ======================================          ROWS          ======================================
      * ====================================================================================================
      * ====================================================================================================
      */
 
-    over onUpdateSize(mut self) {
-        self._rowHeight = self:.measureRowHeight();
-        self:.placeRows();
+    prot over createRow(mut self)-> dmut &Widget {
+        copy ListRow(alias self._manager)
     }
 
-    over onUpdateScissors(mut self) {
-        let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
-        for dmut r in alias self._rows {
-            r:.setScissors(sciPos, sciSize);
+    prot over fillRow(mut self, dmut row: &Widget, item: usize) {
+        if let Ok(dmut r: &ListRow) = (alias row)? {
+            r:.setText(if let Ok(m) = self._model { m.text(item) } else { "" });
         }
-
-        let (barPos, barSize) = self.getScissors(self._absolutePostBorderPosition, self._absolutePostBorderSize);
-        self._scrollbar:.setScissors(barPos, barSize);
-    }
-
-    prot over onApplyStyle(mut self) {
-        self:.restyleRows();
-        self._scrollbar:.restyle(self);
-    }
-
-    pub over getMaxDepth(self)-> u32 {
-        // the scrollbar is drawn over the rows
-        if self._scrollbar.isOverflowing() { self.getRowsDepth() + 1 } else { self.getRowsDepth() }
     }
 
     /**
-     * The rows are not measured, only their height: a list fits in any size, and is as high as its rows at most
+     * @returns: the height of the margin box of a row, a single line of the style of the part ::row laid out in a width
      * */
-    prot over measureContentWidths(mut self)-> (f32, f32) {
-        (0.0f, 0.0f)
+    prot over measureRowHeight(mut self, width: f32)-> f32 {
+        self._probe:.setStyle(self._currentStyle.getSubStyle("row"));
+        self._probe:.measureIntrinsicHeights(width)._1
     }
 
-    prot over measureContentHeights(mut self, width: f32)-> (f32, f32) {
-        let total = cast!f32(cast!u64(self.getCount())) * self:.measureRowHeight(width-> width);
-        (0.0f, total)
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ==================================          MOUSE EVENTS          ==================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
-        if self._scrollbar.isUnder(self.toInner(pos)) {
-            self._scrollbar:.hover(self);
-            self:.setHoverRow(none);
-        } else {
-            self._scrollbar:.leave(self);
-            self:.setHoverRow(self.rowUnder(pos));
-        }
-
-        self:.setHover(true);
-        (alias self)?
-    }
-
-    pub over onLoseHoverFocus(mut self) {
-        self._scrollbar:.leave(self);
-        self:.setHoverRow(none);
-        self:.setHover(false);
-    }
-
-    /**
-     * The left button grabs the scrollbar, or selects the row under it as the modifiers held say
-     * */
-    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
-        if button != SDL_BUTTON_LEFT { return (alias self)?; }
-
-        let inner = self.toInner(pos);
-        if self._scrollbar.isUnder(inner) {
-            self._scrollbar:.grab(self, inner);
-        } else if let Ok(row) = self.rowUnder(pos) {
-            let changed = self._selection:.click(row, SDL_GetModState());
-            self:.showCurrent();
-            if changed { self:.emitSelected(); }
-        }
-
-        (alias self)?
-    }
-
-    pub over onSliding(mut self, pos: vec2, _: vec2, _: u8) {
-        if self._scrollbar.isGrabbed() && self._scrollbar.isOverflowing() {
-            let total = cast!f64(cast!u64(self.getCount())) * cast!f64(self._rowHeight);
-            self._offset = cast!f64(self._scrollbar.dragTo(self.toInner(pos), false)) * total;
-            self:.placeRows();
+    prot over emitSelected(mut self) {
+        if let Ok(dmut s) = alias self._selected {
+            s:.emit(self._selection.getSelected());
         }
     }
 
-    pub over onSlidingEnd(mut self, _: u8) {
-        self._scrollbar:.release(self);
-    }
-
-    /**
-     * The wheel scrolls the rows by three rows a notch, a list whose rows fit leaving it to its layout
-     * */
-    pub over onScroll(mut self, pos: vec2, _: i32, amountY: i32)-> bool {
-        if !self._scrollbar.isOverflowing() { return false; }
-
-        self._offset -= cast!f64(amountY) * WHEEL_ROWS * cast!f64(self._rowHeight);
-        self:.placeRows();
-        self:.onHover(pos);
-        true
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ==================================          FOCUS EVENTS          ==================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    pub over isFocusableLeftClick(self)-> bool {
-        true
-    }
-
-    pub over isFocusableByKeyboard(self)-> bool {
-        true
-    }
-
-    /**
-     * The rows are restyled as the list gains the focus, a sheet styling them in the state focus of the list
-     * */
-    pub over onGainFocus(mut self) {
-        self:.restyleRows();
-    }
-
-    pub over onLoseFocus(mut self) {
-        self._scrollbar:.release(self);
-        self:.restyleRows();
-    }
-
-    /**
-     * The arrows, Page Up, Page Down, Home and End move the current row, scrolled to, and select as the modifiers held
-     * say, as Space and Ctrl-A do; Enter activates the current row
-     * */
-    pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
-        if key == SDLK_RETURN || key == SDLK_KP_ENTER {
-            return self:.activateCurrent(mods);
+    prot over emitActivated(mut self, row: usize) {
+        if let Ok(dmut s) = alias self._activated {
+            s:.emit(row);
         }
-
-        let page = fullRows(self._rowHeight, self._absoluteSize.y);
-        if let Ok(changed) = self._selection:.pressKey(key, mods, page) {
-            self:.showCurrent();
-            if changed { self:.emitSelected(); }
-            return true;
-        }
-
-        false
     }
 
     /*!
@@ -451,282 +238,15 @@ pub class ListView over Widget {
      * ====================================================================================================
      */
 
-    pub over onAttach(mut self, parent: (&Widget)?) {
-        self.__super__:.onAttach(parent);
-        self._hover = none;
-        for dmut r in alias self._rows {
-            r:.onAttach((self)?);
-        }
-    }
-
-    over onHide(mut self) {
-        for dmut r in alias self._rows {
-            r:.hide();
-        }
-
-        self._scrollbar:.hide();
-    }
-
-    over onShow(mut self) {
-        for i in self._first .. self._first + self._shown {
-            self:.getRow(i):.show();
-        }
-
-        self._scrollbar:.show(self);
-    }
-
     impl Disposable {
         pub over dispose(mut self) {
             if let Ok(dmut m) = alias self._model {
                 m:.unwatch(&self:.refresh);
             }
 
-            for dmut r in alias self._rows {
-                r:.dispose();
-            }
-
-            self._rows = [];
             self._probe:.dispose();
-            self._scrollbar:.dispose();
             self.__super__:.dispose();
         }
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ====================================          PRIVATES          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Scroll over the part of the rows kept within them, show the scrollbar when they are higher than the list, and give
-     * the items shown their rows, on top of each other, as wide as the list less the scrollbar, the rows not used being
-     * hidden
-     * */
-    fn placeRows(mut self) {
-        let count = self.getCount();
-        let view = self._absoluteSize.y;
-        let total = cast!f64(cast!u64(count)) * cast!f64(self._rowHeight);
-        self._offset = clampOffset(count, self._rowHeight, self._offset, view);
-
-        if total <= cast!f64(view) || view <= 0.0f {
-            self._scrollbar:.fit();
-        } else {
-            self._scrollbar:.setLength(cast!f32(cast!f64(view) / total));
-            self._scrollbar:.scrollTo(cast!f32(self._offset / total));
-        }
-
-        let overflow = self._scrollbar.isOverflowing();
-        let bar = if overflow { min(self._scrollbar.getOverlap(self, false), self._absoluteSize.x) } else { 0.0f };
-        let width = self._absoluteSize.x - bar;
-
-        let (first, shown) = visibleRows(count, self._rowHeight, self._offset, view);
-        self:.ensureRows(shown);
-        self._first = first;
-        self._shown = shown;
-
-        let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
-        let dmut used = copy [false; self._rows.len];
-        for i in first .. first + shown {
-            used[i % self._rows.len] = true;
-
-            let style = self:.getRowStyle(i);
-            let text = if let Ok(m) = self._model { m.text(i) } else { "" };
-            let top = cast!f64(cast!u64(i)) * cast!f64(self._rowHeight) - self._offset;
-
-            let dmut row = self:.getRow(i);
-            row:.setStyle(style);
-            row:.setText(text);
-            row:.setSize(makeVec2(self._absolutePosition.x, self._absolutePosition.y + cast!f32(top)),
-                         makeVec2(width, self._rowHeight), self._depth + 1, self._absoluteSize);
-            row:.setScissors(sciPos, sciSize);
-            if self.isDrawn() { row:.show(); }
-        }
-
-        for j, dmut r in alias self._rows {
-            if !used[j] { r:.hide(); }
-        }
-
-        if overflow {
-            let (barPos, barSize) = self.getScissors(self._absolutePostBorderPosition, self._absolutePostBorderSize);
-            self._scrollbar:.place(self, false, barPos, barSize, self.getRowsDepth() + 1);
-        }
-    }
-
-    /**
-     * Create the rows missing for a number of items to be shown, their number never decreasing so that the items keep
-     * their rows
-     * */
-    fn ensureRows(mut self, shown: usize) {
-        while self._rows.len < shown {
-            let dmut row = copy ListRow(alias self._manager);
-            if self._attached {
-                row:.onAttach((self)?);
-            }
-
-            self._rows ~= [alias row];
-        }
-    }
-
-    /**
-     * @returns: the row drawing an item
-     * */
-    fn getRow(mut self, item: usize)-> dmut &ListRow {
-        alias self._rows[item % self._rows.len]
-    }
-
-    /**
-     * @returns: the height of the margin box of a row, a single line of the style of the part ::row laid out in a width
-     * @params:
-     *    - width: the width of the rows, that of the list when it is not given
-     * */
-    fn measureRowHeight(mut self, width: f32 = -1.0f)-> f32 {
-        self._probe:.setStyle(self._currentStyle.getSubStyle("row"));
-        let w = if width < 0.0f { self._absoluteSize.x } else { width };
-        self._probe:.measureIntrinsicHeights(w)._1
-    }
-
-    /**
-     * Give each row shown the style of the part ::row in its states
-     * */
-    fn restyleRows(mut self) {
-        for i in self._first .. self._first + self._shown {
-            if i < self.getCount() {
-                let style = self:.getRowStyle(i);
-                self:.getRow(i):.setStyle(style);
-            }
-        }
-    }
-
-    /**
-     * @returns: the style of the part ::row for an item, in its states: hover under the cursor, selected, and current for
-     * the row the keys move from
-     * */
-    fn getRowStyle(mut self, item: usize)-> &Style {
-        if let Ok(s) = self._rowStylesOf && s !is self._currentStyle {
-            self._rowStyles = copy [];
-        }
-
-        self._rowStylesOf = (self._currentStyle)?;
-
-        let mut key = 0u8;
-        if let Ok(h) = self._hover && h == item { key = key | RowState::HOVER; }
-        if self._selection.isSelected(item) { key = key | RowState::SELECTED; }
-        if let Ok(c) = self._selection.getCurrent() && c == item { key = key | RowState::CURRENT; }
-
-        if let Ok(s) = self._rowStyles[key] {
-            return s;
-        }
-
-        let mut states: [[c8]] = [];
-        if (key & RowState::HOVER) != 0u8 { states ~= ["hover"]; }
-        if (key & RowState::SELECTED) != 0u8 { states ~= ["selected"]; }
-        if (key & RowState::CURRENT) != 0u8 { states ~= ["current"]; }
-
-        let style = if states.len == 0us {
-            self._currentStyle.getSubStyle("row")
-        } else {
-            self._manager:.getStyleManager().computePart(self.getStylePath(), self._currentStyle, "row", states-> states)
-        };
-
-        self._rowStyles[key] = style;
-        style
-    }
-
-    /**
-     * Put an item under the cursor, restyling the rows when it changes
-     * */
-    fn setHoverRow(mut self, item: (usize)?) {
-        if item == self._hover { return; }
-
-        self._hover = item;
-        self:.restyleRows();
-    }
-
-    /**
-     * Scroll to the current row, and restyle the rows
-     * */
-    fn showCurrent(mut self) {
-        if let Ok(c) = self._selection.getCurrent() {
-            self._offset = offsetShowing(c, self._rowHeight, self._offset, self._absoluteSize.y);
-        }
-
-        if self._attached {
-            self:.placeRows();
-        }
-    }
-
-    /**
-     * Emit on-activate with the current row, Enter being pressed without Ctrl, Alt or Command
-     * @returns: true iif there is a current row to activate
-     * */
-    fn activateCurrent(mut self, mods: SDL_Keymod)-> bool {
-        if (mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI)) != 0u16 { return false; }
-
-        if let Ok(c) = self._selection.getCurrent() {
-            if let Ok(dmut s) = alias self._activated {
-                s:.emit(c);
-            }
-
-            return true;
-        }
-
-        false
-    }
-
-    /**
-     * Emit on-select with the selected rows
-     * */
-    fn emitSelected(mut self) {
-        if let Ok(dmut s) = alias self._selected {
-            s:.emit(self._selection.getSelected());
-        }
-    }
-
-    /**
-     * @returns: the item under a position, none over no row or over the scrollbar
-     * @params:
-     *    - pos: the position of the cursor, relative to the margin box of the list
-     * */
-    fn rowUnder(self, pos: vec2)-> (usize)? {
-        let cursor = self._absoluteFullPosition + pos * self._absoluteFullSize;
-        let inner = cursor - self._absolutePosition;
-        if inner.x < 0.0f || inner.y < 0.0f || inner.y >= self._absoluteSize.y || self._rowHeight <= 0.0f {
-            return none;
-        }
-
-        if self._scrollbar.isOverflowing() && inner.x >= self._absoluteSize.x - self._scrollbar.getOverlap(self, false) {
-            return none;
-        }
-
-        if inner.x >= self._absoluteSize.x { return none; }
-
-        let item = cast!usize(cast!u64((cast!f64(inner.y) + self._offset) / cast!f64(self._rowHeight)));
-        if item < self.getCount() { (item)? } else { none }
-    }
-
-    /**
-     * @returns: the depth of the deepest row, the list's own when it has none
-     * */
-    fn getRowsDepth(self)-> u32 {
-        let mut depth = self._depth;
-        for r in self._rows {
-            depth = max(depth, r.getMaxDepth());
-        }
-
-        depth
-    }
-
-    /**
-     * @returns: a position relative to the list, relative to its inner box
-     * */
-    fn toInner(self, pos: vec2)-> vec2 {
-        let a = (self._absolutePosition - self._absoluteFullPosition) / self._absoluteFullSize;
-        let b = self._absoluteSize / self._absoluteFullSize;
-
-        (pos - a) / b
     }
 }
 
