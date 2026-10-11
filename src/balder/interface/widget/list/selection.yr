@@ -1,0 +1,398 @@
+in selection;
+
+use ::sdl3::keycode;
+
+use ::std::algorithm::comparison;
+
+/**
+ * The rows selected in a list, and its current row, the one the keys move from
+ * @info:
+ * =====
+ * A list selects a single row, or several when it is multiple. A click selects the row clicked alone. In a multiple
+ * list, Ctrl (or Command) toggles it, Shift selects the rows from the anchor, the row clicked or toggled last, to it,
+ * and Ctrl-Shift adds those rows to the selection. In a single list, Ctrl toggles the row clicked, and Shift is ignored.
+ *
+ * The keys move the current row, the row clicked or moved to last: Up and Down by a row, Page Up and Page Down by a
+ * page, Home and End to the first and the last row, selecting it alone. In a multiple list, Shift selects the rows from
+ * the anchor to it instead, and Ctrl moves it without changing the selection. Space selects the current row alone,
+ * Ctrl-Space toggles it, and Ctrl-A selects every row of a multiple list.
+ *
+ * The selected rows are kept as ranges, so that Shift-End over a million rows makes a single range.
+ * ====
+ * */
+pub class ListSelection {
+
+    // The selected rows, as ranges [start, end) in increasing order, apart from each other
+    let mut _ranges: [(usize, usize)] = [];
+
+    // The number of rows of the list
+    let mut _count: usize = 0us;
+
+    // True iif several rows can be selected
+    let mut _multiple: bool = false;
+
+    // The row the keys move from, none before a row is clicked or moved to
+    let mut _current: (usize)? = none;
+
+    // The row Shift selects the rows from, the row clicked or toggled last, none before
+    let mut _anchor: (usize)? = none;
+
+    /**
+     * @params:
+     *    - count: the number of rows of the list
+     *    - multiple: true iif several rows can be selected
+     * */
+    pub self (count: usize = 0us, multiple: bool = false)
+        with _count = count
+        , _multiple = multiple
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of rows of the list
+     * */
+    pub fn getCount(self)-> usize {
+        self._count
+    }
+
+    /**
+     * @returns: true iif several rows can be selected
+     * */
+    pub fn isMultiple(self)-> bool {
+        self._multiple
+    }
+
+    /**
+     * @returns: true iif a row is selected
+     * */
+    pub fn isSelected(self, row: usize)-> bool {
+        for r in self._ranges {
+            if row < r._0 { return false; }
+            if row < r._1 { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the selected rows, in increasing order
+     * */
+    pub fn getSelected(self)-> [usize] {
+        let mut result: [usize] = [];
+        for r in self._ranges {
+            for i in r._0 .. r._1 {
+                result ~= [i];
+            }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the selected rows, as ranges [start, end) in increasing order
+     * */
+    pub fn getRanges(self)-> [(usize, usize)] {
+        self._ranges
+    }
+
+    /**
+     * @returns: the current row, the one the keys move from, none before a row is clicked or moved to
+     * */
+    pub fn getCurrent(self)-> (usize)? {
+        self._current
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the number of rows of the list, the rows past it being unselected
+     * @returns: true iif the selection changed
+     * */
+    pub fn setCount(mut self, count: usize)-> bool {
+        let before = self._ranges;
+        self._count = count;
+        self:.remove(count, usize::max);
+        if let Ok(c) = self._current && c >= count {
+            self._current = if count == 0us { none } else { (count - 1us)? };
+        }
+
+        if let Ok(a) = self._anchor && a >= count {
+            self._anchor = self._current;
+        }
+
+        self._ranges != before
+    }
+
+    /**
+     * Allow several rows to be selected or a single one, a single list keeping the current row when it is selected, the
+     * first selected row otherwise
+     * @returns: true iif the selection changed
+     * */
+    pub fn setMultiple(mut self, multiple: bool)-> bool {
+        self._multiple = multiple;
+        if multiple || self._ranges.len == 0us { return false; }
+
+        let before = self._ranges;
+        let kept = if let Ok(c) = self._current && self.isSelected(c) { c } else { (self._ranges[0])._0 };
+        self._ranges = copy [(kept, kept + 1us)];
+        self._ranges != before
+    }
+
+    /**
+     * Select some rows, by the code, the last one becoming the current row and the anchor, a single list selecting the
+     * last one only
+     * @params:
+     *    - rows: the rows to select, those past the rows of the list being left out
+     * @returns: true iif the selection changed
+     * */
+    pub fn select(mut self, rows: [usize])-> bool {
+        let before = self._ranges;
+        self._ranges = [];
+        for r in rows {
+            if r < self._count {
+                if !self._multiple { self._ranges = []; }
+                self:.add(r, r + 1us);
+                self._current = (r)?;
+                self._anchor = (r)?;
+            }
+        }
+
+        self._ranges != before
+    }
+
+    /**
+     * Unselect every row
+     * @returns: true iif the selection changed
+     * */
+    pub fn clear(mut self)-> bool {
+        let changed = self._ranges.len != 0us;
+        self._ranges = [];
+        changed
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GESTURES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Select as a click on a row does with some modifiers held
+     * @params:
+     *    - row: the row clicked
+     *    - mods: the modifiers held (SDL_KMOD_*)
+     * @returns: true iif the selection changed
+     * */
+    pub fn click(mut self, row: usize, mods: SDL_Keymod)-> bool {
+        if row >= self._count { return false; }
+
+        let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
+        let shift = (mods & SDL_KMOD_SHIFT) != 0u16;
+        if self._multiple && shift {
+            self:.selectFromAnchor(row, keep-> ctrl)
+        } else if ctrl {
+            self:.toggle(row)
+        } else {
+            self:.selectAlone(row)
+        }
+    }
+
+    /**
+     * Select as a key pressed with some modifiers held does
+     * @params:
+     *    - key: the key (SDLK_*)
+     *    - mods: the modifiers held (SDL_KMOD_*)
+     *    - page: the number of rows Page Up and Page Down move by
+     * @returns: whether the selection changed, none when the key is not one the list uses
+     * */
+    pub fn pressKey(mut self, key: SDL_Keycode, mods: SDL_Keymod, page: usize)-> (bool)? {
+        if self._count == 0us || (mods & SDL_KMOD_ALT) != 0u16 { return none; }
+
+        let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
+        let shift = (mods & SDL_KMOD_SHIFT) != 0u16;
+        if key == SDLK_A && ctrl && !shift {
+            if !self._multiple { return none; }
+            return (self:.selectAll())?;
+        }
+
+        if key == SDLK_SPACE && !shift {
+            let row = self._current ?? self.getFirstSelected();
+            return (if ctrl { self:.toggle(row) } else { self:.selectAlone(row) })?;
+        }
+
+        let target = if let Ok(t) = self.getKeyTarget(key, page) { t } else { return none; };
+        if self._multiple && shift {
+            (self:.selectFromAnchor(target, keep-> false))?
+        } else if self._multiple && ctrl {
+            self._current = (target)?;
+            (false)?
+        } else {
+            (self:.selectAlone(target))?
+        }
+    }
+
+    /**
+     * Select a row alone, the row becoming the current row and the anchor
+     * @returns: true iif the selection changed
+     * */
+    pub fn selectAlone(mut self, row: usize)-> bool {
+        if row >= self._count { return false; }
+
+        let before = self._ranges;
+        self._ranges = copy [(row, row + 1us)];
+        self._current = (row)?;
+        self._anchor = (row)?;
+        self._ranges != before
+    }
+
+    /**
+     * Select a row unselected, or unselect it, the row becoming the current row and the anchor; a single list selects it
+     * alone
+     * @returns: true iif the selection changed
+     * */
+    pub fn toggle(mut self, row: usize)-> bool {
+        if row >= self._count { return false; }
+
+        let before = self._ranges;
+        if self.isSelected(row) {
+            self:.remove(row, row + 1us);
+        } else {
+            if !self._multiple { self._ranges = []; }
+            self:.add(row, row + 1us);
+        }
+
+        self._current = (row)?;
+        self._anchor = (row)?;
+        self._ranges != before
+    }
+
+    /**
+     * Select the rows from the anchor to a row, the row becoming the current row, the anchor staying where it is; a row
+     * is selected alone when there is no anchor yet
+     * @params:
+     *    - row: the row to select up to
+     *    - keep: true to add the rows to the selection, false to select them alone
+     * @returns: true iif the selection changed
+     * */
+    pub fn selectFromAnchor(mut self, row: usize, keep: bool)-> bool {
+        if row >= self._count { return false; }
+
+        let anchor = if let Ok(a) = self._anchor { a } else { return self:.selectAlone(row); };
+        let before = self._ranges;
+        if !keep { self._ranges = []; }
+        self:.add(min(anchor, row), max(anchor, row) + 1us);
+        self._current = (row)?;
+        self._ranges != before
+    }
+
+    /**
+     * Select every row
+     * @returns: true iif the selection changed
+     * */
+    pub fn selectAll(mut self)-> bool {
+        let before = self._ranges;
+        self._ranges = copy [(0us, self._count)];
+        self._ranges != before
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the row a key moves the current row to, from the first selected row when there is no current row yet,
+     * none for a key that does not move it
+     * */
+    fn getKeyTarget(self, key: SDL_Keycode, page: usize)-> (usize)? {
+        let last = self._count - 1us;
+        if key == SDLK_HOME { return (0us)?; }
+        if key == SDLK_END { return (last)?; }
+
+        let current = if let Ok(c) = self._current { c } else {
+            let first = self.getFirstSelected();
+            return if key == SDLK_UP || key == SDLK_DOWN || key == SDLK_PAGEUP || key == SDLK_PAGEDOWN { (first)? } else { none };
+        };
+
+        let step = max(page, 1us);
+        if key == SDLK_UP {
+            (if current > 0us { current - 1us } else { 0us })?
+        } else if key == SDLK_DOWN {
+            (min(current + 1us, last))?
+        } else if key == SDLK_PAGEUP {
+            (if current > step { current - step } else { 0us })?
+        } else if key == SDLK_PAGEDOWN {
+            (min(current + step, last))?
+        } else {
+            none
+        }
+    }
+
+    /**
+     * @returns: the first selected row, the first row when none is selected
+     * */
+    fn getFirstSelected(self)-> usize {
+        if self._ranges.len != 0us { (self._ranges[0])._0 } else { 0us }
+    }
+
+    /**
+     * Select the rows [start, end), merged with the ranges they overlap or touch
+     * */
+    fn add(mut self, start: usize, end: usize) {
+        let mut result: [(usize, usize)] = [];
+        let mut merged = (start, end);
+        let mut placed = false;
+        for r in self._ranges {
+            if r._1 < merged._0 {
+                result ~= [r];
+            } else if r._0 > merged._1 {
+                if !placed {
+                    result ~= [merged];
+                    placed = true;
+                }
+
+                result ~= [r];
+            } else {
+                merged = (min(r._0, merged._0), max(r._1, merged._1));
+            }
+        }
+
+        if !placed { result ~= [merged]; }
+        self._ranges = result;
+    }
+
+    /**
+     * Unselect the rows [start, end), the ranges they cut being split
+     * */
+    fn remove(mut self, start: usize, end: usize) {
+        let mut result: [(usize, usize)] = [];
+        for r in self._ranges {
+            if r._1 <= start || r._0 >= end {
+                result ~= [r];
+            } else {
+                if r._0 < start { result ~= [(r._0, start)]; }
+                if r._1 > end { result ~= [(end, r._1)]; }
+            }
+        }
+
+        self._ranges = result;
+    }
+}
