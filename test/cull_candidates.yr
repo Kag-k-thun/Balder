@@ -3,72 +3,72 @@ in cull_candidates;
 use balder::core::shader::buffers::instance_draw;
 use balder::core::shader::buffers::instance_batch::{grouping, utils};
 
-use ::vulkan::core;
-
 /**
- * @returns: a draw of 'count' indices from 'first', for the object word 'word'
+ * @returns: a draw of 'count' indices for the object word 'word', of the clusters [first, first + clusters), of at most
+ * 'bound' clusters until laid out again
  * */
-fn draw(first: u32, count: u32, word: u32)-> InstanceDraw {
+fn draw(count: u32, word: u32, first: u32, clusters: u32, bound: u32)-> InstanceDraw {
     let mut d = InstanceDraw();
     d.indexCount = count;
-    d.firstIndex = first;
     d.word = word;
+    d.firstCluster = first;
+    d.clusterCount = clusters;
+    d.clusterBound = bound;
     d
 }
 
-
 /**
- * @returns: the commands and the words of draws grouped by a new grouping
+ * @returns: a draw of nothing, of at most 'bound' clusters until laid out again
  * */
-fn groupInstances(draws: [(f32, InstanceDraw)])-> ([VkDrawIndexedIndirectCommand], [u32]) {
-    let dmut grouping = copy DrawGrouping();
-    grouping:.group(draws)
+fn empty(bound: u32)-> InstanceDraw {
+    let mut d = InstanceDraw();
+    d.clusterBound = bound;
+    d
 }
 
 /**
- * @returns: the candidates of a cull pass of grouped draws, by a new grouping
+ * @returns: the candidates of a cull pass of draws laid out, by a new grouping
  * */
-fn cullCandidates(commands: [VkDrawIndexedIndirectCommand], words: [u32], count: usize)-> [u32] {
+fn cullCandidates(draws: [InstanceDraw], count: usize)-> [u32] {
     let dmut grouping = copy DrawGrouping();
-    grouping:.candidates(commands, words, count)
+    grouping:.candidates(draws, count)
 }
 
 __test no_draw_no_candidate {
-    let (commands, words) = groupInstances([]);
-    assert (cullCandidates(commands, words, 0us).len == 0us);
+    assert (cullCandidates([], 0us).len == 0us);
 }
 
-__test a_candidate_holds_its_word_and_its_command {
-    // two ranges: the level 1 holds the closest instance, its command comes first
-    let (commands, words) = groupInstances(copy [(5.0f, draw(0u32, 36u32, 4u32)),
-                                                 (1.0f, draw(36u32, 12u32, 8u32)),
-                                                 (2.0f, draw(0u32, 36u32, 12u32))]);
+__test a_candidate_holds_its_word_and_its_clusters {
+    // the level 0 of a mesh of 4 clusters from the cluster 10, then its level 1 of 2 clusters from the cluster 14
+    let candidates = cullCandidates(copy [draw(36u32, 4u32, 10u32, 4u32, 4u32), draw(12u32, 8u32, 14u32, 2u32, 4u32)], 2us);
+    assert (candidates == [4u32, 10u32, 4u32, 0u32, 8u32, 14u32, 2u32, 4u32]);
+}
 
-    let candidates = cullCandidates(commands, words, 3us);
-    assert (candidates == [8u32, 0u32, 12u32, 1u32, 4u32, 1u32]);
+__test the_visibility_of_a_candidate_follows_the_bounds_before_it {
+    // the empty draw of a mesh out of a cross-fade keeps the place of the clusters of a cross-fade
+    let candidates = cullCandidates(copy [draw(36u32, 4u32, 0u32, 2u32, 5u32),
+                                          empty(5u32),
+                                          draw(12u32, 8u32, 7u32, 1u32, 3u32)], 3us);
+
+    assert (candidates[3us] == 0u32);
+    assert (candidates[7us] == 5u32);
+    assert (candidates[11us] == 10u32);
+    assert (clusterCapacity(copy [draw(36u32, 4u32, 0u32, 2u32, 5u32), empty(5u32), draw(12u32, 8u32, 7u32, 1u32, 3u32)]) == 13u32);
+}
+
+__test the_draws_of_no_index_cull_no_cluster {
+    let candidates = cullCandidates(copy [draw(0u32, 4u32, 3u32, 2u32, 2u32), empty(2u32)], 2us);
+    assert (candidates[2us] == 0u32 && candidates[6us] == 0u32);
+}
+
+__test the_clusters_of_a_candidate_stay_in_its_bound {
+    // a draw modified in place past the bound it was laid out with cannot write over the visibility of the next one
+    let candidates = cullCandidates(copy [draw(36u32, 4u32, 0u32, 6u32, 4u32)], 1us);
+    assert (candidates[2us] == 4u32);
 }
 
 __test the_candidates_past_the_draws_draw_nothing {
-    // a culled mesh and the second draw of a mesh out of a cross-fade are laid out, and draw nothing
-    let (commands, words) = groupInstances(copy [(1.0f, draw(0u32, 36u32, 4u32)),
-                                                 (1.0f, InstanceDraw()),
-                                                 (2.0f, InstanceDraw())]);
-
-    let candidates = cullCandidates(commands, words, 3us);
-    assert (candidates == [4u32, 0u32, 0u32, NO_COMMAND, 0u32, NO_COMMAND]);
-}
-
-__test the_candidates_of_a_command_follow_its_first_instance {
-    // the range of each template in the words the pass writes is the range of its candidates
-    let (commands, words) = groupInstances(copy [(1.0f, draw(0u32, 36u32, 4u32)),
-                                                 (2.0f, draw(36u32, 12u32, 8u32)),
-                                                 (3.0f, draw(0u32, 36u32, 12u32)),
-                                                 (4.0f, draw(36u32, 12u32, 16u32))]);
-
-    let candidates = cullCandidates(commands, words, 4us);
-    for k, c in commands {
-        for i in c.firstInstance .. c.firstInstance + c.instanceCount {
-            assert (candidates[2u32 * i + 1u32] == cast!u32(k));
-        }
-    }
+    // the objects removed since the layout leave fewer draws than laid out
+    let candidates = cullCandidates(copy [draw(36u32, 4u32, 0u32, 2u32, 2u32)], 2us);
+    assert (candidates == [4u32, 0u32, 2u32, 0u32, 0u32, 0u32, 0u32, 2u32]);
 }
