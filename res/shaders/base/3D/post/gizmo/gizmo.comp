@@ -1,0 +1,142 @@
+#version 450 core
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The number of shapes drawn at most (balder::scene::utils::post::gizmo::MAX_GIZMO_SHAPES)
+#define MAX_SHAPES 256
+
+// The kinds of the shapes (balder::scene::utils::post::gizmo::shape::GizmoShapeKind)
+#define SEGMENT  0u
+#define TRIANGLE 1u
+
+// A shape of the gizmo, in texels from the top left corner of the image
+// (balder::scene::utils::post::gizmo::shape::GizmoShape)
+struct Shape {
+    // The ends of a segment, or two corners of a triangle
+    vec2 p0;
+    vec2 p1;
+
+    // The third corner of a triangle
+    vec2 p2;
+
+    // The half width of a segment
+    float width;
+
+    // SEGMENT or TRIANGLE
+    uint kind;
+
+    // The colour, encoded in sRGB, and its opacity
+    vec4 color;
+};
+
+// The colours of the screen, encoded in sRGB, written by the pass before it
+layout (binding = 1) uniform sampler2D inputTex;
+
+// The shapes of the gizmo (balder::scene::utils::post::gizmo::GizmoEffect)
+layout (binding = 2) uniform Params {
+    // The box of texels the shapes cover, from (x, y) included to (z, w) excluded
+    ivec4 area;
+
+    // The number of shapes
+    uint count;
+
+    // The shapes, the first ones drawn under the next ones
+    Shape shapes [MAX_SHAPES];
+} params;
+
+// The colours of the screen, the shapes drawn over them, encoded in sRGB, read by the screen
+layout (set = 0, binding = 0, rgba8) uniform writeonly image2D outTex;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          COVERAGE          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the share of the texel centred on p a segment covers, from the distance of p to the segment, its ends
+ * rounded
+ */
+float segmentCoverage (vec2 p, Shape s) {
+    vec2 span = s.p1 - s.p0;
+    float len2 = dot (span, span);
+    float t = len2 > 0.0 ? clamp (dot (p - s.p0, span) / len2, 0.0, 1.0) : 0.0;
+    float dist = length (p - (s.p0 + t * span));
+
+    return clamp (s.width + 0.5 - dist, 0.0, 1.0);
+}
+
+/**
+ * @returns: the distance of p to the line of an edge from a to b, positive on the side of the triangle when its corners
+ * turn in the direction of orientation
+ */
+float edgeDistance (vec2 p, vec2 a, vec2 b, float orientation) {
+    vec2 edge = b - a;
+    float len = length (edge);
+    if (len <= 0.0) {
+        return 0.0;
+    }
+
+    return orientation * (edge.x * (p.y - a.y) - edge.y * (p.x - a.x)) / len;
+}
+
+/**
+ * @returns: the share of the texel centred on p a filled triangle covers, from its distance to the closest edge inside
+ * the triangle, none for a flat triangle
+ */
+float triangleCoverage (vec2 p, Shape s) {
+    vec2 ab = s.p1 - s.p0;
+    vec2 ac = s.p2 - s.p0;
+    float area = ab.x * ac.y - ab.y * ac.x;
+    if (abs (area) < 1e-4) {
+        return 0.0;
+    }
+
+    float orientation = sign (area);
+    float inside = min (edgeDistance (p, s.p0, s.p1, orientation),
+                        min (edgeDistance (p, s.p1, s.p2, orientation), edgeDistance (p, s.p2, s.p0, orientation)));
+
+    return clamp (inside + 0.5, 0.0, 1.0);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+void main () {
+    ivec2 texelCoord = ivec2 (gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize (outTex);
+    if (texelCoord.x >= size.x || texelCoord.y >= size.y) {
+        return;
+    }
+
+    vec4 color = texelFetch (inputTex, texelCoord, 0);
+    bool covered = texelCoord.x >= params.area.x && texelCoord.y >= params.area.y &&
+        texelCoord.x < params.area.z && texelCoord.y < params.area.w;
+
+    if (covered) {
+        vec2 p = vec2 (texelCoord) + 0.5;
+        uint count = min (params.count, uint (MAX_SHAPES));
+        for (uint i = 0u; i < count; i++) {
+            Shape s = params.shapes [i];
+            float coverage = s.kind == SEGMENT ? segmentCoverage (p, s) : triangleCoverage (p, s);
+            color.rgb = mix (color.rgb, s.color.rgb, s.color.a * coverage);
+        }
+    }
+
+    imageStore (outTex, texelCoord, color);
+}
