@@ -26,8 +26,10 @@ def WHEEL_ROWS = 3.0;
  * The rows are the part `::row`, in the states `:hover` under the cursor, `:selected` for the selected rows and
  * `:current` for the row the keys move from. A view higher than its rows scrolls over them with the wheel or the part
  * `::scrollbar`, in the states `:hover` under the cursor and `:pressed` while it is dragged, drawn in the right padding,
- * the rows narrowing to leave it the room the padding does not. Its size is not measured from its rows: a view is given a
- * size by its style or by the layout stretching it.
+ * the rows narrowing to leave it the room the padding does not. Rows wider than the view (`getContentWidth`) scroll
+ * horizontally with Shift and the wheel, or a second `::scrollbar` drawn in the bottom padding. A view keeps the top of
+ * its inner box for a header (`_headerHeight`), the rows scrolling below it. Its size is not measured from its rows: a
+ * view is given a size by its style or by the layout stretching it.
  * ====
  * */
 @abstract
@@ -44,6 +46,16 @@ pub class RowsView over Widget {
         // The scrollbar, shown when the rows are higher than the view
         let dmut _scrollbar: &Scrollbar;
 
+        // The horizontal scrollbar, shown when the rows are wider than the view
+        let dmut _hbar: &Scrollbar;
+
+        // The part of the inner box above the rows, the header a view draws there, in pixels
+        let mut _headerHeight: f32 = 0.0f;
+
+        // The size of the part of the inner box the rows are shown in, below the header and beside the scrollbars
+        let mut _rowsWidth: f32 = 0.0f;
+        let mut _rowsHeight: f32 = 0.0f;
+
         // The rows drawn, the item i being drawn by the row i modulo their number, so that a row keeps its item while the
         // view scrolls past it
         let dmut _rows: [&Widget] = [];
@@ -57,6 +69,9 @@ pub class RowsView over Widget {
 
         // The part of the rows scrolled over, in pixels
         let mut _offset: f64 = 0.0;
+
+        // The part of the rows scrolled over horizontally, in pixels
+        let mut _offsetX: f32 = 0.0f;
 
         // The item under the cursor, none when the cursor is over no row
         let mut _hover: (usize)? = none;
@@ -83,6 +98,7 @@ pub class RowsView over Widget {
     prot self (dmut manager: &WidgetManager, id: [c8], typeName: [c8])
         with super(alias manager, id, typeName)
         , _scrollbar = copy Scrollbar(alias manager)
+        , _hbar = copy Scrollbar(alias manager)
     {}
 
     /*!
@@ -117,6 +133,13 @@ pub class RowsView over Widget {
      *    - width: the width of the rows
      * */
     prot fn measureRowHeight(mut self, width: f32)-> f32;
+
+    /**
+     * @returns: the width of the rows, those wider than the view scrolling horizontally, 0 for rows as wide as the view
+     * */
+    prot fn getContentWidth(self)-> f32 {
+        0.0f
+    }
 
     /**
      * Emit the signal of the view telling the selected rows, after the user changed them
@@ -171,7 +194,7 @@ pub class RowsView over Widget {
     pub fn scrollToRow(mut self, row: usize) {
         if row >= self.getRowCount() { return; }
 
-        self._offset = offsetShowing(row, self._rowHeight, self._offset, self._absoluteSize.y);
+        self._offset = offsetShowing(row, self._rowHeight, self._offset, self._rowsHeight);
         self:.placeRows();
     }
 
@@ -189,23 +212,25 @@ pub class RowsView over Widget {
     }
 
     over onUpdateScissors(mut self) {
-        let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
+        let (sciPos, sciSize) = self.getRowsScissors();
         for dmut r in alias self._rows {
             r:.setScissors(sciPos, sciSize);
         }
 
         let (barPos, barSize) = self.getScissors(self._absolutePostBorderPosition, self._absolutePostBorderSize);
         self._scrollbar:.setScissors(barPos, barSize);
+        self._hbar:.setScissors(barPos, barSize);
     }
 
     prot over onApplyStyle(mut self) {
         self:.restyleRows();
         self._scrollbar:.restyle(self);
+        self._hbar:.restyle(self);
     }
 
     pub over getMaxDepth(self)-> u32 {
-        // the scrollbar is drawn over the rows
-        if self._scrollbar.isOverflowing() { self.getRowsDepth() + 1 } else { self.getRowsDepth() }
+        // the scrollbars are drawn over the rows
+        if self._scrollbar.isOverflowing() || self._hbar.isOverflowing() { self.getRowsDepth() + 1 } else { self.getRowsDepth() }
     }
 
     /**
@@ -229,11 +254,18 @@ pub class RowsView over Widget {
      */
 
     pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
-        if self._scrollbar.isUnder(self.toInner(pos)) {
+        let inner = self.toInner(pos);
+        if self._scrollbar.isUnder(inner) {
+            self._hbar:.leave(self);
             self._scrollbar:.hover(self);
+            self:.setHoverRow(none);
+        } else if self._hbar.isUnder(inner) {
+            self._scrollbar:.leave(self);
+            self._hbar:.hover(self);
             self:.setHoverRow(none);
         } else {
             self._scrollbar:.leave(self);
+            self._hbar:.leave(self);
             self:.setHoverRow(self.rowUnder(pos));
         }
 
@@ -243,13 +275,14 @@ pub class RowsView over Widget {
 
     pub over onLoseHoverFocus(mut self) {
         self._scrollbar:.leave(self);
+        self._hbar:.leave(self);
         self:.setHoverRow(none);
         self:.setHover(false);
     }
 
     /**
-     * The left button grabs the scrollbar, or selects the row under it as the modifiers held say, unless the view uses
-     * the click on that row (clickRow)
+     * The left button grabs a scrollbar, or selects the row under it as the modifiers held say, unless the view uses the
+     * click on that row (clickRow)
      * */
     pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
         if button != SDL_BUTTON_LEFT { return (alias self)?; }
@@ -257,6 +290,8 @@ pub class RowsView over Widget {
         let inner = self.toInner(pos);
         if self._scrollbar.isUnder(inner) {
             self._scrollbar:.grab(self, inner);
+        } else if self._hbar.isUnder(inner) {
+            self._hbar:.grab(self, inner);
         } else if let Ok(row) = self.rowUnder(pos) {
             if !self:.clickRow(row, self.toPixels(pos)) {
                 let changed = self._selection:.click(row, SDL_GetModState());
@@ -284,20 +319,39 @@ pub class RowsView over Widget {
             let total = cast!f64(cast!u64(self.getRowCount())) * cast!f64(self._rowHeight);
             self._offset = cast!f64(self._scrollbar.dragTo(self.toInner(pos), false)) * total;
             self:.placeRows();
+        } else if self._hbar.isGrabbed() && self._hbar.isOverflowing() {
+            self._offsetX = self._hbar.dragTo(self.toInner(pos), true) * self.getContentWidth();
+            self:.placeRows();
         }
     }
 
     pub over onSlidingEnd(mut self, _: u8) {
         self._scrollbar:.release(self);
+        self._hbar:.release(self);
     }
 
     /**
-     * The wheel scrolls the rows by three rows a notch, a view whose rows fit leaving it to its layout
+     * The wheel scrolls the rows by three rows a notch, horizontally with Shift held or along the horizontal axis of the
+     * wheel, a view whose rows fit leaving it to its layout
      * */
-    pub over onScroll(mut self, pos: vec2, _: i32, amountY: i32)-> bool {
-        if !self._scrollbar.isOverflowing() { return false; }
+    pub over onScroll(mut self, pos: vec2, amountX: i32, amountY: i32)-> bool {
+        let shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0u16;
+        let (dx, dy) = if shift && amountX == 0 { (-amountY, 0) } else { (amountX, amountY) };
+        let step = WHEEL_ROWS * cast!f64(self._rowHeight);
 
-        self._offset -= cast!f64(amountY) * WHEEL_ROWS * cast!f64(self._rowHeight);
+        let mut scrolled = false;
+        if dy != 0 && self._scrollbar.isOverflowing() {
+            self._offset -= cast!f64(dy) * step;
+            scrolled = true;
+        }
+
+        if dx != 0 && self._hbar.isOverflowing() {
+            self._offsetX += cast!f32(cast!f64(dx) * step);
+            scrolled = true;
+        }
+
+        if !scrolled { return false; }
+
         self:.placeRows();
         self:.onHover(pos);
         true
@@ -328,6 +382,7 @@ pub class RowsView over Widget {
 
     pub over onLoseFocus(mut self) {
         self._scrollbar:.release(self);
+        self._hbar:.release(self);
         self:.restyleRows();
     }
 
@@ -340,7 +395,7 @@ pub class RowsView over Widget {
             return self:.activateCurrent(mods);
         }
 
-        let page = fullRows(self._rowHeight, self._absoluteSize.y);
+        let page = fullRows(self._rowHeight, self._rowsHeight);
         if let Ok(changed) = self._selection:.pressKey(key, mods, page) {
             self:.showCurrent();
             if changed { self:.emitSelected(); }
@@ -372,6 +427,7 @@ pub class RowsView over Widget {
         }
 
         self._scrollbar:.hide();
+        self._hbar:.hide();
     }
 
     over onShow(mut self) {
@@ -380,6 +436,7 @@ pub class RowsView over Widget {
         }
 
         self._scrollbar:.show(self);
+        self._hbar:.show(self);
     }
 
     impl Disposable {
@@ -390,6 +447,7 @@ pub class RowsView over Widget {
 
             self._rows = [];
             self._scrollbar:.dispose();
+            self._hbar:.dispose();
             self.__super__:.dispose();
         }
     }
@@ -418,7 +476,7 @@ pub class RowsView over Widget {
      * */
     prot fn showCurrent(mut self) {
         if let Ok(c) = self._selection.getCurrent() {
-            self._offset = offsetShowing(c, self._rowHeight, self._offset, self._absoluteSize.y);
+            self._offset = offsetShowing(c, self._rowHeight, self._offset, self._rowsHeight);
         }
 
         if self._attached {
@@ -509,18 +567,21 @@ pub class RowsView over Widget {
      * */
     prot fn rowUnder(self, pos: vec2)-> (usize)? {
         let inner = self.toPixels(pos);
-        if inner.x < 0.0f || inner.y < 0.0f || inner.y >= self._absoluteSize.y || self._rowHeight <= 0.0f {
+        let y = inner.y - self._headerHeight;
+        if inner.x < 0.0f || y < 0.0f || inner.x >= self._rowsWidth || y >= self._rowsHeight || self._rowHeight <= 0.0f {
             return none;
         }
 
-        if self._scrollbar.isOverflowing() && inner.x >= self._absoluteSize.x - self._scrollbar.getOverlap(self, false) {
-            return none;
-        }
-
-        if inner.x >= self._absoluteSize.x { return none; }
-
-        let item = cast!usize(cast!u64((cast!f64(inner.y) + self._offset) / cast!f64(self._rowHeight)));
+        let item = cast!usize(cast!u64((cast!f64(y) + self._offset) / cast!f64(self._rowHeight)));
         if item < self.getRowCount() { (item)? } else { none }
+    }
+
+    /**
+     * @returns: the scissors of the rows, the part of the inner box below the header
+     * */
+    prot fn getRowsScissors(self)-> (vec2, vec2) {
+        let header = makeVec2(0.0f, min(self._headerHeight, self._absoluteSize.y));
+        self.getScissors(self._absolutePosition + header, self._absoluteSize - header)
     }
 
     /**
@@ -539,16 +600,26 @@ pub class RowsView over Widget {
      */
 
     /**
-     * Scroll over the part of the rows kept within them, show the scrollbar when they are higher than the view, and give
-     * the items shown their rows, on top of each other, as wide as the view less the scrollbar, the rows not used being
-     * hidden
+     * Scroll over the part of the rows kept within them, show the scrollbars when they are higher or wider than the part
+     * of the view below the header, and give the items shown their rows, on top of each other, as wide as the view less
+     * the vertical scrollbar or as wide as the content, the rows not used being hidden
      * */
     fn placeRows(mut self) {
         let count = self.getRowCount();
-        let view = self._absoluteSize.y;
+        let size = self._absoluteSize;
+        let content = self.getContentWidth();
         let total = cast!f64(cast!u64(count)) * cast!f64(self._rowHeight);
-        self._offset = clampOffset(count, self._rowHeight, self._offset, view);
 
+        // the horizontal scrollbar takes the bottom of the inner box when the rows are wider than the view less the
+        // vertical scrollbar they would show, then the vertical scrollbar its right side when they are higher than what
+        // is left
+        let tall = total > cast!f64(size.y - self._headerHeight);
+        let guess = if tall { self._scrollbar.getThickness(self, false) } else { 0.0f };
+        let wide = content > size.x - guess;
+        let hbar = if wide { min(self._hbar.getOverlap(self, true), size.y) } else { 0.0f };
+        let view = max(0.0f, size.y - self._headerHeight - hbar);
+
+        self._offset = clampOffset(count, self._rowHeight, self._offset, view);
         if total <= cast!f64(view) || view <= 0.0f {
             self._scrollbar:.fit();
         } else {
@@ -557,26 +628,37 @@ pub class RowsView over Widget {
         }
 
         let overflow = self._scrollbar.isOverflowing();
-        let bar = if overflow { min(self._scrollbar.getOverlap(self, false), self._absoluteSize.x) } else { 0.0f };
-        let width = self._absoluteSize.x - bar;
+        let bar = if overflow { min(self._scrollbar.getOverlap(self, false), size.x) } else { 0.0f };
+        let width = size.x - bar;
+        if wide && width > 0.0f {
+            self._offsetX = clamp(self._offsetX, 0.0f, max(0.0f, content - width));
+            self._hbar:.setLength(width / content);
+            self._hbar:.scrollTo(self._offsetX / content);
+        } else {
+            self._offsetX = 0.0f;
+            self._hbar:.fit();
+        }
+
+        self._rowsWidth = width;
+        self._rowsHeight = view;
 
         let (first, shown) = visibleRows(count, self._rowHeight, self._offset, view);
         self:.ensureRows(shown);
         self._first = first;
         self._shown = shown;
 
-        let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
+        let (sciPos, sciSize) = self.getRowsScissors();
         let dmut used = copy [false; self._rows.len];
         for i in first .. first + shown {
             used[i % self._rows.len] = true;
 
             let top = cast!f64(cast!u64(i)) * cast!f64(self._rowHeight) - self._offset;
+            let pos = self._absolutePosition + makeVec2(-self._offsetX, self._headerHeight + cast!f32(top));
 
             let dmut row = self:.getRow(i);
             self:.styleRow(alias row, i);
             self:.fillRow(alias row, i);
-            row:.setSize(makeVec2(self._absolutePosition.x, self._absolutePosition.y + cast!f32(top)),
-                         makeVec2(width, self._rowHeight), self._depth + 1, self._absoluteSize);
+            row:.setSize(pos, makeVec2(max(width, content), self._rowHeight), self._depth + 1, size);
             row:.setScissors(sciPos, sciSize);
             if self.isDrawn() { row:.show(); }
         }
@@ -585,9 +667,13 @@ pub class RowsView over Widget {
             if !used[j] { r:.hide(); }
         }
 
+        let (barPos, barSize) = self.getScissors(self._absolutePostBorderPosition, self._absolutePostBorderSize);
         if overflow {
-            let (barPos, barSize) = self.getScissors(self._absolutePostBorderPosition, self._absolutePostBorderSize);
             self._scrollbar:.place(self, false, barPos, barSize, self.getRowsDepth() + 1);
+        }
+
+        if self._hbar.isOverflowing() {
+            self._hbar:.place(self, true, barPos, barSize, self.getRowsDepth() + 1);
         }
     }
 
