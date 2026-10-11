@@ -128,8 +128,8 @@ cd tools && gyllir build
 
 ## The graph of a scene
 
-With shadows, the culling on the GPU, the occlusion culling and the ambient occlusion (`./demo --shadows --gpu-cull
---occlusion --ambient-occlusion`):
+With shadows, the culling on the GPU (the default when the device allows it), the occlusion culling and the ambient
+occlusion (`./demo --shadows --occlusion --ambient-occlusion`):
 
 ```mermaid
 flowchart LR
