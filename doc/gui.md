@@ -203,8 +203,8 @@ FieldRow #NAME "Name" { on-validate: form::name-set; }
 ```
 
 - **The signals are registered by the widget types**, each with the type of its payload: every widget emits
-  `on-click` with the mouse button (`u8`), `on-focus` and `on-blur` when it gains and loses the focus; the others are
-  listed under [Widget types](#widget-types).
+  `on-click` with the mouse button (`u8`, the left one for a button pressed with the [keyboard](#keyboard)), `on-focus`
+  and `on-blur` when it gains and loses the focus; the others are listed under [Widget types](#widget-types).
 - **The slots are registered by the activity**: `Activity.slot (name, delegate)` records the types of the parameters
   of the delegate, which runs in the thread of the activity. The loader looks no slot up anywhere else.
 - **A behavior groups slots under a name.** A class over `Behavior` registers its slots in its constructor
@@ -266,6 +266,50 @@ Image "res:/images/logo.png";
 - **An image shows a picture** as the background image of its inline style, so that `image-fill`, `image-keep-ratio`
   and `image-color` apply to it. Sized to its content it is as wide as the picture and as high as the picture scaled
   to its width; its min-content width is 0.
+
+### Keyboard
+
+```
+LinearLayout #FORM {
+    InputText #NAME;                                    // the order of the tree
+    InputText #CODE { tab-index: 1; }                   // focused before the widgets of the index 0
+    PushButton #HELP "?" { tab-index: -1; }             // never focused by Tab, clicked all the same
+    PushButton #SUBMIT "Submit" { on-click: submit; }   // Enter and Space emit on-click with the left button
+}
+```
+
+- **Tab moves the focus** to the next widget taking it from the keyboard, Shift-Tab to the previous one, wrapping
+  around: the input texts and the spin boxes, the push buttons, menu buttons, check boxes, radio buttons and dropdowns,
+  the sliders and the tab layouts, whose headers come before the content of their selected tab. The widgets not drawn
+  (`display: none`, the content of a tab not selected) are left out. Without a focused widget, Tab moves on from the
+  widget clicked or focused last.
+- **`tab-index` changes the order**, an attribute of every widget: the widgets of a positive index come first, by
+  increasing index, then those of the index 0, the default one, in the order of the tree. Tab never focuses a widget of
+  a negative index, which a click still focuses. It does not make a widget that takes no focus focusable.
+- **The focused widget uses a key first**, the manager using Tab, Shift-Tab, Escape, Up and Down only when it did not:
+
+  | Widget | Keys |
+  |---|---|
+  | `PushButton` | Enter and Space emit `on-click` with the left button |
+  | `CheckBox`, `RadioButton` | Enter and Space check as a click does; the arrows check the radio button of the group before (Up, Left) or after (Down, Right) the focused one, wrapping around, the focus following |
+  | `MenuButton` | Enter and Space open its menu, the focus moving to the first widget of the menu |
+  | `Dropdown` | Up and Down select the item before or after the selected one, emitting `on-change`; Enter and Space open the list, which takes the focus: Up, Down, Home and End move the item under the keyboard, Enter and Space select it |
+  | `Slider` | the arrows move the value by a step, up for Up and Right; Page Up and Page Down by ten steps; Home and End to `min` and `max` |
+  | `SpinBox` | Up and Down move the value by a step, Page Up and Page Down by ten steps, from the number typed; Left and Right move the caret |
+  | `TabLayout` | Left and Right select the tab before or after the selected one, wrapping around; Home and End the first and the last one |
+  | `InputText` | the keys of the text; Enter and Escape validate it, the focus leaving the input |
+
+- **A group of radio buttons is a single stop**: Tab focuses its checked radio button only, every one of them when none
+  is checked.
+- **An open menu keeps the focus**: Tab, Shift-Tab, Up and Down move it among the widgets of the menu opened last (the
+  list of a dropdown is one), and Escape closes that menu, the focus going back to the widget that opened it. A dialog
+  is a window of its own, the window behind it taking no input while it is open.
+- **The focused widget is in the state `:focus`**, which the sheets style as a focus ring, a shadow moving nothing:
+  `PushButton.submit:focus { shadow: 0 0 0 2 #388bfd; }`, `CheckBox:focus::box { border-color: #388bfd; }`. A linear
+  layout that scrolls shows the widget given the focus.
+- **A widget type of the application** takes the focus from the keyboard by overriding `isFocusableByKeyboard`, and
+  uses keys by overriding `onKeyPressed (key, mods)`, returning true when it used the key. A layout keeping the focus in
+  a child overrides `getFocusTrap` and `dismissFocusTrap`, and a layout that scrolls `reveal`.
 
 ## The style file
 
@@ -465,7 +509,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Box`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -476,7 +520,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `CheckBox`
 
-- **Attributes:** `text`: a string; `checked`: true or false
+- **Attributes:** `tab-index`: an integer; `text`: a string; `checked`: true or false
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -487,7 +531,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Dropdown`
 
-- **Attributes:** `items`: strings separated by commas; `selected`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `items`: strings separated by commas; `selected`: an integer of 0 or more
 - **Default attribute:** `items`
 - **Children:** none
 - **Attributes of the children:** none
@@ -498,7 +542,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `FloatingLayout`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** `capture-events`: true or false
@@ -509,7 +553,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `FrameGraph`
 
-- **Attributes:** `frames`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `frames`: an integer of 0 or more
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -520,7 +564,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `GridLayout`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** `cell`: two integers of 0 or more
@@ -531,7 +575,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Image`
 
-- **Attributes:** `src`: a string
+- **Attributes:** `tab-index`: an integer; `src`: a string
 - **Default attribute:** `src`
 - **Children:** none
 - **Attributes of the children:** none
@@ -542,7 +586,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `InputText`
 
-- **Attributes:** `text`: a string; `max-length`: an integer of 0 or more; `only-numbers`: true or false
+- **Attributes:** `tab-index`: an integer; `text`: a string; `max-length`: an integer of 0 or more; `only-numbers`: true or false
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -553,7 +597,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Label`
 
-- **Attributes:** `text`: a string
+- **Attributes:** `tab-index`: an integer; `text`: a string
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -564,7 +608,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `LinearLayout`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** none
@@ -575,7 +619,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `MenuButton`
 
-- **Attributes:** `text`: a string; `open-on-hover`: true or false
+- **Attributes:** `tab-index`: an integer; `text`: a string; `open-on-hover`: true or false
 - **Default attribute:** `text`
 - **Children:** its popup, optional
 - **Attributes of the children:** none
@@ -586,7 +630,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `MenuLayout`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** its bar then its content
 - **Attributes of the children:** none
@@ -597,7 +641,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `ProgressBar`
 
-- **Attributes:** `value`: a number; `min`: a number; `max`: a number
+- **Attributes:** `tab-index`: an integer; `value`: a number; `min`: a number; `max`: a number
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
@@ -608,7 +652,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `PushButton`
 
-- **Attributes:** `text`: a string
+- **Attributes:** `tab-index`: an integer; `text`: a string
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -619,7 +663,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `RadioButton`
 
-- **Attributes:** `text`: a string; `checked`: true or false; `group`: a string
+- **Attributes:** `tab-index`: an integer; `text`: a string; `checked`: true or false; `group`: a string
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -630,7 +674,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Scene3D`
 
-- **Attributes:** `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`
+- **Attributes:** `tab-index`: an integer; `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -641,7 +685,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Separator`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -652,7 +696,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Slider`
 
-- **Attributes:** `value`: a number; `min`: a number; `max`: a number; `step`: a number
+- **Attributes:** `tab-index`: an integer; `value`: a number; `min`: a number; `max`: a number; `step`: a number
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
@@ -663,7 +707,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `SpinBox`
 
-- **Attributes:** `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
@@ -674,7 +718,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Splitter`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** none
@@ -685,7 +729,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `TabLayout`
 
-- **Attributes:** none
+- **Attributes:** `tab-index`: an integer
 - **Default attribute:** none
 - **Children:** at least 1
 - **Attributes of the children:** `tab`: a string, required
