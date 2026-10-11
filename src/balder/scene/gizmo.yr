@@ -1,0 +1,989 @@
+in gizmo;
+
+pub mod ::frame;
+pub mod ::handle;
+pub mod ::mode;
+pub mod ::snap;
+pub mod ::space;
+pub mod ::view;
+mod ::geometry;
+mod ::parts;
+
+use balder::core::application::signal;
+use balder::math::{bounds, utils, vector};
+use balder::scene::edit;
+use balder::scene::gizmo::{frame, handle, mode, snap, space, view};
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::transform;
+use balder::scene::utils::post::gizmo;
+use balder::scene::utils::post::gizmo::shape;
+use balder::utils::log;
+
+use std::math;
+use std::time::dur;
+
+/**
+ * The places along an axis of the gizmo, in shares of its length: the squares of the planes from PLANE_LOW to
+ * PLANE_HIGH on the two axes of their plane, the head of an arrow from HEAD_BASE, the handles of the axes picked from
+ * AXIS_START, the ring about the view at VIEW_RING, the box in the centre picked within CENTRE_BOX
+ * */
+def PLANE_LOW  = 0.25f;
+def PLANE_HIGH = 0.5f;
+def HEAD_BASE  = 0.78f;
+def AXIS_START = 0.12f;
+def VIEW_RING  = 1.2f;
+def CENTRE_BOX = 0.12f;
+
+/**
+ * The number of segments drawing a ring about an axis, and the ring about the view
+ * */
+def RING_SEGMENTS = 48us;
+def VIEW_SEGMENTS = 64us;
+
+/**
+ * The distance in texels from a handle within which the cursor grabs it
+ * */
+def PICK_TEXELS = 7.0f;
+
+/**
+ * An axis pointing at the eye closer than this cosine is hidden, as a plane seen edge on further than this one
+ * */
+def HIDDEN_AXIS  = 0.985f;
+def HIDDEN_PLANE = 0.2f;
+
+/**
+ * A ring is dragged on the plane facing the eye when the cursor sees its plane edge on further than this cosine
+ * */
+def EDGE_ON = 0.1f;
+
+/**
+ * The widths of the lines of the gizmo, the half side of the boxes and the half width of the heads of the arrows, in
+ * texels
+ * */
+def LINE_WIDTH     = 2.5f;
+def HOVERED_WIDTH  = 3.5f;
+def BOX_HALF       = 5.0f;
+def CENTRE_HALF    = 7.0f;
+def HEAD_HALF      = 5.5f;
+def CENTRE_DOT     = 6.0f;
+
+/**
+ * The name of the effect drawing the gizmos in the post-process chain of a scene
+ * */
+def GIZMO_EFFECT = "gizmo";
+
+/**
+ * A transform gizmo: handles drawn over a scene on the nodes it moves, the cursor grabbing one and dragging it
+ * translating, rotating or scaling them (see GizmoMode)
+ * @info:
+ * =====
+ * The gizmo is a node of the scene, spawned by a SceneGizmo while nodes are selected and disposed when none is. While it
+ * is in a scene, an effect of its post-process chain (GizmoEffect, named gizmo) draws its shapes after the other
+ * effects, the shapes following the camera and the nodes at each tick; the effect is skipped once the gizmo leaves.
+ * The gizmo stands on the last node of those it moves (the node selected last), at a size on the image (see size)
+ * whatever its distance. Its handles are picked by the ray through the cursor, within PICK_TEXELS texels, and a drag
+ * projects the ray on the axis or the plane grabbed, its change from the grab given to every node: the same translation
+ * in the world, the same rotation about each origin, the same factors of scale about each origin. The changes go
+ * through TransformEdit, the edits of the drag being kept until the next one (see edits).
+ * In local space the gizmo follows the axes of its node; the scale of a node acts along its own axes, so the gizmo
+ * scales along those whatever its space. The snapping (see snap) rounds the translation along each axis, the
+ * angle and the factors of scale.
+ * ====
+ * */
+pub class TransformGizmo over Node {
+
+    // What the handles change in the nodes
+    let mut _mode: GizmoMode = GizmoMode::TRANSLATE;
+
+    // The axes the gizmo translates and rotates along
+    let mut _space: GizmoSpace = GizmoSpace::WORLD;
+
+    // The length of an axis of the gizmo, in texels of the image
+    let mut _size: f32 = 110.0f;
+
+    // The steps the changes snap to
+    let mut _snap: GizmoSnap = GizmoSnap();
+
+    // The nodes the gizmo moves, those selected under no node selected, the gizmo standing on the last one
+    let dmut _nodes: [&Node3D] = [];
+
+    // The handle under the cursor
+    let mut _hovered: GizmoHandle = GizmoHandle::NONE;
+
+    // The signal emitted when a drag ends having changed the nodes
+    let dmut _transformed: (&Signal!{()})? = none;
+
+    // The effect of the post-process chain drawing the gizmo, while it is in a scene
+    let dmut _effect: (&GizmoEffect)? = none;
+
+    prv { // Drag
+
+        // The handle dragged, NONE when there is no drag
+        let mut _grabbed: GizmoHandle = GizmoHandle::NONE;
+
+        // Where the gizmo stood when the handle was grabbed
+        let mut _grabFrame: GizmoFrame = GizmoFrame();
+
+        // The point of the image the cursor grabbed the handle at, in texels
+        let mut _grabPixel: vec2 = vec2();
+
+        // The distance from the centre along the axis grabbed of the point the cursor grabbed it at
+        let mut _grabAlong: f32 = 0.0f;
+
+        // The point of the plane grabbed the cursor grabbed it at
+        let mut _grabPoint: vec3 = vec3();
+
+        // The direction from the centre of the point of the ring grabbed under the cursor at the last move, and the
+        // angle the cursor turned about the ring since the grab
+        let mut _lastVector: vec3 = vec3();
+        let mut _angle: f32 = 0.0f;
+
+        // The edits of the nodes by the drag, or by the last one, in the order of the nodes
+        let dmut _edits: [TransformEdit] = [];
+    }
+
+    /**
+     * Create a gizmo moving no node, put in a tree
+     * @params:
+     *    - name: the name of the node
+     *    - parent: the node the gizmo is attached to, the root of a scene to draw it
+     * */
+    pub self (name: [c8], dmut parent: &Node)
+        with super(name, alias parent)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SCENE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the gizmo by the effect of the post-process chain of the scene, added the first time a gizmo enters it
+     * */
+    pub over onEnter(mut self, dmut scene: &Scene) {
+        let dmut chain = scene:.getPostChain();
+        if let Ok(dmut e: &GizmoEffect) = alias chain:.get(GIZMO_EFFECT) {
+            chain:.enable(GIZMO_EFFECT, true);
+            self._effect = (alias e)?;
+            return;
+        }
+
+        let dmut effect = copy GizmoEffect(name-> GIZMO_EFFECT);
+        {
+            chain:.add(alias effect);
+            self._effect = (alias effect)?;
+        } catch {
+            err => {
+                log::error #("TransformGizmo", "Failed to draw the gizmo", err);
+            }
+        }
+    }
+
+    /**
+     * Stop drawing the gizmo, the effect of the post-process chain skipped
+     * */
+    pub over onExit(mut self, dmut scene: &Scene) {
+        if let Ok(dmut e) = alias self._effect {
+            e:.setShapes([]);
+        }
+
+        self._effect = none;
+        scene:.getPostChain():.enable(GIZMO_EFFECT, false);
+    }
+
+    /**
+     * Give the effect the shapes the camera of the scene sees the gizmo as
+     * */
+    pub over onTick(mut self, delta: Duration) {
+        if let Ok(dmut e) = alias self._effect {
+            if let Ok(dmut scene) = alias self:.getScene() {
+                e:.setShapes(if let Ok(view) = viewOf(alias scene) { self.shapes(view) } else { [] });
+            }
+        }
+
+        self.__super__:.onTick(delta);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: what the handles change in the nodes
+     * */
+    @field
+    pub fn mode(self)-> GizmoMode {
+        self._mode
+    }
+
+    /**
+     * Change what the handles change in the nodes, ending the drag
+     * */
+    @field
+    pub fn mode(mut self, mode: GizmoMode) {
+        self:.release();
+        self._mode = mode;
+        self._hovered = GizmoHandle::NONE;
+    }
+
+    /**
+     * @returns: the axes the gizmo translates and rotates along
+     * */
+    @field
+    pub fn space(self)-> GizmoSpace {
+        self._space
+    }
+
+    /**
+     * Change the axes the gizmo translates and rotates along, ending the drag
+     * */
+    @field
+    pub fn space(mut self, space: GizmoSpace) {
+        self:.release();
+        self._space = space;
+    }
+
+    /**
+     * @returns: the length of an axis of the gizmo, in texels of the image
+     * */
+    @field
+    pub fn size(self)-> f32 {
+        self._size
+    }
+
+    /**
+     * Change the length of an axis of the gizmo, in texels of the image (110 by default), the gizmo keeping it wherever
+     * it stands
+     * */
+    @field
+    pub fn size(mut self, texels: f32) {
+        self._size = if texels > 1.0f { texels } else { 1.0f };
+    }
+
+    /**
+     * @returns: the steps the changes snap to
+     * */
+    @field
+    pub fn snap(self)-> GizmoSnap {
+        self._snap
+    }
+
+    /**
+     * Change the steps the changes snap to while snapping
+     * */
+    @field
+    pub fn snap(mut self, snap: GizmoSnap) {
+        self._snap = snap;
+    }
+
+    /**
+     * @returns: the nodes the gizmo moves, the gizmo standing on the last one
+     * */
+    @field
+    pub fn nodes(self)-> [&Node3D] {
+        self._nodes
+    }
+
+    /**
+     * @returns: the handle under the cursor at its last move, NONE when there is none
+     * */
+    @field
+    pub fn hovered(self)-> GizmoHandle {
+        self._hovered
+    }
+
+    /**
+     * @returns: the handle dragged, NONE when there is no drag
+     * */
+    @field
+    pub fn grabbed(self)-> GizmoHandle {
+        self._grabbed
+    }
+
+    /**
+     * @returns: true iif a handle is dragged
+     * */
+    @field
+    pub fn isDragging(self)-> bool {
+        self._grabbed != GizmoHandle::NONE
+    }
+
+    /**
+     * @returns: the edits of the nodes by the drag, or by the last one, in the order of the nodes
+     * */
+    @field
+    pub fn edits(self)-> [TransformEdit] {
+        self._edits
+    }
+
+    /**
+     * Move other nodes, the nodes selected: those under another node selected are left out, as they move with it,
+     * and the gizmo stands on the last one; the drag ends first
+     * */
+    pub fn setNodes(mut self, dmut selected: [&Node3D]) {
+        self:.release();
+
+        let dmut uids: [usize => bool] = copy [];
+        for n in selected {
+            uids[n.uid] = true;
+        }
+
+        let dmut kept: [&Node3D] = [];
+        for dmut n in alias selected {
+            if !self.isUnderSelected(alias n, uids) {
+                kept ~= [alias n];
+            }
+        }
+
+        self._nodes = alias kept;
+        self._hovered = GizmoHandle::NONE;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          FRAME          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: where the gizmo stands, seen by a view: on the origin of its last node, along the axes of its mode and
+     * its space, at its size in the image; none without nodes or when its centre is behind the camera
+     * */
+    pub fn frame(self, view: GizmoView)-> (GizmoFrame)? {
+        if self._nodes.len == 0us { return none; }
+
+        let node = self._nodes[self._nodes.len - 1us];
+        let centre = geometry::origin(node.transformation);
+        let pixel = if let Ok(p) = view.project(centre) { p } else { return none; };
+
+        let texels = view.texelsPerUnit(centre);
+        if texels <= 0.0f { return none; }
+
+        let (x, y, z) = self.axesOf(node);
+        GizmoFrame(centre-> centre,
+                   axisX-> x,
+                   axisY-> y,
+                   axisZ-> z,
+                   size-> self._size / texels,
+                   toEye-> -view.ray(pixel).direction)?
+    }
+
+    /**
+     * @returns: the axes of the gizmo standing on a node: those of the node scaling it or in local space, those of the
+     * world otherwise
+     * */
+    fn axesOf(self, node: &Node3D)-> (vec3, vec3, vec3) {
+        let x = makeVec3(1.0f, 0.0f, 0.0f), y = makeVec3(0.0f, 1.0f, 0.0f), z = makeVec3(0.0f, 0.0f, 1.0f);
+        if self._mode == GizmoMode::SCALE || self._space == GizmoSpace::LOCAL {
+            let t = node.transformation;
+            return geometry::orthonormal(geometry::direction(t, x), geometry::direction(t, y), geometry::direction(t, z));
+        }
+
+        (x, y, z)
+    }
+
+    /**
+     * @returns: true iif the handle of an axis is shown, the axis not pointing at the eye
+     * */
+    fn axisShown(self, frame: GizmoFrame, i: usize)-> bool {
+        math::abs(frame.axis(i).dot(frame.toEye)) < HIDDEN_AXIS
+    }
+
+    /**
+     * @returns: true iif the square of the plane across an axis is shown, the plane not seen edge on
+     * */
+    fn planeShown(self, frame: GizmoFrame, i: usize)-> bool {
+        math::abs(frame.axis(i).dot(frame.toEye)) > HIDDEN_PLANE
+    }
+
+    /**
+     * @returns: the places of the axes, the one pointing the farthest from the eye first, so the closest is drawn last
+     * */
+    fn axisOrder(self, frame: GizmoFrame)-> [usize] {
+        let dmut order = copy [0us, 1us, 2us];
+        for i in 0us .. 2us {
+            for j in 0us .. 2us - i {
+                if frame.axis(order[j]).dot(frame.toEye) > frame.axis(order[j + 1us]).dot(frame.toEye) {
+                    let k = order[j];
+                    order[j] = order[j + 1us];
+                    order[j + 1us] = k;
+                }
+            }
+        }
+
+        order
+    }
+
+    /**
+     * @returns: the points of a ring about the centre of a frame, the first one repeated at the end
+     * @params:
+     *    - normal: the unit axis of the ring
+     *    - radius: the radius of the ring, in world units
+     *    - segments: the number of segments joining the points
+     * */
+    fn ringPoints(self, frame: GizmoFrame, normal: vec3, radius: f32, segments: usize)-> [vec3] {
+        let side = if math::abs(normal.x) < 0.9f { makeVec3(1.0f, 0.0f, 0.0f) } else { makeVec3(0.0f, 1.0f, 0.0f) };
+        let u = normal.cross(side).normalized();
+        let v = normal.cross(u);
+
+        let mut points: [vec3] = [];
+        for k in 0us .. segments + 1us {
+            let angle = 2.0f * cast!f32(math::PI) * cast!f32(cast!u64(k)) / cast!f32(cast!u64(segments));
+            points ~= [frame.centre + (u * math::cos(angle) + v * math::sin(angle)) * radius];
+        }
+
+        points
+    }
+
+    /**
+     * @returns: true iif the segment of a ring between two points faces the eye, on the side of the centre toward it
+     * */
+    fn facesEye(self, frame: GizmoFrame, a: vec3, b: vec3)-> bool {
+        ((a + b) / 2.0f - frame.centre).dot(frame.toEye) >= -0.02f * frame.size
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PICKING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - pixel: the point of the image under the cursor, in texels from its top left corner
+     * @returns: the handle the ray through a point of the image passes the closest to, within PICK_TEXELS texels, the
+     * closest to the eye among those it enters; NONE when it passes by them all
+     * */
+    pub fn handleAt(self, view: GizmoView, pixel: vec2)-> GizmoHandle {
+        let frame = if let Ok(f) = self.frame(view) { f } else { return GizmoHandle::NONE; };
+        let ray = view.ray(pixel);
+        let c = frame.centre, s = frame.size;
+
+        // the handles the ray passes by, how far, and how far along it
+        let mut found: [(GizmoHandle, f32, f32)] = [];
+        match self._mode {
+            GizmoMode::TRANSLATE => {
+                for i in 0us .. 3us if self.axisShown(frame, i) {
+                    let (miss, depth) = geometry::raySegment(ray, c + frame.axis(i) * (AXIS_START * s), c + frame.axis(i) * s);
+                    found ~= [(parts::axisHandle(i), miss, depth)];
+                }
+
+                for i in 0us .. 3us if self.planeShown(frame, i) {
+                    if let Ok(t) = geometry::crossPlane(ray, c, frame.axis(i)) && t >= 0.0f {
+                        let p = ray.at(t) - c;
+                        let u = p.dot(frame.axis((i + 1us) % 3us)) / s, v = p.dot(frame.axis((i + 2us) % 3us)) / s;
+                        if u >= PLANE_LOW && u <= PLANE_HIGH && v >= PLANE_LOW && v <= PLANE_HIGH {
+                            found ~= [(parts::planeHandle(i), 0.0f, t)];
+                        }
+                    }
+                }
+            }
+            GizmoMode::ROTATE => {
+                for i in 0us .. 3us {
+                    let (miss, depth) = self.ringMiss(ray, frame, frame.axis(i), s, RING_SEGMENTS, true);
+                    found ~= [(parts::axisHandle(i), miss, depth)];
+                }
+
+                let (miss, depth) = self.ringMiss(ray, frame, frame.toEye, VIEW_RING * s, VIEW_SEGMENTS, false);
+                found ~= [(GizmoHandle::VIEW, miss, depth)];
+            }
+            GizmoMode::SCALE => {
+                for i in 0us .. 3us if self.axisShown(frame, i) {
+                    let (miss, depth) = geometry::raySegment(ray, c + frame.axis(i) * (AXIS_START * s), c + frame.axis(i) * s);
+                    found ~= [(parts::axisHandle(i), miss, depth)];
+                }
+
+                let (miss, depth) = geometry::raySegment(ray, c, c);
+                let outside = miss - CENTRE_BOX * s;
+                found ~= [(GizmoHandle::CENTRE, if outside < 0.0f { 0.0f } else { outside }, depth)];
+            }
+        }
+
+        let tolerance = PICK_TEXELS * s / self._size;
+        let mut best = GizmoHandle::NONE;
+        let mut bestMiss = f32::max;
+        let mut bestDepth = f32::max;
+        for h in found if h._1 <= tolerance {
+            if h._1 < bestMiss || (h._1 == bestMiss && h._2 < bestDepth) {
+                best = h._0;
+                bestMiss = h._1;
+                bestDepth = h._2;
+            }
+        }
+
+        best
+    }
+
+    /**
+     * @returns: the closest distance between a ray and a ring, and the distance along the ray of its point closest to it
+     * @params:
+     *    - frontOnly: true to leave out the segments of the ring on the far side of the centre
+     * */
+    fn ringMiss(self, ray: Ray, frame: GizmoFrame, normal: vec3, radius: f32, segments: usize, frontOnly: bool)-> (f32, f32) {
+        let points = self.ringPoints(frame, normal, radius, segments);
+        let mut best = (f32::max, f32::max);
+        for k in 0us .. segments {
+            if frontOnly && !self.facesEye(frame, points[k], points[k + 1us]) { continue; }
+
+            let hit = geometry::raySegment(ray, points[k], points[k + 1us]);
+            if hit._0 < best._0 {
+                best = hit;
+            }
+        }
+
+        best
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          DRAG          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Follow the cursor over the handles, the handle grabbed staying the one hovered during a drag
+     * @params:
+     *    - pixel: the point of the image under the cursor, in texels from its top left corner
+     * @returns: the handle under the cursor, the one grabbed during a drag
+     * */
+    pub fn hover(mut self, view: GizmoView, pixel: vec2)-> GizmoHandle {
+        if !self.isDragging {
+            self._hovered = self.handleAt(view, pixel);
+        }
+
+        self._hovered
+    }
+
+    /**
+     * Forget the handle under the cursor, the cursor leaving the image, the handle grabbed staying the one hovered
+     * during a drag
+     * */
+    pub fn leave(mut self) {
+        if !self.isDragging {
+            self._hovered = GizmoHandle::NONE;
+        }
+    }
+
+    /**
+     * Grab the handle under the cursor, a drag starting from the transforms the nodes have
+     * @params:
+     *    - pixel: the point of the image under the cursor, in texels from its top left corner
+     * @returns: true iif a handle is under the cursor and is grabbed
+     * */
+    pub fn grab(mut self, view: GizmoView, pixel: vec2)-> bool {
+        self:.release();
+
+        let handle = self.handleAt(view, pixel);
+        if handle == GizmoHandle::NONE { return false; }
+
+        let frame = if let Ok(f) = self.frame(view) { f } else { return false; };
+        let ray = view.ray(pixel);
+
+        self._grabbed = handle;
+        self._hovered = handle;
+        self._grabFrame = frame;
+        self._grabPixel = pixel;
+        self._angle = 0.0f;
+        self._lastVector = vec3();
+        self._grabAlong = 0.0f;
+        self._grabPoint = frame.centre;
+
+        let dmut edits: [TransformEdit] = [];
+        for dmut n in alias self._nodes {
+            edits ~= [TransformEdit(alias n, NodeTransform(n))];
+        }
+
+        self._edits = alias edits;
+
+        if parts::isAxis(handle) {
+            if let Ok(along) = geometry::alongAxis(ray, frame.centre, frame.axis(parts::indexOf(handle))) {
+                self._grabAlong = along;
+            }
+
+            if self._mode == GizmoMode::ROTATE {
+                if let Ok(v) = self.ringVector(frame, frame.axis(parts::indexOf(handle)), ray) {
+                    self._lastVector = v;
+                }
+            }
+        } else if handle == GizmoHandle::VIEW {
+            if let Ok(v) = self.ringVector(frame, frame.toEye, ray) {
+                self._lastVector = v;
+            }
+        } else if handle != GizmoHandle::CENTRE {
+            if let Ok(t) = geometry::crossPlane(ray, frame.centre, frame.axis(parts::indexOf(handle))) {
+                self._grabPoint = ray.at(t);
+            }
+        }
+
+        true
+    }
+
+    /**
+     * Drag the handle grabbed to the cursor, the nodes given the change from the grab
+     * @params:
+     *    - pixel: the point of the image under the cursor, in texels from its top left corner, outside the image too
+     *    - snapping: true to round the change to the steps of the snapping (see snap)
+     * */
+    pub fn drag(mut self, view: GizmoView, pixel: vec2, snapping: bool) {
+        if !self.isDragging { return; }
+
+        let ray = view.ray(pixel);
+        match self._mode {
+            GizmoMode::TRANSLATE => {
+                if let Ok(delta) = self.translation(ray, snapping) {
+                    self:.translate(delta);
+                }
+            }
+            GizmoMode::ROTATE => {
+                let frame = self._grabFrame;
+                let axis = if self._grabbed == GizmoHandle::VIEW { frame.toEye } else { frame.axis(parts::indexOf(self._grabbed)) };
+                if let Ok(v) = self.ringVector(frame, axis, ray) {
+                    if self._lastVector.length() > 0.0f {
+                        self._angle += geometry::signedAngle(self._lastVector, v, axis);
+                    }
+
+                    self._lastVector = v;
+                }
+
+                let angle = if snapping { geometry::snapped(self._angle, self._snap.angle) } else { self._angle };
+                self:.rotate(axis, angle);
+            }
+            GizmoMode::SCALE => {
+                if let Ok(factors) = self.factors(ray, pixel, snapping) {
+                    self:.scaleBy(factors);
+                }
+            }
+        }
+    }
+
+    /**
+     * End the drag, the nodes keeping their transforms, the edits of the drag kept (see edits)
+     * @returns: true iif the drag changed a node, the transformed signal being emitted then
+     * */
+    pub fn release(mut self)-> bool {
+        if !self.isDragging { return false; }
+
+        self._grabbed = GizmoHandle::NONE;
+        let mut changed = false;
+        for e in self._edits {
+            if !parts::sameTransform(e.before, e.after) { changed = true; }
+        }
+
+        if changed {
+            if let Ok(dmut s) = alias self._transformed {
+                s:.emit();
+            }
+        }
+
+        changed
+    }
+
+    /**
+     * End the drag, the nodes given back the transforms they had when it started
+     * */
+    pub fn cancel(mut self) {
+        if !self.isDragging { return; }
+
+        for i in 0us .. self._edits.len {
+            self._edits[i]:.revert();
+        }
+
+        self._edits = [];
+        self._grabbed = GizmoHandle::NONE;
+    }
+
+    /**
+     * @returns: the translation in the world from the grab to a ray, along the axis or in the plane grabbed, none when
+     * the ray runs along them
+     * */
+    fn translation(self, ray: Ray, snapping: bool)-> (vec3)? {
+        let frame = self._grabFrame;
+        let step = if snapping { self._snap.translation } else { 0.0f };
+        let i = parts::indexOf(self._grabbed);
+        if parts::isAxis(self._grabbed) {
+            if let Ok(along) = geometry::alongAxis(ray, frame.centre, frame.axis(i)) {
+                return (frame.axis(i) * geometry::snapped(along - self._grabAlong, step))?;
+            }
+
+            return none;
+        }
+
+        if let Ok(t) = geometry::crossPlane(ray, frame.centre, frame.axis(i)) {
+            let d = ray.at(t) - self._grabPoint;
+            let u = frame.axis((i + 1us) % 3us), v = frame.axis((i + 2us) % 3us);
+            return (u * geometry::snapped(d.dot(u), step) + v * geometry::snapped(d.dot(v), step))?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the direction from the centre of the point of a ring under a ray, on the plane of the ring, or on the
+     * plane facing the eye when the ray sees the ring edge on; none when it is the centre
+     * */
+    fn ringVector(self, frame: GizmoFrame, axis: vec3, ray: Ray)-> (vec3)? {
+        let normal = if math::abs(ray.direction.dot(axis)) >= EDGE_ON { axis } else { frame.toEye };
+        if let Ok(t) = geometry::crossPlane(ray, frame.centre, normal) {
+            let p = ray.at(t) - frame.centre;
+            let v = p - axis * p.dot(axis);
+            if v.length() > 1.0e-6f { return v?; }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the factors of scale along the axes of the nodes from the grab to a ray: along the axis grabbed, or
+     * along every axis for the box in the centre, the cursor moving right or up growing them; none when the ray runs
+     * along the axis grabbed
+     * */
+    fn factors(self, ray: Ray, pixel: vec2, snapping: bool)-> (vec3)? {
+        let step = if snapping { self._snap.scale } else { 0.0f };
+        if self._grabbed == GizmoHandle::CENTRE {
+            let moved = (pixel.x - self._grabPixel.x) - (pixel.y - self._grabPixel.y);
+            let f = parts::factorOf(geometry::snapped(1.0f + moved / self._size, step));
+            return makeVec3(f, f, f)?;
+        }
+
+        let frame = self._grabFrame;
+        let i = parts::indexOf(self._grabbed);
+        if let Ok(along) = geometry::alongAxis(ray, frame.centre, frame.axis(i)) {
+            let f = parts::factorOf(geometry::snapped(1.0f + (along - self._grabAlong) / frame.size, step));
+            return makeVec3(if i == 0us { f } else { 1.0f }, if i == 1us { f } else { 1.0f }, if i == 2us { f } else { 1.0f })?;
+        }
+
+        none
+    }
+
+    /**
+     * Translate the nodes from their transforms at the grab by the same translation in the world
+     * */
+    fn translate(mut self, delta: vec3) {
+        for i in 0us .. self._edits.len {
+            let before = self._edits[i].before;
+            let local = geometry::direction(self._nodes[i].parentTransformation.inversed(), delta);
+            let after = NodeTransform(before.position + local, before.rotation, before.scale);
+            self:.edit(i, after);
+        }
+    }
+
+    /**
+     * Rotate the nodes from their transforms at the grab about their origin, by an angle about an axis of the world, or
+     * about their own axis in local space
+     * */
+    fn rotate(mut self, axis: vec3, angle: f32) {
+        for i in 0us .. self._edits.len {
+            let before = self._edits[i].before;
+            let start = eulerRotation(before.rotation);
+
+            // the axis of the world in the space of the parent, the rotation of the node turning in it
+            let inParent = geometry::direction(self._nodes[i].parentTransformation.inversed(), axis);
+            let local = self._space == GizmoSpace::LOCAL && self._grabbed != GizmoHandle::VIEW;
+            if !local && inParent.length() < 1.0e-9f { continue; }
+
+            let own = parts::indexOf(self._grabbed);
+            let turned = if local {
+                start * rotation(angle, makeVec3(if own == 0us { 1.0f } else { 0.0f },
+                                                 if own == 1us { 1.0f } else { 0.0f },
+                                                 if own == 2us { 1.0f } else { 0.0f }))
+            } else {
+                rotation(angle, inParent.normalized()) * start
+            };
+
+            self:.edit(i, NodeTransform(before.position, eulerAngles(turned), before.scale));
+        }
+    }
+
+    /**
+     * Scale the nodes from their transforms at the grab by factors along their own axes, about their origin
+     * */
+    fn scaleBy(mut self, factors: vec3) {
+        for i in 0us .. self._edits.len {
+            let before = self._edits[i].before;
+            self:.edit(i, NodeTransform(before.position, before.rotation, before.scale * factors));
+        }
+    }
+
+    /**
+     * Give a node a transform, through the edit of the drag
+     * @params:
+     *    - i: the place of the node among the nodes
+     * */
+    fn edit(mut self, i: usize, after: NodeTransform) {
+        self._edits[i] = TransformEdit(alias self._nodes[i], self._edits[i].before, after);
+        self._edits[i]:.apply();
+    }
+
+    /**
+     * @returns: true iif a node is under a node selected
+     * @params:
+     *    - selected: the uniq ids of the nodes selected
+     * */
+    fn isUnderSelected(self, dmut node: &Node, selected: [usize => bool])-> bool {
+        if let Ok(dmut parent) = alias node:.getParent() {
+            if selected[parent.uid].hasValue { return true; }
+
+            return self.isUnderSelected(alias parent, selected);
+        }
+
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SHAPES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the shapes drawing the gizmo seen by a view, in texels of its image, the handle dragged or the one under
+     * the cursor highlighted; none without nodes or when the gizmo is behind the camera
+     * */
+    pub fn shapes(self, view: GizmoView)-> [GizmoShape] {
+        let frame = if let Ok(f) = self.frame(view) { f } else { return []; };
+        let centre = if let Ok(p) = view.project(frame.centre) { p } else { return []; };
+        let active = if self.isDragging { self._grabbed } else { self._hovered };
+
+        if self._mode == GizmoMode::TRANSLATE {
+            self.translateShapes(view, frame, centre, active)
+        } else if self._mode == GizmoMode::ROTATE {
+            self.rotateShapes(view, frame, active)
+        } else {
+            self.scaleShapes(view, frame, centre, active)
+        }
+    }
+
+    /**
+     * @returns: the shapes of the translation: the squares of the planes, the arrows of the axes and the centre
+     * */
+    fn translateShapes(self, view: GizmoView, frame: GizmoFrame, centre: vec2, active: GizmoHandle)-> [GizmoShape] {
+        let c = frame.centre, s = frame.size;
+        let mut shapes: [GizmoShape] = [];
+        for i in self.axisOrder(frame) if self.planeShown(frame, i) {
+            let u = frame.axis((i + 1us) % 3us) * s, v = frame.axis((i + 2us) % 3us) * s;
+            let q0 = view.project(c + u * PLANE_LOW + v * PLANE_LOW), q1 = view.project(c + u * PLANE_HIGH + v * PLANE_LOW);
+            let q2 = view.project(c + u * PLANE_HIGH + v * PLANE_HIGH), q3 = view.project(c + u * PLANE_LOW + v * PLANE_HIGH);
+            if !q0.hasValue || !q1.hasValue || !q2.hasValue || !q3.hasValue { continue; }
+
+            let lit = active == parts::planeHandle(i);
+            let color = parts::colorOf(i, lit, if lit { 0.8f } else { 0.45f });
+            shapes ~= [GizmoShape(q0 ?? centre, q1 ?? centre, q2 ?? centre, color),
+                       GizmoShape(q0 ?? centre, q2 ?? centre, q3 ?? centre, color)];
+        }
+
+        for i in self.axisOrder(frame) if self.axisShown(frame, i) {
+            let tip = if let Ok(p) = view.project(c + frame.axis(i) * s) { p } else { continue; };
+            let base = if let Ok(p) = view.project(c + frame.axis(i) * (HEAD_BASE * s)) { p } else { continue; };
+
+            let lit = active == parts::axisHandle(i);
+            let color = parts::colorOf(i, lit, 1.0f);
+            shapes ~= [GizmoShape(centre, base, if lit { HOVERED_WIDTH } else { LINE_WIDTH }, color)];
+
+            let span = tip - base;
+            let len = span.length();
+            if len > 0.5f {
+                let side = makeVec2(-span.y, span.x) * (HEAD_HALF / len);
+                shapes ~= [GizmoShape(tip, base + side, base - side, color)];
+            }
+        }
+
+        shapes ~= [GizmoShape(centre, centre, CENTRE_DOT, parts::neutralColor(false))];
+        shapes
+    }
+
+    /**
+     * @returns: the shapes of the rotation: the ring about the view, then the halves of the rings about the axes facing
+     * the eye
+     * */
+    fn rotateShapes(self, view: GizmoView, frame: GizmoFrame, active: GizmoHandle)-> [GizmoShape] {
+        let mut shapes: [GizmoShape] = [];
+        let lit = active == GizmoHandle::VIEW;
+        shapes ~= self.ringShapes(view, frame, frame.toEye, VIEW_RING * frame.size, VIEW_SEGMENTS, false, lit, parts::neutralColor(lit));
+
+        for i in self.axisOrder(frame) {
+            let litAxis = active == parts::axisHandle(i);
+            shapes ~= self.ringShapes(view, frame, frame.axis(i), frame.size, RING_SEGMENTS, true, litAxis, parts::colorOf(i, litAxis, 1.0f));
+        }
+
+        shapes
+    }
+
+    /**
+     * @returns: the segments drawing a ring, those facing the eye only when frontOnly
+     * */
+    fn ringShapes(self, view: GizmoView, frame: GizmoFrame, normal: vec3, radius: f32, segments: usize, frontOnly: bool, lit: bool, color: vec4)-> [GizmoShape] {
+        let points = self.ringPoints(frame, normal, radius, segments);
+        let width = if lit { HOVERED_WIDTH } else { LINE_WIDTH };
+
+        let mut shapes: [GizmoShape] = [];
+        for k in 0us .. segments {
+            if frontOnly && !self.facesEye(frame, points[k], points[k + 1us]) { continue; }
+
+            if let Ok(a) = view.project(points[k]) {
+                if let Ok(b) = view.project(points[k + 1us]) {
+                    shapes ~= [GizmoShape(a, b, width, color)];
+                }
+            }
+        }
+
+        shapes
+    }
+
+    /**
+     * @returns: the shapes of the scale: the axes ended by boxes, and the box in the centre
+     * */
+    fn scaleShapes(self, view: GizmoView, frame: GizmoFrame, centre: vec2, active: GizmoHandle)-> [GizmoShape] {
+        let mut shapes: [GizmoShape] = [];
+        for i in self.axisOrder(frame) if self.axisShown(frame, i) {
+            let end = if let Ok(p) = view.project(frame.centre + frame.axis(i) * frame.size) { p } else { continue; };
+
+            let lit = active == parts::axisHandle(i);
+            let color = parts::colorOf(i, lit, 1.0f);
+            shapes ~= [GizmoShape(centre, end, if lit { HOVERED_WIDTH } else { LINE_WIDTH }, color)];
+            shapes ~= parts::boxShapes(end, BOX_HALF, color);
+        }
+
+        shapes ~= parts::boxShapes(centre, CENTRE_HALF, parts::neutralColor(active == GizmoHandle::CENTRE));
+        shapes
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted when a drag ends having changed the nodes, the edits of the drag read from the gizmo
+     * (see edits)
+     * */
+    pub fn transformed(mut self)-> dmut &Signal!{()} {
+        if let Ok(dmut s) = alias self._transformed {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{()} ();
+        self._transformed = (alias s)?;
+
+        alias s
+    }
+
+}

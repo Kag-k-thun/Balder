@@ -6,7 +6,9 @@ use balder::interface;
 use balder::interface::_;
 use balder::interface::widget;
 use balder::interface::widget::{button, layout::_, text::_};
-use balder::interface::widget::layout::d3scene::picker;
+use balder::interface::widget::layout::d3scene::{gizmo, picker};
+use balder::scene::editable;
+use balder::scene::gizmo::{mode, space};
 use balder::scene::node::{_, node3D::_, node3D::camera, node3D::visual::_, node3D::visual::material::_};
 use balder::scene::utils::post::tonemap::operator;
 use balder::utils;
@@ -66,7 +68,7 @@ lazy dmut __AMBIENT_OCCLUSION__ = copy [false];
 lazy dmut __OCCLUSION_SCALE__ = copy [1.0f];
 
 /**
- * The environment lighting the scene at the start, set by '--environment', empty for the ambient colour ('E' cycling
+ * The environment lighting the scene at the start, set by '--environment', empty for the ambient colour ('N' cycling
  * through the environments of res/environments)
  * */
 lazy mut __ENVIRONMENT__: [mut [c8]] = copy [""];
@@ -83,7 +85,7 @@ lazy dmut __ENVIRONMENT_INTENSITY__ = copy [1.0f];
 lazy dmut __LIGHTS__ = copy [true];
 
 /**
- * The environments 'E' cycles through, after none
+ * The environments 'N' cycles through, after none
  * */
 enum Environments : [c8]
 | OUTDOOR = "res:/environments/kloofendal_48d_partly_cloudy_1k.hdr"
@@ -116,21 +118,20 @@ class MyActivity over Activity {
     let dmut _culling: (&Label)? = none;
     let dmut _picking: (&Label)? = none;
     let dmut _cam: (&Camera)?    = none;
+    let dmut _gizmo: (&SceneGizmo)? = none;
     let dmut _lights: [&Light]   = [];
-
-    let mut _angle: f32 = 0.0f;
 
     // The frames drawn before the render graph is written once, the scene being declared in it by then
     let mut _graphCountdown: u32 = 10u32;
-    let mut _dist: f32  = 8.0f;
 
+    // The first person camera: the eye looks along the direction of its yaw and its pitch, in degrees, toward -z at 0
     let mut _movingCam: bool      = false;
     let mut _camStart: (i32, i32) = (0, 0);
     let mut _yaw: f32             = 0.0f;
-    let mut _pitch: f32           = 45.0f;
+    let mut _pitch: f32           = -45.0f;
     let mut _camSens: f32         = 1.0f / 5.0f;
 
-    let mut _target: vec3               = makeVec3(0.0f, 0.0f, 0.0f);
+    let mut _eye: vec3                  = makeVec3(0.0f, 0.0f, 0.0f);
     let dmut _subject: (&Node3D)?       = none;
     let dmut _camSpeed: (f32, f32, f32) = (0.0f, 0.0f, 100.0f);
     let dmut _forward: vec3             = makeVec3(0.0f, 0.0f, 0.0f);
@@ -142,6 +143,9 @@ class MyActivity over Activity {
 
     // The names of the nodes selected, separated by commas, empty for none
     let mut _selectedNames: [c8] = "";
+
+    // The text of the label of the picking, written again when it changes only
+    let mut _pickingText: [c8] = "";
 
     pub self (uid: usize, dmut app: &Application, dmut window: &Window)
         with super(uid, alias app, alias window)
@@ -174,7 +178,7 @@ class MyActivity over Activity {
         self.input:.keyboard(KeyInfo(SDLK_O, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleOcclusion);
         self.input:.keyboard(KeyInfo(SDLK_H, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleShadows);
         self.input:.keyboard(KeyInfo(SDLK_A, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleAmbientOcclusion);
-        self.input:.keyboard(KeyInfo(SDLK_E, KeyEvent::DOWN)):.connect(self.box, &self:.onCycleEnvironment);
+        self.input:.keyboard(KeyInfo(SDLK_N, KeyEvent::DOWN)):.connect(self.box, &self:.onCycleEnvironment);
         self.input:.keyboard(KeyInfo(SDLK_X, KeyEvent::DOWN)):.connect(self.box, &self:.onExportGraph);
         self.input:.keyboard(KeyInfo(SDLK_PAGEUP, KeyEvent::DOWN)):.connect(self.box, &self:.onExposeMore);
         self.input:.keyboard(KeyInfo(SDLK_PAGEDOWN, KeyEvent::DOWN)):.connect(self.box, &self:.onExposeLess);
@@ -197,12 +201,13 @@ class MyActivity over Activity {
             self._scene = w:.getScene();
         }
 
-        if let Ok(dmut p: &ScenePicker) = self.gui:.find("picker") {
-            p:.picked():.connect(self.box, &self:.onPicked);
-            p:.hovered():.connect(self.box, &self:.onHovered);
+        if let Ok(dmut g: &SceneGizmo) = self.gui:.find("scene/gizmo") {
+            g:.picked():.connect(self.box, &self:.onPicked);
+            g:.hovered():.connect(self.box, &self:.onHovered);
+            self._gizmo = (alias g)?;
         }
 
-        if let Ok(dmut s: &Scene) = alias self._scene {
+        if let Ok(dmut s: &EditableScene) = alias self._scene {
             let dmut selection = alias s.selection;
             selection:.changed():.connect(self.box, &self:.onSelectionChanged);
         }
@@ -274,11 +279,14 @@ class MyActivity over Activity {
             }
         }
 
+        // the keys of the gizmo change its mode and its space
+        self:.showPicking();
+
         if self._camSpeed._0 != 0.0f || self._camSpeed._1 != 0.0f {
             let speed = cast!f32(_delta_.millis) / self._camSpeed._2;
-            self._target += (self._camSpeed._0 * speed * self._forward) + (self._camSpeed._1 * speed * self._right);
+            self._eye += (self._camSpeed._0 * speed * self._forward) + (self._camSpeed._1 * speed * self._right);
 
-            self:.computeCamPosition();
+            self:.updateCamera();
         }
     }
 
@@ -312,7 +320,7 @@ class MyActivity over Activity {
      * */
     pub fn onSelectionChanged(mut self) {
         let mut names: [c8] = "";
-        if let Ok(s: &Scene) = self._scene {
+        if let Ok(s: &EditableScene) = self._scene {
             for n in s.selection.nodes {
                 names = if names.len == 0us { n.name.toStr() } else { names ~ ", " ~ n.name.toStr() };
             }
@@ -323,15 +331,34 @@ class MyActivity over Activity {
     }
 
     /**
-     * Write the instances under the cursor, picked and selected in their label
+     * Write the instances under the cursor, picked and selected in their label, with the mode and the space of the
+     * gizmo
      * */
     fn showPicking(mut self) {
+        let text = std::format::format("under the cursor: {} | picked: {} | selected: {} | gizmo: {}",
+                                       if self._hoveredName.len == 0us { "-" } else { self._hoveredName },
+                                       if self._pickedName.len == 0us { "-" } else { self._pickedName },
+                                       if self._selectedNames.len == 0us { "-" } else { self._selectedNames },
+                                       self.gizmoName());
+        if text == self._pickingText { return; }
+
+        self._pickingText = text;
         if let Ok(dmut lbl) = alias self._picking {
-            lbl:.setText(std::format::format("under the cursor: {} | picked: {} | selected: {}",
-                                             if self._hoveredName.len == 0us { "-" } else { self._hoveredName },
-                                             if self._pickedName.len == 0us { "-" } else { self._pickedName },
-                                             if self._selectedNames.len == 0us { "-" } else { self._selectedNames }));
+            lbl:.setText(text);
         }
+    }
+
+    /**
+     * @returns: the mode and the space of the gizmo of the scene, as the label shows them
+     * */
+    fn gizmoName(self)-> [c8] {
+        if let Ok(g) = self._gizmo {
+            let mode = if g.mode == GizmoMode::TRANSLATE { "translate (W)" } else if g.mode == GizmoMode::ROTATE { "rotate (E)" } else { "scale (R)" };
+            let space = if g.mode == GizmoMode::SCALE { "local" } else if g.space == GizmoSpace::LOCAL { "local" } else { "world" };
+            return mode ~ " in " ~ space ~ " space";
+        }
+
+        "-"
     }
 
     pub fn onQuit(mut self) {
@@ -348,8 +375,8 @@ class MyActivity over Activity {
      */
 
     pub fn onWheel(mut self, _: i32, _: i32, _: i32, w: i32) {
-        self._dist -= cast!f32(w) / 10.0f;
-        self:.computeCamPosition();
+        self._eye += (cast!f32(w) / 2.0f) * self._forward;
+        self:.updateCamera();
     }
 
     pub fn onCameraEnter(mut self, x: i32, y: i32, _: MouseInfo) {
@@ -364,47 +391,47 @@ class MyActivity over Activity {
 
     pub fn onMouseMove(mut self, x: i32, y: i32) {
         if self._movingCam {
-            self._yaw += (cast!f32(self._camStart._0 - x) * self._camSens);
+            self._yaw += cast!f32(x - self._camStart._0) * self._camSens;
             self._yaw %= 360.0f;
 
             self._pitch += cast!f32(self._camStart._1 - y) * self._camSens;
-            self._pitch = std::algorithm::comparison::clamp(self._pitch, -45.0f, 89.0f);
+            self._pitch = std::algorithm::comparison::clamp(self._pitch, -89.0f, 89.0f);
 
             self._camStart = (x, y);
 
-            self:.computeCamPosition();
+            self:.updateCamera();
         }
     }
 
     pub fn onMoveForward(mut self, info: KeyInfo) {
         if info.type == KeyEvent::DOWN {
-            self._camSpeed._0 -= 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
             self._camSpeed._0 += 0.5f;
+        } else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._0 -= 0.5f;
         }
     }
 
     pub fn onMoveBackward(mut self, info: KeyInfo) {
         if info.type == KeyEvent::DOWN {
-            self._camSpeed._0 += 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
             self._camSpeed._0 -= 0.5f;
+        } else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._0 += 0.5f;
         }
     }
 
     pub fn onMoveLeft(mut self, info: KeyInfo) {
         if info.type == KeyEvent::DOWN {
-            self._camSpeed._1 += 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
             self._camSpeed._1 -= 0.5f;
+        } else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._1 += 0.5f;
         }
     }
 
     pub fn onMoveRight(mut self, info: KeyInfo) {
         if info.type == KeyEvent::DOWN {
-            self._camSpeed._1 -= 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
             self._camSpeed._1 += 0.5f;
+        } else if info.type == KeyEvent::RELEASE {
+            self._camSpeed._1 -= 0.5f;
         }
     }
 
@@ -654,14 +681,14 @@ class MyActivity over Activity {
         let dmut _wall_1_ = copy SolidObjectModel::copyOf("wall_1", scene:.getRootNode(), alias ground);
         let dmut _wall_2_ = copy SolidObjectModel::copyOf("wall_2", scene:.getRootNode(), alias ground);
 
-        // a position is scaled with its node: the ground spans [-15, 15] and the walls stand at x = -15 and z = -15
-        ground.position = makeVec3(0.0f, -1.0f, 0.0f);
+        // the ground spans [-15, 15] under y = 0 and the walls stand at x = -15 and z = -15
+        ground.position = makeVec3(0.0f, -0.2f, 0.0f);
         ground.scale = makeVec3(30.0f, 0.2f, 30.0f);
 
-        _wall_1_.position = makeVec3(-75.0f, 0.0f, 0.0f);
+        _wall_1_.position = makeVec3(-15.0f, 0.0f, 0.0f);
         _wall_1_.scale = makeVec3(0.2f, 10.0f, 30.0f);
 
-        _wall_2_.position = makeVec3(0.0f, 0.0f, -75.0f);
+        _wall_2_.position = makeVec3(0.0f, 0.0f, -15.0f);
         _wall_2_.scale = makeVec3(30.0f, 10.0f, 0.2f);
 
         self:.createRoom(alias scene, alias ground);
@@ -678,7 +705,7 @@ class MyActivity over Activity {
         if !__ROOM__[0] { return; }
 
         // the cube of the ground is loaded in a unit box standing on its origin: the scale of a copy is its size, its
-        // position (the center of its base) scaled with it
+        // position the center of its base
         let boxes = [("room_back", makeVec3(11.0f, 0.0f, -4.1f), makeVec3(6.4f, 3.5f, 0.2f)),
                      ("room_left", makeVec3(7.9f, 0.0f, -1.0f), makeVec3(0.2f, 3.5f, 6.0f)),
                      ("room_right", makeVec3(14.1f, 0.0f, -1.0f), makeVec3(0.2f, 3.5f, 6.0f)),
@@ -688,7 +715,7 @@ class MyActivity over Activity {
         for b in boxes {
             let dmut wall = copy SolidObjectModel::copyOf(b._0, scene:.getRootNode(), alias ground);
             wall.scale = b._2;
-            wall.position = b._1 / b._2;
+            wall.position = b._1;
         }
 
         let (array, indices) = sphere(24u32, 48u32);
@@ -699,7 +726,7 @@ class MyActivity over Activity {
         let dmut material = copy ConstantMaterial(config);
         let dmut ball = copy IndexedMesh3D("room_ball", scene:.getRootNode(), LodChain(indices), array, alias material);
         ball.scale = makeVec3(0.6f, 0.6f, 0.6f);
-        ball.position = makeVec3(12.2f, 0.6f, -1.0f) / 0.6f;
+        ball.position = makeVec3(12.2f, 0.6f, -1.0f);
 
         if !__LIGHTS__[0] { return; }
 
@@ -724,7 +751,7 @@ class MyActivity over Activity {
 
         let dmut model = copy SolidObjectModel::fromFile("model", scene:.getRootNode(), path, lods-> false);
         model.scale *= 2.0f;
-        model.position = makeVec3(3.25f, 0.0f, 0.75f);
+        model.position = makeVec3(6.5f, 0.0f, 1.5f);
 
         model.rotation = facingCamera(path);
     }
@@ -748,10 +775,10 @@ class MyActivity over Activity {
                 let dmut material = copy ConstantMaterial(config);
                 let dmut ball = copy IndexedMesh3D(name, scene:.getRootNode(), LodChain(indices), array, alias material);
 
-                // a position is scaled with its node: the spheres are 0.8 unit wide, 2 units apart
+                // the spheres are 0.8 unit wide, 2 units apart
                 let z = if metal { 3.4f } else { 2.2f };
                 ball.scale = makeVec3(0.4f, 0.4f, 0.4f);
-                ball.position = makeVec3(4.0f - cast!f32(i) * 2.0f, 0.4f, z) / 0.4f;
+                ball.position = makeVec3(4.0f - cast!f32(i) * 2.0f, 0.4f, z);
             }
         }
     }
@@ -762,7 +789,7 @@ class MyActivity over Activity {
      * */
     fn placeSubject(mut self, dmut subject: &SolidObjectModel, x: f32, z: f32, lod: (usize)?) {
         subject.scale *= 2.5f;
-        subject.position = makeVec3(x / 2.5f, 0.0f, z / 2.5f);
+        subject.position = makeVec3(x, 0.0f, z);
         subject.rotation = facingCamera(__SUBJECT__[0]);
         subject:.forceLod(lod);
     }
@@ -788,35 +815,30 @@ class MyActivity over Activity {
         cam.fov = 90.0f;
         cam.exposure = __EXPOSURE__[0];
 
+        // 8 units in front of the subjects, looking down at them at 45 degrees
         self._yaw = 0.0f;
-        self._pitch = 45.0f;
+        self._pitch = -45.0f;
+        self._eye = makeVec3(0.0f, 5.66f, 5.66f);
 
         self._cam = (alias cam)?;
-        self:.computeCamPosition();
+        self:.updateCamera();
     }
 
-    fn computeCamPosition(mut self) {
-        let radius = self._dist;
+    /**
+     * Place the camera at the eye, looking along the direction of the yaw and the pitch, 'Z' and 'S' moving the eye along
+     * it and 'Q' and 'D' to its right
+     * */
+    fn updateCamera(mut self) {
         if let Ok(dmut cam) = alias self._cam {
-            // self._angle = (self._angle + cam.position.x) % 360.0f;
-            let mut pos    = cam.position;
-            let mut target = self._target;
-
             let pitchRad = math::utils::radian(self._pitch);
             let yawRad   = math::utils::radian(self._yaw);
 
-            pos.x = target.x + radius * cos(pitchRad) * sin(yawRad);
-            pos.y = target.y + radius * sin(pitchRad);
-            pos.z = target.z + radius * cos(pitchRad) * cos(yawRad);
+            // the view mirrors x: looking toward -z, the right of the screen is -x
+            self._forward = makeVec3(-cos(pitchRad) * sin(yawRad), sin(pitchRad), -cos(pitchRad) * cos(yawRad));
+            self._right = makeVec3(-cos(yawRad), 0.0f, sin(yawRad));
 
-            self._forward.x = cos(pitchRad) * sin(yawRad);
-            self._forward.y = sin(pitchRad);
-            self._forward.z = cos(pitchRad) * cos(yawRad);
-
-            self._right = makeVec3(cos(yawRad), 0.0f, -sin(yawRad));
-
-            cam.target = self._target;
-            cam.position = pos;
+            cam.position = self._eye;
+            cam.target = self._eye + self._forward;
         }
     }
 
@@ -915,7 +937,7 @@ fn readArguments(args: [[c8]])-> bool {
         :.flag("room", comments-> "build a closed room beside the subjects, a lamp inside it casting shadows with --shadows")
         :.flag("ambient-occlusion", comments-> "the ambient occlusion of the screen shades the ambient light, 'A' toggling it (off by default)")
         :.option!{[c8]} ("occlusion-scale", comments-> "the size of the ambient occlusion in shares of the size of the scene, from 0.25 to 1 (1 by default)")
-        :.option!{[c8]} ("environment", comments-> "an equirectangular .hdr image lighting the scene (res:/environments/...), 'E' cycling through those of res/environments (the ambient colour by default)")
+        :.option!{[c8]} ("environment", comments-> "an equirectangular .hdr image lighting the scene (res:/environments/...), 'N' cycling through those of res/environments (the ambient colour by default)")
         :.option!{[c8]} ("environment-intensity", comments-> "the scale of the light of the environment (1 by default)")
         :.flag("no-lights", comments-> "light the scene by its environment or its ambient colour only, without the sun, the lamp and the spot")
         :.option!{[c8]} ("exposure", comments-> "the exposure of the camera in stops, 'Page Up' and 'Page Down' changing it (0 by default)")

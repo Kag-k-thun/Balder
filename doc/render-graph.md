@@ -254,7 +254,7 @@ does not read it (an optional use). At 1280 × 720 on an Intel Lunar Lake iGPU, 
 ## The lighting of the environment
 
 The light of the environment (`EnvironmentLighting`, set by `Scene::setEnvironment` from an equirectangular Radiance
-`.hdr` image, `--environment` in the demo, `E` cycling through `res/environments`) is the indirect light of the
+`.hdr` image, `--environment` in the demo, `N` cycling through `res/environments`) is the indirect light of the
 composition in place of the ambient colour of the scene. It declares nothing in the graph: it is precomputed once when
 the environment changes, recorded in the transfer pass of the device, which runs before the subpasses of the frame that
 first samples it, and the frames only sample what it computed. Its images are owned by the lighting, bound to the
@@ -282,8 +282,9 @@ its own. An effect declares the space of the colours it works on, `HDR` (the lig
 `DISPLAY` (the colours of the screen, encoded in sRGB, after it), the images of the g-buffer it reads besides (`DEPTH`,
 `NORMALS`, `VELOCITY`), its compute shaders and the size of its parameters. The tone mapping is the effect the chain always holds: the effects
 in HDR space run before it and those in display space after it, each in the order of the chain, but the effects
-declaring `runsFirst` (the anti-aliasing), which run before the others of their space wherever they are in the chain.
-An effect is told when its passes start or stop running (`setRunning`), as the chain declares them again.
+declaring `runsFirst` (the anti-aliasing), which run before the others of their space wherever they are in the chain,
+and those declaring `runsLast` (the gizmo of the scene, `GizmoEffect`, drawn over the image in display space), which run
+after them. An effect is told when its passes start or stop running (`setRunning`), as the chain declares them again.
 
 ```
 let dmut chain = scene:.getPostChain ();

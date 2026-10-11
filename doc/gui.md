@@ -410,19 +410,21 @@ fn onClearClicked (mut self, button: u8) {
 ### Picking and selecting in a Scene3D
 
 ```
-Scene3D #scene { resolution: 1280 720;
+Scene3D #scene { resolution: 1280 720; editable: true;
     ScenePicker #picker { selectable: true; }
 }
 ```
 
 ```
-if let Ok (dmut p : &ScenePicker) = self.gui:.find ("picker") {
+if let Ok (dmut p : &ScenePicker) = self.gui:.find ("scene/picker") {
     p:.picked ():.connect (self.box, &self:.onPicked);     // fn onPicked (mut self, instance: (&VisualInstance3D)?)
     p:.hovered ():.connect (self.box, &self:.onHovered);   // fn onHovered (mut self, instance: (&VisualInstance3D)?)
 }
 
-let dmut selection = alias scene.selection;
-selection:.changed ():.connect (self.box, &self:.onSelectionChanged);   // read scene.selection.nodes there
+if let Ok (dmut scene : &EditableScene) = alias scene3D:.getScene () {
+    let dmut selection = alias scene.selection;
+    selection:.changed ():.connect (self.box, &self:.onSelectionChanged);   // read scene.selection.nodes there
+}
 ```
 
 - **A `Scene3D` takes no input of its own**: its child, optional, is an overlay covering it and taking the mouse over
@@ -434,13 +436,17 @@ selection:.changed ():.connect (self.box, &self:.onSelectionChanged);   // read 
   the cursor leaves the instances or the picker; the instance under the cursor is looked for at each move only once
   `hovered` was asked for. Both are connected by code: a payload that may be `none` has no type a slot of a `.gui` file
   can name yet.
+- **Only an editable scene selects**: `editable: true` makes the `Scene3D` render an `EditableScene`, the `Scene` that
+  owns a selection; a plain `Scene` (the default, a game, a preview) renders what it is given and selects nothing.
 - **`selectable: true` makes a left click select**: the instance clicked alone, Ctrl (or Command) toggling it, and a
-  click on no instance clearing the selection (a Ctrl click on none leaving it). The selection is the `Selection` of
-  the scene, `scene.selection`, holding `Node3D`s in the order they were selected; the code selects through it too
-  (`select`, `add`, `toggle`, `remove`, `clear`). Its `changed` signal is emitted at each change, and a node removed
-  from the scene leaves it.
+  click on no instance clearing the selection (a Ctrl click on none leaving it). A click on a mesh of a
+  `SolidObjectModel` selects the model, the node placing and scaling its meshes (`selectedOnClick`); `picked` and
+  `hovered` still give the mesh. The selection is the `Selection` of the editable scene, `scene.selection`, holding
+  `Node3D`s in the order they were selected; the code selects through it too (`select`, `add`, `toggle`, `remove`,
+  `clear`). Its `changed` signal is emitted at each change, and a node removed from the scene leaves it.
 - **The selected instances are outlined**, with the visual instances under the selected nodes (the meshes of a model):
-  the composition draws `scene.outlineColor` around their pixels, `scene.outlineWidth` pixels of the render resolution
+  the editable scene gives them to `Scene.outline (instances)`, and the composition draws `scene.outlineColor` around
+  their pixels, `scene.outlineWidth` pixels of the render resolution
   wide (3 by default, up to 6, 0 for none). The outline is an edge detect on a bit of the material word of the
   g-buffer, with no extra geometry pass; it is drawn where the selected surface is in front, so the objects in front
   of a selected one cut its outline, and the objects standing on a selected ground are not outlined.
@@ -453,6 +459,60 @@ selection:.changed ():.connect (self.box, &self:.onSelectionChanged);   // read 
   plane under the cursor is entered at once, so an instance around the camera (a room seen from inside) is picked
   before what it contains. The rays and their tests are in `balder::math::bounds`: `Ray`, `Aabb.intersect (ray)`, the
   slab test, and `Bvh.raycast (ray)`, giving a `RayHit`.
+
+### Moving the selection with a gizmo
+
+```
+Scene3D #scene { resolution: 1280 720; editable: true;
+    SceneGizmo #gizmo { selectable: true; size: 110; }
+}
+```
+
+```
+if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
+    gizmo.mode = GizmoMode::ROTATE;              // TRANSLATE, ROTATE, SCALE
+    gizmo.space = GizmoSpace::LOCAL;             // WORLD, LOCAL
+    gizmo.snap = GizmoSnap (translation-> 0.25f, angle-> radian (10.0f), scale-> 0.1f);
+    gizmo:.transformed ():.connect (self.box, &self:.onTransformed);   // read gizmo.edits there
+}
+```
+
+- **A `SceneGizmo` is a `ScenePicker` moving the selection** of an editable scene: a left click on a handle grabs it
+  instead of picking, and a click off the handles picks and selects as the picker does (`selectable`, `picked`,
+  `hovered`).
+- **The gizmo is a node of the scene, there only while nodes are selected**: when the selection gets a node, the
+  `SceneGizmo` spawns a `TransformGizmo` under the root of the scene (named `__gizmo__`) moving the nodes selected, and
+  disposes it when the selection empties. A scene with nothing selected holds no gizmo, and draws none. The overlay
+  keeps the mode, the space, the size and the snapping between two gizmos, and `gizmo.gizmo` gives the one spawned,
+  `none` while there is none.
+- **Three modes**: translate (arrows along the axes, squares in the planes between them), rotate (rings about the axes,
+  the halves facing the eye, and a ring about the view around them) and scale (boxes at the end of the axes, one in the
+  centre scaling every axis, the cursor moving right or up growing them). A click gives the gizmo the focus: `W`, `E`
+  and `R` then switch to each mode, the key of the mode in use switching between the world and the local space.
+  Escape cancels a drag, the nodes taking back their transforms.
+- **The drag follows the ray through the cursor**: projected on the axis grabbed, on the plane of the square grabbed,
+  or turning about the ring grabbed (on the plane facing the eye when the ring is seen edge on). The change from the
+  grab is given to every node selected, those under another node selected moving with it: the same translation in the
+  world, the same rotation and the same factors of scale about the origin of each. Ctrl (or Command) snaps it to the
+  steps of `gizmo.snap`, 0.5 world units along each axis, 15° and a tenth of the scale by default.
+- **The gizmo stands on the node selected last**, at the same size on the image wherever it is: an axis spans `size`
+  texels of the render resolution (110 by default), from `Camera::screenSize`. An axis pointing at the eye and a plane
+  seen edge on are hidden. In local space it follows the axes of the node; the scale of a `Node3D` acts along its own
+  axes (its matrix is `translation (position) * rotation * scaling (scale)`), so the gizmo scales along those whatever
+  its space, about the origin of the node, and a rotation turns the node as a whole, however unevenly it is scaled. A
+  node under a parent scaled unevenly turns in the space of that parent and is sheared by its scale.
+- **A rotation turns the matrix of the node and reads its angles back**: the node keeps Euler angles (`rotationX (x) *
+  rotationY (y) * rotationZ (z)`, `eulerRotation`), so a ring turns that matrix about the axis grabbed, in the world or
+  the node's own, and `eulerAngles` gives the angles of the result, y from -π/2 to π/2.
+- **Every change goes through a `TransformEdit`**, the transform of a node before and after it (`NodeTransform`), applied
+  and reverted as a whole. The edits of the last drag that changed the nodes are kept in `gizmo.edits`, and
+  `transformed` is emitted when a drag ends having changed a node: the place an undo would start from.
+- **The gizmo is drawn after the post-process chain**: a `GizmoEffect` (`gizmo`), added to the chain the first time a
+  gizmo enters the scene and skipped while there is none (`PostChain.enable`), runs last in display space (`PostEffect::runsLast`), after the grading and the
+  anti-aliasing, so its colours are its own and its lines stay sharp. Its compute pass copies the image and blends the
+  shapes of the gizmo over it (segments and triangles in texels, `GizmoShape`, 256 at most, their edges smoothed),
+  testing no depth; the texels outside the box the shapes cover are only copied. The gizmo writes its shapes in its
+  parameters at each tick of the scene when they change, without recording the frames again.
 
 ## The style file
 
@@ -839,9 +899,20 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Scene3D`
 
-- **Attributes:** `tab-index`: an integer; `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`
+- **Attributes:** `tab-index`: an integer; `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`; `editable`: true or false
 - **Default attribute:** none
 - **Children:** its overlay, optional
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** none
+
+### `SceneGizmo`
+
+- **Attributes:** `tab-index`: an integer; `selectable`: true or false; `size`: a number
+- **Default attribute:** none
+- **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `pressed`
