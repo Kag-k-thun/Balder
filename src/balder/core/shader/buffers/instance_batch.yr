@@ -27,17 +27,13 @@ def MIN_COMMANDS = 64us;
 def WORD_SIZE = 4us;
 
 /**
- * The number of words of a candidate of the cull pass: the word of its instance, the index of its command
- * */
-def CANDIDATE_WORDS = 2us;
-
-/**
  * The counters at the start of the counter buffer of a frame culled on the GPU: the number of commands written by the
- * first phase of the cull pass (read by its draw indirect count call), the number of instances they draw, then the same
- * two counters for the second phase (see cullOccluded); the instances seen in the range of each template follow, with
- * the number of them drawn by the first phase
+ * first phase of the cull pass (read by its draw indirect count call, one command per cluster seen), the number of
+ * triangles they draw, the same two counters for the second phase (see the occlusion below), then the number of
+ * candidates whose object the camera sees and the size of the indirect dispatch of the clusters of those candidates
+ * (x, y, z); the candidates listed follow
  * */
-def COUNTER_HEADER = 4us;
+def COUNTER_HEADER = 8us;
 
 /**
  * The index in the counters of the number of commands written by the second phase of the cull pass
@@ -45,10 +41,14 @@ def COUNTER_HEADER = 4us;
 def LATE_COUNTER = 2us;
 
 /**
- * The number of counters of each template, after the header: the instances seen in its range, and those of them drawn by
- * the first phase
+ * The index in the counters of the indirect dispatch of the clusters of the candidates seen
  * */
-def TEMPLATE_COUNTERS = 2us;
+def DISPATCH_COUNTER = 5us;
+
+/**
+ * The number of counters copied for the CPU, the commands and the triangles of the two phases
+ * */
+def READBACK_COUNTERS = 4us;
 
 /**
  * The draws of objects laid out by the recordings of a subpass, the draws of the same range of indices being drawn by
@@ -59,14 +59,17 @@ def TEMPLATE_COUNTERS = 2us;
  * @info: each frame in flight has its own objects, laid out by its recording, and its own buffers of commands and of
  * words, built again at its submission when the draws of its objects changed; a frame never draws the objects laid out
  * by the recording of another, nor commands placing geometry the buffers it bound do not hold
- * @info: when culled on the GPU, the commands built are the templates of a cull pass, each holding the range of its
- * instances in the words, and the words its candidates, each with the index of its template (see DrawGrouping::candidates); the
- * pass writes the instances it sees and the commands drawing them in buffers of the GPU, with their number in a counter
- * buffer read by a draw indirect count call, the CPU reading the counters back once the submission of the frame is over
- * @info: the cull pass runs in two phases when the instances hidden behind others are culled (occlusion): the first one
- * draws the instances seen by the last frame, whose depth gives a depth pyramid the second one tests the others against,
- * drawing those it finds; the commands of the second phase follow those of the first one, and the visibility of each
- * candidate is kept for the next frame (see getVisibilityBuffer)
+ * @info: when culled on the GPU, the draws are culled cluster by cluster: the words built are the candidates of a cull
+ * pass, one per draw laid out with the range of its clusters (see DrawGrouping::candidates), no command being built;
+ * the pass lists the candidates whose object it sees, then tests each cluster of those, writing one command per cluster
+ * seen and the word of its instance in buffers of the GPU, with their number in a counter buffer read by a draw indirect
+ * count call, the CPU reading the counters back once the submission of the frame is over
+ * @info: the clusters a frame culls are bounded by the bounds of the draws laid out (InstanceDraw::clusterBound), its
+ * capacity, so the draws modified in place (a new level of detail...) fit in the buffers of its recording
+ * @info: the cull pass runs in two phases when the clusters hidden behind others are culled (occlusion): the first one
+ * draws the clusters seen by the last frame, whose depth gives a depth pyramid the second one tests the others against,
+ * drawing those it finds; the commands of the second phase follow the capacity of the first one, and the visibility of
+ * each cluster of each candidate is kept for the next frame (see getVisibilityBuffer)
  * */
 @final
 pub class InstanceBatch {
@@ -99,8 +102,8 @@ pub class InstanceBatch {
     // The words of the instances of each frame
     let dmut _words: [[u32]] = [];
 
-    // The number of commands drawing something and of instances, at the last build of a frame
-    let mut _drawn: (u32, u32) = (0u32, 0u32);
+    // The number of commands drawing something, of instances and of triangles, at the last build of a frame
+    let mut _drawn: (u32, u32, u32) = (0u32, 0u32, 0u32);
 
     // The buffer of indirect commands read by each frame
     let dmut _commandCopies: [(&Buffer)?] = [];
@@ -116,10 +119,14 @@ pub class InstanceBatch {
 
     prv { // Culling on the GPU
 
-        // The commands written by the cull pass of each frame, drawing the instances it sees
+        // The number of clusters the cull pass of each frame culls at most, the bounds of the draws it laid out
+        let mut _capacities: [mut u32] = [];
+
+        // The commands written by the cull pass of each frame, one per cluster it sees
         let dmut _culledCommands: [(&Buffer)?] = [];
 
-        // The words of the instances seen by the cull pass of each frame, read by the shaders
+        // The words of the instances seen by the cull pass of each frame, read by the shaders, each followed by the slot of
+        // its cluster
         let dmut _culledWords: [(&Buffer)?] = [];
 
         // The counters of the cull pass of each frame (see COUNTER_HEADER)
@@ -128,8 +135,8 @@ pub class InstanceBatch {
         // The header of the counters of each frame, copied for the CPU at the end of its cull pass
         let dmut _readbacks: [(&Buffer)?] = [];
 
-        // The visibility of each candidate of each frame at its last cull pass, written by the second phase, read by the
-        // first one of the next pass of the frame
+        // The visibility of each cluster of each candidate of each frame at its last cull pass, written by the second
+        // phase, read by the first one of the next pass of the frame
         let dmut _visibilities: [(&Buffer)?] = [];
     }
 
@@ -156,6 +163,7 @@ pub class InstanceBatch {
     {
         let nbFrames = device.getNbFrames();
         self._frameCulled = copy [false; nbFrames];
+        self._capacities = copy [0u32; nbFrames];
 
         let dmut commands: [[VkDrawIndexedIndirectCommand]] = [];
         let dmut words: [[u32]]                            = [];
@@ -232,9 +240,10 @@ pub class InstanceBatch {
     }
 
     /**
-     * End the layout of the objects of a frame, its commands being built and its buffers enlarged to hold them
-     * @returns: the number of commands laid out, the number of commands to draw (the largest number the cull pass
-     * writes, when culled on the GPU)
+     * End the layout of the objects of a frame, its commands (or its candidates, when culled on the GPU) being built and
+     * its buffers enlarged to hold them
+     * @returns: the number of draws laid out, the number of commands to draw when culled on the CPU, the number of
+     * candidates otherwise
      * */
     pub fn end(mut self, frame: u32)-> u32
         throws BalderError
@@ -244,7 +253,7 @@ pub class InstanceBatch {
 
             let count = cast!usize(self._table.getCount(frame));
             let nbWords = if self._culled { count * CANDIDATE_WORDS } else { count };
-            if count > self._commands[frame].len {
+            if !self._culled && count > self._commands[frame].len {
                 let extra = max(count - self._commands[frame].len, max(self._commands[frame].len, 16us));
                 self._commands[frame] = self._commands[frame] ~ copy [VkDrawIndexedIndirectCommand(); extra];
             }
@@ -254,10 +263,12 @@ pub class InstanceBatch {
                 self._words[frame] = self._words[frame] ~ copy [0u32; extra];
             }
 
-            self:.reserve(frame, count * VkDrawIndexedIndirectCommand::size, true);
             self:.reserve(frame, nbWords * WORD_SIZE, false);
             if self._culled {
-                self:.reserveCulled(frame, count);
+                self._capacities[frame] = clusterCapacity(self._table:.collectLaid(frame));
+                self:.reserveCulled(frame, count, cast!usize(self._capacities[frame]));
+            } else {
+                self:.reserve(frame, count * VkDrawIndexedIndirectCommand::size, true);
             }
 
             self:.build(frame);
@@ -364,17 +375,18 @@ pub class InstanceBatch {
     }
 
     /**
-     * @returns: the number of commands drawing something and the number of instances they draw, at the last build of a
-     * frame, or at the last cull pass read back when culled on the GPU
+     * @returns: the number of commands drawing something, the number of instances and the number of triangles they draw,
+     * at the last build of a frame, or at the last cull pass read back when culled on the GPU (a command per cluster)
      * */
-    pub fn getDrawn(self)-> (u32, u32) {
+    pub fn getDrawn(self)-> (u32, u32, u32) {
         atomic self {
             self._drawn
         }
     }
 
     /**
-     * @returns: the buffer of indirect commands read by the frame 'frame', null if nothing was laid out
+     * @returns: the buffer of indirect commands read by the frame 'frame', null if nothing was laid out or when culled on
+     * the GPU
      * */
     pub fn getVulkanBuffer(self, frame: u32)-> VkBuffer {
         atomic self {
@@ -401,16 +413,8 @@ pub class InstanceBatch {
     }
 
     /**
-     * @returns: the templates of the cull pass of the frame 'frame', the commands built, none if nothing was laid out
-     * */
-    pub fn getTemplateBuffer(self, frame: u32)-> (&Buffer)? {
-        atomic self {
-            self._commandCopies[frame]
-        }
-    }
-
-    /**
-     * @returns: the candidates of the cull pass of the frame 'frame', the words built, none if nothing was laid out
+     * @returns: the candidates of the cull pass of the frame 'frame', the words built (see DrawGrouping::candidates), none
+     * if nothing was laid out
      * */
     pub fn getCandidateBuffer(self, frame: u32)-> (&Buffer)? {
         atomic self {
@@ -451,16 +455,26 @@ pub class InstanceBatch {
     }
 
     /**
-     * @returns: the visibility of the candidates of the cull pass of the frame 'frame', one word each, none unless culled
-     * on the GPU
-     * @info: the content is undefined until a cull pass of the frame culling the occluded instances wrote it, and when
-     * the candidates of the frame are laid out again; it only decides which instances the first phase draws, the second
+     * @returns: the visibility of the clusters of the candidates of the cull pass of the frame 'frame', one word each,
+     * none unless culled on the GPU
+     * @info: the content is undefined until a cull pass of the frame culling the occluded clusters wrote it, and when
+     * the candidates of the frame are laid out again; it only decides which clusters the first phase draws, the second
      * phase drawing the others it finds
      * */
     pub fn getVisibilityBuffer(self, frame: u32)-> (&Buffer)? {
         atomic self {
             if !self._frameCulled[frame] { return none; }
             self._visibilities[frame]
+        }
+    }
+
+    /**
+     * @returns: the number of clusters the cull pass of the frame 'frame' culls at most, the most commands each of its
+     * phases writes
+     * */
+    pub fn getCulledCapacity(self, frame: u32)-> u32 {
+        atomic self {
+            self._capacities[frame]
         }
     }
 
@@ -472,7 +486,7 @@ pub class InstanceBatch {
      * */
     pub fn getCulledCommandOffset(self, frame: u32, late: bool)-> u64 {
         if !late { return 0u64; }
-        cast!u64(self.getCount(frame)) * cast!u64(VkDrawIndexedIndirectCommand::size)
+        cast!u64(self.getCulledCapacity(frame)) * cast!u64(VkDrawIndexedIndirectCommand::size)
     }
 
     /**
@@ -486,10 +500,17 @@ pub class InstanceBatch {
     }
 
     /**
-     * @returns: the size in bytes of the header of the counters, copied for the CPU
+     * @returns: the offset in bytes of the indirect dispatch of the clusters of the candidates seen, in the counters
+     * */
+    pub fn getDispatchOffset(self)-> u64 {
+        cast!u64(DISPATCH_COUNTER * WORD_SIZE)
+    }
+
+    /**
+     * @returns: the size in bytes of the counters copied for the CPU, at the start of the counters
      * */
     pub fn getCounterHeaderSize(self)-> usize {
-        COUNTER_HEADER * WORD_SIZE
+        READBACK_COUNTERS * WORD_SIZE
     }
 
     /*!
@@ -515,7 +536,13 @@ pub class InstanceBatch {
 
             if self._table.isStale(frame) && self._inPlace {
                 self._table:.built(frame);
-                (self._table:.collect(frame))?
+                if self._frameCulled[frame] {
+                    // the candidates need no grouping
+                    self:.writeCandidates(frame);
+                    none
+                } else {
+                    (self._table:.collect(frame))?
+                }
             } else {
                 none
             }
@@ -557,17 +584,22 @@ pub class InstanceBatch {
      */
 
     /**
-     * Build the commands and the words of a frame from the draws of its objects
+     * Build the commands and the words of a frame from the draws of its objects, or its candidates when culled on the GPU
      * @atomic
      * */
     fn build(mut self, frame: u32) {
-        let (commands, words) = self._grouping:.group(self._table:.collect(frame));
         self._table:.built(frame);
+        if self._frameCulled[frame] {
+            self:.writeCandidates(frame);
+            return;
+        }
+
+        let (commands, words) = self._grouping:.group(self._table:.collect(frame));
         self:.writeBuilt(frame, commands, words);
     }
 
     /**
-     * Write the commands and the words built for a frame, the commands past them drawing nothing
+     * Write the commands and the words built for a frame culled on the CPU, the commands past them drawing nothing
      * @atomic
      * */
     fn writeBuilt(mut self, frame: u32, commands: [VkDrawIndexedIndirectCommand], words: [u32]) {
@@ -577,45 +609,56 @@ pub class InstanceBatch {
             self:.writeCommand(frame, i, c);
         }
 
-        if self._frameCulled[frame] {
-            // the counters of the cull pass give the commands and the instances drawn
-            for i, w in self._grouping:.candidates(commands, words, cast!usize(count)) {
-                self:.writeWord(frame, cast!u32(i), w);
-            }
-        } else {
-            for i in 0u32 .. count {
-                let w = if cast!usize(i) < words.len { words[i] } else { 0u32 };
-                self:.writeWord(frame, i, w);
-            }
+        for i in 0u32 .. count {
+            let w = if cast!usize(i) < words.len { words[i] } else { 0u32 };
+            self:.writeWord(frame, i, w);
+        }
 
-            self._drawn = (cast!u32(commands.len), cast!u32(words.len));
+        let mut triangles = 0u32;
+        for c in commands {
+            triangles += c.indexCount / 3u32 * c.instanceCount;
+        }
+
+        self._drawn = (cast!u32(commands.len), cast!u32(words.len), triangles);
+    }
+
+    /**
+     * Write the candidates of the cull pass of a frame culled on the GPU, from the draws it laid out, the counters of
+     * the cull pass giving the commands and the triangles drawn
+     * @atomic
+     * */
+    fn writeCandidates(mut self, frame: u32) {
+        let count = cast!usize(self._table.getCount(frame));
+        for i, w in self._grouping:.candidates(self._table:.collectLaid(frame), count) {
+            self:.writeWord(frame, cast!u32(i), w);
         }
     }
 
     /**
-     * Read the header of the counters of the last cull pass of a frame, the commands and the instances it drew
+     * Read the counters of the last cull pass of a frame, the commands and the triangles it drew, a command per cluster
      * @atomic
      * @assume: the previous submission of the frame was awaited
      * */
     fn readBack(mut self, frame: u32) {
         if let Ok(dmut readback) = alias self._readbacks[frame] {
-            let dmut header: [u32] = copy [0u32; COUNTER_HEADER];
+            let dmut header: [u32] = copy [0u32; READBACK_COUNTERS];
 
             let ptr = readback:.map();
             if ptr != null {
-                memcpy(cast!{*void} (header.ptr), ptr, COUNTER_HEADER * WORD_SIZE);
+                memcpy(cast!{*void} (header.ptr), ptr, READBACK_COUNTERS * WORD_SIZE);
             }
 
-            self._drawn = (header[0] + header[LATE_COUNTER], header[1] + header[LATE_COUNTER + 1us]);
+            let commands = header[0] + header[LATE_COUNTER];
+            self._drawn = (commands, commands, header[1] + header[LATE_COUNTER + 1us]);
         }
     }
 
     /**
-     * Enlarge the buffers the cull pass of a frame writes to hold the commands and the instances of 'count' draws, the
-     * commands of its two phases
+     * Enlarge the buffers the cull pass of a frame writes to hold 'count' candidates and the commands and the instances
+     * of 'capacity' clusters for each of its two phases, two words per instance
      * @atomic
      * */
-    fn reserveCulled(mut self, frame: u32, count: usize)
+    fn reserveCulled(mut self, frame: u32, count: usize, capacity: usize)
         throws BalderError
     {
         let local = cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -628,27 +671,28 @@ pub class InstanceBatch {
                                     | VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
         self._culledCommands[frame] = self:.enlarge(alias self._culledCommands[frame],
-                                                    2us * count * VkDrawIndexedIndirectCommand::size,
+                                                    2us * capacity * VkDrawIndexedIndirectCommand::size,
                                                     commandUsage,
                                                     local);
-        self._culledWords[frame] = self:.enlarge(alias self._culledWords[frame], count * WORD_SIZE, wordUsage, local);
+        // two words per command, the word of its instance and the slot of its cluster
+        self._culledWords[frame] = self:.enlarge(alias self._culledWords[frame], 4us * capacity * WORD_SIZE, wordUsage, local);
         self._counters[frame] = self:.enlarge(alias self._counters[frame],
-                                              (COUNTER_HEADER + TEMPLATE_COUNTERS * count) * WORD_SIZE,
+                                              (COUNTER_HEADER + count) * WORD_SIZE,
                                               counterUsage,
                                               local);
-        self._visibilities[frame] = self:.enlarge(alias self._visibilities[frame], count * WORD_SIZE, wordUsage, local);
+        self._visibilities[frame] = self:.enlarge(alias self._visibilities[frame], capacity * WORD_SIZE, wordUsage, local);
 
         if !self._readbacks[frame].hasValue {
             let dmut readback = self._device
                 :.getMemoryAllocator()
-                :.allocBuffer(COUNTER_HEADER * WORD_SIZE,
+                :.allocBuffer(READBACK_COUNTERS * WORD_SIZE,
                               cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_TRANSFER_DST_BIT),
                               cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                                        | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
 
             // read before the first cull pass of the frame copies its counters
-            let zeros: [u32] = copy [0u32; COUNTER_HEADER];
-            self:.write(alias readback, cast!{*void} (zeros.ptr), COUNTER_HEADER * WORD_SIZE, 0us, COUNTER_HEADER * WORD_SIZE);
+            let zeros: [u32] = copy [0u32; READBACK_COUNTERS];
+            self:.write(alias readback, cast!{*void} (zeros.ptr), READBACK_COUNTERS * WORD_SIZE, 0us, READBACK_COUNTERS * WORD_SIZE);
             self._readbacks[frame] = (alias readback)?;
         }
     }

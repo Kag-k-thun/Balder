@@ -14,6 +14,9 @@ layout(set = 1, binding = 0) uniform Camera {
 
     // The view-projection the frame before drew with
     mat4 prevViewProj;
+
+    // What the g-buffer shows instead of the materials (see DebugView), 0 for the materials
+    uint debugView;
 } camera;
 
 // The data of an object, in the slot given by the words of its instances (see the draws of IndexedMesh3D)
@@ -25,6 +28,9 @@ struct Object {
 
     // The index of the material of the object in the composition pass
     uint material;
+
+    // The level of detail drawn alone or fading in, and in the high 16 bits the level fading out
+    uint lod;
 
     // The center and the half size along each axis of the box enclosing the object in world space, read by the cull
     // pass of the scene (an empty box has a negative extent)
@@ -59,6 +65,19 @@ layout (location = 3) flat out uint outMaterial;
 layout (location = 4) out vec4 outCurrent;
 layout (location = 5) out vec4 outPrevious;
 
+// The debug view of the camera (see DebugView), the word of the instance, the slot of the cluster the command draws
+// (NO_CLUSTER when the command draws a whole level, culled on the CPU) and the level of detail of the draw
+layout (location = 6) flat out uvec4 outDebug;
+
+// The mark of the second word of the instance of a command drawing a cluster (see the cull pass)
+const uint CLUSTER_DRAW = 0x80000000u;
+
+// The cluster of a command drawing a whole level
+const uint NO_CLUSTER = 0xffffffffu;
+
+// The role of the draw of the outgoing level of a cross-fade, in the low bits of its word
+const uint OUTGOING_DRAW = 1u;
+
 // Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
 out gl_PerVertex {
     invariant vec4 gl_Position;
@@ -79,4 +98,15 @@ void main () {
     outUV = inUV;
     outFade = vec2 (object.fade, float (word & 3u));
     outMaterial = object.material;
+
+    // the cull pass writes the slot of the cluster after the word of the instance of its commands, marked, as no word of
+    // an instance is
+    uint cluster = NO_CLUSTER;
+    if (camera.debugView != 0u) {
+        uint next = instances [gl_InstanceIndex + 1];
+        if ((next & CLUSTER_DRAW) != 0u) cluster = next & ~CLUSTER_DRAW;
+    }
+
+    uint level = (word & 3u) == OUTGOING_DRAW ? object.lod >> 16 : object.lod & 0xffffu;
+    outDebug = uvec4 (camera.debugView, word, cluster, level);
 }

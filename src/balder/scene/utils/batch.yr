@@ -7,7 +7,7 @@ use balder::core::shader::{_, buffers::_};
 use balder::math::{matrix, vector};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
-use balder::scene::utils::{casters, draw_stats, motion, shadow_map};
+use balder::scene::utils::{casters, cluster_slot, draw_stats, motion, shadow_map};
 use balder::utils::log;
 
 use std::algorithm::comparison;
@@ -16,8 +16,8 @@ use ::vulkan::core;
 
 /**
  * The size of the slot of an object in the storage buffer of the 3D shaders: its world (mat4), the progress of its
- * cross-fade (f32), its material (u32), its world box (two vec4) and its world in the frame before (mat4), laid out as
- * std430 aligns them
+ * cross-fade (f32), its material (u32), its levels of detail (u32), its world box (two vec4) and its world in the frame
+ * before (mat4), laid out as std430 aligns them
  * */
 pub def OBJECT_STRIDE = 176us;
 
@@ -44,6 +44,17 @@ pub def OBJECT_MATERIAL = 68us;
 pub def OBJECT_OUTLINED = 0x80000000u32;
 
 /**
+ * The offset of the levels of detail an object draws in its slot: the level drawn alone or fading in, and above
+ * OBJECT_LOD_SHIFT the level fading out, the debug view of the levels colouring them (see DebugView::LODS)
+ * */
+pub def OBJECT_LOD = 72us;
+
+/**
+ * The shift of the level fading out in the levels of detail word of an object
+ * */
+pub def OBJECT_LOD_SHIFT = 16u32;
+
+/**
  * The offset of the center of the world box of an object in its slot (vec4, w unused), read by the cull pass
  * */
 pub def OBJECT_BOX_CENTER = 80us;
@@ -66,7 +77,8 @@ pub def OBJECT_PREV_WORLD = 112us;
 def MIN_SWEEP = 16us;
 
 /**
- * The geometry of a mesh placed in the pool of a shader, shared by the instances drawing it
+ * The geometry of a mesh placed in the pool of a shader, and its clusters in the clusters of the shader, shared by the
+ * instances drawing it
  * */
 @final
 class SharedGeometry {
@@ -74,15 +86,30 @@ class SharedGeometry {
     // The range of the geometry in the pool
     pub let dmut range: &GeometryRange;
 
+    // The clusters of the shader
+    let dmut _clusters: &ObjectStorage;
+
+    // The slot of the first cluster of the geometry in the clusters of the shader
+    pub let firstCluster: u32;
+
+    // The number of clusters of the geometry
+    pub let nbClusters: u32;
+
     // The number of instances drawing the geometry, the range being given back to the pool with the last one
     let mut _users: usize = 1us;
 
     /**
      * @params:
      *    - range: the range placed for a first instance
+     *    - clusters: the clusters of the shader
+     *    - firstCluster: the slot of the first cluster of the geometry
+     *    - nbClusters: the number of clusters of the geometry, placed from firstCluster
      * */
-    pub self (dmut range: &GeometryRange)
+    pub self (dmut range: &GeometryRange, dmut clusters: &ObjectStorage, firstCluster: u32, nbClusters: u32)
         with range = alias range
+        , _clusters = alias clusters
+        , firstCluster = firstCluster
+        , nbClusters = nbClusters
     {}
 
     /**
@@ -108,7 +135,7 @@ class SharedGeometry {
     }
 
     /**
-     * Count one instance less drawing the geometry, the range being given back to the pool with the last one
+     * Count one instance less drawing the geometry, the range and the clusters being given back with the last one
      * @warning: through a retire, the recordings in use may still draw the geometry
      * */
     pub fn release(mut self) {
@@ -118,6 +145,9 @@ class SharedGeometry {
             self._users -= 1us;
             if self._users == 0us {
                 self.range:.dispose();
+                if self.nbClusters != 0u32 {
+                    self._clusters:.free(self.firstCluster, count-> cast!usize(self.nbClusters));
+                }
             }
         }
     }
@@ -183,6 +213,14 @@ pub class SceneDraws {
      * */
     pub fn getGeometry(self)-> &GeometryRange {
         self._geometry.range
+    }
+
+    /**
+     * @returns: the slot of the first cluster of the geometry of the instance in the clusters of its shader, the clusters
+     * of a level of its mesh following it from the first cluster of the level
+     * */
+    pub fn getFirstCluster(self)-> u32 {
+        self._geometry.firstCluster
     }
 
     /**
@@ -315,6 +353,9 @@ pub class ShaderGroup {
     // The worlds, the cross-fades and the materials of the instances
     let dmut _objects: &ObjectStorage;
 
+    // The clusters of the geometries placed in the pool, read by the cull pass (see ClusterSlot)
+    let dmut _clusters: &ObjectStorage;
+
     // The worlds of the frame before of the instances moving
     let dmut _motion: &MotionTracker;
 
@@ -351,6 +392,7 @@ pub class ShaderGroup {
         , _camera = shader:.get():.allocateDescriptorSet(DescriptorContext::CAMERA)
         , _geometry = copy GeometryPool(alias shader:.get():.getDevice(), vertexStride(cfg))
         , _objects = alias objects
+        , _clusters = copy ObjectStorage(alias shader:.get():.getDevice(), CLUSTER_STRIDE)
         , _motion = copy MotionTracker(alias objects, OBJECT_WORLD, OBJECT_PREV_WORLD)
         , _casters = copy ShadowCasters(shader:.get():.getDevice().isMultiDraw())
         throws BalderError
@@ -436,7 +478,8 @@ pub class ShaderGroup {
     }
 
     /**
-     * @returns: the geometry of a mesh in the pool, placed unless an instance drawing it placed it already
+     * @returns: the geometry of a mesh in the pool, with its clusters, placed unless an instance drawing it placed it
+     * already
      * @params:
      *    - mesh: the mesh
      *    - material: the material of the instance, giving the layout of the vertices
@@ -453,7 +496,25 @@ pub class ShaderGroup {
         }
 
         let (vertices, indices) = mesh.compact(material);
-        let dmut g = copy SharedGeometry(alias self._geometry:.alloc(vertices, indices));
+        let dmut range = self._geometry:.alloc(vertices, indices);
+
+        let clusters = mesh.clusters;
+        let first = if clusters.len == 0us { 0u32 } else {
+            {
+                self._clusters:.alloc(count-> clusters.len)
+            } catch {
+                err => {
+                    range:.dispose();
+                    throw err;
+                }
+            }
+        };
+
+        for i, c in clusters {
+            self._clusters:.setData!{ClusterSlot} (first + cast!u32(i), 0us, ClusterSlot(c, range.firstIndex, range.vertexOffset));
+        }
+
+        let dmut g = copy SharedGeometry(alias range, alias self._clusters, first, cast!u32(clusters.len));
         self._meshes[mesh.uid] = alias g;
 
         alias g
@@ -478,11 +539,12 @@ pub class ShaderGroup {
     pub fn drawStats(self)-> DrawStats {
         let mut stats = DrawStats();
         for _, b in self._batches {
-            let (commands, instances) = b.draws.getDrawn();
+            let (commands, instances, triangles) = b.draws.getDrawn();
             if commands != 0u32 { stats.multiDraws += 1us; }
 
             stats.commands += cast!usize(commands);
             stats.instances += cast!usize(instances);
+            stats.triangles += cast!usize(triangles);
         }
 
         stats
@@ -628,49 +690,45 @@ pub class ShaderGroup {
     }
 
     /**
-     * Record the cull of the candidates of the material keys culled on the GPU
-     * @assume: the counters are cleared, the cull pass of the scene is bound (see CullPass::select); for the late cull,
-     * the first commands are drawn and the depth pyramid built
+     * Record the cull of the objects of the candidates of the material keys culled on the GPU, listing those seen
+     * @assume: the counters are cleared, the cull pass of the scene is bound (see CullPass::select)
      * @params:
      *    - frame: the frame being recorded
      *    - cmd: the command allocator of the cull passes
-     *    - late: false for the first cull, true for the second one testing the candidates against the depth pyramid
      *    - width: the width of the view, in pixels
      *    - height: the height of the view, in pixels
      *    - minPixels: the size on screen in pixels under which an instance is culled
-     *    - levels: the number of levels of the depth pyramid, 0 when the occluded instances are not culled
      * */
-    pub fn cull(mut self,
-                frame: u32,
-                dmut cmd: &CullCommandAllocator,
-                late: bool,
-                width: f32,
-                height: f32,
-                minPixels: f32,
-                levels: u32)
-    {
+    pub fn cullObjects(mut self, frame: u32, dmut cmd: &CullCommandAllocator, width: f32, height: f32, minPixels: f32) {
         if let Ok(dmut shader) = alias self._cull {
             for _, b in self._batches {
                 if let Ok(set) = b.cullSet {
                     set.select(frame, cmd.getCommandBuffer());
-                    cmd:.cull(alias shader, b.draws, late, width, height, minPixels, levels);
+                    cmd:.cullObjects(alias shader, b.draws, width, height, minPixels);
                 }
             }
         }
     }
 
     /**
-     * Record the writing of the commands of the material keys culled on the GPU
-     * @assume: the candidates are culled, the cull pass of the scene is bound
+     * Record the cull of the clusters of the candidates listed by cullObjects, writing the commands of the material keys
+     * culled on the GPU
+     * @assume: the objects are culled and their list made visible, the cull pass of the scene is bound; for the late
+     * cull, the first commands are drawn and the depth pyramid built
      * @params:
-     *    - late: false for the commands of the first cull, true for those of the second one
+     *    - frame: the frame being recorded
+     *    - cmd: the command allocator of the cull passes
+     *    - late: false for the first cull, true for the second one testing the clusters against the depth pyramid
+     *    - width: the width of the view, in pixels
+     *    - height: the height of the view, in pixels
+     *    - levels: the number of levels of the depth pyramid, 0 when the occluded clusters are not culled
      * */
-    pub fn writeCommands(mut self, frame: u32, dmut cmd: &CullCommandAllocator, late: bool) {
+    pub fn cullClusters(mut self, frame: u32, dmut cmd: &CullCommandAllocator, late: bool, width: f32, height: f32, levels: u32) {
         if let Ok(dmut shader) = alias self._cull {
             for _, b in self._batches {
                 if let Ok(set) = b.cullSet {
                     set.select(frame, cmd.getCommandBuffer());
-                    cmd:.writeCommands(alias shader, b.draws, late);
+                    cmd:.cullClusters(alias shader, b.draws, late, width, height, levels);
                 }
             }
         }
@@ -869,8 +927,8 @@ pub class ShaderGroup {
         if !draws.isCulled(frame) { return; }
 
         set:.setBuffer(UniformNames::OBJECTS, self._objects.getBuffer(), frame);
+        set:.setBuffer(UniformNames::CLUSTERS, self._clusters.getBuffer(), frame);
         for name, buffer in copy [UniformNames::DRAWS => draws.getCandidateBuffer(frame),
-                                  UniformNames::TEMPLATES => draws.getTemplateBuffer(frame),
                                   UniformNames::COUNTERS => draws.getCounterBuffer(frame),
                                   UniformNames::COMMANDS => draws.getCulledCommandBuffer(frame),
                                   UniformNames::INSTANCES => draws.getWordBuffer(frame),
@@ -910,6 +968,7 @@ pub class ShaderGroup {
         window:.retire(alias self._camera);
         window:.retire(alias self._geometry);
         window:.retire(alias self._objects);
+        window:.retire(alias self._clusters);
         self._shader:.dispose();
     }
 }

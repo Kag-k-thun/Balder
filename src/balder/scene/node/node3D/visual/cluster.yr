@@ -1,0 +1,243 @@
+in cluster;
+
+use balder::math::vector;
+use balder::scene::node::node3D::visual::lod;
+
+use std::algorithm::sorting;
+
+/**
+ * The number of triangles of a cluster, the last cluster of a level holding the triangles left
+ * */
+pub def CLUSTER_TRIANGLES = 64us;
+
+/**
+ * The cutoff of the cone of a cluster whose normals spread too much for its back faces to be culled, never reached
+ * */
+pub def NO_CONE = 2.0f;
+
+/**
+ * A cluster of a mesh: a run of at most CLUSTER_TRIANGLES triangles of a level of detail, close to each other, culled
+ * on the GPU as a whole (see the cull pass of the scene)
+ * */
+@data
+pub record MeshCluster {
+
+    // The offset of the first index of the cluster in the indices of the mesh
+    pub let mut firstIndex : u32 = 0u32;
+
+    // The number of indices of the cluster, three per triangle
+    pub let mut indexCount : u32 = 0u32;
+
+    // The center of the box enclosing the triangles, in the space of the positions
+    pub let mut center : vec3 = makeVec3 (0.0f, 0.0f, 0.0f);
+
+    // The half size of the box along each axis
+    pub let mut extent : vec3 = makeVec3 (0.0f, 0.0f, 0.0f);
+
+    // The axis of the cone enclosing the normals of the triangles, their winding facing the eye being the front
+    pub let mut coneAxis : vec3 = makeVec3 (0.0f, 0.0f, 0.0f);
+
+    // The sine of the angle between the axis and the normal the farthest from it, NO_CONE when the normals spread
+    // too much: an eye sees only back faces when the angle between the axis and the direction from the eye to the
+    // cluster is under 90 degrees minus that angle
+    pub let mut coneCutoff : f32 = NO_CONE;
+
+}
+
+/**
+ * The smallest cosine between the axis of a cone and a normal of its cluster for the back faces of the cluster to be
+ * culled, the cone of a wider cluster culling almost nothing
+ * */
+def MIN_CONE_COSINE = 0.1f;
+
+/**
+ * The number of cells of the grid ordering the triangles of a level along each axis (10 bits)
+ * */
+def MORTON_CELLS = 1024.0f;
+
+/**
+ * Split the levels of detail of a mesh into clusters, the triangles of each level being ordered so the clusters follow
+ * each other in its range of indices
+ * @info: the triangles of a level are sorted along a Morton curve of the grid of their centroids, then cut in runs of
+ * CLUSTER_TRIANGLES triangles, so the triangles of a cluster are close to each other; a level keeps its range of
+ * indices and its triangles, and gets the range of its clusters
+ * @params:
+ *    - positions: the positions of the vertices of the mesh
+ *    - chain: the levels of the mesh
+ * @returns:
+ *    - .0: the levels, their triangles reordered, each with the range of its clusters
+ *    - .1: the clusters of every level, those of a level following each other, the levels in order
+ * */
+pub fn buildClusters (positions : [vec3], chain : LodChain)-> (LodChain, [MeshCluster]) {
+    let dmut indices = copy chain.indices;
+    let dmut levels = copy chain.levels;
+    let dmut clusters : [MeshCluster] = [];
+
+    for l in 0us .. levels.len {
+        let first = cast!usize (levels [l].firstIndex);
+        let end = first + cast!usize (levels [l].count);
+        levels [l].firstCluster = cast!u32 (clusters.len);
+        if end > indices.len || end - first < 3us { continue; }
+
+        orderTriangles (positions, alias indices [first .. end]);
+
+        let nbTriangles = (end - first) / 3us;
+        let mut t = 0us;
+        while t < nbTriangles {
+            let n = if nbTriangles - t < CLUSTER_TRIANGLES { nbTriangles - t } else { CLUSTER_TRIANGLES };
+            let start = first + 3us * t;
+            clusters ~= [makeCluster (positions, indices [start .. start + 3us * n], cast!u32 (start))];
+            t += n;
+        }
+
+        levels [l].clusterCount = cast!u32 (clusters.len) - levels [l].firstCluster;
+    }
+
+    let mut result = chain;
+    result.indices = indices;
+    result.levels = levels;
+    (result, clusters)
+}
+
+/**
+ * Sort the triangles of a level along the Morton curve of the grid of their centroids
+ * @params:
+ *    - positions: the positions of the vertices
+ *    - indices: the triangles, three indices each, sorted in place
+ * */
+fn orderTriangles (positions : [vec3], dmut indices : [u32]) {
+    let nbTriangles = indices.len / 3us;
+
+    let mut min = makeVec3 (f32::max, f32::max, f32::max), mut max = makeVec3 (-f32::max, -f32::max, -f32::max);
+    let dmut centroids = copy [makeVec3 (0.0f, 0.0f, 0.0f) ; nbTriangles];
+    for t in 0us .. nbTriangles {
+        let c = (vertex (positions, indices [3us * t])
+                 + vertex (positions, indices [3us * t + 1us])
+                 + vertex (positions, indices [3us * t + 2us])) * (1.0f / 3.0f);
+        centroids [t] = c;
+        if c.x < min.x { min.x = c.x; }
+        if c.y < min.y { min.y = c.y; }
+        if c.z < min.z { min.z = c.z; }
+        if c.x > max.x { max.x = c.x; }
+        if c.y > max.y { max.y = c.y; }
+        if c.z > max.z { max.z = c.z; }
+    }
+
+    let size = max - min;
+    let dmut keys = copy [(0u32, 0u32) ; nbTriangles];
+    for t in 0us .. nbTriangles {
+        let c = centroids [t];
+        keys [t] = (morton (cell (c.x - min.x, size.x), cell (c.y - min.y, size.y), cell (c.z - min.z, size.z)), cast!u32 (t));
+    }
+
+    sort (alias keys, |a, b| => {
+        if a._0 != b._0 { return a._0 < b._0; }
+        a._1 < b._1
+    });
+
+    let source = copy indices;
+    for i, k in keys {
+        let t = cast!usize (k._1);
+        indices [3us * i] = source [3us * t];
+        indices [3us * i + 1us] = source [3us * t + 1us];
+        indices [3us * i + 2us] = source [3us * t + 2us];
+    }
+}
+
+/**
+ * @returns: the cluster of a run of triangles, its box and the cone of its normals
+ * @params:
+ *    - positions: the positions of the vertices
+ *    - triangles: the triangles of the cluster, three indices each
+ *    - firstIndex: the offset of the first index of the cluster in the indices of the mesh
+ * */
+fn makeCluster (positions : [vec3], triangles : [u32], firstIndex : u32)-> MeshCluster {
+    let mut min = makeVec3 (f32::max, f32::max, f32::max), mut max = makeVec3 (-f32::max, -f32::max, -f32::max);
+    let mut sum = makeVec3 (0.0f, 0.0f, 0.0f);
+    for t in 0us .. triangles.len / 3us {
+        let a = vertex (positions, triangles [3us * t]);
+        let b = vertex (positions, triangles [3us * t + 1us]);
+        let c = vertex (positions, triangles [3us * t + 2us]);
+        for p in [a, b, c] {
+            if p.x < min.x { min.x = p.x; }
+            if p.y < min.y { min.y = p.y; }
+            if p.z < min.z { min.z = p.z; }
+            if p.x > max.x { max.x = p.x; }
+            if p.y > max.y { max.y = p.y; }
+            if p.z > max.z { max.z = p.z; }
+        }
+
+        let n = (b - a).cross (c - a);
+        if n.length () > 0.0f {
+            sum = sum + n.normalized ();
+        }
+    }
+
+    let mut cluster = MeshCluster ();
+    cluster.firstIndex = firstIndex;
+    cluster.indexCount = cast!u32 (triangles.len);
+    cluster.center = (min + max) * 0.5f;
+    cluster.extent = (max - min) * 0.5f;
+
+    if sum.length () <= 0.0f { return cluster; }
+
+    // the cosine of the widest angle between the axis and a normal, the degenerate triangles facing nowhere
+    let axis = sum.normalized ();
+    let mut cosine = 1.0f;
+    for t in 0us .. triangles.len / 3us {
+        let a = vertex (positions, triangles [3us * t]);
+        let n = (vertex (positions, triangles [3us * t + 1us]) - a).cross (vertex (positions, triangles [3us * t + 2us]) - a);
+        if n.length () > 0.0f {
+            let d = n.normalized ().dot (axis);
+            if d < cosine { cosine = d; }
+        }
+    }
+
+    cluster.coneAxis = axis;
+    if cosine > MIN_CONE_COSINE {
+        cluster.coneCutoff = core::math::sqrt (1.0f - cosine * cosine);
+    }
+
+    cluster
+}
+
+/**
+ * @returns: the position of a vertex, the origin for an index out of the positions
+ * */
+fn vertex (positions : [vec3], index : u32)-> vec3 {
+    if cast!usize (index) < positions.len { positions [index] } else { makeVec3 (0.0f, 0.0f, 0.0f) }
+}
+
+/**
+ * @returns: the cell of a coordinate in the grid ordering the triangles along an axis
+ * @params:
+ *    - offset: the coordinate from the smallest one along the axis
+ *    - size: the size of the grid along the axis
+ * */
+fn cell (offset : f32, size : f32)-> u32 {
+    if size <= 0.0f { return 0u32; }
+
+    let c = offset / size * (MORTON_CELLS - 1.0f);
+    if c <= 0.0f { return 0u32; }
+    if c >= MORTON_CELLS - 1.0f { return cast!u32 (MORTON_CELLS - 1.0f); }
+    cast!u32 (c)
+}
+
+/**
+ * @returns: the Morton code of a cell, the bits of its three coordinates interleaved
+ * */
+fn morton (x : u32, y : u32, z : u32)-> u32 {
+    spread (x) | (spread (y) << 1u32) | (spread (z) << 2u32)
+}
+
+/**
+ * @returns: the ten low bits of a value spread two bits apart
+ * */
+fn spread (v : u32)-> u32 {
+    let mut x = v & 0x3ffu32;
+    x = (x | (x << 16u32)) & 0x30000ffu32;
+    x = (x | (x << 8u32)) & 0x300f00fu32;
+    x = (x | (x << 4u32)) & 0x30c30c3u32;
+    x = (x | (x << 2u32)) & 0x9249249u32;
+    x
+}
