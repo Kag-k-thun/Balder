@@ -1,16 +1,16 @@
 #version 450 core
 
-// The cull pass of the instances of a batch of the 3D shaders (see InstanceBatch), dispatched twice per phase:
-//    - phase 0, one thread per candidate: the instances whose world box the camera sees are written in the range of
-//      their template, counted in the counter of the template; when the occluded instances are culled, only those the
-//      last pass found visible are
-//    - phase 1, one thread per template: the templates with an instance seen are written as the commands of the first
-//      draw indirect count call, counted in the counter of the commands
-//    - phase 2, one thread per candidate, once the instances of phase 0 are drawn and their depth reduced into the depth
-//      pyramid: the instances the camera sees that are not hidden behind that depth are visible, kept for the next pass;
-//      those phase 0 did not draw are written after its instances in the range of their template
-//    - phase 3, one thread per template: the instances phase 2 wrote are written as the commands of the second draw
-//      indirect count call, after the commands of phase 1
+// The cull pass of the draws of a batch of the 3D shaders (see InstanceBatch), culling them cluster by cluster, a
+// cluster being a run of a fixed number of triangles of a level of detail of a mesh (see buildClusters):
+//    - phase 0, one thread per candidate: the candidates whose object the camera sees (its world box in the frustum and
+//      not smaller on screen than the threshold) are listed, and the size of the dispatch of their clusters counted
+//    - phase 1, dispatched indirectly, one workgroup per candidate listed, its threads striding over its clusters: the
+//      clusters the camera sees (their world box in the frustum, a front face possibly facing it) are written as one
+//      command each, with the word of their instance, counted by the counter of the first draw indirect count call;
+//      when the occluded clusters are culled, only those the last pass found visible are
+//    - phase 2, the same dispatch once the clusters of phase 1 are drawn and their depth reduced into the depth pyramid:
+//      the clusters the camera sees that are not hidden behind that depth are visible, kept for the next pass; those
+//      phase 1 did not draw are written after the capacity of phase 1, counted by the counter of the second call
 // The frustum test is the one of the culling on the CPU (Frustum::classify, ViewVolume::pixelSize), its reference
 
 layout (local_size_x = 64) in;
@@ -23,7 +23,7 @@ layout (set = 1, binding = 0) uniform Camera {
 } camera;
 
 // The levels of the depth pyramid of the frame, each texel the farthest depth of the texels it covers, from the level 1
-// (see balder::scene::utils::pyramid::layout); bound when the occluded instances are culled only
+// (see balder::scene::utils::pyramid::layout); bound when the occluded clusters are culled only
 layout (std430, set = 1, binding = 1) readonly buffer Pyramid {
     float texels [];
 } pyramid;
@@ -47,16 +47,64 @@ layout (std430, set = 0, binding = 0) readonly buffer Objects {
     Object objects [];
 };
 
-// A candidate: the word of its instance (the slot of its object above the two low bits), the index of its template,
-// NO_COMMAND when it draws nothing
+// A candidate, a draw laid out: the word of its instance (the slot of its object above the two low bits), the range of
+// its clusters (none when it draws nothing), and the first word of the visibility of its clusters
 struct Candidate {
     uint word;
-    uint command;
+    uint firstCluster;
+    uint clusterCount;
+    uint visibility;
 };
 
 layout (std430, set = 0, binding = 1) readonly buffer Draws {
     Candidate draws [];
 };
+
+// A cluster of a geometry of the pool (see ClusterSlot)
+struct Cluster {
+    // The center and the half size of the box of the cluster, in the space of the positions of its mesh
+    vec4 center;
+    vec4 extent;
+
+    // The axis of the cone of the normals of the cluster, and in w the sine of the widest angle between them, above 1
+    // when its back faces are not culled
+    vec4 cone;
+
+    uint firstIndex;
+    uint indexCount;
+    int vertexOffset;
+    uint pad;
+};
+
+layout (std430, set = 0, binding = 2) readonly buffer Clusters {
+    Cluster clusters [];
+};
+
+// Cleared before the pass
+layout (std430, set = 0, binding = 3) buffer Counters {
+    // The commands written by phase 1, read by the first draw indirect count call
+    uint drawCount;
+
+    // The triangles drawn by the commands written by phase 1
+    uint triangleCount;
+
+    // The commands written by phase 2, read by the second draw indirect count call
+    uint lateDrawCount;
+
+    // The triangles drawn by the commands written by phase 2
+    uint lateTriangleCount;
+
+    // The candidates listed by phase 0
+    uint listed;
+
+    // The size of the indirect dispatch of phases 1 and 2, a workgroup per candidate listed
+    uint dispatchX;
+    uint dispatchY;
+    uint dispatchZ;
+
+    // The candidates listed by phase 0
+    uint candidates [];
+} counters;
 
 // A VkDrawIndexedIndirectCommand
 struct Command {
@@ -67,80 +115,60 @@ struct Command {
     uint firstInstance;
 };
 
-// The commands grouping the candidates by range of indices, the candidates of a template following each other from its
-// first instance
-layout (std430, set = 0, binding = 2) readonly buffer Templates {
-    Command templates [];
-};
-
-// The instances seen in the range of a template, and those of them written by phase 0
-struct Range {
-    uint seen;
-    uint early;
-};
-
-// Cleared before the pass
-layout (std430, set = 0, binding = 3) buffer Counters {
-    // The commands written by phase 1, read by the first draw indirect count call
-    uint drawCount;
-
-    // The instances drawn by the commands written by phase 1
-    uint instanceCount;
-
-    // The commands written by phase 3, read by the second draw indirect count call
-    uint lateDrawCount;
-
-    // The instances drawn by the commands written by phase 3
-    uint lateInstanceCount;
-
-    Range ranges [];
-} counters;
-
-// The commands of phase 1, then those of phase 3 from the index 'count'
+// The commands of phase 1, then those of phase 2 from the index 'capacity'
 layout (std430, set = 0, binding = 4) writeonly buffer Commands {
     Command commands [];
 };
 
-// The words of the instances seen, read by the vertex shaders at their instance index
+// Two words per command, from its first instance: the word of its instance, read by the vertex shaders at their instance
+// index, then the slot of its cluster marked by CLUSTER_DRAW, read by the debug views of the g-buffer
 layout (std430, set = 0, binding = 5) writeonly buffer Instances {
     uint instances [];
 };
 
-// The visibility of each candidate at the last pass culling the occluded instances, 0 when it was culled
+// The visibility of each cluster of each candidate at the last pass culling the occluded clusters, 0 when it was culled
 layout (std430, set = 0, binding = 6) buffer Visibility {
     uint visible [];
 };
 
 layout (push_constant) uniform Push {
-    // The number of candidates, as many as the templates at most
+    // The number of candidates
     uint count;
 
-    // 0 to cull the candidates, 1 to write the commands
+    // 0 to list the candidates seen, 1 to cull their clusters, 2 to cull them against the depth pyramid
     uint phase;
 
     // The height of the view, in pixels
     float height;
 
-    // The size on screen in pixels under which an instance is culled, 0 to cull the instances outside the view only
+    // The size on screen in pixels under which an object is culled, 0 to cull the objects outside the view only
     float minPixels;
 
     // The width of the view, in pixels
     float width;
 
-    // The number of levels of the depth pyramid, 0 when the occluded instances are not culled
+    // The number of levels of the depth pyramid, 0 when the occluded clusters are not culled
     uint levels;
 
-    uint pad0;
-    uint pad1;
+    // The number of clusters each phase culls at most, the commands of phase 2 following as many of phase 1
+    uint capacity;
+
+    uint pad;
 } push;
 
-const uint NO_COMMAND = 0xffffffffu;
+// The largest number of workgroups of a dimension of a dispatch (maxComputeWorkGroupCount, at least that much)
+const uint MAX_GROUPS = 65535u;
+
+// The largest ratio between two scales of a world under which the cone of the normals of a cluster is turned with it
+const float UNIFORM_SCALE = 1.001;
+
+// The mark of the second word of the instance of a command drawing a cluster, never set in the word of an instance
+const uint CLUSTER_DRAW = 0x80000000u;
 
 /**
- * @returns: true iif the camera sees the box: a part of it may be in the frustum, and it is not smaller on screen than
- * the threshold
+ * @returns: true iif a part of the box may be in the frustum of the camera
  * */
-bool sees (vec3 center, vec3 extent) {
+bool inFrustum (vec3 center, vec3 extent) {
     if (any (lessThan (extent, vec3 (0.0)))) return false;
 
     // the rows of the projection by the view, the planes of the frustum facing its inside (Gribb–Hartmann)
@@ -156,17 +184,36 @@ bool sees (vec3 center, vec3 extent) {
         if (d < -r) return false;
     }
 
-    if (push.minPixels > 0.0) {
-        // the diameter of the box seen at the depth of its point closest to the eye, the box reaching the plane of the
-        // eye being seen
-        float w = dot (rows [3].xyz, center) + rows [3].w - dot (abs (rows [3].xyz), extent);
-        if (w > 0.0) {
-            float pixelScale = length (rows [1].xyz) * push.height / 2.0;
-            if (2.0 * length (extent) * (pixelScale / w) < push.minPixels) return false;
-        }
-    }
-
     return true;
+}
+
+/**
+ * @returns: true iif the box is smaller on screen than the threshold: the diameter of the box seen at the depth of its
+ * point closest to the eye, the box reaching the plane of the eye being large
+ * */
+bool tooSmall (vec3 center, vec3 extent) {
+    if (push.minPixels <= 0.0) return false;
+
+    mat4 rows = transpose (camera.viewProj);
+    float w = dot (rows [3].xyz, center) + rows [3].w - dot (abs (rows [3].xyz), extent);
+    if (w <= 0.0) return false;
+
+    float pixelScale = length (rows [1].xyz) * push.height / 2.0;
+    return 2.0 * length (extent) * (pixelScale / w) < push.minPixels;
+}
+
+/**
+ * @returns: true iif the eye sees only back faces of a cluster: the direction from the eye to the sphere of the cluster
+ * stays within the cone of its normals widened by 90 degrees (the cone test of meshoptimizer)
+ * @params:
+ *    - center: the center of the sphere of the cluster, in world space
+ *    - radius: the radius of the sphere
+ *    - axis: the axis of the cone in world space
+ *    - cutoff: the sine of the widest angle between the axis and a normal
+ * */
+bool backFacing (vec3 center, float radius, vec3 axis, float cutoff) {
+    vec3 toCluster = center - camera.eyePos;
+    return dot (toCluster, axis) >= cutoff * length (toCluster) + radius;
 }
 
 /**
@@ -235,61 +282,95 @@ bool occluded (vec3 center, vec3 extent) {
 }
 
 /**
- * Write an instance seen in the range of its template, after those written before
+ * Write the command drawing a cluster seen, the word of its instance and the slot of the cluster, after those written
+ * before by the phase
  * */
-void append (Candidate candidate) {
-    uint slot = atomicAdd (counters.ranges [candidate.command].seen, 1u);
-    instances [templates [candidate.command].firstInstance + slot] = candidate.word;
+void append (Cluster cluster, uint slot, uint word, bool late) {
+    uint written = late ? atomicAdd (counters.lateDrawCount, 1u) : atomicAdd (counters.drawCount, 1u);
+    if (late) {
+        atomicAdd (counters.lateTriangleCount, cluster.indexCount / 3u);
+    } else {
+        atomicAdd (counters.triangleCount, cluster.indexCount / 3u);
+    }
+
+    uint index = late ? push.capacity + written : written;
+    commands [index] = Command (cluster.indexCount, 1u, cluster.firstIndex, cluster.vertexOffset, 2u * index);
+    instances [2u * index] = word;
+    instances [2u * index + 1u] = slot | CLUSTER_DRAW;
+}
+
+/**
+ * List a candidate whose object the camera sees, the dispatch of the clusters growing to cover it
+ * */
+void listObject (uint index) {
+    Candidate candidate = draws [index];
+    if (candidate.clusterCount == 0u) return;
+
+    Object object = objects [candidate.word >> 2];
+    vec3 center = object.boxCenter.xyz;
+    vec3 extent = object.boxExtent.xyz;
+    if (!inFrustum (center, extent) || tooSmall (center, extent)) return;
+
+    uint slot = atomicAdd (counters.listed, 1u);
+    counters.candidates [slot] = index;
+
+    // a workgroup per candidate listed, in rows of MAX_GROUPS
+    atomicMax (counters.dispatchX, min (slot + 1u, MAX_GROUPS));
+    atomicMax (counters.dispatchY, slot / MAX_GROUPS + 1u);
+    atomicMax (counters.dispatchZ, 1u);
+}
+
+/**
+ * Cull the clusters of a candidate listed by phase 0, the threads of the workgroup striding over them
+ * */
+void cullClusters (uint index, bool late) {
+    Candidate candidate = draws [index];
+    mat4 model = objects [candidate.word >> 2].model;
+    mat3 linear = mat3 (model);
+
+    // the normals of the triangles turn with the cofactor of the world, which keeps their side under a mirror; the cone
+    // keeps its angle under a uniform scale only
+    mat3 cofactor = mat3 (cross (linear [1], linear [2]), cross (linear [2], linear [0]), cross (linear [0], linear [1]));
+    vec3 scales = vec3 (length (linear [0]), length (linear [1]), length (linear [2]));
+    bool cones = max (scales.x, max (scales.y, scales.z)) <= UNIFORM_SCALE * min (scales.x, min (scales.y, scales.z));
+
+    for (uint i = gl_LocalInvocationID.x; i < candidate.clusterCount; i += gl_WorkGroupSize.x) {
+        Cluster cluster = clusters [candidate.firstCluster + i];
+
+        // the world box of the cluster
+        vec3 center = (model * vec4 (cluster.center.xyz, 1.0)).xyz;
+        vec3 extent = abs (linear [0]) * cluster.extent.x + abs (linear [1]) * cluster.extent.y + abs (linear [2]) * cluster.extent.z;
+
+        bool seen = inFrustum (center, extent);
+        if (seen && cones && cluster.cone.w <= 1.0) {
+            seen = !backFacing (center, length (extent), normalize (cofactor * cluster.cone.xyz), cluster.cone.w);
+        }
+
+        uint v = candidate.visibility + i;
+        if (!late) {
+            // the clusters the last pass did not see are tested against the depth pyramid by phase 2
+            if (push.levels != 0u && visible [v] == 0u) continue;
+            if (seen) append (cluster, candidate.firstCluster + i, candidate.word, false);
+        } else {
+            // the test of phase 1, the cluster being the only one reading and writing its visibility
+            bool early = seen && visible [v] != 0u;
+            bool now = seen && !occluded (center, extent);
+
+            visible [v] = now ? 1u : 0u;
+            if (now && !early) append (cluster, candidate.firstCluster + i, candidate.word, true);
+        }
+    }
 }
 
 void main () {
-    uint index = gl_GlobalInvocationID.x;
-    if (index >= push.count) return;
-
     if (push.phase == 0u) {
-        Candidate candidate = draws [index];
-        if (candidate.command == NO_COMMAND) return;
-
-        // the instances the last pass did not see are tested against the depth pyramid by phase 2
-        if (push.levels != 0u && visible [index] == 0u) return;
-
-        Object object = objects [candidate.word >> 2];
-        if (!sees (object.boxCenter.xyz, object.boxExtent.xyz)) return;
-
-        append (candidate);
-    } else if (push.phase == 1u) {
-        uint seen = counters.ranges [index].seen;
-        counters.ranges [index].early = seen;
-        if (seen == 0u) return;
-
-        Command command = templates [index];
-        command.instanceCount = seen;
-
-        commands [atomicAdd (counters.drawCount, 1u)] = command;
-        atomicAdd (counters.instanceCount, seen);
-    } else if (push.phase == 2u) {
-        Candidate candidate = draws [index];
-        if (candidate.command == NO_COMMAND) return;
-
-        Object object = objects [candidate.word >> 2];
-        bool seen = sees (object.boxCenter.xyz, object.boxExtent.xyz);
-
-        // the test of phase 0, the candidate being the only one reading and writing its visibility
-        bool early = seen && visible [index] != 0u;
-        bool now = seen && !occluded (object.boxCenter.xyz, object.boxExtent.xyz);
-
-        visible [index] = now ? 1u : 0u;
-        if (now && !early) append (candidate);
-    } else {
-        Range range = counters.ranges [index];
-        uint late = range.seen - range.early;
-        if (late == 0u) return;
-
-        Command command = templates [index];
-        command.firstInstance += range.early;
-        command.instanceCount = late;
-
-        commands [push.count + atomicAdd (counters.lateDrawCount, 1u)] = command;
-        atomicAdd (counters.lateInstanceCount, late);
+        uint index = gl_GlobalInvocationID.x;
+        if (index < push.count) listObject (index);
+        return;
     }
+
+    uint slot = gl_WorkGroupID.y * MAX_GROUPS + gl_WorkGroupID.x;
+    if (slot >= counters.listed) return;
+
+    cullClusters (counters.candidates [slot], push.phase == 2u);
 }

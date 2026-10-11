@@ -8,24 +8,20 @@ use balder::core::shader::buffers::instance_batch;
 use ::vulkan::core;
 
 /**
- * The phase of the cull pass culling the candidates
+ * The phase of the cull pass listing the candidates whose object the camera sees
  * */
-def CULL_PHASE = 0u32;
+def OBJECTS_PHASE = 0u32;
 
 /**
- * The phase of the cull pass writing the commands
+ * The phase of the cull pass culling the clusters of the candidates listed, writing a command per cluster seen
  * */
-def COMMANDS_PHASE = 1u32;
+def CLUSTERS_PHASE = 1u32;
 
 /**
- * The phase of the cull pass testing the candidates against the depth pyramid, once the first commands are drawn
+ * The phase of the cull pass testing the clusters of the candidates listed against the depth pyramid, once the first
+ * commands are drawn, writing a command per cluster the first phase did not draw
  * */
-def LATE_CULL_PHASE = 2u32;
-
-/**
- * The phase of the cull pass writing the commands of the candidates the late cull found
- * */
-def LATE_COMMANDS_PHASE = 3u32;
+def LATE_CLUSTERS_PHASE = 2u32;
 
 /**
  * The push constant of the cull shader
@@ -33,7 +29,7 @@ def LATE_COMMANDS_PHASE = 3u32;
 @data
 record CullPush {
 
-    // The number of candidates, as many as the templates at most
+    // The number of candidates
     pub let count: u32;
 
     // The phase of the pass
@@ -48,27 +44,30 @@ record CullPush {
     // The width of the view, in pixels
     pub let width: f32;
 
-    // The number of levels of the depth pyramid, 0 when the occluded instances are not culled
+    // The number of levels of the depth pyramid, 0 when the occluded clusters are not culled
     pub let levels: u32;
 
-    pub let pad0: u32;
-    pub let pad1: u32;
+    // The number of clusters each phase culls at most, the commands of the second phase following as many of the first
+    pub let capacity: u32;
+
+    pub let pad: u32;
 }
 
 /**
  * The cull command allocator records the cull passes of the batches culled on the GPU, outside of the render pass of a
- * draw subpass: the counters of the batches cleared, the candidates culled, the commands written, then the counters
- * copied for the CPU, each step of every batch separated from the next one by a barrier
+ * draw subpass: the counters of the batches cleared, the objects of the candidates culled, the clusters of those seen
+ * culled (a command written per cluster seen), then the counters copied for the CPU, each step of every batch separated
+ * from the next one by a barrier
  * @info: the steps are recorded for every batch before the next one starts, so the batches share the barriers:
  *    - clear of each batch, afterClear
- *    - cull of each batch, afterCull
- *    - writeCommands of each batch
+ *    - cullObjects of each batch, afterObjects
+ *    - cullClusters of each batch
  *    - beforeReadBack, readBack of each batch, afterReadBack
  * @info: the draws read the commands and the instances written once the render graph made them visible, the cull pass
  * being a compute pass of the graph writing them
- * @info: when the occluded instances are culled, the cull and the writing of the commands are recorded a second time
- * (late), after the first commands were drawn and their depth reduced into the depth pyramid, the counters being read
- * back after the second commands
+ * @info: when the occluded clusters are culled, the clusters are culled a second time (late), after the first commands
+ * were drawn and their depth reduced into the depth pyramid, from the candidates the first phase listed; the counters
+ * are read back after the second commands
  * @assume: recorded by a compute pass of a render graph, outside of the render pass of the subpass
  * */
 @final
@@ -103,40 +102,57 @@ pub class CullCommandAllocator over CommandAllocator {
     }
 
     /**
-     * Cull the candidates of a batch, the instances seen being written in the range of their template
-     * @assume: the cull shader and the descriptor sets of the batch are bound
+     * List the candidates of a batch whose object the camera sees, and the size of the dispatch of their clusters
+     * @assume: the counters of the batch are cleared, the cull shader and the descriptor sets of the batch are bound
      * @params:
      *    - shader: the cull shader
      *    - batch: the batch, nothing being done unless it was laid out for the current frame to be culled on the GPU
-     *    - late: false for the first cull, drawing the instances the last pass saw (all of them when the occluded instances
-     *            are not culled), true for the second one, testing the candidates against the depth pyramid
      *    - width: the width of the view, in pixels
      *    - height: the height of the view, in pixels
-     *    - minPixels: the size on screen in pixels under which an instance is culled, 0 to cull those outside the view only
-     *    - levels: the number of levels of the depth pyramid, 0 when the occluded instances are not culled
+     *    - minPixels: the size on screen in pixels under which an object is culled, 0 to cull those outside the view only
      * */
-    pub fn cull(mut self,
-                dmut shader: &ComputeShader,
-                batch: &InstanceBatch,
-                late: bool,
-                width: f32,
-                height: f32,
-                minPixels: f32,
-                levels: u32)
-    {
-        let phase = if late { LATE_CULL_PHASE } else { CULL_PHASE };
-        self:.dispatch(alias shader, batch, CullPush(0u32, phase, height, minPixels, width, levels, 0u32, 0u32));
+    pub fn cullObjects(mut self, dmut shader: &ComputeShader, batch: &InstanceBatch, width: f32, height: f32, minPixels: f32) {
+        let frame = self._pass.getCurrentFrame();
+        let count = batch.getCount(frame);
+        if count == 0u32 || !batch.isCulled(frame) { return; }
+
+        let groupSize = shader.getGroupSizes()[0];
+        if groupSize == 0u32 { return; }
+
+        let cmd = self.getCommandBuffer();
+        shader:.setPush(cmd,
+                        UniformNames::CULL,
+                        CullPush(count, OBJECTS_PHASE, height, minPixels, width, 0u32, batch.getCulledCapacity(frame), 0u32));
+        vkCmdDispatch(cmd, (count + groupSize - 1u32) / groupSize, 1u32, 1u32);
     }
 
     /**
-     * Write the commands drawing the instances seen in the range of each template of a batch, and their number
-     * @assume: the candidates of the batch are culled, the cull shader and the descriptor sets of the batch are bound
+     * Cull the clusters of the candidates of a batch listed by cullObjects, a workgroup per candidate, writing a command
+     * drawing each cluster seen and the word of its instance
+     * @assume: the objects of the batch are culled and their dispatch made visible (see afterObjects), the cull shader and
+     * the descriptor sets of the batch are bound
      * @params:
-     *    - late: false for the commands of the first cull, true for those of the second one
+     *    - shader: the cull shader
+     *    - batch: the batch, nothing being done unless it was laid out for the current frame to be culled on the GPU
+     *    - late: false for the first cull, drawing the clusters the last pass saw (all of them when the occluded clusters
+     *            are not culled), true for the second one, testing the clusters against the depth pyramid
+     *    - width: the width of the view, in pixels
+     *    - height: the height of the view, in pixels
+     *    - levels: the number of levels of the depth pyramid, 0 when the occluded clusters are not culled
      * */
-    pub fn writeCommands(mut self, dmut shader: &ComputeShader, batch: &InstanceBatch, late: bool) {
-        let phase = if late { LATE_COMMANDS_PHASE } else { COMMANDS_PHASE };
-        self:.dispatch(alias shader, batch, CullPush(0u32, phase, 0.0f, 0.0f, 0.0f, 0u32, 0u32, 0u32));
+    pub fn cullClusters(mut self, dmut shader: &ComputeShader, batch: &InstanceBatch, late: bool, width: f32, height: f32, levels: u32) {
+        let frame = self._pass.getCurrentFrame();
+        let count = batch.getCount(frame);
+        if count == 0u32 || !batch.isCulled(frame) { return; }
+
+        if let Ok(counters) = batch.getCounterBuffer(frame) {
+            let cmd = self.getCommandBuffer();
+            let phase = if late { LATE_CLUSTERS_PHASE } else { CLUSTERS_PHASE };
+            shader:.setPush(cmd,
+                            UniformNames::CULL,
+                            CullPush(count, phase, height, 0.0f, width, levels, batch.getCulledCapacity(frame), 0u32));
+            vkCmdDispatchIndirect(cmd, counters.getVulkanBuffer(), batch.getDispatchOffset());
+        }
     }
 
     /**
@@ -164,23 +180,31 @@ pub class CullCommandAllocator over CommandAllocator {
      */
 
     /**
-     * Make the counters cleared visible to the cull of the candidates
+     * Make the counters cleared visible to the cull of the objects, and the empty dispatch of their clusters to the
+     * indirect dispatch when no object is seen
      * */
     pub fn afterClear(mut self) {
         self:.barrier(VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
                       VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
-                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                      VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT | VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT);
+                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                      | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                      VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT
+                      | VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT
+                      | VkAccessFlagBits::VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
     }
 
     /**
-     * Make the instances seen and their counters visible to the writing of the commands
+     * Make the candidates listed visible to the cull of their clusters, and the size of its dispatch to the indirect
+     * dispatch, of the first phase and of the late one
      * */
-    pub fn afterCull(mut self) {
+    pub fn afterObjects(mut self) {
         self:.barrier(VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT,
-                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                      VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT | VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT);
+                      VkPipelineStageFlagBits::VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                      | VkPipelineStageFlagBits::VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                      VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT
+                      | VkAccessFlagBits::VK_ACCESS_SHADER_WRITE_BIT
+                      | VkAccessFlagBits::VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
     }
 
     /**
@@ -210,26 +234,6 @@ pub class CullCommandAllocator over CommandAllocator {
      * ====================================================================================================
      * ====================================================================================================
      */
-
-    /**
-     * Dispatch a phase of the cull pass of a batch, one thread per candidate or per template
-     * @params:
-     *    - push: the push constant of the phase, its number of candidates being set to those of the batch
-     * */
-    fn dispatch(mut self, dmut shader: &ComputeShader, batch: &InstanceBatch, push: CullPush) {
-        let frame = self._pass.getCurrentFrame();
-        let count = batch.getCount(frame);
-        if count == 0u32 || !batch.isCulled(frame) { return; }
-
-        let groupSize = shader.getGroupSizes()[0];
-        if groupSize == 0u32 { return; }
-
-        let cmd = self.getCommandBuffer();
-        shader:.setPush(cmd,
-                        UniformNames::CULL,
-                        CullPush(count, push.phase, push.height, push.minPixels, push.width, push.levels, 0u32, 0u32));
-        vkCmdDispatch(cmd, (count + groupSize - 1u32) / groupSize, 1u32, 1u32);
-    }
 
     /**
      * Record a memory barrier between two stages
