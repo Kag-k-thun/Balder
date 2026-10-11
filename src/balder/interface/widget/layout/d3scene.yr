@@ -1,22 +1,25 @@
 in d3scene;
 
+pub mod ::overlay;
+pub mod ::picker;
+
 use balder::utils;
 use balder::core::dispose;
-use balder::core::application::signal;
 use balder::interface::loader::registry::schema;
+use balder::interface::widget::layout::d3scene::overlay;
 use balder::math::vector;
 use balder::scene;
-use balder::scene::node::node3D::visual;
 use balder::scene::utils::post::description;
 
-use ::sdl3::mouse;
-
+use ::std::algorithm::comparison;
 use ::std::time::dur;
 
 /**
- * A widget containing and displaying a 3D scene
+ * A widget containing and displaying a 3D scene, and an overlay covering it
+ * @info: the overlay takes the mouse over the scene: a ScenePicker picks and selects the instances under the cursor, a
+ * scene without overlay taking no input
  * */
-pub class Scene3DLayout over Widget {
+pub class Scene3DLayout over Layout {
 
     // The scene to render
     let dmut _scene: (&Scene)? = none;
@@ -30,16 +33,14 @@ pub class Scene3DLayout over Widget {
     // The effects of the post-process chain of the scene, added when the widget is attached
     let mut _post: [PostDescription] = [];
 
-    prv { // Picking
+    prv { // Overlay
 
-        // The signal emitted when the left button clicks the image of the scene, with the instance under the cursor
-        let dmut _picked: (&Signal!{(&VisualInstance3D)?})? = none;
+        // The widget covering the scene, taking the mouse over it
+        let dmut _overlay: (&Widget)? = none;
 
-        // The signal emitted when the instance under the cursor changes, with the new one
-        let dmut _hovered: (&Signal!{(&VisualInstance3D)?})? = none;
-
-        // The uniq id of the instance under the cursor at the last emission of _hovered, none when there was none
-        let mut _hoveredUid: (usize)? = none;
+        // The position and the size of the margin box of the overlay, relative to the content box of the scene
+        let mut _overlayPos: vec2  = vec2();
+        let mut _overlaySize: vec2 = vec2();
 
     }
 
@@ -89,6 +90,51 @@ pub class Scene3DLayout over Widget {
      * */
     pub fn setPostEffects(mut self, effects: [PostDescription]) {
         self._post = effects;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHILDREN          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the widget covering the scene, taking the mouse over it, disposing the one it replaces; a SceneOverlay is
+     * bound to the scene
+     * */
+    pub fn setOverlay(mut self, dmut ch: &Widget) {
+        if let Ok(dmut o) = alias self._overlay {
+            o:.dispose();
+        }
+
+        self._overlay = (alias ch)?;
+        if let dmut o: &SceneOverlay = alias ch {
+            o:.setScene3D(alias self);
+        }
+
+        if self._attached {
+            ch:.onAttach((self)?);
+        }
+
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * @returns: the widget covering the scene, none until it is set
+     * */
+    pub fn getOverlay(mut self)-> dmut (&Widget)? {
+        alias self._overlay
+    }
+
+    pub over getChildren(mut self)-> dmut [&Widget] {
+        let dmut res: [&Widget] = [];
+        if let Ok(dmut o) = alias self._overlay {
+            res ~= [alias o];
+        }
+
+        alias res
     }
 
     /*!
@@ -163,10 +209,33 @@ pub class Scene3DLayout over Widget {
      * ====================================================================================================
      */
 
+    /**
+     * The overlay covers the content box of the scene
+     * */
     over onUpdateSize(mut self) {
         if let Ok(dmut scene) = alias self._scene {
             scene:.setAspect(cast!u32(self._absoluteSize.x), cast!u32(self._absoluteSize.y));
         }
+
+        if let Ok(dmut o) = alias self._overlay {
+            let (relPos, relSize) = self:.placeChild(alias o, self._absolutePosition, self._absoluteSize, self._depth + 1);
+            self._overlayPos = relPos;
+            self._overlaySize = relSize;
+        }
+    }
+
+    over onUpdateScissors(mut self) {
+        if let Ok(dmut o) = alias self._overlay {
+            self:.clipChild(alias o, self._overlayPos, self._overlaySize);
+        }
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        if let Ok(o) = self._overlay {
+            return max(self._depth, o.getMaxDepth());
+        }
+
+        self._depth
     }
 
     /*!
@@ -178,48 +247,16 @@ pub class Scene3DLayout over Widget {
      */
 
     /**
-     * The instance under the cursor is looked for only when the hovered signal was asked for
-     * */
-    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
-        if self._hovered.hasValue {
-            let hit = self:.pickUnder(pos);
-            self:.emitHovered(hit);
-        }
-
-        self.__super__:.onHover(pos)
-    }
-
-    pub over onLoseHoverFocus(mut self) {
-        self:.emitHovered(none);
-        self.__super__:.onLoseHoverFocus();
-    }
-
-    /**
-     * A click of the left button picks the instance under the cursor
-     * */
-    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
-        if button == SDL_BUTTON_LEFT {
-            if let Ok(dmut s) = alias self._picked {
-                let hit = self:.pickUnder(pos);
-                s:.emit(hit);
-            }
-        }
-
-        self.__super__:.onClick(pos, button)
-    }
-
-    /**
      * @params:
-     *    - pos: the position of the cursor relative to the widget, between 0 and 1
+     *    - cursor: the position of the cursor in the window, in pixels
      * @returns: the position under the cursor in the image of the scene, in pixels of the resolution the scene is
      * rendered at from its top left corner, none when the cursor is off the image or the scene was not created
      * */
-    pub fn renderPixel(self, pos: vec2)-> (vec2)? {
+    pub fn renderPixel(self, cursor: vec2)-> (vec2)? {
         if let Ok(scene) = self._scene {
             let (imagePos, imageSize) = self.computeBackgroundImageSize();
             if imageSize.x <= 0.0f || imageSize.y <= 0.0f { return none; }
 
-            let cursor = self._absoluteFullPosition + pos * self._absoluteFullSize;
             let fraction = (cursor - imagePos) / imageSize;
             if fraction.x < 0.0f || fraction.x > 1.0f || fraction.y < 0.0f || fraction.y > 1.0f { return none; }
 
@@ -230,31 +267,19 @@ pub class Scene3DLayout over Widget {
     }
 
     /**
-     * @params:
-     *    - pos: the position of the cursor relative to the widget, between 0 and 1
-     * @returns: the instance the camera of the scene sees first under the cursor, none when it sees none there
+     * @returns: the overlay when the cursor is over it, the scene itself taking the cursor elsewhere
      * */
-    fn pickUnder(mut self, pos: vec2)-> (&VisualInstance3D)? {
-        if let Ok(pixel) = self.renderPixel(pos) {
-            if let Ok(dmut scene) = alias self._scene {
-                return scene:.pick(pixel);
+    prot over mouseToWidget(mut self, pos: vec2, ref mut canBeSelf: bool)-> dmut (&Widget, vec2)? {
+        canBeSelf = true;
+        if let Ok(inPaddingPos) = self.isInPadding(pos) {
+            if let Ok(dmut o) = alias self._overlay {
+                if let Ok(relPos) = self.isInSquare(inPaddingPos, self._overlayPos, self._overlayPos + self._overlaySize) {
+                    return (alias o, relPos)?;
+                }
             }
         }
 
         none
-    }
-
-    /**
-     * Emit the hovered signal when the instance under the cursor is not the one it was last emitted with
-     * */
-    fn emitHovered(mut self, hit: (&VisualInstance3D)?) {
-        let uid = if let Ok(n) = hit { (n.uid)? } else { none };
-        if uid == self._hoveredUid { return; }
-
-        self._hoveredUid = uid;
-        if let Ok(dmut s) = alias self._hovered {
-            s:.emit(hit);
-        }
     }
 
     /*!
@@ -266,12 +291,14 @@ pub class Scene3DLayout over Widget {
      */
 
     /**
-     * Event emitted by the application at each UI frameo
+     * Event emitted by the application at each UI frame, ticking the scene and the overlay
      * */
     pub over onTick(mut self, delta: Duration) {
         if let Ok(dmut scene) = alias self._scene {
             scene:.onTick(delta);
         }
+
+        self.__super__:.onTick(delta);
     }
 
     /*!
@@ -289,37 +316,6 @@ pub class Scene3DLayout over Widget {
         alias self._scene
     }
 
-    /**
-     * @returns: the signal emitted when the left button clicks the image of the scene, with the visual instance the
-     * camera sees first under the cursor, told apart by its world box, none when it sees none there
-     * */
-    pub fn picked(mut self)-> dmut &Signal!{(&VisualInstance3D)?} {
-        if let Ok(dmut s) = alias self._picked {
-            return alias s;
-        }
-
-        let dmut s = copy Signal!{(&VisualInstance3D)?} ();
-        self._picked = (alias s)?;
-
-        alias s
-    }
-
-    /**
-     * @returns: the signal emitted when the visual instance the camera sees first under the cursor changes, with the new
-     * one, none when the cursor leaves the instances or the widget
-     * @info: the instance under the cursor is looked for at each move of the cursor once this signal is asked for
-     * */
-    pub fn hovered(mut self)-> dmut &Signal!{(&VisualInstance3D)?} {
-        if let Ok(dmut s) = alias self._hovered {
-            return alias s;
-        }
-
-        let dmut s = copy Signal!{(&VisualInstance3D)?} ();
-        self._hovered = (alias s)?;
-
-        alias s
-    }
-
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -331,6 +327,7 @@ pub class Scene3DLayout over Widget {
     impl Disposable {
         pub over dispose(mut self) {
             self.__super__:.dispose();
+            self._overlay = none;
 
             if let Ok(dmut sc) = alias self._scene {
                 sc:.dispose();
@@ -347,11 +344,14 @@ pub mod Scene3DLayout {
 
     /**
      * @returns: the schema of the 3D scenes, rendered at their resolution: 1280 720 before being scaled to the widget, the
-     * effects of their post-process chain described by post: vignette(0.5), invert(off)
+     * effects of their post-process chain described by post: vignette(0.5), invert(off), taking an overlay covering them
      * */
     pub fn schema()-> &WidgetSchema {
         copy WidgetSchema("Scene3D",
                           |dmut m, id|-> dmut &Widget => copy Scene3DLayout(alias m, id),
+                          children-> (copy Inserter!{&Scene3DLayout}(|dmut s, dmut c, _| => {
+                              s:.setOverlay(alias c);
+                          }, roles-> copy ["overlay"]))?,
                           attributes-> copy [copy Setter!{&Scene3DLayout, (u32, u32)}("resolution", |dmut s, r| => {
                                                  s:.setResolution(r._0, r._1);
                                              }),
