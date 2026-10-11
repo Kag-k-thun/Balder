@@ -407,6 +407,30 @@ fn onClearClicked (mut self, button: u8) {
   (`.dialog`, `.dialog-question`, `.dialog-accept`, `.dialog-cancel`, `.dialog-entries`, …), so that the rules of the
   application select them by these names only, and `Overlay { background-color: … }` sets the backdrop.
 
+### Picking in a Scene3D
+
+```
+if let Ok (dmut w : &Scene3DLayout) = self.gui:.find ("scene") {
+    w:.picked ():.connect (self.box, &self:.onPicked);     // fn onPicked (mut self, instance: (&VisualInstance3D)?)
+    w:.hovered ():.connect (self.box, &self:.onHovered);   // fn onHovered (mut self, instance: (&VisualInstance3D)?)
+}
+```
+
+- **A left click on a `Scene3D` emits `picked`** with the visual instance the camera sees first under the cursor, or
+  `none` when it sees none there. **`hovered`** is emitted when the instance under the cursor changes, `none` when the
+  cursor leaves the instances or the widget; the instance under the cursor is looked for at each move only once
+  `hovered` was asked for. Both are connected by code: a payload that may be `none` has no type a slot of a `.gui` file
+  can name yet.
+- **The cursor is mapped to the resolution the scene renders at**: the image is drawn over the square of the larger side
+  of the widget, centred on it, so `renderPixel (pos)` gives the pixel of the image under the cursor, from its top left
+  corner, `none` off the image. `Scene.pick (pixel)` picks from a pixel, and `Scene.rayThroughPixel (pixel)` gives the
+  ray the camera sees through it, from its near plane to its far plane.
+- **The instances are told apart by their world boxes**: the ray goes down the hierarchy of the boxes the culling uses
+  (`Bvh.raycast`, the closest box first), and the box it enters first gives the instance. A box enclosing the near
+  plane under the cursor is entered at once, so an instance around the camera (a room seen from inside) is picked
+  before what it contains. The rays and their tests are in `balder::math::bounds`: `Ray`, `Aabb.intersect (ray)`, the
+  slab test, and `Bvh.raycast (ray)`, giving a `RayHit`.
+
 ## The style file
 
 ```
