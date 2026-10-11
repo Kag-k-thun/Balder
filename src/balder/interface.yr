@@ -17,7 +17,9 @@ use balder::interface::_;
 use balder::interface::loader::registry;
 use balder::interface::loader::registry::behavior;
 use balder::interface::style::conditions;
-use balder::interface::widget::{focus, layout};
+use balder::interface::widget::focus;
+use balder::interface::widget::layout;
+use balder::interface::widget::layout::overlay;
 use balder::math::vector;
 use balder::scene::utils::post::registry;
 
@@ -37,6 +39,12 @@ pub class WidgetManager {
 
     // The root widget
     let dmut _content : (&Widget)? = none;
+
+    // The overlays opened over the content, from the bottom one to the top one, which takes the mouse and the Tab key
+    let dmut _overlays : [&Overlay] = [];
+
+    // Emitted when Escape is pressed and nothing uses it: not the focused widget, no menu being open and no overlay
+    let dmut _escaped : (&Signal!{()})? = none;
 
     // The window to which the manager is attached
     let dmut _window : &Window;
@@ -230,7 +238,7 @@ pub class WidgetManager {
             self._styleManager:.addSheet (sheet);
         }
 
-        if let Ok (dmut root) = alias self._content {
+        for dmut root in alias self:.getRoots () {
             root:.reloadStyle (deep-> true);
         }
     }
@@ -373,7 +381,7 @@ pub class WidgetManager {
         }
 
         if added {
-            if let Ok (dmut root) = alias self._content {
+            for dmut root in alias self:.getRoots () {
                 root:.reloadStyle (deep-> true);
             }
         }
@@ -399,6 +407,77 @@ pub class WidgetManager {
         root:.onAttach (none);
         self._content = (alias root)?;
         self:.updateWidgets ();
+    }
+
+    /**
+     * Open an overlay over the content and the overlays already open: a backdrop filling the window, a widget centred
+     * over it. The top overlay takes the mouse, the Tab key moving the focus among its widgets, and Escape dismisses it
+     * when nothing else uses it; the content and the overlays under it keep being drawn and ticked, but receive nothing
+     * @params:
+     *    - child: the widget centred over the backdrop, disposed with the overlay
+     * @returns: the overlay, to connect its on-dismiss and to close it
+     * */
+    pub fn openOverlay (mut self, dmut child : &Widget)-> dmut &Overlay {
+        // what the cursor was over is under the backdrop now, and the focus is not given to the widgets under it
+        if let Ok (dmut r) = alias self:.getEventRoot () && self._wasHover {
+            r:.onLoseHoverFocus ();
+        }
+
+        self._wasHover = false;
+        self:.setFocus (none);
+        self._anchor = none;
+
+        let dmut overlay = copy Overlay (alias self, "");
+        overlay:.onAttach (none);
+        self._overlays ~= [alias overlay];
+        overlay:.setChild (alias child);
+
+        self._drawer:.redraw ();
+        alias overlay
+    }
+
+    /**
+     * Close an overlay opened by openOverlay, disposing it with its child, the overlay under it (or the content) taking
+     * the mouse and the Tab key back
+     * @params:
+     *    - overlay: the overlay, closed already when it is not open
+     * */
+    pub fn closeOverlay (mut self, overlay : &Overlay) {
+        let dmut rest : [&Overlay] = [];
+        let dmut closed : [&Overlay] = [];
+        for dmut o in alias self._overlays {
+            if o is overlay { closed ~= [alias o]; } else { rest ~= [alias o]; }
+        }
+
+        if let Ok (f) = self._focus && f.isWithin (overlay) {
+            self:.setFocus (none);
+        }
+
+        if let Ok (a) = self._anchor && a.isWithin (overlay) {
+            self._anchor = none;
+        }
+
+        for i in 0us .. 3us {
+            if let Ok (c) = self._clickedW [i] && c.isWithin (overlay) {
+                self._clickedW [i] = none;
+            }
+        }
+
+        self._overlays = alias rest;
+        for dmut o in alias closed {
+            o:.dispose ();
+            self._wasHover = false;
+        }
+
+        self:.updateWidgets ();
+        self._drawer:.redraw ();
+    }
+
+    /**
+     * @returns: the number of overlays open over the content
+     * */
+    pub fn getOverlayCount (self)-> usize {
+        self._overlays.len
     }
 
     /**
@@ -549,6 +628,21 @@ pub class WidgetManager {
     }
 
     /**
+     * @returns: the signal emitted when Escape is pressed and nothing uses it: not the focused widget, no menu being open
+     * and no overlay, which Escape dismisses
+     * */
+    pub fn escaped (mut self)-> dmut &Signal!{()} {
+        if let Ok (dmut s) = alias self._escaped {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{()} ();
+        self._escaped = (alias s)?;
+
+        alias s
+    }
+
+    /**
      * @returns: the position of the mouse in the window, in CSS pixels
      * */
     pub fn getMousePosition (self)-> vec2 {
@@ -580,7 +674,7 @@ pub class WidgetManager {
 
         let laidOut = self:.layoutResized ();
 
-        if let Ok (dmut w) = alias self._content {
+        for dmut w in alias self:.getRoots () {
             w:.onTick (delta);
         }
 
@@ -606,18 +700,22 @@ pub class WidgetManager {
      * all the same
      * */
     pub fn updateWidgets (mut self) {
-        if let Ok (dmut root) = alias self._content {
-            let size = self.getLayoutSize ();
-            let readsAvailable = self._styleManager.isRead (AvailableVariable::WIDTH)
-                || self._styleManager.isRead (AvailableVariable::HEIGHT);
+        let size = self.getLayoutSize ();
+        let readsAvailable = self._styleManager.isRead (AvailableVariable::WIDTH)
+            || self._styleManager.isRead (AvailableVariable::HEIGHT);
 
+        // each overlay is drawn over the content and the overlays under it
+        let mut depth = 0u32;
+        for dmut root in alias self:.getRoots () {
             for _ in 0us .. MAX_LAYOUT_PASSES {
-                root:.setSize (makeVec2 (0.0f, 0.0f), size, 0);
+                root:.setSize (makeVec2 (0.0f, 0.0f), size, depth);
                 root:.setScissors (makeVec2 (0.0f, 0.0f), size);
                 if !readsAvailable || !root:.restyleConditions ([]) {
                     break;
                 }
             }
+
+            depth = root.getMaxDepth () + 1u32;
         }
     }
 
@@ -644,6 +742,11 @@ pub class WidgetManager {
             input:.windowResized ():.disconnect (&self:.onWindowResize);
             input:.windowScaleChanged ():.disconnect (&self:.onWindowScaleChange);
 
+            for dmut o in alias self._overlays {
+                o:.dispose ();
+            }
+
+            self._overlays = [];
             if let Ok (dmut w) = alias self._content {
                 w:.dispose ();
                 self._content = none;
@@ -680,8 +783,10 @@ pub class WidgetManager {
             self._drawer:.onWindowResize (w, h);
 
             let changed = self:.updateWindowVariables ();
-            if let Ok (dmut root) = alias self._content && changed.len != 0us {
-                root:.restyleConditions (changed);
+            if changed.len != 0us {
+                for dmut root in alias self:.getRoots () {
+                    root:.restyleConditions (changed);
+                }
             }
 
             self:.updateWidgets ();
@@ -732,10 +837,13 @@ pub class WidgetManager {
             return;
         }
 
-        if let Ok (dmut root) = alias self._content {
-            if root:.restyleConditions (copy [full]) {
-                self:.updateWidgets ();
-            }
+        let mut layout = false;
+        for dmut root in alias self:.getRoots () {
+            if root:.restyleConditions (copy [full]) { layout = true; }
+        }
+
+        if layout {
+            self:.updateWidgets ();
         }
     }
 
@@ -768,7 +876,7 @@ pub class WidgetManager {
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
 
-        if let Ok (dmut w) = alias self._content {
+        if let Ok (dmut w) = alias self:.getEventRoot () {
             let wpos = w.getAbsolutePosition (), wsize = w.getAbsoluteSize ();
             let relPos = makeVec2 ((pos.x - wpos.x) / wsize.x, (pos.y - wpos.y) / wsize.y);
 
@@ -787,7 +895,7 @@ pub class WidgetManager {
      * */
     fn onMouseFocus (mut self, gain : bool) {
         if !gain {
-            if let Ok (dmut r) = alias self._content && self._wasHover {
+            if let Ok (dmut r) = alias self:.getEventRoot () && self._wasHover {
                 r:.onLoseHoverFocus ();
                 self._wasHover = false;
             }
@@ -844,7 +952,7 @@ pub class WidgetManager {
             }
         }
 
-        if let Ok (dmut w) = alias self._content {
+        if let Ok (dmut w) = alias self:.getEventRoot () {
             let wpos = w.getAbsolutePosition (), wsize = w.getAbsoluteSize ();
             let relPos = makeVec2 ((pos.x - wpos.x) / wsize.x, (pos.y - wpos.y) / wsize.y);
 
@@ -866,7 +974,7 @@ pub class WidgetManager {
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
 
-        if let Ok (dmut w) = alias self._content {
+        if let Ok (dmut w) = alias self:.getEventRoot () {
             if info.type == KeyEvent::DOWN {
                 let wpos = w.getAbsolutePosition (), wsize = w.getAbsoluteSize ();
                 let relPos = makeVec2 ((pos.x - wpos.x) / wsize.x, (pos.y - wpos.y) / wsize.y);
@@ -912,7 +1020,7 @@ pub class WidgetManager {
      */
     fn onMouseDoubleClick (mut self, x : i32, y : i32) {
         let pos = self._drawer.toLayout (x, y);
-        if let Ok (dmut w) = alias self._content {
+        if let Ok (dmut w) = alias self:.getEventRoot () {
             let wpos = w.getAbsolutePosition (), wsize = w.getAbsoluteSize ();
             let relPos = makeVec2 ((pos.x - wpos.x) / wsize.x, (pos.y - wpos.y) / wsize.y);
 
@@ -936,7 +1044,7 @@ pub class WidgetManager {
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
 
-        if let Ok (dmut w) = alias self._content {
+        if let Ok (dmut w) = alias self:.getEventRoot () {
             if info.type == KeyEvent::DOWN {
                 let wpos = w.getAbsolutePosition (), wsize = w.getAbsoluteSize ();
                 let relPos = makeVec2 ((pos.x - wpos.x) / wsize.x, (pos.y - wpos.y) / wsize.y);
@@ -989,7 +1097,7 @@ pub class WidgetManager {
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
 
-        if let Ok (dmut w) = alias self._content {
+        if let Ok (dmut w) = alias self:.getEventRoot () {
             if info.type == KeyEvent::DOWN {
                 let wpos = w.getAbsolutePosition (), wsize = w.getAbsoluteSize ();
                 let relPos = makeVec2 ((pos.x - wpos.x) / wsize.x, (pos.y - wpos.y) / wsize.y);
@@ -1054,7 +1162,7 @@ pub class WidgetManager {
             new:.onGainFocus ();
             self._anchor = (alias new)?;
 
-            if let Ok (dmut root) = alias self._content {
+            for dmut root in alias self:.getRoots () {
                 WidgetManager::reveal (alias root, new);
             }
         }
@@ -1072,7 +1180,8 @@ pub class WidgetManager {
 
     /**
      * Slot activated when a key is pressed or repeated: the widget having the focus uses it first, then Tab and Shift-Tab
-     * move the focus, as Up and Down do in an open menu, and Escape closes the menu opened last
+     * move the focus, as Up and Down do in an open menu, and Escape closes the menu opened last, or dismisses the top
+     * overlay (onEscape)
      * */
     fn onKeyPressed (mut self, key : SDL_Keycode, mods : SDL_Keymod) {
         if let Ok (dmut f) = alias self._focus && f.isAttached () {
@@ -1082,9 +1191,24 @@ pub class WidgetManager {
         if key == SDLK_TAB && (mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI)) == 0u16 {
             self:.moveFocus (backward-> (mods & SDL_KMOD_SHIFT) != 0u16);
         } else if key == SDLK_ESCAPE {
-            self:.dismissFocusTrap ();
+            self:.onEscape ();
         } else if (key == SDLK_UP || key == SDLK_DOWN) && self:.isFocusTrapped () {
             self:.moveFocus (backward-> key == SDLK_UP);
+        }
+    }
+
+    /**
+     * Use Escape when the focused widget did not: close the menu opened last, or dismiss the top overlay when no menu is
+     * open, or emit escaped when no overlay is either
+     * */
+    fn onEscape (mut self) {
+        if self:.isFocusTrapped () {
+            self:.dismissFocusTrap ();
+        } else if self._overlays.len != 0us {
+            let dmut top = alias self._overlays [$ - 1us];
+            top:.dismiss ();
+        } else if let Ok (dmut s) = alias self._escaped {
+            s:.emit ();
         }
     }
 
@@ -1092,7 +1216,7 @@ pub class WidgetManager {
      * @returns: true iif a layout keeps the focus in one of its children, a menu being open
      * */
     fn isFocusTrapped (mut self)-> bool {
-        if let Ok (dmut root) = alias self._content {
+        if let Ok (dmut root) = alias self:.getEventRoot () {
             return WidgetManager::findTrappingLayout (alias root).hasValue;
         }
 
@@ -1104,7 +1228,7 @@ pub class WidgetManager {
      * widget that opened it
      * */
     fn dismissFocusTrap (mut self) {
-        if let Ok (dmut root) = alias self._content {
+        if let Ok (dmut root) = alias self:.getEventRoot () {
             if let Ok (dmut l) = alias WidgetManager::findTrappingLayout (alias root) {
                 let dmut back = alias l:.dismissFocusTrap ();
                 if let Ok (dmut w) = alias back && w.isAttached () {
@@ -1142,6 +1266,34 @@ pub class WidgetManager {
     }
 
     /**
+     * @returns: the root widgets of the interface, the content then the overlays, from the bottom one to the top one
+     * */
+    fn getRoots (mut self)-> dmut [&Widget] {
+        let dmut res : [&Widget] = [];
+        if let Ok (dmut c) = alias self._content {
+            res ~= [alias c];
+        }
+
+        for dmut o in alias self._overlays {
+            res ~= [alias o];
+        }
+
+        alias res
+    }
+
+    /**
+     * @returns: the root widget taking the mouse and the Tab key: the top overlay, the content when no overlay is open
+     * */
+    fn getEventRoot (mut self)-> dmut (&Widget)? {
+        if self._overlays.len != 0us {
+            let dmut top : &Widget = alias self._overlays [$ - 1us];
+            return (alias top)?;
+        }
+
+        alias self._content
+    }
+
+    /**
      * @returns: the widget the Tab key moves the focus on from: the one having the focus, or the last one focused or
      * clicked, none when it is no longer attached
      * */
@@ -1153,10 +1305,11 @@ pub class WidgetManager {
     }
 
     /**
-     * @returns: the widget the Tab key moves the focus within: the menu opened last, the root widget when no menu is open
+     * @returns: the widget the Tab key moves the focus within: the menu opened last, the top overlay, or the root widget
+     * when no menu is open in it
      * */
     fn getFocusScope (mut self)-> dmut (&Widget)? {
-        if let Ok (dmut root) = alias self._content {
+        if let Ok (dmut root) = alias self:.getEventRoot () {
             if let Ok (dmut l) = alias WidgetManager::findTrappingLayout (alias root) {
                 if let Ok (dmut trap) = alias l:.getFocusTrap () {
                     return (alias trap)?;
