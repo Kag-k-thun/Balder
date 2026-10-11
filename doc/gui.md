@@ -236,6 +236,7 @@ Slider #VOLUME 40 { max: 100; step: 1; on-change: volume; }             // fn vo
 SpinBox #COUNT 3 { min: 1; max: 12; decimals: 0; on-change: count; }
 ProgressBar #LEVEL 0.25 { max: 1; }
 Dropdown #THEME "Dark", "Light" { selected: 0; on-change: theme; }      // fn theme (mut self, index: usize)
+ListView #FILES { multiple: true; on-select: picked; on-activate: open; }  // fn picked (mut self, rows: [usize])
 Separator;
 Image "res:/images/logo.png";
 ```
@@ -261,6 +262,20 @@ Image "res:/images/logo.png";
   wheel or the `::scrollbar` (8 pixels wide unless its style sets a width), shown only then, in the states `:hover`
   under the cursor and `:pressed` while dragged. The selected item is scrolled to when the list opens. `on-change` gives
   the index of the item the user selected.
+- **A list view shows the items of a model given by the code**, a .gui having no loops: `setModel` takes a class over
+  `ListModel`, whose `len` and `text (index)` the list reads on demand (`TextListModel` holds a list of texts), and a
+  model whose items change calls `changed`, the lists showing it reading it again. Only the rows shown exist, recycled
+  as the list scrolls, so a million items cost no more than a dozen. The rows are its `::row`, all of the height of a
+  single line of their style, in the states `:hover` under the cursor, `:selected`, and `:current` for the row the keys
+  move from (`ListView:focus::row:current` rings it while the list has the focus). Rows higher than the list are
+  scrolled with the wheel, three rows a notch, or the `::scrollbar` (10 pixels wide unless its style sets a width, twice
+  as long as wide at least), shown only then, in the states `:hover` and `:pressed`. It is drawn in the right padding,
+  as the scrollbar of a linear layout, the rows narrowing by what the padding does not leave it. A click selects a row
+  alone. With `multiple: true`, Ctrl (or Command) toggles the row clicked, Shift selects the rows from the one clicked
+  last without Shift, and Ctrl-Shift adds them. `on-select` gives the selected rows in increasing order when the user
+  changes them; `setSelected`, `clearSelection` and a model that changes do not emit it. `on-activate` gives the current
+  row when Enter is pressed on it (`fn open (mut self, row: usize)`). A list fits in any height, its min-content being
+  0, as a linear layout that scrolls: a list in a layout that shrinks its children needs a `min-height`.
 - **A separator is a rule** a pixel thick across its `direction`, a row (horizontal) by default, drawn with its
   background colour. An auto size stretches it along the layout it is in.
 - **An image shows a picture** as the background image of its inline style, so that `image-fill`, `image-keep-ratio`
@@ -280,7 +295,7 @@ LinearLayout #FORM {
 
 - **Tab moves the focus** to the next widget taking it from the keyboard, Shift-Tab to the previous one, wrapping
   around: the input texts and the spin boxes, the push buttons, menu buttons, check boxes, radio buttons and dropdowns,
-  the sliders and the tab layouts, whose headers come before the content of their selected tab. The widgets not drawn
+  the sliders, the list views and the tab layouts, whose headers come before the content of their selected tab. The widgets not drawn
   (`display: none`, the content of a tab not selected) are left out. Without a focused widget, Tab moves on from the
   widget clicked or focused last.
 - **`tab-index` changes the order**, an attribute of every widget: the widgets of a positive index come first, by
@@ -294,6 +309,7 @@ LinearLayout #FORM {
   | `CheckBox`, `RadioButton` | Enter and Space check as a click does; the arrows check the radio button of the group before (Up, Left) or after (Down, Right) the focused one, wrapping around, the focus following |
   | `MenuButton` | Enter and Space open its menu, the focus moving to the first widget of the menu |
   | `Dropdown` | Up and Down select the item before or after the selected one, emitting `on-change`; Enter and Space open the list, which takes the focus: Up, Down, Home and End move the item under the keyboard, Enter and Space select it |
+  | `ListView` | Up and Down move the current row by a row, Page Up and Page Down by the rows shown, Home and End to the first and the last row, selecting it alone; in a multiple list Shift selects the rows from the one clicked last instead, and Ctrl moves without selecting; Space selects the current row, Ctrl-Space toggles it, Ctrl-A selects every row of a multiple list. The current row is scrolled to, and `on-select` is emitted when the selection changes; Enter emits `on-activate` with the current row |
   | `Slider` | the arrows move the value by a step, up for Up and Right; Page Up and Page Down by ten steps; Home and End to `min` and `max` |
   | `SpinBox` | Up and Down move the value by a step, Page Up and Page Down by ten steps, from the number typed; Left and Right move the caret |
   | `TabLayout` | Left and Right select the tab before or after the selected one, wrapping around; Home and End the first and the last one |
@@ -616,6 +632,17 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** `scrollbar` (states `hover`, `pressed`)
 - **Properties:** `direction`: row or column; `overflow`: hidden or scroll; `scroll-speed`: a number of 0 or more
+
+### `ListView`
+
+- **Attributes:** `tab-index`: an integer; `multiple`: true or false
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([usize]), `on-activate` (usize)
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `row` (states `hover`, `selected`, `current`), `scrollbar` (states `hover`, `pressed`)
+- **Properties:** none
 
 ### `MenuButton`
 
