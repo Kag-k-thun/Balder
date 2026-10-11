@@ -1,11 +1,14 @@
 in scene_visibility;
 
+use balder::core::error;
 use balder::core::shader::buffers::instance_draw;
 use balder::math::{bounds, matrix, utils, vector};
 use balder::scene::_;
 use balder::scene::node;
-use balder::scene::node::node3D::visual;
+use balder::scene::node::node3D::visual::{_, array, lod, material::_};
 use balder::scene::utils::visibility;
+
+use std::math;
 
 /**
  * A root with no scene, for the nodes of the tests to hang from
@@ -47,6 +50,56 @@ class Block over VisualInstance3D {
         []
     }
 
+}
+
+/**
+ * @returns: a mesh of positions and triangles, drawn with a constant material
+ * */
+fn mesh(name: [c8], dmut parent: &Node, positions: [vec3], indices: [u32])-> dmut &IndexedMesh3D
+    throws BalderError
+{
+    let mut array = MeshArray();
+    array.positions = copy positions;
+
+    let dmut material = copy ConstantMaterial(MaterialConfig());
+    let dmut m = copy IndexedMesh3D(name, alias parent, LodChain(indices), array, alias material, shadow-> false);
+    alias m
+}
+
+/**
+ * @returns: the square of side 2 centered on (0, 0, z), facing z, in two triangles
+ * */
+fn square(name: [c8], dmut parent: &Node, z: f32)-> dmut &IndexedMesh3D
+    throws BalderError
+{
+    let positions = copy [makeVec3(-1.0f, -1.0f, z), makeVec3(1.0f, -1.0f, z), makeVec3(1.0f, 1.0f, z), makeVec3(-1.0f, 1.0f, z)];
+    alias mesh(name, alias parent, positions, copy [0u32, 1u32, 2u32, 0u32, 2u32, 3u32])
+}
+
+/**
+ * @returns: the faces of the cube of side 20 centered on the origin, in twelve triangles
+ * */
+fn room(name: [c8], dmut parent: &Node)-> dmut &IndexedMesh3D
+    throws BalderError
+{
+    let dmut positions = copy [vec3(); 8us];
+    for i in 0us .. 8us {
+        positions[i] = makeVec3(if i & 1us != 0us { 10.0f } else { -10.0f },
+                                if i & 2us != 0us { 10.0f } else { -10.0f },
+                                if i & 4us != 0us { 10.0f } else { -10.0f });
+    }
+
+    let dmut indices = copy [0u32; 36us];
+    let faces = [[0u32, 2u32, 6u32, 4u32], [1u32, 3u32, 7u32, 5u32], [0u32, 1u32, 5u32, 4u32],
+                 [2u32, 3u32, 7u32, 6u32], [0u32, 1u32, 3u32, 2u32], [4u32, 5u32, 7u32, 6u32]];
+    for f in 0us .. 6us {
+        let q = faces[f];
+        for j, v in [q[0], q[1], q[2], q[0], q[2], q[3]] {
+            indices[6us * f + j] = v;
+        }
+    }
+
+    alias mesh(name, alias parent, positions, indices)
 }
 
 /**
@@ -223,4 +276,99 @@ __test a_ray_picks_the_instances_where_they_moved_and_not_those_removed {
 
     vis:.remove(far);
     assert (!pickedUid(ref vis, ray).hasValue);
+}
+
+__test a_ray_picks_the_mesh_whose_triangles_it_hits_first {
+    let dmut root = copy Root();
+    let dmut walls = room("walls", alias root);
+    let dmut front = square("front", alias root, -5.0f);
+    let dmut tilted = mesh("tilted", alias root,
+                           copy [makeVec3(-1.0f, -1.0f, -3.0f), makeVec3(1.0f, -1.0f, -3.0f), makeVec3(-1.0f, 1.0f, -4.0f)],
+                           copy [0u32, 1u32, 2u32]);
+    tilted.position = makeVec3(0.0f, 4.0f, 0.0f);
+
+    let dmut vis = VisibilityScene();
+    vis:.insert(alias walls);
+    vis:.insert(alias front);
+    vis:.insert(alias tilted);
+
+    // the box of the walls encloses the origin of the rays, their triangles are behind the square
+    assert (pickedUid(ref vis, Ray(vec3(), makeVec3(0.0f, 0.0f, -1.0f))) == (front.uid)?);
+    assert (pickedUid(ref vis, Ray(makeVec3(4.0f, 0.0f, 0.0f), makeVec3(0.0f, 0.0f, -1.0f))) == (walls.uid)?);
+
+    // the ray enters the box of the tilted triangle, its corner past the triangle
+    assert (pickedUid(ref vis, Ray(makeVec3(-0.5f, 4.0f, 0.0f), makeVec3(0.0f, 0.0f, -1.0f))) == (tilted.uid)?);
+    assert (pickedUid(ref vis, Ray(makeVec3(0.8f, 4.8f, 0.0f), makeVec3(0.0f, 0.0f, -1.0f))) == (walls.uid)?);
+
+    // a ray stopping before every triangle picks nothing
+    assert (!pickedUid(ref vis, Ray(vec3(), makeVec3(0.0f, 0.0f, -1.0f), length-> 4.0f)).hasValue);
+}
+
+__test a_ray_hits_a_mesh_where_its_transformation_places_its_triangles {
+    let dmut root = copy Root();
+    let dmut quad = square("quad", alias root, 1.0f);
+    quad:.setTransform(makeVec3(0.0f, 0.0f, -5.0f), makeVec3(0.0f, 0.0f, radian(45.0f)), makeVec3(2.0f, 2.0f, 3.0f));
+
+    // the square is a diamond of half diagonal 2√2 at z = -5 + 3, turned and scaled
+    let down = makeVec3(0.0f, 0.0f, -1.0f);
+    if let Ok(d) = quad:.raycast(Ray(makeVec3(2.5f, 0.0f, 0.0f), down)) {
+        assert (math::abs(d - 2.0f) < 0.001f);
+    } else {
+        assert (false);
+    }
+
+    // inside the square scaled but outside of the diamond
+    assert (!quad:.raycast(Ray(makeVec3(1.8f, 1.8f, 0.0f), down)).hasValue);
+
+    let up = makeVec3(0.0f, 0.0f, 1.0f);
+    assert (!quad:.raycast(Ray(makeVec3(0.0f, -2.5f, 0.0f), up)).hasValue);
+    if let Ok(d) = quad:.raycast(Ray(makeVec3(0.0f, -2.5f, -10.0f), up)) {
+        assert (math::abs(d - 8.0f) < 0.001f);
+    } else {
+        assert (false);
+    }
+}
+
+__test a_mesh_released_in_a_scene_picking_it_is_still_hit_by_its_triangles {
+    let positions = copy [makeVec3(-1.0f, -1.0f, -5.0f), makeVec3(1.0f, -1.0f, -5.0f), makeVec3(1.0f, 1.0f, -5.0f), makeVec3(-1.0f, 1.0f, -5.0f)];
+    let mut array = MeshArray();
+    array.positions = copy positions;
+
+    // the coarser level is the first triangle alone
+    let mut lods = LodChain(copy [0u32, 1u32, 2u32, 0u32, 2u32, 3u32]);
+    lods.levels = lods.levels ~ [LodLevel(6u32, 3u32, 0.1f)];
+    lods.indices = lods.indices ~ [0u32, 1u32, 2u32];
+
+    let dmut geometry = copy MeshGeometry(array, lods);
+    geometry:.releaseUnshared(keepTriangles-> true);
+    assert (geometry.isReleased && geometry.hasTriangles);
+
+    // the second triangle belongs to the full mesh only
+    let ray = Ray(makeVec3(-0.5f, 0.5f, 0.0f), makeVec3(0.0f, 0.0f, -1.0f));
+    if let Ok(d) = geometry:.raycast(ray) {
+        assert (math::abs(d - 5.0f) < 0.001f);
+    } else {
+        assert (false);
+    }
+}
+
+__test a_mesh_released_in_a_scene_not_picking_it_is_hit_by_its_world_box {
+    let dmut root = copy Root();
+    let dmut tilted = mesh("tilted", alias root,
+                           copy [makeVec3(-1.0f, -1.0f, -3.0f), makeVec3(1.0f, -1.0f, -3.0f), makeVec3(-1.0f, 1.0f, -4.0f)],
+                           copy [0u32, 1u32, 2u32]);
+
+    // the ray enters the box of the triangle by its corner past the triangle
+    let ray = Ray(makeVec3(0.8f, 0.8f, 0.0f), makeVec3(0.0f, 0.0f, -1.0f));
+    assert (!tilted:.raycast(ray).hasValue);
+
+    tilted.mesh:.releaseUnshared(keepTriangles-> false);
+    assert (tilted.mesh.isReleased && !tilted.mesh.hasTriangles);
+    assert (!tilted.mesh:.raycast(ray).hasValue);
+
+    if let Ok(d) = tilted:.raycast(ray) {
+        assert (math::abs(d - 3.0f) < 0.001f);
+    } else {
+        assert (false);
+    }
 }

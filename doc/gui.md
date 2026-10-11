@@ -454,11 +454,20 @@ if let Ok (dmut scene : &EditableScene) = alias scene3D:.getScene () {
   of the widget, centred on it, so `Scene3DLayout.renderPixel (cursor)` gives the pixel of the image under a position
   of the window, from its top left corner, `none` off the image. `Scene.pick (pixel)` picks from a pixel, and
   `Scene.rayThroughPixel (pixel)` gives the ray the camera sees through it, from its near plane to its far plane.
-- **The instances are told apart by their world boxes**: the ray goes down the hierarchy of the boxes the culling uses
-  (`Bvh.raycast`, the closest box first), and the box it enters first gives the instance. A box enclosing the near
-  plane under the cursor is entered at once, so an instance around the camera (a room seen from inside) is picked
-  before what it contains. The rays and their tests are in `balder::math::bounds`: `Ray`, `Aabb.intersect (ray)`, the
-  slab test, and `Bvh.raycast (ray)`, giving a `RayHit`.
+- **The instances are told apart by their triangles**: the ray goes down the hierarchy of the world boxes the culling
+  uses, the closest box first, and each instance whose box it enters tells where the ray hits it
+  (`VisualInstance3D.raycast (ray)`); the closest hit gives the instance, and the boxes entered past it are skipped. A
+  mesh brings the ray to its local space and tests the triangles of its full mesh, whatever the level drawn, through a
+  hierarchy of their boxes built at its first pick; an instance with no surface of its own is hit where the ray enters
+  its box. So an instance around the camera (a room seen from inside) is picked where its walls are seen, behind what it
+  contains, and a ray through the empty corner of a box picks what is behind. A `MeshGeometry` keeps the positions and
+  the indices of its full mesh once its vertices are released only when its scene picks (`scene.keepsTriangles`): an
+  `EditableScene` and the scene of a `Scene3D` with an overlay do, any other scene releases them with the vertices, its
+  meshes then told apart by their world boxes. Code picking in a scene without overlay sets `keepsTriangles` before the
+  meshes enter it. The rays and their tests are in `balder::math::bounds`: `Ray` (`transformed (m)` to change its
+  space), `Aabb.intersect (ray)`, the slab test, `Triangle.intersect (ray)`, the test of Möller and Trumbore,
+  `Bvh.raycast (ray, hit)`, the leaf whose content the ray hits first, giving a `RayHit`, and `TriangleBvh`, the
+  triangles of a mesh.
 
 ### Moving the selection with a gizmo
 
