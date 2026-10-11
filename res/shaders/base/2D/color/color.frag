@@ -18,6 +18,9 @@ layout (location = 4) flat in vec2 inRatio;
 // The radii of the corners of the box, clockwise from the top left one
 layout (location = 5) flat in vec4 inRadii;
 
+// The standard deviation of the gaussian blurring the box, a sharp box when it is 0
+layout (location = 6) flat in float inBlur;
+
 layout (location = 0) out vec4 out_color;
 
 // The colors of the shapes are sRGB values, like those of the style sheets, and the framebuffer encodes linear ones
@@ -77,10 +80,68 @@ float roundedCoverage (vec2 pixel, vec4 box, vec4 radii) {
     return coverage;
 }
 
-// The coverage of the shape at a framebuffer pixel: the pixels the rasterizer would cover with its box, less those
-// within its edges when it is drawn as a ring, the radius of each inner corner being that of the corner less the widest
-// of its two edges
+// The error function of each component, approximated to 5.10^-4
+vec2 erf (vec2 x) {
+    vec2 s = sign (x);
+    vec2 a = abs (x);
+    x = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    x *= x;
+    return s - s / (x * x);
+}
+
+// The density of a centred gaussian of standard deviation sigma
+float gaussian (float x, float sigma) {
+    return exp (-(x * x) / (2.0 * sigma * sigma)) / (2.5066283 * sigma);
+}
+
+// The coverage along a row of a blurred rounded rectangle, the integral of the gaussian across the row of its centred
+// rectangle at the height y, the row of a corner being shortened as the arc does
+// @params:
+//    - x, y: the point, from the centre of the rectangle
+//    - corner: the radius of the corner of the quarter the point is in
+//    - halfSize: the half size of the rectangle
+float shadowRow (float x, float y, float sigma, float corner, vec2 halfSize) {
+    float delta = min (halfSize.y - corner - abs (y), 0.0);
+    float curved = halfSize.x - corner + sqrt (max (0.0, corner * corner - delta * delta));
+    vec2 integral = 0.5 + 0.5 * erf ((x + vec2 (-curved, curved)) * (sqrt (0.5) / sigma));
+    return integral.y - integral.x;
+}
+
+// The coverage of a rounded rectangle blurred by a gaussian at a point, in CSS pixels: the integral across the rows is
+// exact, the one down the columns sampled four times within three standard deviations of the point (Evan Wallace,
+// "Fast Rounded Rectangle Shadows")
+// @params:
+//    - box: the corners of the rectangle
+//    - radii: the radii of its corners, clockwise from the top left one
+//    - sigma: the standard deviation of the gaussian
+float shadowCoverage (vec2 point, vec4 box, vec4 radii, float sigma) {
+    vec2 halfSize = (box.zw - box.xy) * 0.5;
+    vec2 p = point - (box.xy + box.zw) * 0.5;
+    float corner = p.y < 0.0 ? (p.x < 0.0 ? radii.x : radii.y) : (p.x < 0.0 ? radii.w : radii.z);
+    corner = min (corner, min (halfSize.x, halfSize.y));
+
+    float start = clamp (-3.0 * sigma, p.y - halfSize.y, p.y + halfSize.y);
+    float end = clamp (3.0 * sigma, p.y - halfSize.y, p.y + halfSize.y);
+    float step = (end - start) / 4.0;
+
+    float y = start + step * 0.5;
+    float coverage = 0.0;
+    for (int i = 0; i < 4; i++) {
+        coverage += shadowRow (p.x, p.y - y, sigma, corner, halfSize) * gaussian (y, sigma) * step;
+        y += step;
+    }
+
+    return coverage;
+}
+
+// The coverage of the shape at a framebuffer pixel: its box blurred when it is a shadow, otherwise the pixels the
+// rasterizer would cover with its box, less those within its edges when it is drawn as a ring, the radius of each inner
+// corner being that of the corner less the widest of its two edges
 float shapeCoverage (vec2 pixel) {
+    if (inBlur > 0.0) {
+        return shadowCoverage ((pixel + 0.5) / inRatio, inBox, inRadii, inBlur);
+    }
+
     vec4 box = coveredPixels (inBox);
     vec4 radii = inRadii * (inRatio.x + inRatio.y) / 2.0;
 

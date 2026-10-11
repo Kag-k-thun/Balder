@@ -29,6 +29,9 @@ struct Object {
     vec4 box;
     vec4 radii;
     int level;
+
+    // The standard deviation of the gaussian blurring the box, in CSS pixels, a sharp box when it is 0
+    float blur;
 };
 
 layout (std430, set = 0, binding = 0) readonly buffer Objects {

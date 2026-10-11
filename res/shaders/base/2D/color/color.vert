@@ -28,6 +28,9 @@ struct Object {
     vec4 box;
     vec4 radii;
     int level;
+
+    // The standard deviation of the gaussian blurring the box, in CSS pixels, a sharp box when it is 0
+    float blur;
 };
 
 layout (std430, set = 0, binding = 0) readonly buffer Objects {
@@ -51,6 +54,9 @@ layout (location = 4) flat out vec2 outRatio;
 
 // The radii of the corners of the box, clockwise from the top left one
 layout (location = 5) flat out vec4 outRadii;
+
+// The standard deviation of the gaussian blurring the box, a sharp box when it is 0
+layout (location = 6) flat out float outBlur;
 
 out gl_PerVertex {
     vec4 gl_Position;
@@ -83,4 +89,5 @@ void main () {
     outEdges = world.edges;
     outRatio = window.ratio;
     outRadii = world.radii;
+    outBlur = world.blur;
 }
