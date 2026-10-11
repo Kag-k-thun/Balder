@@ -4,6 +4,23 @@ use balder::math::{bounds, matrix};
 use balder::scene::node::node3D::visual;
 
 /**
+ * An instance of the visibility, with the last culling that saw it
+ * */
+@final
+class Seen {
+
+    // The instance
+    pub let dmut node : &VisualInstance3D;
+
+    // The number of the last culling done by update that saw the instance, 0 when none did
+    pub let mut stamp : usize = 0us;
+
+    pub self (dmut node : &VisualInstance3D)
+        with node = alias node
+    {}
+}
+
+/**
  * The visual instances of a scene in a bounding volume hierarchy of their world boxes, and those seen by the camera
  * @info: an instance the camera does not see is culled, its draws drawing nothing; the instances seen are found again
  * only when the view of the camera changed or an instance moved, entered or left the scene
@@ -13,14 +30,15 @@ pub record VisibilityScene {
     // The world boxes of the instances, by uniq id
     let dmut _index : &Bvh = copy Bvh ();
 
-    // The instances
-    let dmut _nodes : [usize => &VisualInstance3D] = copy [];
+    // The instances, with the last culling that saw them
+    let dmut _nodes : [usize => &Seen] = copy [];
 
     // The instances moved since their boxes were last refit
     let dmut _moved : [usize => &VisualInstance3D] = copy [];
 
-    // The instances seen by the camera, the other ones being culled
-    let dmut _visible : [usize => &VisualInstance3D] = copy [];
+    // The instances seen by the camera, the other ones being culled, and their entries in the same order
+    let dmut _visible : [&VisualInstance3D] = [];
+    let dmut _visibleSeen : [&Seen] = [];
 
     prv { // View of the last culling
 
@@ -41,6 +59,9 @@ pub record VisibilityScene {
 
         // The number of cullings done by update
         let mut _updates : usize = 0us;
+
+        // The stamp of the instances in the visible ones (see Seen)
+        let mut _stamp : usize = 1us;
 
         // The number of times an instance moved, entered or left
         let mut _changes : usize = 0us;
@@ -100,7 +121,7 @@ pub record VisibilityScene {
     /**
      * @returns: the instances seen by the camera at the last culling
      * */
-    pub fn getVisible (mut self)-> dmut [usize => &VisualInstance3D] {
+    pub fn getVisible (mut self)-> dmut [&VisualInstance3D] {
         alias self._visible
     }
 
@@ -116,14 +137,19 @@ pub record VisibilityScene {
      * Insert an instance, seen until a culling finds it is not unless it is already culled
      * */
     pub fn insert (mut self, dmut node : &VisualInstance3D) {
+        if node.uid in self._nodes {
+            self:.forgetVisible (node.uid);
+        }
+
         self._index:.insert (node.uid, node:.ownBounds ());
-        self._nodes [node.uid] = alias node;
+        let dmut seen = copy Seen (alias node);
+        self._nodes [node.uid] = alias seen;
         self._moved:.remove (node.uid);
 
-        if node.culled {
-            self._visible:.remove (node.uid);
-        } else {
-            self._visible [node.uid] = alias node;
+        if !node.culled {
+            seen.stamp = self._stamp;
+            self._visible ~= [alias node];
+            self._visibleSeen ~= [alias seen];
         }
 
         self._dirty = true;
@@ -136,10 +162,10 @@ pub record VisibilityScene {
     pub fn remove (mut self, node : &VisualInstance3D) {
         if node.uid !in self._nodes { return; }
 
+        self:.forgetVisible (node.uid);
         self._index:.remove (node.uid);
         self._nodes:.remove (node.uid);
         self._moved:.remove (node.uid);
-        self._visible:.remove (node.uid);
         self._dirty = true;
         self._changes += 1us;
     }
@@ -163,7 +189,8 @@ pub record VisibilityScene {
         self._index:.clear ();
         self._nodes = copy [];
         self._moved = copy [];
-        self._visible = copy [];
+        self._visible = [];
+        self._visibleSeen = [];
         self._stats = CullStats ();
         self._dirty = true;
         self._changes += 1us;
@@ -217,7 +244,7 @@ pub record VisibilityScene {
         let dmut nodes = alias self._nodes;
         let found = self._index.raycast (ray, copy |uid : usize, _ : f32| {
             if let Ok (dmut n) = alias nodes [uid] {
-                if let Ok (distance) = n:.raycast (ray) { distance } else { f32::max }
+                if let Ok (distance) = n.node:.raycast (ray) { distance } else { f32::max }
             } else {
                 f32::max
             }
@@ -225,7 +252,7 @@ pub record VisibilityScene {
 
         if let Ok (hit) = found {
             if let Ok (dmut n) = alias self._nodes [hit.id] {
-                return (alias n)?;
+                return (alias n.node)?;
             }
         }
 
@@ -239,15 +266,19 @@ pub record VisibilityScene {
      * */
     pub fn showAll (mut self)-> bool {
         let mut redraw = false;
-        let dmut visible : [usize => &VisualInstance3D] = copy [];
-        for uid, dmut n in alias self._nodes {
-            visible [uid] = alias n;
-            if n.culled {
-                if n:.setCulled (false) { redraw = true; }
+        let dmut visible : [&VisualInstance3D] = [];
+        let dmut visibleSeen : [&Seen] = [];
+        for _, dmut s in alias self._nodes {
+            s.stamp = self._stamp;
+            visible ~= [alias s.node];
+            visibleSeen ~= [alias s];
+            if s.node.culled {
+                if s.node:.setCulled (false) { redraw = true; }
             }
         }
 
         self._visible = alias visible;
+        self._visibleSeen = alias visibleSeen;
         self._dirty = true;
         redraw
     }
@@ -274,25 +305,51 @@ pub record VisibilityScene {
         self._dirty = false;
         self._updates += 1us;
 
+        // the instances seen get the stamp of the culling, those seen by the last one keeping theirs being culled
+        let previous = self._stamp;
+        let stamp = previous + 1us;
         let mut redraw = false;
-        let dmut visible : [usize => &VisualInstance3D] = copy [];
+        let dmut visible : [&VisualInstance3D] = [];
+        let dmut visibleSeen : [&Seen] = [];
         for uid in ids {
-            if let Ok (dmut n) = alias self._nodes [uid] {
-                visible [uid] = alias n;
-                if uid !in self._visible {
-                    if n:.setCulled (false) { redraw = true; }
+            if let Ok (dmut s) = alias self._nodes [uid] {
+                if s.stamp != previous {
+                    if s.node:.setCulled (false) { redraw = true; }
                 }
+
+                s.stamp = stamp;
+                visible ~= [alias s.node];
+                visibleSeen ~= [alias s];
             }
         }
 
-        for uid, dmut n in alias self._visible {
-            if uid !in visible {
-                if n:.setCulled (true) { redraw = true; }
+        for dmut s in alias self._visibleSeen {
+            if s.stamp != stamp {
+                if s.node:.setCulled (true) { redraw = true; }
+            }
+        }
+
+        self._stamp = stamp;
+        self._visible = alias visible;
+        self._visibleSeen = alias visibleSeen;
+        redraw
+    }
+
+    /**
+     * Remove an instance from the instances seen, when it is one of them
+     * */
+    fn forgetVisible (mut self, uid : usize) {
+        let dmut visible : [&VisualInstance3D] = [];
+        let dmut visibleSeen : [&Seen] = [];
+        for i in 0us .. self._visibleSeen.len {
+            if self._visible [i].uid != uid {
+                visible ~= [alias self._visible [i]];
+                visibleSeen ~= [alias self._visibleSeen [i]];
             }
         }
 
         self._visible = alias visible;
-        redraw
+        self._visibleSeen = alias visibleSeen;
     }
 
 }
