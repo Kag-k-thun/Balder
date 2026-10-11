@@ -1,0 +1,434 @@
+in gizmo;
+
+use balder::core::application::signal;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::layout::d3scene::picker;
+use balder::math::vector;
+use balder::scene;
+use balder::scene::{edit, editable};
+use balder::scene::gizmo;
+use balder::scene::gizmo::{mode, snap, space, view};
+use balder::utils::log;
+
+use std::time::dur;
+
+use ::sdl3::{keyboard, keycode, mouse};
+
+/**
+ * The name of the node of the gizmo, under the root of the scene
+ * */
+def GIZMO_NODE = "__gizmo__";
+
+/**
+ * The overlay of a Scene3D moving the nodes selected in its scene by a transform gizmo drawn over them (see
+ * TransformGizmo), picking and selecting the instances under the cursor as a ScenePicker does
+ * @info: the scene is an EditableScene (editable: true); the gizmo is a node spawned under its root when nodes are
+ * selected and disposed when none is, the overlay keeping its mode, its space, its size and its snapping between them.
+ * A left click on a handle grabs it, the drag translating, rotating or scaling the nodes, Ctrl (or Command) snapping
+ * the change and Escape cancelling it; a click off the handles picks and selects. A click gives it the focus, W then
+ * translating, E rotating and R scaling, the key of the mode in use switching between the world and the local space
+ * */
+pub class SceneGizmo over ScenePicker {
+
+    // What the handles of the gizmo change in the nodes
+    let mut _mode: GizmoMode = GizmoMode::TRANSLATE;
+
+    // The axes the gizmo translates and rotates along
+    let mut _space: GizmoSpace = GizmoSpace::WORLD;
+
+    // The length of an axis of the gizmo, in texels of the image of the scene
+    let mut _size: f32 = 110.0f;
+
+    // The steps the changes of the gizmo snap to
+    let mut _snap: GizmoSnap = GizmoSnap();
+
+    // The gizmo moving the nodes selected, none while no node is
+    let dmut _gizmo: (&TransformGizmo)? = none;
+
+    // The edits of the nodes by the last drag that changed them
+    let mut _edits: [TransformEdit] = [];
+
+    // The signal emitted when a drag ends having changed the nodes
+    let dmut _transformed: (&Signal!{()})? = none;
+
+    // The slots of the changes of the selection and of the drags, emitted at each tick
+    let dmut _slots: &SlotEmitter = copy SlotEmitter();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "SceneGizmo")
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: what the handles of the gizmo change in the nodes
+     * */
+    @field
+    pub fn mode(self)-> GizmoMode {
+        self._mode
+    }
+
+    /**
+     * Change what the handles of the gizmo change in the nodes, the drag ending first
+     * */
+    @field
+    pub fn mode(mut self, mode: GizmoMode) {
+        self._mode = mode;
+        if let Ok(dmut g) = alias self._gizmo {
+            g.mode = mode;
+        }
+    }
+
+    /**
+     * @returns: the axes the gizmo translates and rotates along
+     * */
+    @field
+    pub fn space(self)-> GizmoSpace {
+        self._space
+    }
+
+    /**
+     * Change the axes the gizmo translates and rotates along, the drag ending first
+     * */
+    @field
+    pub fn space(mut self, space: GizmoSpace) {
+        self._space = space;
+        if let Ok(dmut g) = alias self._gizmo {
+            g.space = space;
+        }
+    }
+
+    /**
+     * @returns: the steps the changes of the gizmo snap to
+     * */
+    @field
+    pub fn snap(self)-> GizmoSnap {
+        self._snap
+    }
+
+    /**
+     * Change the steps the changes of the gizmo snap to, Ctrl (or Command) held
+     * */
+    @field
+    pub fn snap(mut self, snap: GizmoSnap) {
+        self._snap = snap;
+        if let Ok(dmut g) = alias self._gizmo {
+            g.snap = snap;
+        }
+    }
+
+    /**
+     * Change the length of an axis of the gizmo, in texels of the image of the scene (see TransformGizmo::size)
+     * */
+    pub fn setSize(mut self, texels: f32) {
+        self._size = texels;
+        if let Ok(dmut g) = alias self._gizmo {
+            g.size = texels;
+        }
+    }
+
+    /**
+     * @returns: the gizmo moving the nodes selected, none while no node is
+     * */
+    @field
+    pub fn gizmo(self)-> (&TransformGizmo)? {
+        self._gizmo
+    }
+
+    /**
+     * @returns: the edits of the nodes by the last drag that changed them, in the order of the nodes
+     * */
+    @field
+    pub fn edits(self)-> [TransformEdit] {
+        self._edits
+    }
+
+    /**
+     * @returns: the signal emitted when a drag ends having changed the nodes, the edits of the drag read from the overlay
+     * (see edits)
+     * */
+    pub fn transformed(mut self)-> dmut &Signal!{()} {
+        if let Ok(dmut s) = alias self._transformed {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{()} ();
+        self._transformed = (alias s)?;
+
+        alias s
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SCENE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The gizmo follows the selection of the scene once it is created, the scene being editable
+     * */
+    pub over onSceneCreated(mut self, dmut scene: &Scene) {
+        if let dmut editable: &EditableScene = alias scene {
+            let dmut selection = alias editable.selection;
+            selection:.changed():.connect(alias self._slots, &self:.onSelectionChanged);
+        } else {
+            log::error #("SceneGizmo", "The scene of a gizmo must be editable (editable: true)", self.id);
+        }
+    }
+
+    /**
+     * Follow the changes of the selection and the ends of the drags
+     * */
+    pub over onTick(mut self, delta: Duration) {
+        self._slots:.emit();
+        self.__super__:.onTick(delta);
+    }
+
+    /**
+     * Spawn the gizmo under the root of the scene when nodes are selected, moving them, and dispose it when none is
+     * */
+    fn onSelectionChanged(mut self) {
+        let dmut scene = if let Ok(dmut s: &EditableScene) = alias self:.getScene() { alias s } else { return; };
+        let dmut nodes = alias scene.selection.nodes;
+        if nodes.len == 0us {
+            if let Ok(dmut g) = alias self._gizmo {
+                g:.dispose();
+            }
+
+            self._gizmo = none;
+            return;
+        }
+
+        if let Ok(dmut g) = alias self._gizmo {
+            g:.setNodes(alias nodes);
+            return;
+        }
+
+        let dmut g = copy TransformGizmo(GIZMO_NODE, alias scene:.getRootNode());
+        g.mode = self._mode;
+        g.space = self._space;
+        g.size = self._size;
+        g.snap = self._snap;
+        g:.setNodes(alias nodes);
+        g:.transformed():.connect(alias self._slots, &self:.onGizmoTransformed);
+        self._gizmo = (alias g)?;
+    }
+
+    /**
+     * A drag of the gizmo ended having changed the nodes
+     * */
+    fn onGizmoTransformed(mut self) {
+        if let Ok(g) = self._gizmo {
+            self._edits = g.edits;
+        }
+
+        if let Ok(dmut s) = alias self._transformed {
+            s:.emit();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          FOCUSING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A click gives the gizmo the focus, its drag and its keys
+     * */
+    pub over isFocusableLeftClick(self)-> bool {
+        true
+    }
+
+    /**
+     * A click of the right button keeps the focus on the gizmo
+     * */
+    pub over isFocusableRightClick(self)-> bool {
+        true
+    }
+
+    /**
+     * A click of the middle button (moving a camera) keeps the focus on the gizmo
+     * */
+    pub over isFocusableMiddleClick(self)-> bool {
+        true
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The handle under the cursor is highlighted
+     * */
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        if let Ok(pixel) = self.imagePixel(pos) {
+            if let Ok(view) = self:.sceneView() {
+                if let Ok(dmut g) = alias self._gizmo {
+                    g:.hover(view, pixel);
+                }
+            }
+        }
+
+        self.__super__:.onHover(pos)
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        if let Ok(dmut g) = alias self._gizmo {
+            g:.leave();
+        }
+
+        self.__super__:.onLoseHoverFocus();
+    }
+
+    /**
+     * A click of the left button on a handle grabs it, a click elsewhere picks as the picker does
+     * */
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if button == SDL_BUTTON_LEFT && self:.grabUnder(pos) {
+            return (alias self)?;
+        }
+
+        self.__super__:.onClick(pos, button)
+    }
+
+    /**
+     * The handle grabbed follows the cursor, Ctrl (or Command) snapping the change
+     * */
+    pub over onSliding(mut self, pos: vec2, _: vec2, button: u8) {
+        if button != SDL_BUTTON_LEFT { return; }
+
+        if let Ok(pixel) = self.imagePixel(pos) {
+            if let Ok(view) = self:.sceneView() {
+                if let Ok(dmut g) = alias self._gizmo {
+                    g:.drag(view, pixel, (SDL_GetModState() & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16);
+                }
+            }
+        }
+    }
+
+    /**
+     * Releasing the left button ends the drag
+     * */
+    pub over onSlidingEnd(mut self, button: u8) {
+        if button != SDL_BUTTON_LEFT { return; }
+
+        if let Ok(dmut g) = alias self._gizmo {
+            g:.release();
+        }
+    }
+
+    /**
+     * @returns: true iif a handle of the gizmo is under the cursor and is grabbed
+     * */
+    fn grabUnder(mut self, pos: vec2)-> bool {
+        if let Ok(pixel) = self.imagePixel(pos) {
+            if let Ok(view) = self:.sceneView() {
+                if let Ok(dmut g) = alias self._gizmo {
+                    return g:.grab(view, pixel);
+                }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: how the camera sees the scene into its image, none without a scene or a camera
+     * */
+    fn sceneView(mut self)-> (GizmoView)? {
+        if let Ok(dmut scene) = alias self:.getScene() {
+            return viewOf(alias scene);
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          KEYBOARD EVENTS          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * W translates, E rotates and R scales, the key of the mode in use switching between the world and the local
+     * space; Escape cancels a drag
+     * */
+    pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
+        if key == SDLK_ESCAPE {
+            if let Ok(dmut g) = alias self._gizmo {
+                if g.isDragging {
+                    g:.cancel();
+                    return true;
+                }
+            }
+        }
+
+        if (mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI)) != 0u16 { return false; }
+
+        let mode = if key == SDLK_W {
+            GizmoMode::TRANSLATE
+        } else if key == SDLK_E {
+            GizmoMode::ROTATE
+        } else if key == SDLK_R {
+            GizmoMode::SCALE
+        } else {
+            return false;
+        };
+
+        if self._mode == mode {
+            self.space = if self._space == GizmoSpace::WORLD { GizmoSpace::LOCAL } else { GizmoSpace::WORLD };
+        } else {
+            self.mode = mode;
+        }
+
+        true
+    }
+
+}
+
+/**
+ * The scene gizmos in a .gui file
+ * */
+pub mod SceneGizmo {
+
+    /**
+     * @returns: the schema of the scene gizmos, the overlay of an editable Scene3D moving the nodes selected, a left
+     * click off the handles selecting the instance under the cursor when selectable: true, the axes of the gizmo size:
+     * 110 texels long
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("SceneGizmo",
+                          |dmut m, id|-> dmut &Widget => copy SceneGizmo(alias m, id),
+                          attributes-> copy [copy Setter!{&SceneGizmo, bool}("selectable", |dmut g, b| => {
+                                                 g:.setSelectable(b);
+                                             }),
+                                             copy Setter!{&SceneGizmo, f32}("size", |dmut g, s| => {
+                                                 g:.setSize(s);
+                                             })])
+    }
+}
