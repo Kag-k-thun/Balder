@@ -7,7 +7,7 @@ use balder::core::shader::{_, buffers::_};
 use balder::math::{matrix, vector};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
-use balder::scene::utils::{casters, draw_stats, motion, shadow_map};
+use balder::scene::utils::{casters, cluster_slot, draw_stats, motion, shadow_map};
 use balder::utils::log;
 
 use std::algorithm::comparison;
@@ -66,7 +66,8 @@ pub def OBJECT_PREV_WORLD = 112us;
 def MIN_SWEEP = 16us;
 
 /**
- * The geometry of a mesh placed in the pool of a shader, shared by the instances drawing it
+ * The geometry of a mesh placed in the pool of a shader, and its clusters in the clusters of the shader, shared by the
+ * instances drawing it
  * */
 @final
 class SharedGeometry {
@@ -74,15 +75,30 @@ class SharedGeometry {
     // The range of the geometry in the pool
     pub let dmut range: &GeometryRange;
 
+    // The clusters of the shader
+    let dmut _clusters: &ObjectStorage;
+
+    // The slot of the first cluster of the geometry in the clusters of the shader
+    pub let firstCluster: u32;
+
+    // The number of clusters of the geometry
+    pub let nbClusters: u32;
+
     // The number of instances drawing the geometry, the range being given back to the pool with the last one
     let mut _users: usize = 1us;
 
     /**
      * @params:
      *    - range: the range placed for a first instance
+     *    - clusters: the clusters of the shader
+     *    - firstCluster: the slot of the first cluster of the geometry
+     *    - nbClusters: the number of clusters of the geometry, placed from firstCluster
      * */
-    pub self (dmut range: &GeometryRange)
+    pub self (dmut range: &GeometryRange, dmut clusters: &ObjectStorage, firstCluster: u32, nbClusters: u32)
         with range = alias range
+        , _clusters = alias clusters
+        , firstCluster = firstCluster
+        , nbClusters = nbClusters
     {}
 
     /**
@@ -108,7 +124,7 @@ class SharedGeometry {
     }
 
     /**
-     * Count one instance less drawing the geometry, the range being given back to the pool with the last one
+     * Count one instance less drawing the geometry, the range and the clusters being given back with the last one
      * @warning: through a retire, the recordings in use may still draw the geometry
      * */
     pub fn release(mut self) {
@@ -118,6 +134,9 @@ class SharedGeometry {
             self._users -= 1us;
             if self._users == 0us {
                 self.range:.dispose();
+                if self.nbClusters != 0u32 {
+                    self._clusters:.free(self.firstCluster, count-> cast!usize(self.nbClusters));
+                }
             }
         }
     }
@@ -183,6 +202,14 @@ pub class SceneDraws {
      * */
     pub fn getGeometry(self)-> &GeometryRange {
         self._geometry.range
+    }
+
+    /**
+     * @returns: the slot of the first cluster of the geometry of the instance in the clusters of its shader, the clusters
+     * of a level of its mesh following it from the first cluster of the level
+     * */
+    pub fn getFirstCluster(self)-> u32 {
+        self._geometry.firstCluster
     }
 
     /**
@@ -315,6 +342,9 @@ pub class ShaderGroup {
     // The worlds, the cross-fades and the materials of the instances
     let dmut _objects: &ObjectStorage;
 
+    // The clusters of the geometries placed in the pool, read by the cull pass (see ClusterSlot)
+    let dmut _clusters: &ObjectStorage;
+
     // The worlds of the frame before of the instances moving
     let dmut _motion: &MotionTracker;
 
@@ -351,6 +381,7 @@ pub class ShaderGroup {
         , _camera = shader:.get():.allocateDescriptorSet(DescriptorContext::CAMERA)
         , _geometry = copy GeometryPool(alias shader:.get():.getDevice(), vertexStride(cfg))
         , _objects = alias objects
+        , _clusters = copy ObjectStorage(alias shader:.get():.getDevice(), CLUSTER_STRIDE)
         , _motion = copy MotionTracker(alias objects, OBJECT_WORLD, OBJECT_PREV_WORLD)
         , _casters = copy ShadowCasters(shader:.get():.getDevice().isMultiDraw())
         throws BalderError
@@ -436,7 +467,8 @@ pub class ShaderGroup {
     }
 
     /**
-     * @returns: the geometry of a mesh in the pool, placed unless an instance drawing it placed it already
+     * @returns: the geometry of a mesh in the pool, with its clusters, placed unless an instance drawing it placed it
+     * already
      * @params:
      *    - mesh: the mesh
      *    - material: the material of the instance, giving the layout of the vertices
@@ -453,7 +485,25 @@ pub class ShaderGroup {
         }
 
         let (vertices, indices) = mesh.compact(material);
-        let dmut g = copy SharedGeometry(alias self._geometry:.alloc(vertices, indices));
+        let dmut range = self._geometry:.alloc(vertices, indices);
+
+        let clusters = mesh.clusters;
+        let first = if clusters.len == 0us { 0u32 } else {
+            {
+                self._clusters:.alloc(count-> clusters.len)
+            } catch {
+                err => {
+                    range:.dispose();
+                    throw err;
+                }
+            }
+        };
+
+        for i, c in clusters {
+            self._clusters:.setData!{ClusterSlot} (first + cast!u32(i), 0us, ClusterSlot(c, range.firstIndex, range.vertexOffset));
+        }
+
+        let dmut g = copy SharedGeometry(alias range, alias self._clusters, first, cast!u32(clusters.len));
         self._meshes[mesh.uid] = alias g;
 
         alias g
@@ -910,6 +960,7 @@ pub class ShaderGroup {
         window:.retire(alias self._camera);
         window:.retire(alias self._geometry);
         window:.retire(alias self._objects);
+        window:.retire(alias self._clusters);
         self._shader:.dispose();
     }
 }
