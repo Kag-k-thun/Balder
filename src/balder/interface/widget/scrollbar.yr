@@ -1,0 +1,365 @@
+in scrollbar;
+
+use balder::utils;
+use balder::interface::_;
+use balder::interface::shape::rounded;
+use balder::math::vector;
+
+use ::sdl3::mouse;
+
+use ::std::algorithm::comparison;
+
+// The thickness of the scrollbar when the style sets none, in pixels
+def DEFAULT_THICKNESS = 10.0f;
+
+/**
+ * The scrollbar of a widget showing a part of a content longer than it along an axis
+ * @info:
+ * =====
+ * The scrollbar measures the content in parts of its length: the widget shows `length` of it, from the part `shift`
+ * scrolled over. It is drawn over the content, along the end of the inner box of the widget across the axis, as thick as
+ * the width (in a column) or the height (in a row) of the part `::scrollbar` of the widget, 10 pixels when it sets none,
+ * and coloured with the background of that part in the states `:hover` under the cursor and `:pressed` while it is
+ * dragged. The widget forwards it the cursor, relative to its inner box, and scrolls its content to the part it gives.
+ * ====
+ * */
+pub class Scrollbar {
+
+    // The manager of the widget scrolling
+    let dmut _manager: &WidgetManager;
+
+    // The shape drawing the scrollbar, registered when it is first placed
+    let dmut _shape: (&Shape)? = none;
+
+    // The part of the content the widget shows along its axis, 1 when it fits
+    let mut _length: f32 = 1.0f;
+
+    // The part of the content scrolled over along the axis, from 0 to 1 - _length
+    let mut _shift: f32 = 0.0f;
+
+    // The position and the size of the scrollbar relative to the inner box of the widget
+    let mut _relPos: vec2 = vec2();
+    let mut _relSize: vec2 = vec2();
+
+    // The position of the cursor in the inner box, minus the part scrolled over, when the scrollbar was grabbed
+    let mut _grabStart: vec2 = vec2();
+
+    // True iif the scrollbar is dragged
+    let mut _grabbed: bool = false;
+
+    // True iif the cursor is over the scrollbar
+    let mut _over: bool = false;
+
+    /**
+     * @params:
+     *    - manager: the manager of the widget scrolling
+     * */
+    pub self (dmut manager: &WidgetManager)
+        with _manager = alias manager
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the content is longer than the widget, which scrolls over it
+     * */
+    pub fn isOverflowing(self)-> bool {
+        self._length < 1.0f
+    }
+
+    /**
+     * @returns: the part of the content shown along the axis, 1 when it fits
+     * */
+    pub fn getLength(self)-> f32 {
+        self._length
+    }
+
+    /**
+     * @returns: the part of the content scrolled over along the axis, from 0 to 1 - the part shown
+     * */
+    pub fn getShift(self)-> f32 {
+        self._shift
+    }
+
+    /**
+     * @returns: true iif the scrollbar is dragged
+     * */
+    pub fn isGrabbed(self)-> bool {
+        self._grabbed
+    }
+
+    /**
+     * @returns: the thickness of the scrollbar across the axis, the width (in a column) or the height (in a row) of the
+     * part ::scrollbar of a widget, 10 pixels when its style sets none
+     * @params:
+     *    - owner: the widget scrolling
+     *    - row: true iif the widget scrolls along a row
+     * */
+    pub fn getThickness(self, owner: &Widget, row: bool)-> f32 {
+        let sub = owner.getStyle().getSubStyle("scrollbar");
+        let inner = owner.getAbsoluteInnerSize();
+        if row {
+            (sub.height._1).resolve(inner.y) ?? DEFAULT_THICKNESS
+        } else {
+            (sub.width._1).resolve(inner.x) ?? DEFAULT_THICKNESS
+        }
+    }
+
+    /**
+     * @returns: true iif a position is over the scrollbar of a widget whose content overflows
+     * @params:
+     *    - inner: the position relative to the inner box of the widget
+     * */
+    pub fn isUnder(self, inner: vec2)-> bool {
+        if !self.isOverflowing() { return false; }
+
+        let end = self._relPos + self._relSize;
+        inner.x >= self._relPos.x && inner.x <= end.x && inner.y >= self._relPos.y && inner.y <= end.y
+    }
+
+    /**
+     * @returns: the part of the content to scroll over for the scrollbar grabbed to follow the cursor
+     * @params:
+     *    - inner: the position of the cursor relative to the inner box of the widget
+     *    - row: true iif the widget scrolls along a row
+     * */
+    pub fn dragTo(self, inner: vec2, row: bool)-> f32 {
+        let amount = inner - self._grabStart;
+        if row { amount.x } else { amount.y }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SCROLLING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Show the whole content, hiding the scrollbar
+     * */
+    pub fn fit(mut self) {
+        self._length = 1.0f;
+        self._shift = 0.0f;
+        if let Ok(dmut s) = alias self._shape {
+            s:.hide();
+        }
+    }
+
+    /**
+     * Set the part of the content shown, the part scrolled over being kept as it is until the next scroll
+     * @params:
+     *    - length: the part of the content shown along the axis, 1 when it fits
+     * */
+    pub fn setLength(mut self, length: f32) {
+        self._length = min(1.0f, length);
+    }
+
+    /**
+     * Scroll over a part of the content, kept within it
+     * @params:
+     *    - shift: the part of the content to scroll over, from 0 to 1
+     * @returns: the part scrolled over, from 0 to 1 - the part shown
+     * */
+    pub fn scrollTo(mut self, shift: f32)-> f32 {
+        self._shift = clamp(shift, 0.0f, 1.0f - self._length);
+        self._shift
+    }
+
+    /**
+     * Place the scrollbar along the end of the inner box of a widget, as long as the part of the content shown, from the
+     * part scrolled over, and show it while the widget is drawn
+     * @params:
+     *    - owner: the widget scrolling
+     *    - row: true iif the widget scrolls along a row
+     *    - sciPos, sciSize: the scissors of the inner box of the widget
+     *    - level: the depth of the scrollbar, over the content
+     * */
+    pub fn place(mut self, owner: &Widget, row: bool, sciPos: vec2, sciSize: vec2, level: u32) {
+        let inner = owner.getAbsoluteInnerSize();
+        let thickness = self.getThickness(owner, row);
+        if row {
+            self._relSize = makeVec2(self._length, thickness / inner.y);
+            self._relPos = makeVec2(self._shift, 1.0f - self._relSize.y);
+        } else {
+            self._relSize = makeVec2(thickness / inner.x, self._length);
+            self._relPos = makeVec2(1.0f - self._relSize.x, self._shift);
+        }
+
+        if !self._shape.hasValue {
+            self:.register(owner, sciPos, sciSize);
+        }
+
+        if let Ok(dmut s) = alias self._shape {
+            let pos = self._relPos * inner + owner.getAbsoluteInnerPosition();
+            let size = self._relSize * inner;
+            s:.setPosition(pos);
+            s:.setSize(size);
+            s:.setBox(RoundedBox(pos, size, radii-> owner.getStyle().getSubStyle("scrollbar").getRadii()).fitted());
+            s:.setLevel(level);
+            if owner.isDrawn() { s:.show(); }
+        }
+    }
+
+    /**
+     * Cut the scrollbar to the scissors of the inner box of the widget
+     * */
+    pub fn setScissors(mut self, sciPos: vec2, sciSize: vec2) {
+        if let Ok(dmut s) = alias self._shape {
+            s:.setScissors(sciPos, sciSize);
+        }
+    }
+
+    /**
+     * Hide the scrollbar, with the widget
+     * */
+    pub fn hide(mut self) {
+        if let Ok(dmut s) = alias self._shape {
+            s:.hide();
+        }
+    }
+
+    /**
+     * Show the scrollbar again with the widget, when its content overflows
+     * */
+    pub fn show(mut self, owner: &Widget) {
+        if !self.isOverflowing() || !owner.isDrawn() { return; }
+        if let Ok(dmut s) = alias self._shape {
+            s:.show();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Put the scrollbar under the cursor, restyled when it was not, the cursor becoming a pointer
+     * @params:
+     *    - owner: the widget scrolling
+     * */
+    pub fn hover(mut self, owner: &Widget) {
+        if !self._over {
+            self._over = true;
+            self:.restyle(owner);
+        }
+
+        self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_POINTER);
+    }
+
+    /**
+     * Give the cursor back when it leaves the scrollbar
+     * @params:
+     *    - owner: the widget scrolling
+     * */
+    pub fn leave(mut self, owner: &Widget) {
+        if self._over {
+            self._over = false;
+            self:.restyle(owner);
+            self._manager:.getCursorManager():.setCursor(SDL_SystemCursor::SDL_SYSTEM_CURSOR_DEFAULT);
+        }
+    }
+
+    /**
+     * Grab the scrollbar to drag it
+     * @params:
+     *    - owner: the widget scrolling
+     *    - inner: the position of the cursor relative to the inner box of the widget
+     * */
+    pub fn grab(mut self, owner: &Widget, inner: vec2) {
+        self._grabStart = inner - self._shift;
+        self:.setGrabbed(owner, true);
+    }
+
+    /**
+     * Release the scrollbar dragged
+     * @params:
+     *    - owner: the widget scrolling
+     * */
+    pub fn release(mut self, owner: &Widget) {
+        self:.setGrabbed(owner, false);
+    }
+
+    /**
+     * Colour the scrollbar with the background of the part ::scrollbar of the widget in its states
+     * @params:
+     *    - owner: the widget scrolling
+     * */
+    pub fn restyle(mut self, owner: &Widget) {
+        if self._shape.hasValue {
+            let color = self:.getStyle(owner).getColor(WidgetShapeKind::BACKGROUND);
+            if let Ok(dmut s) = alias self._shape {
+                s:.setColor(color);
+            }
+        }
+    }
+
+    /**
+     * Remove the shape of the scrollbar
+     * */
+    pub fn dispose(mut self) {
+        if let Ok(s) = self._shape {
+            self._manager:.getShapeDrawer():.removeShape(s.uid);
+            self._shape = none;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Grab or release the scrollbar, restyling it when it changes
+     * */
+    fn setGrabbed(mut self, owner: &Widget, grabbed: bool) {
+        if self._grabbed != grabbed {
+            self._grabbed = grabbed;
+            self:.restyle(owner);
+        }
+    }
+
+    /**
+     * @returns: the style of the part ::scrollbar of the widget in the states of the scrollbar: hover under the cursor,
+     * pressed while it is dragged
+     * */
+    fn getStyle(mut self, owner: &Widget)-> &Style {
+        let mut states: [[c8]] = [];
+        if self._over { states ~= ["hover"]; }
+        if self._grabbed { states ~= ["pressed"]; }
+        if states.len == 0us { return owner.getStyle().getSubStyle("scrollbar"); }
+
+        self._manager:.getStyleManager().computePart(owner.getStylePath(), owner.getStyle(), "scrollbar", states-> states)
+    }
+
+    /**
+     * Register the shape of the scrollbar
+     * */
+    fn register(mut self, owner: &Widget, sciPos: vec2, sciSize: vec2) {
+        let color = self:.getStyle(owner).getColor(WidgetShapeKind::BACKGROUND);
+        let dmut shDr = self._manager:.getShapeDrawer();
+        {
+            let dmut shape = shDr:.registerColorQuad(color-> color);
+            shape:.setScissors(sciPos, sciSize);
+            self._shape = (alias shape)?;
+        } catch {
+            err => {
+                log::error #("Scrollbar", "Failed to construct the scrollbar : ", err);
+            }
+        }
+    }
+}
