@@ -1,0 +1,437 @@
+in transform_gizmo;
+
+use balder::core::application::signal;
+use balder::math::{matrix, utils, vector};
+use balder::scene::{_, edit};
+use balder::scene::gizmo;
+use balder::scene::gizmo::{frame, handle, mode, snap, space, view};
+use balder::scene::node::_;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{camera, transform};
+use balder::scene::utils::post::gizmo::shape;
+
+use std::math;
+
+/**
+ * A quarter turn, in radian
+ * */
+def QUARTER = 1.5707964f;
+
+/**
+ * A root with no scene, for the nodes of the tests to hang from
+ * */
+class Root over Node {
+
+    pub self ()
+        with super("")
+    {}
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+}
+
+/**
+ * A 3D node with no volume, to move
+ * */
+class Item over Node3D {
+
+    pub self (name: [c8], dmut parent: &Node)
+        with super(name, alias parent)
+    {}
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+}
+
+/**
+ * Counts the emissions of a signal
+ * */
+class Counter {
+
+    pub let mut count: usize = 0us;
+
+    pub self () {}
+
+    pub fn onTransformed(mut self) {
+        self.count += 1us;
+    }
+
+}
+
+/**
+ * @returns: true iif two vectors are equal, give or take the rounding errors
+ * */
+fn near(a: vec3, b: vec3, tolerance: f32 = 0.001f)-> bool {
+    (a - b).length() < tolerance
+}
+
+/**
+ * @returns: true iif two numbers are equal, give or take the rounding errors
+ * */
+fn near(a: f32, b: f32, tolerance: f32 = 0.001f)-> bool {
+    math::abs(a - b) < tolerance
+}
+
+/**
+ * @returns: true iif two rotations are the same, give or take the rounding errors
+ * */
+fn sameRotation(a: vec3, b: mat4)-> bool {
+    let r = eulerRotation(a);
+    let x = makeVec3(1.0f, 0.0f, 0.0f), y = makeVec3(0.0f, 1.0f, 0.0f), z = makeVec3(0.0f, 0.0f, 1.0f);
+    near((r * makeVec4(x, 0.0f)).xyz, (b * makeVec4(x, 0.0f)).xyz) &&
+        near((r * makeVec4(y, 0.0f)).xyz, (b * makeVec4(y, 0.0f)).xyz) &&
+        near((r * makeVec4(z, 0.0f)).xyz, (b * makeVec4(z, 0.0f)).xyz)
+}
+
+/**
+ * @returns: a camera on the Z axis 10 units from the origin, looking at it, seeing it into an image of 1280 × 720
+ * */
+fn cameraOf(dmut root: &Node)-> dmut &Camera {
+    let dmut cam = copy PerspectiveCamera("cam", alias root);
+    cam.position = makeVec3(0.0f, 0.0f, 10.0f);
+    cam.target = makeVec3(0.0f, 0.0f, 0.0f);
+
+    alias cam
+}
+
+/**
+ * @returns: the point of the image a point of the world is seen at, the centre of the image when it is behind the camera
+ * */
+fn seen(view: GizmoView, p: vec3)-> vec2 {
+    if let Ok(px) = view.project(p) { px } else { makeVec2(640.0f, 360.0f) }
+}
+
+/**
+ * @returns: a gizmo moving a node alone
+ * */
+fn gizmoOn(dmut node: &Node3D)-> dmut &TransformGizmo {
+    let dmut root = copy Root();
+    let dmut g = copy TransformGizmo("gizmo", alias root);
+    g:.setNodes(copy [alias node]);
+
+    alias g
+}
+
+__test the_gizmo_stands_on_its_last_node_at_its_size_in_the_image {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+
+    let dmut a = copy Item("a", alias root);
+    let dmut b = copy Item("b", alias root);
+    a.position = makeVec3(-2.0f, 0.0f, 0.0f);
+    b.position = makeVec3(0.0f, 1.0f, 0.0f);
+
+    let dmut g = copy TransformGizmo("gizmo", alias root);
+    assert (!g.frame(view).hasValue && g.shapes(view).len == 0us);
+
+    g:.setNodes(copy [alias a, alias b]);
+    if let Ok(f) = g.frame(view) {
+        assert (near(f.centre, makeVec3(0.0f, 1.0f, 0.0f)));
+        assert (near(f.toEye, (makeVec3(0.0f, 0.0f, 10.0f) - f.centre).normalized()));
+
+        // the Y axis, across the view, spans the size of the gizmo in texels
+        let centre = seen(view, f.centre);
+        assert (near((seen(view, f.centre + f.axisY * f.size) - centre).length(), 110.0f, tolerance-> 1.0f));
+    } else {
+        assert (false);
+    }
+
+    // behind the camera, the gizmo is not drawn
+    b.position = makeVec3(0.0f, 0.0f, 20.0f);
+    assert (!g.frame(view).hasValue && g.shapes(view).len == 0us);
+}
+
+__test the_nodes_under_a_node_selected_move_with_it {
+    let dmut root = copy Root();
+    let dmut a = copy Item("a", alias root);
+    let dmut child = copy Item("child", alias a);
+    let dmut b = copy Item("b", alias root);
+
+    let dmut g = copy TransformGizmo("gizmo", alias root);
+    g:.setNodes(copy [alias child, alias a, alias b]);
+    assert (g.nodes.len == 2us && g.nodes[0].uid == a.uid && g.nodes[1].uid == b.uid);
+}
+
+__test the_cursor_finds_the_handles_of_each_mode {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.position = makeVec3(0.0f, 0.0f, 0.0f);
+
+    let dmut g = gizmoOn(alias a);
+    let f = if let Ok(f) = g.frame(view) { f } else { GizmoFrame() };
+    let s = f.size;
+
+    // the arrows, the square facing the eye, and nothing far from them; the Z axis points at the eye, hidden
+    assert (g.handleAt(view, seen(view, makeVec3(0.6f * s, 0.0f, 0.0f))) == GizmoHandle::X);
+    assert (g.handleAt(view, seen(view, makeVec3(0.0f, 0.9f * s, 0.0f))) == GizmoHandle::Y);
+    assert (g.handleAt(view, seen(view, makeVec3(0.37f * s, 0.37f * s, 0.0f))) == GizmoHandle::XY);
+    assert (g.handleAt(view, seen(view, makeVec3(0.0f, 0.0f, 0.0f))) == GizmoHandle::NONE);
+    assert (g.handleAt(view, makeVec2(10.0f, 10.0f)) == GizmoHandle::NONE);
+    assert (g:.hover(view, seen(view, makeVec3(0.6f * s, 0.0f, 0.0f))) == GizmoHandle::X && g.hovered == GizmoHandle::X);
+
+    // the ring about Z faces the eye, the ring about the view is past it
+    g.mode = GizmoMode::ROTATE;
+    assert (g.hovered == GizmoHandle::NONE);
+    assert (g.handleAt(view, seen(view, makeVec3(0.7071f * s, -0.7071f * s, 0.0f))) == GizmoHandle::Z);
+    assert (g.handleAt(view, seen(view, makeVec3(-1.2f * s, 0.0f, 0.0f))) == GizmoHandle::VIEW);
+    assert (g.handleAt(view, seen(view, makeVec3(0.35f * s, 0.35f * s, 0.0f))) == GizmoHandle::NONE);
+
+    // the boxes at the end of the axes and in the centre
+    g.mode = GizmoMode::SCALE;
+    assert (g.handleAt(view, seen(view, makeVec3(s, 0.0f, 0.0f))) == GizmoHandle::X);
+    assert (g.handleAt(view, seen(view, makeVec3(0.0f, 0.0f, 0.0f))) == GizmoHandle::CENTRE);
+}
+
+__test an_arrow_dragged_translates_the_node_along_its_axis {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.position = makeVec3(0.0f, 0.0f, 0.0f);
+
+    let dmut g = gizmoOn(alias a);
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+    let start = seen(view, makeVec3(0.6f * s, 0.0f, 0.0f));
+    assert (g:.grab(view, start) && g.isDragging && g.grabbed == GizmoHandle::X);
+
+    // the cursor moving along the axis moves the node along it, and off it along it only
+    g:.drag(view, seen(view, makeVec3(1.1f * s, 0.0f, 0.0f)), false);
+    assert (near(a.position, makeVec3(0.5f * s, 0.0f, 0.0f)));
+
+    g:.drag(view, seen(view, makeVec3(1.1f * s, 0.0f, 0.0f)) + makeVec2(0.0f, 30.0f), false);
+    assert (a.position.x > 0.0f && a.position.y == 0.0f && a.position.z == 0.0f);
+
+    // snapping rounds the translation to its step
+    g:.drag(view, seen(view, makeVec3(1.1f * s, 0.0f, 0.0f)), true);
+    assert (near(a.position.x, geometrySnap(0.5f * s, 0.5f)) && near(a.position.y, 0.0f));
+
+    assert (g:.release() && !g.isDragging);
+}
+
+/**
+ * @returns: a value rounded to the closest multiple of a step
+ * */
+fn geometrySnap(v: f32, step: f32)-> f32 {
+    math::round(v / step) * step
+}
+
+__test a_square_dragged_translates_the_node_in_its_plane {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.position = makeVec3(1.0f, 0.0f, 0.0f);
+
+    let dmut g = gizmoOn(alias a);
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+    let grabbed = makeVec3(1.0f + 0.37f * s, 0.37f * s, 0.0f);
+    assert (g:.grab(view, seen(view, grabbed)) && g.grabbed == GizmoHandle::XY);
+
+    g:.drag(view, seen(view, grabbed + makeVec3(0.5f, -0.25f, 0.0f)), false);
+    assert (near(a.position, makeVec3(1.5f, -0.25f, 0.0f)));
+}
+
+__test a_translation_follows_the_scales_of_the_node_and_of_its_parent {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+
+    // the position of a node is scaled by its parent, not by its own scale
+    let dmut parent = copy Item("parent", alias root);
+    parent.scale = makeVec3(2.0f, 2.0f, 2.0f);
+    let dmut a = copy Item("a", alias parent);
+    a.scale = makeVec3(1.0f, 0.5f, 1.0f);
+    a.position = makeVec3(0.0f, 0.0f, 0.0f);
+
+    let dmut g = gizmoOn(alias a);
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+    let grabbed = makeVec3(0.37f * s, 0.37f * s, 0.0f);
+    assert (g:.grab(view, seen(view, grabbed)));
+
+    g:.drag(view, seen(view, grabbed + makeVec3(1.0f, 1.0f, 0.0f)), false);
+    assert (near(a.position, makeVec3(0.5f, 0.5f, 0.0f)));
+
+    // the node moved by the translation in the world
+    let t = a.transformation;
+    assert (near(makeVec3(t.a4, t.b4, t.c4), makeVec3(1.0f, 1.0f, 0.0f)));
+}
+
+__test a_ring_dragged_rotates_the_node_about_its_axis {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.rotation = makeVec3(QUARTER, 0.0f, 0.0f);
+
+    let dmut g = gizmoOn(alias a);
+    g.mode = GizmoMode::ROTATE;
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+
+    // the ring about Z of the world, turned a quarter counterclockwise
+    assert (g:.grab(view, seen(view, makeVec3(0.7071f * s, 0.7071f * s, 0.0f))) && g.grabbed == GizmoHandle::Z);
+    g:.drag(view, seen(view, makeVec3(0.0f, s, 0.0f)), false);
+    g:.drag(view, seen(view, makeVec3(-0.7071f * s, 0.7071f * s, 0.0f)), false);
+    assert (sameRotation(a.rotation, rotationZ(QUARTER) * rotationX(QUARTER)));
+
+    // the snapping rounds the angle to 15°
+    g:.drag(view, seen(view, makeVec3(-0.743f * s, 0.669f * s, 0.0f)), true);
+    assert (sameRotation(a.rotation, rotationZ(QUARTER) * rotationX(QUARTER)));
+
+    // cancelled, the node turns back
+    g:.cancel();
+    assert (!g.isDragging && near(a.rotation, makeVec3(QUARTER, 0.0f, 0.0f)));
+}
+
+__test a_ring_dragged_in_local_space_rotates_the_node_about_its_own_axis {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.rotation = makeVec3(QUARTER, 0.0f, 0.0f);
+
+    // turned about X, the Y axis of the node points along Z of the world, at the eye
+    let dmut g = gizmoOn(alias a);
+    g.mode = GizmoMode::ROTATE;
+    g.space = GizmoSpace::LOCAL;
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+
+    assert (g:.grab(view, seen(view, makeVec3(0.7071f * s, 0.7071f * s, 0.0f))) && g.grabbed == GizmoHandle::Y);
+    g:.drag(view, seen(view, makeVec3(0.0f, s, 0.0f)), false);
+    g:.drag(view, seen(view, makeVec3(-0.7071f * s, 0.7071f * s, 0.0f)), false);
+    assert (sameRotation(a.rotation, rotationX(QUARTER) * rotationY(QUARTER)));
+}
+
+__test a_ring_dragged_turns_a_node_scaled_unevenly_without_shearing_it {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.scale = makeVec3(2.0f, 1.0f, 0.5f);
+
+    let dmut g = gizmoOn(alias a);
+    g.mode = GizmoMode::ROTATE;
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+
+    assert (g:.grab(view, seen(view, makeVec3(0.7071f * s, 0.7071f * s, 0.0f))) && g.grabbed == GizmoHandle::Z);
+    g:.drag(view, seen(view, makeVec3(0.0f, s, 0.0f)), false);
+    g:.drag(view, seen(view, makeVec3(-0.7071f * s, 0.7071f * s, 0.0f)), false);
+
+    // the node turned a quarter about Z of the world as a whole, each axis keeping its length
+    let t = a.transformation, r = rotationZ(QUARTER);
+    assert (near(a.scale, makeVec3(2.0f, 1.0f, 0.5f)));
+    assert (near((t * makeVec4(1.0f, 0.0f, 0.0f, 0.0f)).xyz, (r * makeVec4(2.0f, 0.0f, 0.0f, 0.0f)).xyz));
+    assert (near((t * makeVec4(0.0f, 1.0f, 0.0f, 0.0f)).xyz, (r * makeVec4(0.0f, 1.0f, 0.0f, 0.0f)).xyz));
+    assert (near((t * makeVec4(0.0f, 0.0f, 1.0f, 0.0f)).xyz, (r * makeVec4(0.0f, 0.0f, 0.5f, 0.0f)).xyz));
+}
+
+__test a_box_dragged_scales_the_node_about_its_origin {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.position = makeVec3(1.0f, 0.0f, 0.0f);
+
+    let dmut g = gizmoOn(alias a);
+    g.mode = GizmoMode::SCALE;
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+
+    // the box of X dragged one length of the axis further doubles the scale along X
+    assert (g:.grab(view, seen(view, makeVec3(1.0f + s, 0.0f, 0.0f))) && g.grabbed == GizmoHandle::X);
+    g:.drag(view, seen(view, makeVec3(1.0f + 2.0f * s, 0.0f, 0.0f)), false);
+    assert (near(a.scale, makeVec3(2.0f, 1.0f, 1.0f)));
+
+    // its origin stays where it was
+    assert (near(a.position, makeVec3(1.0f, 0.0f, 0.0f)));
+    let t = a.transformation;
+    assert (near(makeVec3(t.a4, t.b4, t.c4), makeVec3(1.0f, 0.0f, 0.0f)));
+    g:.release();
+
+    // the box in the centre dragged right by the size of the gizmo doubles every axis
+    let centre = seen(view, makeVec3(1.0f, 0.0f, 0.0f));
+    assert (g:.grab(view, centre) && g.grabbed == GizmoHandle::CENTRE);
+    g:.drag(view, centre + makeVec2(110.0f, 0.0f), false);
+    assert (near(a.scale, makeVec3(4.0f, 2.0f, 2.0f)));
+
+    // snapped, the factor is rounded to a tenth
+    g:.drag(view, centre + makeVec2(56.0f, 0.0f), true);
+    assert (near(a.scale, makeVec3(3.0f, 1.5f, 1.5f)));
+}
+
+__test every_node_moves_by_the_drag_and_the_end_of_a_change_is_signalled {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    let dmut b = copy Item("b", alias root);
+    a.position = makeVec3(-3.0f, 0.0f, 0.0f);
+    b.position = makeVec3(0.0f, 0.0f, 0.0f);
+
+    let dmut g = copy TransformGizmo("gizmo", alias root);
+    g:.setNodes(copy [alias a, alias b]);
+
+    let dmut box = copy SlotEmitter();
+    let dmut counter = copy Counter();
+    g:.transformed():.connect(alias box, &counter:.onTransformed);
+
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+    let start = seen(view, makeVec3(0.0f, 0.6f * s, 0.0f));
+
+    // a grab released without a move changes nothing
+    assert (g:.grab(view, start) && !g:.release());
+
+    assert (g:.grab(view, start));
+    g:.drag(view, seen(view, makeVec3(0.0f, 0.6f * s + 1.0f, 0.0f)), false);
+    assert (near(a.position, makeVec3(-3.0f, 1.0f, 0.0f)) && near(b.position, makeVec3(0.0f, 1.0f, 0.0f)));
+    assert (g:.release());
+
+    // the edits of the drag are kept, and revert the nodes
+    assert (g.edits.len == 2us && near(g.edits[0].before.position, makeVec3(-3.0f, 0.0f, 0.0f)));
+    assert (near(g.edits[1].after.position, makeVec3(0.0f, 1.0f, 0.0f)));
+
+    box:.emit();
+    assert (counter.count == 1us);
+}
+
+__test the_shapes_highlight_the_handle_under_the_cursor {
+    let dmut root = copy Root();
+    let cam = cameraOf(alias root);
+    let view = GizmoView(cam, 1280u32, 720u32);
+    let dmut a = copy Item("a", alias root);
+    a.position = makeVec3(0.0f, 0.0f, 0.0f);
+
+    let dmut g = gizmoOn(alias a);
+    let s = if let Ok(f) = g.frame(view) { f.size } else { 1.0f };
+    let yellow = makeVec4(1.0f, 0.82f, 0.18f, 1.0f);
+
+    for m in [GizmoMode::TRANSLATE, GizmoMode::ROTATE, GizmoMode::SCALE] {
+        g.mode = m;
+        let shapes = g.shapes(view);
+        assert (shapes.len != 0us && shapes.len <= 256us);
+
+        let mut lit = false;
+        for sh in shapes if sh.color == yellow { lit = true; }
+        assert (!lit);
+    }
+
+    g.mode = GizmoMode::TRANSLATE;
+    g:.hover(view, seen(view, makeVec3(0.6f * s, 0.0f, 0.0f)));
+    let mut lit = 0us;
+    for sh in g.shapes(view) if sh.color == yellow { lit += 1us; }
+
+    // the shaft and the head of the arrow
+    assert (lit == 2us);
+}
+
+__test the_gizmo_is_a_node_of_its_parent_until_it_is_disposed {
+    let dmut root = copy Root();
+    let dmut g = copy TransformGizmo("gizmo", alias root);
+    assert (root:.getChilds()["gizmo"].hasValue);
+
+    g:.dispose();
+    assert (!root:.getChilds()["gizmo"].hasValue);
+}
