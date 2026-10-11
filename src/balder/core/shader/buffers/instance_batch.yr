@@ -488,14 +488,28 @@ pub class InstanceBatch {
      * @assume: the previous submission of the frame was awaited
      * */
     pub fn flush(mut self, frame: u32) {
-        atomic self {
+        // the draws of a stale frame are grouped outside the lock, the objects being modified meanwhile for the next build
+        let stale = atomic self {
             if frame >= cast!u32(self._commandCopies.len) { return; }
             if self._frameCulled[frame] {
                 self:.readBack(frame);
             }
 
             if self._table.isStale(frame) && self._inPlace {
-                self:.build(frame);
+                self._table:.built(frame);
+                (self._table.collect(frame))?
+            } else {
+                none
+            }
+        };
+
+        let grouped = if let Ok(draws) = stale { (groupInstances(draws))? } else { none };
+
+        atomic self {
+            // disposed meanwhile
+            if frame >= cast!u32(self._commandCopies.len) { return; }
+            if let Ok((commands, words)) = grouped {
+                self:.writeBuilt(frame, commands, words);
             }
 
             if let Ok((start, end)) = self._dirtyCommands:.take(frame) {
@@ -529,8 +543,17 @@ pub class InstanceBatch {
      * @atomic
      * */
     fn build(mut self, frame: u32) {
-        let count = self._table.getCount(frame);
         let (commands, words) = self._table.build(frame);
+        self._table:.built(frame);
+        self:.writeBuilt(frame, commands, words);
+    }
+
+    /**
+     * Write the commands and the words built for a frame, the commands past them drawing nothing
+     * @atomic
+     * */
+    fn writeBuilt(mut self, frame: u32, commands: [VkDrawIndexedIndirectCommand], words: [u32]) {
+        let count = self._table.getCount(frame);
         for i in 0u32 .. count {
             let c = if cast!usize(i) < commands.len { commands[i] } else { VkDrawIndexedIndirectCommand() };
             self:.writeCommand(frame, i, c);
@@ -549,8 +572,6 @@ pub class InstanceBatch {
 
             self._drawn = (cast!u32(commands.len), cast!u32(words.len));
         }
-
-        self._table:.built(frame);
     }
 
     /**
