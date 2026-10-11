@@ -125,6 +125,8 @@ layout (binding = 1) uniform sampler2D normals;
 // The texels of the base colour (.rgb) and of the occlusion (.a) of the maps of the materials
 layout (binding = 2) uniform sampler2D albedo;
 layout (binding = 3) uniform sampler2D depth;
+
+// The material word of each texel: the index of its material, and OUTLINED when its object is outlined
 layout (binding = 4) uniform usampler2D materialID;
 
 // The texels of the metalness (.r) and of the roughness (.g) of the maps of the materials
@@ -273,6 +275,21 @@ layout (binding = 12) uniform Ambient {
     // The last level of the prefiltered environment, read for a roughness of 1
     float levels;
 } ambient;
+
+// The outline drawn around the pixels of the outlined objects, those of the objects selected in the scene
+layout (binding = 22) uniform Outline {
+    // The light of the outline, exposed and tone mapped with the scene
+    vec3 color;
+
+    // The width of the outline in pixels, 0 when no object is outlined
+    uint width;
+} outline;
+
+// The bit of the material word of a texel set when its object is outlined, the other bits holding its material
+const uint OUTLINED = 0x80000000u;
+
+// The widest outline drawn, in pixels
+const int MAX_OUTLINE_WIDTH = 6;
 
 
 /*!
@@ -672,6 +689,50 @@ float occlusionAt (ivec2 texel, ivec2 size, float z) {
 /*!
  * ====================================================================================================
  * ====================================================================================================
+ * ====================================          OUTLINE          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: true iif an outlined object is drawn at a texel, false off the image (the material word is cleared where
+ * nothing is drawn)
+ */
+bool outlinedAt (ivec2 texel, ivec2 size) {
+    if (any (lessThan (texel, ivec2 (0))) || any (greaterThanEqual (texel, size))) {
+        return false;
+    }
+
+    return (texelFetch (materialID, texel, 0).x & OUTLINED) != 0u;
+}
+
+/**
+ * @returns: true iif a texel is on the outline of the outlined objects: no outlined object is drawn there, but one is
+ * drawn in front of it closer to it than the width of the outline; an object in front of an outlined one cuts its
+ * outline instead of being outlined, a selected ground leaving the objects standing on it unmarked
+ */
+bool onOutline (ivec2 texel, ivec2 size) {
+    int w = min (int (outline.width), MAX_OUTLINE_WIDTH);
+    if (w == 0 || outlinedAt (texel, size)) {
+        return false;
+    }
+
+    float z = texelFetch (depth, texel, 0).x;
+    for (int dy = -w ; dy <= w ; dy++) {
+        for (int dx = -w ; dx <= w ; dx++) {
+            ivec2 n = texel + ivec2 (dx, dy);
+            if (dx * dx + dy * dy <= w * w && outlinedAt (n, size) && texelFetch (depth, n, 0).x < z) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
  * ======================================          MAIN          ======================================
  * ====================================================================================================
  * ====================================================================================================
@@ -683,6 +744,12 @@ void main () {
 
     if(texelCoord.x < size.x && texelCoord.y < size.y)
         {
+            // the outline covers what is drawn around the outlined objects, the background included
+            if (onOutline (texelCoord, size)) {
+                imageStore (outTex, texelCoord, vec4 (outline.color, 1.0));
+                return;
+            }
+
             // the g-buffer has the size of the output, its texels read as they were written, never filtered; the depth
             // was written with the camera of this frame, the one bound here
             vec2 ndc = (vec2 (texelCoord) + 0.5) / vec2 (size) * 2.0 - 1.0;
@@ -701,7 +768,7 @@ void main () {
 
             vec3 position = worldPosition (ndc, z);
 
-            uint matID = texelFetch (materialID, texelCoord, 0).x;
+            uint matID = texelFetch (materialID, texelCoord, 0).x & ~OUTLINED;
             Material mat = materials [matID];
 
             // the factors of the material times the texels of its maps

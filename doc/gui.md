@@ -407,24 +407,47 @@ fn onClearClicked (mut self, button: u8) {
   (`.dialog`, `.dialog-question`, `.dialog-accept`, `.dialog-cancel`, `.dialog-entries`, …), so that the rules of the
   application select them by these names only, and `Overlay { background-color: … }` sets the backdrop.
 
-### Picking in a Scene3D
+### Picking and selecting in a Scene3D
 
 ```
-if let Ok (dmut w : &Scene3DLayout) = self.gui:.find ("scene") {
-    w:.picked ():.connect (self.box, &self:.onPicked);     // fn onPicked (mut self, instance: (&VisualInstance3D)?)
-    w:.hovered ():.connect (self.box, &self:.onHovered);   // fn onHovered (mut self, instance: (&VisualInstance3D)?)
+Scene3D #scene { resolution: 1280 720;
+    ScenePicker #picker { selectable: true; }
 }
 ```
 
-- **A left click on a `Scene3D` emits `picked`** with the visual instance the camera sees first under the cursor, or
-  `none` when it sees none there. **`hovered`** is emitted when the instance under the cursor changes, `none` when the
-  cursor leaves the instances or the widget; the instance under the cursor is looked for at each move only once
+```
+if let Ok (dmut p : &ScenePicker) = self.gui:.find ("picker") {
+    p:.picked ():.connect (self.box, &self:.onPicked);     // fn onPicked (mut self, instance: (&VisualInstance3D)?)
+    p:.hovered ():.connect (self.box, &self:.onHovered);   // fn onHovered (mut self, instance: (&VisualInstance3D)?)
+}
+
+let dmut selection = alias scene.selection;
+selection:.changed ():.connect (self.box, &self:.onSelectionChanged);   // read scene.selection.nodes there
+```
+
+- **A `Scene3D` takes no input of its own**: its child, optional, is an overlay covering it and taking the mouse over
+  it. A `ScenePicker` is the overlay picking the instances under the cursor; a scene without one (a game, a preview)
+  picks nothing. Any widget can be the overlay, a `SceneOverlay` being bound to the scene it covers (`getScene`,
+  `renderPixel`, `pickUnder`).
+- **A left click on a `ScenePicker` emits `picked`** with the visual instance the camera sees first under the cursor,
+  or `none` when it sees none there. **`hovered`** is emitted when the instance under the cursor changes, `none` when
+  the cursor leaves the instances or the picker; the instance under the cursor is looked for at each move only once
   `hovered` was asked for. Both are connected by code: a payload that may be `none` has no type a slot of a `.gui` file
   can name yet.
+- **`selectable: true` makes a left click select**: the instance clicked alone, Ctrl (or Command) toggling it, and a
+  click on no instance clearing the selection (a Ctrl click on none leaving it). The selection is the `Selection` of
+  the scene, `scene.selection`, holding `Node3D`s in the order they were selected; the code selects through it too
+  (`select`, `add`, `toggle`, `remove`, `clear`). Its `changed` signal is emitted at each change, and a node removed
+  from the scene leaves it.
+- **The selected instances are outlined**, with the visual instances under the selected nodes (the meshes of a model):
+  the composition draws `scene.outlineColor` around their pixels, `scene.outlineWidth` pixels of the render resolution
+  wide (3 by default, up to 6, 0 for none). The outline is an edge detect on a bit of the material word of the
+  g-buffer, with no extra geometry pass; it is drawn where the selected surface is in front, so the objects in front
+  of a selected one cut its outline, and the objects standing on a selected ground are not outlined.
 - **The cursor is mapped to the resolution the scene renders at**: the image is drawn over the square of the larger side
-  of the widget, centred on it, so `renderPixel (pos)` gives the pixel of the image under the cursor, from its top left
-  corner, `none` off the image. `Scene.pick (pixel)` picks from a pixel, and `Scene.rayThroughPixel (pixel)` gives the
-  ray the camera sees through it, from its near plane to its far plane.
+  of the widget, centred on it, so `Scene3DLayout.renderPixel (cursor)` gives the pixel of the image under a position
+  of the window, from its top left corner, `none` off the image. `Scene.pick (pixel)` picks from a pixel, and
+  `Scene.rayThroughPixel (pixel)` gives the ray the camera sees through it, from its near plane to its far plane.
 - **The instances are told apart by their world boxes**: the ray goes down the hierarchy of the boxes the culling uses
   (`Bvh.raycast`, the closest box first), and the box it enters first gives the instance. A box enclosing the near
   plane under the cursor is entered at once, so an instance around the camera (a room seen from inside) is picked
@@ -817,6 +840,17 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 ### `Scene3D`
 
 - **Attributes:** `tab-index`: an integer; `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`
+- **Default attribute:** none
+- **Children:** its overlay, optional
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** none
+
+### `ScenePicker`
+
+- **Attributes:** `tab-index`: an integer; `selectable`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
