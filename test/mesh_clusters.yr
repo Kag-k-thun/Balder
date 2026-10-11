@@ -1,0 +1,148 @@
+in mesh_clusters;
+
+use balder::math::vector;
+use balder::scene::node::node3D::visual::{cluster, lod};
+
+use std::algorithm::sorting;
+
+/**
+ * A flat square of n by n quads in the plane y = 0, of side 1, its front faces facing +y
+ * @returns:
+ *    - .0: the positions
+ *    - .1: the indices
+ * */
+fn grid(n: u32)-> ([vec3], [u32]) {
+    let positions = copy [makeVec3(cast!f32(i % (n + 1u32)) / cast!f32(n), 0.0f, cast!f32(i / (n + 1u32)) / cast!f32(n))
+                          for i in 0u32 .. (n + 1u32) * (n + 1u32)];
+
+    let dmut indices = copy [0u32; 6u32 * n * n];
+    for y in 0u32 .. n {
+        for x in 0u32 .. n {
+            let a = y * (n + 1u32) + x, q = (y * n + x) * 6u32;
+            indices[q] = a;
+            indices[q + 1u32] = a + n + 1u32;
+            indices[q + 2u32] = a + 1u32;
+            indices[q + 3u32] = a + 1u32;
+            indices[q + 4u32] = a + n + 1u32;
+            indices[q + 5u32] = a + n + 2u32;
+        }
+    }
+
+    (positions, indices)
+}
+
+/**
+ * The six faces of a cube of side 2 around the origin, two triangles each
+ * @returns:
+ *    - .0: the positions
+ *    - .1: the indices
+ * */
+fn cube()-> ([vec3], [u32]) {
+    let positions = copy [makeVec3(if (i & 1u32) == 0u32 { -1.0f } else { 1.0f },
+                                   if (i & 2u32) == 0u32 { -1.0f } else { 1.0f },
+                                   if (i & 4u32) == 0u32 { -1.0f } else { 1.0f }) for i in 0u32 .. 8u32];
+
+    let indices = copy [0u32, 1u32, 3u32, 0u32, 3u32, 2u32,
+                        4u32, 6u32, 7u32, 4u32, 7u32, 5u32,
+                        0u32, 4u32, 5u32, 0u32, 5u32, 1u32,
+                        2u32, 3u32, 7u32, 2u32, 7u32, 6u32,
+                        0u32, 2u32, 6u32, 0u32, 6u32, 4u32,
+                        1u32, 5u32, 7u32, 1u32, 7u32, 3u32];
+
+    (positions, indices)
+}
+
+/**
+ * @returns: the triangles of a range of indices, sorted, to compare two orders of the same triangles
+ * */
+fn sortedTriangles(indices: [u32])-> [(u32, u32, u32)] {
+    let dmut triangles = copy [(indices[3us * t], indices[3us * t + 1us], indices[3us * t + 2us]) for t in 0us .. indices.len / 3us];
+    sort(alias triangles, |a, b| {
+        if a._0 != b._0 { return a._0 < b._0; }
+        if a._1 != b._1 { return a._1 < b._1; }
+        a._2 < b._2
+    });
+
+    triangles
+}
+
+__test a_level_is_cut_in_runs_of_cluster_triangles {
+    // 16 x 16 quads, 512 triangles, 8 clusters following each other
+    let (positions, indices) = grid(16u32);
+    let (chain, clusters) = buildClusters(positions, LodChain(indices));
+
+    assert (clusters.len == 8us);
+    assert (chain.levels[0].firstCluster == 0u32 && chain.levels[0].clusterCount == 8u32);
+    for k, c in clusters {
+        assert (c.firstIndex == cast!u32(k) * 192u32);
+        assert (c.indexCount == 192u32);
+    }
+}
+
+__test the_last_cluster_of_a_level_holds_the_triangles_left {
+    // 10 x 5 quads, 100 triangles
+    let (positions, indices) = grid(10u32);
+    let (_, clusters) = buildClusters(positions, LodChain(indices[0us .. 300us]));
+
+    assert (clusters.len == 2us);
+    assert (clusters[0].indexCount == 192u32 && clusters[1].indexCount == 108u32);
+}
+
+__test the_clusters_keep_the_triangles_of_their_level {
+    let (positions, indices) = grid(32u32);
+    let source = buildLodChain(positions, indices);
+    let (chain, clusters) = buildClusters(positions, source);
+
+    assert (chain.levels.len == source.levels.len);
+    for l, level in chain.levels {
+        let start = level.firstIndex, end = level.firstIndex + level.count;
+        assert (level.firstIndex == source.levels[l].firstIndex && level.count == source.levels[l].count);
+        assert (sortedTriangles(chain.indices[start .. end]) == sortedTriangles(source.indices[start .. end]));
+
+        // the clusters of the level cover its range, one after the other
+        let mut next = start;
+        for k in level.firstCluster .. level.firstCluster + level.clusterCount {
+            assert (clusters[k].firstIndex == next);
+            next += clusters[k].indexCount;
+        }
+
+        assert (next == end);
+    }
+}
+
+__test the_box_of_a_cluster_encloses_its_triangles {
+    let (positions, indices) = grid(16u32);
+    let (chain, clusters) = buildClusters(positions, LodChain(indices));
+
+    for c in clusters {
+        for i in c.firstIndex .. c.firstIndex + c.indexCount {
+            let p = positions[chain.indices[i]] - c.center;
+            assert (p.x >= -c.extent.x - 0.0001f && p.x <= c.extent.x + 0.0001f);
+            assert (p.y >= -c.extent.y - 0.0001f && p.y <= c.extent.y + 0.0001f);
+            assert (p.z >= -c.extent.z - 0.0001f && p.z <= c.extent.z + 0.0001f);
+        }
+    }
+
+    // the triangles of a cluster are close to each other: the boxes of the 8 clusters of the grid are an eighth of it
+    for c in clusters {
+        assert (c.extent.x * c.extent.z <= 0.25f * 0.25f * 2.0f);
+    }
+}
+
+__test a_flat_cluster_has_the_cone_of_its_normal {
+    let (positions, indices) = grid(4u32);
+    let (_, clusters) = buildClusters(positions, LodChain(indices));
+
+    assert (clusters.len == 1us);
+    assert ((clusters[0].coneAxis - makeVec3(0.0f, 1.0f, 0.0f)).length() < 0.0001f);
+    assert (clusters[0].coneCutoff < 0.0001f);
+}
+
+__test a_closed_cluster_culls_no_back_face {
+    // the normals of a cube go every way, an eye always sees some of its faces
+    let (positions, indices) = cube();
+    let (_, clusters) = buildClusters(positions, LodChain(indices));
+
+    assert (clusters.len == 1us);
+    assert (clusters[0].coneCutoff == NO_CONE);
+}
