@@ -1,0 +1,329 @@
+in file;
+
+pub mod ::mode;
+pub mod ::entry;
+pub mod ::model;
+pub mod ::utils;
+
+use balder::core::application::signal;
+use balder::interface::dialog::file::model;
+use balder::interface::widget::button;
+use balder::interface::widget::table::view;
+use balder::interface::widget::text::{input, label};
+
+use std::fs::{path, sys};
+
+use ::sdl3::mouse;
+
+/**
+ * A file dialog chooses a file to open, a file to save or a directory, browsing the directories in a table: a double
+ * click (or Enter) on a directory enters it, on a file chooses it, Up goes to the parent directory and the path typed
+ * above the table goes to that directory. It emits the absolute path chosen, or none when it is cancelled or dismissed
+ * @info:
+ * =====
+ * The name typed under the table is read from the directory shown, an absolute path or a relative one ('..' going up):
+ * a directory is entered, and otherwise the file must exist to be opened, its directory to be saved. The table lists
+ * the directories, then the files having one of the extensions of the filters, the hidden entries (their name starting
+ * with a dot) only when the check box asks for them. A dialog choosing a directory lists the directories only, and
+ * chooses the one shown when no name is typed.
+ * ====
+ * @example:
+ * ===
+ * let dmut d = copy FileDialog (FileDialogMode::OPEN, filters-> copy ["png", "jpg"]);
+ * d:.answered ():.connect (self.box, &self:.onImageChosen);   // fn onImageChosen (mut self, path: ([c8])?)
+ * d:.open (DialogMode::OVERLAY, alias self.gui)?;
+ * ===
+ * */
+pub class FileDialog over Dialog {
+
+    // What the dialog chooses
+    let _mode: FileDialogMode;
+
+    // The extensions of the files listed, every file when it is empty
+    let _filters: [[c8]];
+
+    // The absolute path of the directory shown
+    let mut _directory: [c8];
+
+    // True iif the hidden entries are listed
+    let mut _hidden: bool = false;
+
+    // The entries of the directory shown
+    let dmut _entries: &DirectoryModel = copy DirectoryModel();
+
+    // Emitted with the absolute path chosen, none when the dialog is cancelled, in the thread of the slots connected
+    let dmut _answered: &Signal!{([c8])?} = copy Signal!{([c8])?} ();
+
+    /**
+     * @params:
+     *    - mode: what the dialog chooses
+     *    - directory: the directory shown first, the working directory when it is empty or does not exist
+     *    - filters: the extensions of the files listed, without their dot ("png"), every file when it is empty
+     *    - title: the title of its window
+     * */
+    pub self (mode: FileDialogMode, directory: [c8] = "", filters: [[c8]] = [], title: [c8] = "")
+        with super("res:/dialog/file.gui", "res:/dialog/file.toml", title)
+        , _mode = mode
+        , _filters = filters
+        , _directory = FileDialog::startDirectory(directory)
+    {
+        // the slots the 'on-…' attributes of file.gui name
+        self:.slot("up", &self:.onUpClicked);
+        self:.slot("go", &self:.onPathValidated);
+        self:.slot("pick", &self:.onRowsSelected);
+        self:.slot("enter", &self:.onRowActivated);
+        self:.slot("hidden", &self:.onHiddenToggled);
+        self:.slot("accept", &self:.onAcceptClicked);
+        self:.slot("cancel", &self:.onCancelClicked);
+    }
+
+    /**
+     * @returns: the signal emitted with the absolute path chosen, none when the dialog is cancelled
+     * */
+    pub fn answered(mut self)-> dmut &Signal!{([c8])?} {
+        alias self._answered
+    }
+
+    /**
+     * @returns: the absolute path of the directory shown
+     * */
+    pub fn getDirectory(self)-> [c8] {
+        self._directory
+    }
+
+    pub over dismiss(mut self) {
+        self:.answer(none);
+    }
+
+    prot over onShow(mut self) {
+        if let Ok(dmut t: &TableView) = self:.find("ENTRIES") {
+            t:.setModel(alias self._entries);
+        }
+
+        if let Ok(dmut b: &Button) = self:.find("ACCEPT") {
+            b:.setText(match self._mode {
+                FileDialogMode::OPEN => { "Open" }
+                FileDialogMode::SAVE => { "Save" }
+                _                    => { "Choose" }
+            });
+        }
+
+        self:.enter(self._directory);
+        self:.focus(if self._mode == FileDialogMode::SAVE { "NAME" } else { "ENTRIES" });
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onUpClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.enter(utils::parentDirectory(self._directory));
+        }
+    }
+
+    /**
+     * Go to the directory typed above the table, the path of the directory shown being written again when there is none
+     * */
+    fn onPathValidated(mut self, text: [c8]) {
+        let target = utils::resolveName(self._directory, text);
+        if target == self._directory { return; }
+
+        if isDir(Path(target)) {
+            self:.enter(target);
+        } else {
+            self:.setText("PATH", self._directory);
+            self:.setError("No folder " ~ target);
+        }
+    }
+
+    /**
+     * Write the name of the entry selected alone under the table, a directory only when the dialog chooses one
+     * */
+    fn onRowsSelected(mut self, rows: [usize]) {
+        if rows.len != 1us { return; }
+
+        let e = self._entries.getEntry(rows[0]);
+        if !e.isDirectory || self._mode == FileDialogMode::DIRECTORY {
+            self:.setText("NAME", e.name);
+        }
+    }
+
+    /**
+     * Enter the directory of a row activated, or choose its file
+     * */
+    fn onRowActivated(mut self, row: usize) {
+        let e = self._entries.getEntry(row);
+        let target = utils::resolveName(self._directory, e.name);
+        if e.isDirectory {
+            self:.enter(target);
+        } else {
+            self:.setText("NAME", e.name);
+            self:.accept();
+        }
+    }
+
+    fn onHiddenToggled(mut self, checked: bool) {
+        self._hidden = checked;
+        self:.enter(self._directory);
+    }
+
+    fn onAcceptClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.accept();
+        }
+    }
+
+    fn onCancelClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.answer(none);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CHOOSING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Choose the name typed: enter it when it is a directory (unless the dialog chooses one), answer it when the mode
+     * accepts it, tell why otherwise
+     * */
+    fn accept(mut self) {
+        let name = self:.getText("NAME");
+        let target = utils::resolveName(self._directory, name);
+        let path = Path(target);
+
+        match self._mode {
+            FileDialogMode::DIRECTORY => {
+                if isDir(path) {
+                    self:.answer((target)?);
+                } else {
+                    self:.setError("No folder " ~ target);
+                }
+            }
+            FileDialogMode::OPEN => {
+                if name == "" {
+                    self:.setError("Choose a file");
+                } else if isDir(path) {
+                    self:.enter(target);
+                } else if isFile(path) {
+                    self:.answer((target)?);
+                } else {
+                    self:.setError("No file " ~ target);
+                }
+            }
+            _ => {
+                if name == "" {
+                    self:.setError("Type the name of the file");
+                } else if isDir(path) {
+                    self:.enter(target);
+                } else if isDir(path.parent()) {
+                    self:.answer((target)?);
+                } else {
+                    self:.setError("No folder " ~ path.parent().toStr());
+                }
+            }
+        }
+    }
+
+    /**
+     * Show a directory: list its entries, write its path above the table, clear the name typed (but the name of the
+     * file to save) and the error
+     * */
+    fn enter(mut self, directory: [c8]) {
+        self._directory = directory;
+        self._entries:.setEntries(utils::listDirectory(directory, self._filters, self._hidden,
+                                                       self._mode == FileDialogMode::DIRECTORY));
+
+        if let Ok(dmut t: &TableView) = self:.find("ENTRIES") {
+            t:.clearSelection();
+            if self._entries.len() != 0us {
+                t:.scrollToRow(0us);
+            }
+        }
+
+        self:.setText("PATH", directory);
+        if self._mode != FileDialogMode::SAVE {
+            self:.setText("NAME", "");
+        }
+
+        self:.setError("");
+    }
+
+    /**
+     * Close the dialog then emit its answer, a dialog closed already answering nothing
+     * */
+    fn answer(mut self, path: ([c8])?) {
+        if !self.isOpen { return; }
+
+        self:.close();
+        self._answered:.emit(path);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          WIDGETS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the text of an input of the dialog
+     * */
+    fn getText(mut self, path: [c8])-> [c8] {
+        if let Ok(dmut i: &InputText) = self:.find(path) {
+            return i.getText();
+        }
+
+        ""
+    }
+
+    /**
+     * Write the text of an input of the dialog
+     * */
+    fn setText(mut self, path: [c8], text: [c8]) {
+        if let Ok(dmut i: &InputText) = self:.find(path) {
+            i:.setText(text, moveCursor-> true);
+        }
+    }
+
+    /**
+     * Tell why the name typed was not chosen, "" to clear it
+     * */
+    fn setError(mut self, text: [c8]) {
+        if let Ok(dmut l: &Label) = self:.find("ERROR") {
+            l:.setText(text);
+        }
+    }
+}
+
+/**
+ * The statics of the file dialogs
+ * */
+pub mod FileDialog {
+
+    /**
+     * @returns: the absolute path of the directory a file dialog shows first: the one given when it exists, the working
+     * directory otherwise
+     * */
+    pub fn startDirectory(directory: [c8])-> [c8] {
+        {
+            if directory != "" && isDir(Path(directory)) {
+                return canonicalize(Path(directory)).toStr();
+            }
+
+            canonicalize(Path(".")).toStr()
+        } catch {
+            _ => { "/" }
+        }
+    }
+}
