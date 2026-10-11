@@ -36,9 +36,17 @@ pub record VisibilityScene {
     // The instances moved since their boxes were last refit
     let dmut _moved : [usize => &VisualInstance3D] = copy [];
 
-    // The instances seen by the camera, the other ones being culled, and their entries in the same order
+    // The instances seen by the camera, the other ones being culled, and their entries in the same order, the first
+    // _visibleLen of the buffers; the buffers the next culling fills, swapped with them, the buffers being kept from a
+    // culling to the next
     let dmut _visible : [&VisualInstance3D] = [];
     let dmut _visibleSeen : [&Seen] = [];
+    let mut _visibleLen : usize = 0us;
+    let dmut _nextVisible : [&VisualInstance3D] = [];
+    let dmut _nextSeen : [&Seen] = [];
+
+    // The ids of the instances the last culling by update saw, kept from a culling to the next
+    let dmut _ids : [usize] = [];
 
     prv { // View of the last culling
 
@@ -122,7 +130,7 @@ pub record VisibilityScene {
      * @returns: the instances seen by the camera at the last culling
      * */
     pub fn getVisible (mut self)-> dmut [&VisualInstance3D] {
-        alias self._visible
+        alias self._visible [0us .. self._visibleLen]
     }
 
     /*!
@@ -148,8 +156,8 @@ pub record VisibilityScene {
 
         if !node.culled {
             seen.stamp = self._stamp;
-            self._visible ~= [alias node];
-            self._visibleSeen ~= [alias seen];
+            self:.setVisible (self._visibleLen, alias seen);
+            self._visibleLen += 1us;
         }
 
         self._dirty = true;
@@ -191,6 +199,9 @@ pub record VisibilityScene {
         self._moved = copy [];
         self._visible = [];
         self._visibleSeen = [];
+        self._visibleLen = 0us;
+        self._nextVisible = [];
+        self._nextSeen = [];
         self._stats = CullStats ();
         self._dirty = true;
         self._changes += 1us;
@@ -266,19 +277,17 @@ pub record VisibilityScene {
      * */
     pub fn showAll (mut self)-> bool {
         let mut redraw = false;
-        let dmut visible : [&VisualInstance3D] = [];
-        let dmut visibleSeen : [&Seen] = [];
+        let mut n = 0us;
         for _, dmut s in alias self._nodes {
             s.stamp = self._stamp;
-            visible ~= [alias s.node];
-            visibleSeen ~= [alias s];
+            self:.setVisible (n, alias s);
+            n += 1us;
             if s.node.culled {
                 if s.node:.setCulled (false) { redraw = true; }
             }
         }
 
-        self._visible = alias visible;
-        self._visibleSeen = alias visibleSeen;
+        self._visibleLen = n;
         self._dirty = true;
         redraw
     }
@@ -297,7 +306,12 @@ pub record VisibilityScene {
             return false;
         }
 
-        let (ids, stats) = self:.cull (ViewVolume (viewProj, height), minPixels);
+        self:.refit ();
+        if self._ids.len < self._nodes.len {
+            self._ids = copy [0us; 2us * self._nodes.len];
+        }
+
+        let stats = self._index.cull (ViewVolume (viewProj, height), minPixels, alias self._ids);
         self._viewProj = viewProj;
         self._height = height;
         self._minPixels = minPixels;
@@ -309,47 +323,82 @@ pub record VisibilityScene {
         let previous = self._stamp;
         let stamp = previous + 1us;
         let mut redraw = false;
-        let dmut visible : [&VisualInstance3D] = [];
-        let dmut visibleSeen : [&Seen] = [];
-        for uid in ids {
-            if let Ok (dmut s) = alias self._nodes [uid] {
+        let mut n = 0us;
+        for i in 0us .. stats.visible {
+            if let Ok (dmut s) = alias self._nodes [self._ids [i]] {
                 if s.stamp != previous {
                     if s.node:.setCulled (false) { redraw = true; }
                 }
 
                 s.stamp = stamp;
-                visible ~= [alias s.node];
-                visibleSeen ~= [alias s];
+                self:.setNext (n, alias s);
+                n += 1us;
             }
         }
 
-        for dmut s in alias self._visibleSeen {
+        for i in 0us .. self._visibleLen {
+            let dmut s = alias self._visibleSeen [i];
             if s.stamp != stamp {
                 if s.node:.setCulled (true) { redraw = true; }
             }
         }
 
+        // the buffers of the instances seen swapped, those of the last culling filled by the next one
+        let dmut visible = alias self._visible;
+        let dmut visibleSeen = alias self._visibleSeen;
+        self._visible = alias self._nextVisible;
+        self._visibleSeen = alias self._nextSeen;
+        self._nextVisible = alias visible;
+        self._nextSeen = alias visibleSeen;
+        self._visibleLen = n;
+
         self._stamp = stamp;
-        self._visible = alias visible;
-        self._visibleSeen = alias visibleSeen;
         redraw
     }
 
     /**
-     * Remove an instance from the instances seen, when it is one of them
+     * Remove an instance from the instances seen, when it is one of them, the others keeping their order
      * */
     fn forgetVisible (mut self, uid : usize) {
-        let dmut visible : [&VisualInstance3D] = [];
-        let dmut visibleSeen : [&Seen] = [];
-        for i in 0us .. self._visibleSeen.len {
-            if self._visible [i].uid != uid {
-                visible ~= [alias self._visible [i]];
-                visibleSeen ~= [alias self._visibleSeen [i]];
+        let mut n = 0us;
+        for i in 0us .. self._visibleLen {
+            if self._visibleSeen [i].node.uid != uid {
+                if n != i {
+                    self._visible [n] = alias self._visible [i];
+                    self._visibleSeen [n] = alias self._visibleSeen [i];
+                }
+
+                n += 1us;
             }
         }
 
-        self._visible = alias visible;
-        self._visibleSeen = alias visibleSeen;
+        self._visibleLen = n;
+    }
+
+    /**
+     * Write an instance at a place of the instances seen, after the last one or over one of them
+     * */
+    fn setVisible (mut self, place : usize, dmut s : &Seen) {
+        if place < self._visibleSeen.len {
+            self._visible [place] = alias s.node;
+            self._visibleSeen [place] = alias s;
+        } else {
+            self._visible ~= [alias s.node];
+            self._visibleSeen ~= [alias s];
+        }
+    }
+
+    /**
+     * Write an instance at a place of the instances the culling being done sees, after the last one or over one of them
+     * */
+    fn setNext (mut self, place : usize, dmut s : &Seen) {
+        if place < self._nextSeen.len {
+            self._nextVisible [place] = alias s.node;
+            self._nextSeen [place] = alias s;
+        } else {
+            self._nextVisible ~= [alias s.node];
+            self._nextSeen ~= [alias s];
+        }
     }
 
 }
