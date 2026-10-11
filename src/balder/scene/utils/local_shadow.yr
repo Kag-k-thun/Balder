@@ -19,6 +19,8 @@ use balder::scene::utils::local_shadow::{atlas, stats, tile, utils, view, views}
 
 use std::algorithm::{comparison, sorting};
 
+use ::etc::c::memory;
+
 use ::vulkan::core;
 
 /**
@@ -175,8 +177,13 @@ pub record LocalShadowScene {
         let mut _relayout : bool = false;
 
         // The contents of the uniform buffers written last
-        let mut _writtenCameras : [u8] = [];
-        let mut _written : [u8] = [];
+        let dmut _writtenCameras : [u8] = [];
+        let dmut _written : [u8] = [];
+
+        // The contents of the buffers being built, compared with the ones written and swapped with them on a change,
+        // kept from an update to the next
+        let dmut _nextCameras : [u8] = [];
+        let dmut _next : [u8] = [];
 
         // The projections of the views when their casters were last culled
         let mut _culledViews : [mat4] = [];
@@ -313,7 +320,8 @@ pub record LocalShadowScene {
         self._relayout = false;
         self._sides = copy [];
         self._culledViews = [];
-        self:.write ([], []);
+        self:.clearNext ();
+        self:.write ();
     }
 
     /*!
@@ -513,7 +521,8 @@ pub record LocalShadowScene {
         }
 
         self._layout = placed;
-        self:.write (self.camerasContent (), self.content ());
+        self:.fillNext ();
+        self:.write ();
 
         let mut texels = 0u64;
         let mut lights = 0u32;
@@ -602,33 +611,43 @@ pub record LocalShadowScene {
     }
 
     /**
-     * @returns: the content of the buffer of the cameras, the camera of each view drawn: the shadow pipelines project the
-     * view of the camera, the view of the light being in the projection
+     * Empty the contents being built, sized for the buffers, the cameras of no view and no view and no shadow
      * */
-    fn camerasContent (self)-> [u8] {
-        let dmut content = copy [0u8; self.camerasSize ()];
-        for i, v in self._layout {
-            let block = i * CAMERA_STRIDE;
-            put (alias content, block + CAMERA_PROJ, v.view.viewProj);
-            put (alias content, block + CAMERA_VIEW, mat4 ());
-            put (alias content, block + CAMERA_VIEWPROJ, v.view.viewProj);
+    fn clearNext (mut self) {
+        let size = self.camerasSize ();
+        if self._nextCameras.len != size {
+            self._nextCameras = copy [0u8; size];
+        } else {
+            memset (cast!{*void} (self._nextCameras.ptr), 0, size);
         }
 
-        content
+        if self._next.len != LOCAL_SHADOW_SIZE {
+            self._next = copy [0u8; LOCAL_SHADOW_SIZE];
+        } else {
+            memset (cast!{*void} (self._next.ptr), 0, LOCAL_SHADOW_SIZE);
+        }
     }
 
     /**
-     * @returns: the content of the buffer the composition reads: the views drawn, and the views of each shadow
+     * Build the contents of the buffers from the views laid out: the camera of each view drawn, the shadow pipelines
+     * projecting the view of the camera, the view of the light being in the projection; and for the composition, the
+     * views drawn and the views of each shadow
      * */
-    fn content (self)-> [u8] {
-        let dmut content = copy [0u8; LOCAL_SHADOW_SIZE];
+    fn fillNext (mut self) {
+        self:.clearNext ();
+
         let atlas = cast!f32 (self._side);
         for i, v in self._layout {
-            let block = i * VIEW_STRIDE;
+            let block = i * CAMERA_STRIDE;
+            put (alias self._nextCameras, block + CAMERA_PROJ, v.view.viewProj);
+            put (alias self._nextCameras, block + CAMERA_VIEW, mat4 ());
+            put (alias self._nextCameras, block + CAMERA_VIEWPROJ, v.view.viewProj);
+
+            let view = i * VIEW_STRIDE;
             let t = v.tile;
-            put (alias content, block + VIEW_VIEWPROJ, v.view.viewProj);
-            put (alias content, block + VIEW_TILE, makeVec4 (cast!f32 (t.x) / atlas, cast!f32 (t.y) / atlas, cast!f32 (t.side) / atlas, cast!f32 (t.side) / atlas));
-            put (alias content, block + VIEW_INFO, makeVec4 (v.view.texel, 0.0f, 0.0f, 0.0f));
+            put (alias self._next, view + VIEW_VIEWPROJ, v.view.viewProj);
+            put (alias self._next, view + VIEW_TILE, makeVec4 (cast!f32 (t.x) / atlas, cast!f32 (t.y) / atlas, cast!f32 (t.side) / atlas, cast!f32 (t.side) / atlas));
+            put (alias self._next, view + VIEW_INFO, makeVec4 (v.view.texel, 0.0f, 0.0f, 0.0f));
 
             if v.face == 0u32 {
                 let shadow = SHADOWS_OFFSET + cast!usize (v.shadow) * SHADOW_STRIDE;
@@ -638,39 +657,36 @@ pub record LocalShadowScene {
                     count += 1u32;
                 }
 
-                put (alias content, shadow + SHADOW_FIRST, cast!u32 (i));
-                put (alias content, shadow + SHADOW_COUNT, count);
+                put (alias self._next, shadow + SHADOW_FIRST, cast!u32 (i));
+                put (alias self._next, shadow + SHADOW_COUNT, count);
                 if let Ok (l) = self._lights [v.shadow] {
-                    put (alias content, shadow + SHADOW_NORMAL_OFFSET, l.shadowNormalOffset);
-                    put (alias content, shadow + SHADOW_BIAS, l.shadowBias);
+                    put (alias self._next, shadow + SHADOW_NORMAL_OFFSET, l.shadowNormalOffset);
+                    put (alias self._next, shadow + SHADOW_BIAS, l.shadowBias);
                 }
             }
         }
-
-        content
     }
 
     /**
-     * Write the uniform buffers at once for the next submissions, when their content changed
-     * @params:
-     *    - cameras: the content of the buffer of the cameras, the cameras of no view when empty
-     *    - content: the content of the buffer the composition reads, no view and no shadow when empty
+     * Write the uniform buffers at once for the next submissions with the contents built, when they changed, the
+     * contents written swapped with them so the next build reuses their buffers
      * */
-    fn write (mut self, cameras : [u8], content : [u8]) {
-        let c = if cameras.len == 0us { copy [0u8; self.camerasSize ()] } else { cameras };
-        let u = if content.len == 0us { copy [0u8; LOCAL_SHADOW_SIZE] } else { content };
-
-        if c != self._writtenCameras {
+    fn write (mut self) {
+        if self._nextCameras != self._writtenCameras {
             if let Ok (dmut ubo) = alias self._cameras {
-                ubo:.setData (0us, c);
-                self._writtenCameras = c;
+                ubo:.setData (0us, self._nextCameras);
+                let dmut written = alias self._writtenCameras;
+                self._writtenCameras = alias self._nextCameras;
+                self._nextCameras = alias written;
             }
         }
 
-        if u != self._written {
+        if self._next != self._written {
             if let Ok (dmut ubo) = alias self._ubo {
-                ubo:.setData (0us, u);
-                self._written = u;
+                ubo:.setData (0us, self._next);
+                let dmut written = alias self._written;
+                self._written = alias self._next;
+                self._next = alias written;
             }
         }
     }

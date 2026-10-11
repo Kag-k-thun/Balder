@@ -95,51 +95,83 @@ pub class TextShape over Shape {
     {
         let ratio = pixelRatio;
 
-        let dmut vertices: [u32 => [f32]] = copy [];
-        let mut keys: [GlyphKey] = [];
+        let mut nbGlyphs = 0us;
+        for line in text.lines {
+            nbGlyphs += line.run.glyphs.len;
+        }
+
+        // the glyphs found in the atlas once each, the quads of each page counted to place them without growing a buffer
+        let dmut keys: [GlyphKey] = copy [GlyphKey(0us, 0u32, 0u32, 0u8); nbGlyphs];
+        let dmut entries: [GlyphEntry] = copy [GlyphEntry(); nbGlyphs];
+        let dmut perPage: [u32] = copy [0u32; self._atlas.getNbPages()];
+        let mut nbQuads = 0u32;
+        let mut n = 0us;
+        for line in text.lines {
+            let run = line.run;
+            for g in run.glyphs {
+                let (_, sub) = quantizePen(line.x + g.x);
+                let dmut face = chain:.getFace(g.face);
+                let entry = self._atlas:.getGlyph(alias face, run.pixelSize, g.glyph, sub);
+                keys[n] = GlyphKey(face.getUniqId(), run.pixelSize, g.glyph, sub);
+                entries[n] = entry;
+                n += 1us;
+
+                if !entry.isPacked() { continue; }
+                if cast!usize(entry.page) >= perPage.len {
+                    perPage = perPage ~ copy [0u32; cast!usize(entry.page) + 1us - perPage.len];
+                }
+
+                perPage[entry.page] += 1u32;
+                nbQuads += 1u32;
+            }
+        }
+
+        // the quads of a page side by side, the pages in order
+        let dmut cursors: [u32] = copy [0u32; perPage.len];
+        let mut batches: [PageBatch] = [];
+        let mut first = 0u32;
+        for page in 0u32 .. cast!u32(perPage.len) {
+            if perPage[page] == 0u32 { continue; }
+
+            cursors[page] = first;
+            batches ~= [PageBatch(page, 6u32 * first, 6u32 * perPage[page])];
+            self._context:.selectPage(page);
+            first += perPage[page];
+        }
+
+        let dmut points: [f32] = copy [0.0f; 16us * cast!usize(nbQuads)];
+        let dmut indices: [u32] = copy [0u32; 6us * cast!usize(nbQuads)];
+        n = 0us;
         for line in text.lines {
             let run = line.run;
             let baseline = round(line.y + run.metrics.ascender);
             for g in run.glyphs {
-                let (whole, sub) = quantizePen(line.x + g.x);
-                let dmut face = chain:.getFace(g.face);
-                let entry = self._atlas:.getGlyph(alias face, run.pixelSize, g.glyph, sub);
-                keys ~= [GlyphKey(face.getUniqId(), run.pixelSize, g.glyph, sub)];
+                let entry = entries[n];
+                n += 1us;
                 if !entry.isPacked() { continue; }
 
+                let (whole, _) = quantizePen(line.x + g.x);
                 let x0 = (whole + cast!f32(entry.left)) / ratio;
                 let y0 = (baseline - round(g.y) - cast!f32(entry.top)) / ratio;
                 let x1 = x0 + cast!f32(entry.width) / ratio;
                 let y1 = y0 + cast!f32(entry.height) / ratio;
 
-                let dmut quad = copy [x0, y0, entry.u0, entry.v0,
-                            x0, y1, entry.u0, entry.v1,
-                            x1, y1, entry.u1, entry.v1,
-                            x1, y0, entry.u1, entry.v0];
+                let q = cursors[entry.page];
+                cursors[entry.page] = q + 1u32;
 
-                if let Ok(v) = vertices[entry.page] {
-                    vertices[entry.page] = v ~ quad;
-                } else {
-                    vertices[entry.page] = alias quad;
-                }
-            }
-        }
-
-        let mut points: [f32] = [];
-        let mut indices: [u32] = [];
-        let mut batches: [PageBatch] = [];
-        for page in 0u32 .. self._atlas.getNbPages() {
-            if let Ok(v) = vertices[page] {
-                let first = cast!u32(indices.len);
-                for q in 0u32 .. cast!u32(v.len / 16us) {
-                    let base = cast!u32(points.len / 4us) + q * 4u32;
-                    indices ~= [base + 1u32, base, base + 2u32,
-                                base + 2u32, base, base + 3u32];
+                let p = 16us * cast!usize(q);
+                for k, v in [x0, y0, entry.u0, entry.v0,
+                             x0, y1, entry.u0, entry.v1,
+                             x1, y1, entry.u1, entry.v1,
+                             x1, y0, entry.u1, entry.v0] {
+                    points[p + k] = v;
                 }
 
-                points ~= v;
-                batches ~= [PageBatch(page, first, cast!u32(indices.len) - first)];
-                self._context:.selectPage(page);
+                let base = 4u32 * q;
+                let i = 6us * cast!usize(q);
+                for k, v in [base + 1u32, base, base + 2u32, base + 2u32, base, base + 3u32] {
+                    indices[i + k] = v;
+                }
             }
         }
 
@@ -218,19 +250,27 @@ pub class TextShape over Shape {
     }
 
     /**
-     * @returns: the draws of the quads of each page, with the descriptor set of the page
+     * @returns: the number of pages holding glyphs of the text, a draw each, none before the text is placed
      * */
-    pub over getDraws(self)-> [ShapeDraw] {
+    pub over drawCount(self)-> usize {
+        if self._geometry.hasValue { self._batches.len } else { 0us }
+    }
+
+    /**
+     * @returns: the draw of the quads of a page, with the descriptor set of the page
+     * */
+    pub over drawAt(self, index: usize)-> ShapeDraw {
         if let Ok(g) = self._geometry {
-            return copy [self.makeDraw(ShapeKind::TEXT,
-                                       cast!usize(b.page),
-                                       b.nbIndices,
-                                       firstIndex-> g.firstIndex + b.firstIndex,
-                                       vertexOffset-> cast!i32(g.vertexOffset))
-                         for b in self._batches];
+            let b = self._batches[index];
+            return self.makeDraw(ShapeKind::TEXT,
+                                 cast!usize(b.page),
+                                 b.nbIndices,
+                                 firstIndex-> g.firstIndex + b.firstIndex,
+                                 vertexOffset-> cast!i32(g.vertexOffset));
         }
 
-        []
+        // no draw before the text is placed (see drawCount)
+        self.makeDraw(ShapeKind::TEXT, 0us, 0u32)
     }
 
     /*!

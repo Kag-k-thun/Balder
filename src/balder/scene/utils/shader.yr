@@ -10,7 +10,7 @@ use balder::math::{bounds, matrix, vector};
 use balder::scene::node::node3D::camera;
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
-use balder::scene::utils::{batch, cull, draw_stats, material, pyramid, shadow_map, visibility};
+use balder::scene::utils::{batch, cull, draw_stats, frame_motion, material, pyramid, shadow_map, visibility};
 use balder::scene::utils::light;
 use balder::scene::utils::light::{direction, point, spot};
 
@@ -64,6 +64,9 @@ pub record ShaderNodeScene {
     // The array containing the list of materials used by the drawable nodes
     let dmut _materials : &MaterialArray = copy MaterialArray ();
 
+    // The motion trackers of the shaders and the camera, advanced at the submission of each frame
+    let dmut _motion : &FrameMotion = copy FrameMotion ();
+
     prv { // Camera
 
         let mut _cam : (&UniformBufferObject)? = none;
@@ -84,6 +87,26 @@ pub record ShaderNodeScene {
 
         // The depth pyramid of the deferred, loaded with the cull pass
         let dmut _pyramid : (&DepthPyramid)? = none;
+
+    }
+
+    prv { // Levels of detail
+
+        // The eye, the projection, the height of the view and the threshold the levels were last selected with, and the
+        // cullings and the changes of the instances they were selected after; false before the first selection
+        let mut _lodEye : vec3 = vec3 ();
+        let mut _lodProj : mat4 = mat4 ();
+        let mut _lodHeight : f32 = 0.0f;
+        let mut _lodThreshold : f32 = 0.0f;
+        let mut _lodUpdates : usize = 0us;
+        let mut _lodChanges : usize = 0us;
+        let mut _lodSelected : bool = false;
+
+        // The instances seen whose cross-fade was in progress at the last selection
+        let dmut _fading : [&VisualInstance3D] = [];
+
+        // The instances whose level is selected again at the next selection, whatever the camera
+        let dmut _lodRequests : [usize => &VisualInstance3D] = copy [];
 
     }
 
@@ -188,17 +211,9 @@ pub record ShaderNodeScene {
 
             self._cam = (ubo)?;
         }
-    }    
 
-    /**
-     * Write the worlds the last frame drew in the slots of the instances moving, for the frame being submitted, the
-     * g-buffer writing their motion (see MotionTracker)
-     * */
-    pub fn advanceFrame (mut self) {
-        for _, dmut g in alias self._groups {
-            g:.advanceFrame ();
-        }
-    }
+        self._motion:.setCamera (alias cam);
+    }    
     
     /*!
      * ====================================================================================================
@@ -262,6 +277,14 @@ pub record ShaderNodeScene {
     pub fn materials (mut self)-> dmut &MaterialArray {
         alias self._materials
     }    
+
+    /**
+     * @returns: the motion trackers of the shaders and the camera, advanced at the submission of each frame without the
+     * lock of the scene, the g-buffer writing the motion of the instances and of the camera
+     * */
+    pub fn getMotion (mut self)-> dmut &FrameMotion {
+        alias self._motion
+    }
 
     /**
      * @returns: the array containing spot light information in the composition pass
@@ -363,6 +386,7 @@ pub record ShaderNodeScene {
 
                     self:.castAllShadows (alias g);
                     self._groups [shCfg.name] = alias g;
+                    self._motion:.track (shCfg.name, alias g:.getMotion ());
                 }
             }
         }
@@ -390,6 +414,7 @@ pub record ShaderNodeScene {
             if let Ok (dmut g) = alias self._groups [name] {
                 g:.release (alias win, material, node);
                 if g.isEmpty () {
+                    self._motion:.forget (name);
                     g:.retire (alias win);
                     self._groups:.remove (name);
                 }
@@ -700,12 +725,56 @@ pub record ShaderNodeScene {
      * @returns: true iif the draws of a node changed and the commands have to be recorded again to draw them
      * */
     pub fn selectLods (mut self, camera : &Camera, height : f32, threshold : f32, delta : Duration)-> bool {
+        let still = self._lodSelected
+            && camera.position == self._lodEye
+            && camera.proj == self._lodProj
+            && height == self._lodHeight
+            && threshold == self._lodThreshold
+            && self._visibility.updates == self._lodUpdates
+            && self._visibility.changes == self._lodChanges;
+
         let mut changed = false;
-        for _, dmut v in alias self._visibility:.getVisible () {
-            if v:.selectLod (camera, height, threshold, delta) { changed = true; }
+        let dmut fading : [&VisualInstance3D] = [];
+        if still {
+            // nothing the levels depend on changed: the cross-fades in progress advance, the instances asking are selected
+            for dmut v in alias self._fading {
+                if v:.selectLod (camera, height, threshold, delta) { changed = true; }
+                if v.isFading () { fading ~= [alias v]; }
+            }
+
+            for _, dmut v in alias self._lodRequests if !v.culled && !v.isFading () {
+                if v:.selectLod (camera, height, threshold, delta) { changed = true; }
+                if v.isFading () { fading ~= [alias v]; }
+            }
+        } else {
+            for dmut v in alias self._visibility:.getVisible () {
+                if v:.selectLod (camera, height, threshold, delta) { changed = true; }
+                if v.isFading () { fading ~= [alias v]; }
+            }
+
+            self._lodEye = camera.position;
+            self._lodProj = camera.proj;
+            self._lodHeight = height;
+            self._lodThreshold = threshold;
+            self._lodUpdates = self._visibility.updates;
+            self._lodChanges = self._visibility.changes;
+            self._lodSelected = true;
+        }
+
+        self._fading = alias fading;
+        if self._lodRequests.len != 0us {
+            self._lodRequests = copy [];
         }
 
         changed
+    }
+
+    /**
+     * Select the level of detail of an instance again at the next selection, whatever the camera (its forced level
+     * changed...)
+     * */
+    pub fn requestLod (mut self, dmut node : &VisualInstance3D) {
+        self._lodRequests [node.uid] = alias node;
     }
 
     /*!
@@ -910,6 +979,10 @@ pub record ShaderNodeScene {
             }
 
             self._groups = copy [];
+            self._fading = [];
+            self._lodRequests = copy [];
+            self._lodSelected = false;
+            self._motion:.clear ();
             self._shadowMaps = copy [];
             self._cull = none;
             self._pyramid = none;

@@ -1,0 +1,171 @@
+in instance_table;
+
+use balder::core::shader::buffers::instance_draw;
+use balder::core::shader::buffers::instance_batch::{grouping, table};
+
+use ::vulkan::core;
+
+/**
+ * @returns: a draw of 'count' indices from 'first', for the object word 'word'
+ * */
+fn draw(first: u32, count: u32, word: u32)-> InstanceDraw {
+    let mut d = InstanceDraw();
+    d.indexCount = count;
+    d.firstIndex = first;
+    d.word = word;
+    d
+}
+
+/**
+ * @returns: the commands and the words of the draws a frame of a table laid out, grouped by a new grouping
+ * */
+fn build(dmut t: &InstanceTable, frame: u32)-> ([VkDrawIndexedIndirectCommand], [u32]) {
+    let dmut grouping = copy DrawGrouping();
+    grouping:.group(t:.collect(frame))
+}
+
+/**
+ * @returns: a table of two frames laying out in frame 0 the objects 1, 2 and 3, drawing the words 4, 8 and 12 with the
+ * same range of indices, at the distances 3, 1 and 2
+ * */
+fn threeObjects()-> dmut &InstanceTable {
+    let dmut t = copy InstanceTable(2u32);
+    t:.begin(0u32);
+    t:.add(0u32, 1us, copy [draw(0u32, 36u32, 4u32)]);
+    t:.add(0u32, 2us, copy [draw(0u32, 36u32, 8u32)]);
+    t:.add(0u32, 3us, copy [draw(0u32, 36u32, 12u32)]);
+    t:.setDistance(1us, 3.0f);
+    t:.setDistance(2us, 1.0f);
+    t:.setDistance(3us, 2.0f);
+    t:.built(0u32);
+
+    alias t
+}
+
+__test a_frame_builds_the_objects_it_laid_out {
+    let dmut t = threeObjects();
+    let (commands, words) = build(alias t, 0u32);
+
+    assert (t.getCount(0u32) == 3u32);
+    assert (commands.len == 1us && commands[0].instanceCount == 3u32);
+    assert (words == [8u32, 12u32, 4u32]);
+
+    // the other frame laid out nothing
+    let (others, _) = build(alias t, 1u32);
+    assert (t.getCount(1u32) == 0u32 && others.len == 0us);
+}
+
+__test the_draws_drawing_nothing_are_left_out {
+    // a culled object lays out two empty draws, the second draw of an object out of a cross-fade is empty
+    let dmut t = threeObjects();
+    t:.update(2us, copy [InstanceDraw()]);
+    t:.update(3us, copy [draw(0u32, 36u32, 12u32), InstanceDraw()]);
+
+    let (commands, words) = build(alias t, 0u32);
+    assert (commands.len == 1us && commands[0].instanceCount == 2u32);
+    assert (words == [12u32, 4u32]);
+}
+
+__test a_frame_builds_as_many_draws_as_laid_out {
+    // a second draw appearing after the layout is not built: the recording of the frame laid out one command
+    let dmut t = threeObjects();
+    t:.update(1us, copy [draw(0u32, 36u32, 4u32), draw(36u32, 12u32, 16u32)]);
+
+    let (commands, _) = build(alias t, 0u32);
+    assert (commands.len == 1us && commands[0].instanceCount == 3u32);
+}
+
+__test a_change_stales_the_frames_laying_the_object_out {
+    let dmut t = threeObjects();
+    assert (!t.isStale(0u32));
+
+    t:.update(2us, copy [draw(0u32, 36u32, 8u32)]);
+    assert (t.isStale(0u32) && !t.isStale(1u32));
+
+    t:.built(0u32);
+    assert (!t.isStale(0u32));
+}
+
+__test the_same_distance_stales_nothing {
+    let dmut t = threeObjects();
+    assert (!t:.setDistance(2us, 1.0f));
+    assert (!t.isStale(0u32));
+
+    assert (t:.setDistance(2us, 5.0f));
+    assert (t.isStale(0u32));
+
+    let (_, words) = build(alias t, 0u32);
+    assert (words == [12u32, 4u32, 8u32]);
+}
+
+__test an_unknown_object_changes_nothing {
+    let dmut t = threeObjects();
+    assert (!t:.update(9us, copy [draw(0u32, 36u32, 40u32)]));
+    assert (!t:.setDistance(9us, 1.0f));
+    t:.remove(9us);
+
+    assert (t.len == 3us && !t.isStale(0u32));
+}
+
+__test a_removed_object_is_replaced_by_the_last_one {
+    let dmut t = threeObjects();
+    t:.remove(1us);
+
+    assert (t.len == 2us && !t.contains(1us) && t.contains(3us));
+    assert (t.isStale(0u32));
+
+    // the object moved to the place keeps its draws, its distance and its layout
+    let (commands, words) = build(alias t, 0u32);
+    assert (commands.len == 1us && commands[0].instanceCount == 2u32);
+    assert (words == [8u32, 12u32]);
+
+    // the count laid out is kept until the next layout
+    assert (t.getCount(0u32) == 3u32);
+
+    assert (t:.setDistance(3us, 0.5f));
+    let (_, closer) = build(alias t, 0u32);
+    assert (closer == [12u32, 8u32]);
+}
+
+__test removing_the_last_object_empties_the_table {
+    let dmut t = threeObjects();
+    t:.remove(3us);
+    t:.remove(2us);
+    t:.remove(1us);
+
+    let (commands, words) = build(alias t, 0u32);
+    assert (t.len == 0us && commands.len == 0us && words.len == 0us);
+}
+
+__test an_object_added_after_a_layout_waits_for_the_next_one {
+    let dmut t = threeObjects();
+
+    // laid out by frame 1 only
+    t:.begin(1u32);
+    t:.add(1u32, 4us, copy [draw(0u32, 36u32, 16u32)]);
+
+    let (_, words0) = build(alias t, 0u32);
+    let (_, words1) = build(alias t, 1u32);
+    assert (words0 == [8u32, 12u32, 4u32]);
+    assert (words1 == [16u32]);
+
+    // a change of the object stales frame 1 only
+    t:.built(0u32);
+    t:.built(1u32);
+    t:.update(4us, copy [draw(0u32, 36u32, 20u32)]);
+    assert (!t.isStale(0u32) && t.isStale(1u32));
+}
+
+__test a_new_layout_drops_the_objects_not_laid_out_again {
+    let dmut t = threeObjects();
+    t:.begin(0u32);
+    t:.add(0u32, 2us, copy [draw(0u32, 36u32, 8u32)]);
+
+    let (_, words) = build(alias t, 0u32);
+    assert (t.getCount(0u32) == 1u32 && words == [8u32]);
+
+    // the objects not laid out stay in the table, a change of them stales no frame
+    t:.built(0u32);
+    t:.update(1us, copy [draw(0u32, 36u32, 4u32)]);
+    assert (t.len == 3us && !t.isStale(0u32));
+}

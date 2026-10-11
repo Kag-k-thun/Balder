@@ -23,12 +23,14 @@ pub class SegmentList {
     // The size of the range
     let mut _size: usize;
 
-    // The free segments, sorted and never adjacent
-    let dmut _segments: [FreeSegment];
+    // The free segments, sorted and never adjacent, the first _len of the buffer, kept as it grows so a reservation or a
+    // free allocates nothing
+    let dmut _buffer: [FreeSegment];
+    let mut _len: usize = 1us;
 
     pub self (size: usize)
         with _size = size
-        , _segments = copy [FreeSegment(0, size)]
+        , _buffer = copy [FreeSegment(0, size); 4us]
     {}
 
     /*!
@@ -50,23 +52,23 @@ pub class SegmentList {
      * @returns: true if the range is completely free
      */
     pub fn isEmpty(self)-> bool {
-        if (self._segments.len != 1) return false;
-        return (self._segments[0].start == 0 && self._segments[0].end == self._size);
+        if (self._len != 1) return false;
+        return (self._buffer[0].start == 0 && self._buffer[0].end == self._size);
     }
 
     /**
      * @returns: the free segments of the range
      * */
     pub fn getFreeSegments(self)-> [FreeSegment] {
-        self._segments
+        self._buffer[0us .. self._len]
     }
 
     /**
      * @returns: the end of the last reservation, 0 when nothing is reserved
      * */
     pub fn getReservedEnd(self)-> usize {
-        if self._segments.len != 0 && self._segments[$ - 1].end == self._size {
-            return self._segments[$ - 1].start;
+        if self._len != 0 && self._buffer[self._len - 1us].end == self._size {
+            return self._buffer[self._len - 1us].start;
         }
 
         self._size
@@ -89,7 +91,7 @@ pub class SegmentList {
      * */
     pub fn findFreeSegment(self, size: usize, align: usize)-> (bool, usize, usize) {
         let mut best = (false, 0us, i64::max, 0us);
-        for i, seg in self._segments {
+        for i, seg in self._buffer[0us .. self._len] {
             let segAlign = if seg.start % align != 0 {
                 align - (seg.start % align)
             } else { 0 };
@@ -122,30 +124,29 @@ pub class SegmentList {
      * @assume: the segment is free
      */
     pub fn reserve(mut self, index: usize, offset: usize, size: usize) {
-        let seg = self._segments[index];
+        let seg = self._buffer[index];
 
         // full reservation
         if seg.start == offset && seg.end == offset + size {
-            self._segments = self._segments[0 .. index] ~ self._segments[index + 1 .. $];
+            self:.removeAt(index);
             return;
         }
 
         // left reservation
         if seg.start == offset {
-            self._segments[index].start += size;
+            self._buffer[index].start += size;
             return;
         }
 
         // Right reservation
         if seg.end == offset + size {
-            self._segments[index].end -= size;
+            self._buffer[index].end -= size;
             return;
         }
 
         // Middle reservation
-        self._segments[index].end = offset;
-        let onRight = FreeSegment(offset + size, seg.end);
-        self._segments = self._segments[0 .. index + 1] ~ [onRight] ~ self._segments[index + 1 .. $];
+        self._buffer[index].end = offset;
+        self:.insertAt(index + 1us, FreeSegment(offset + size, seg.end));
     }
 
     /**
@@ -189,14 +190,14 @@ pub class SegmentList {
      * @assume the segment was reserved
      */
     pub fn free(mut self, offset: usize, size: usize) {
-        if self._segments.len == 0 {
-            self._segments = copy [FreeSegment(offset, offset + size)];
+        if self._len == 0 {
+            self:.insertAt(0us, FreeSegment(offset, offset + size));
             return;
         }
 
         let mut index = 0us;
         // searching where to insert the free segment
-        for seg in self._segments {
+        for seg in self._buffer[0us .. self._len] {
             if seg.start <= offset && seg.end >= offset + size {
                 log::warn #("SegmentList", "segment already free : ", offset, size);
                 return;
@@ -208,21 +209,21 @@ pub class SegmentList {
 
         // Free at the beginning
         if index == 0 {
-            if self._segments[0].start == offset + size { // collide first free
-                self._segments[0].start = offset;
+            if self._buffer[0].start == offset + size { // collide first free
+                self._buffer[0].start = offset;
             } else {
-                self._segments = [FreeSegment(offset, offset + size)] ~ self._segments;
+                self:.insertAt(0us, FreeSegment(offset, offset + size));
             }
 
             return;
         }
 
         // Free at the end
-        if index == self._segments.len {
-            if self._segments[$ - 1].end == offset { // collide last free
-                self._segments[$ - 1].end += size;
+        if index == self._len {
+            if self._buffer[self._len - 1us].end == offset { // collide last free
+                self._buffer[self._len - 1us].end += size;
             } else {
-                self._segments ~= [FreeSegment(offset, offset + size)];
+                self:.insertAt(self._len, FreeSegment(offset, offset + size));
             }
 
             return;
@@ -230,27 +231,69 @@ pub class SegmentList {
 
         // Middle insertion
         // 1. collide with left and right
-        if self._segments[index - 1].end == offset && self._segments[index].start == offset + size {
-            self._segments[index - 1].end = self._segments[index].end;
-            self._segments = self._segments[0 .. index] ~ self._segments[index + 1 .. $];
+        if self._buffer[index - 1].end == offset && self._buffer[index].start == offset + size {
+            self._buffer[index - 1].end = self._buffer[index].end;
+            self:.removeAt(index);
 
             return;
         }
 
         // 2. Collide with left
-        if self._segments[index - 1].end == offset {
-            self._segments[index - 1].end += size;
+        if self._buffer[index - 1].end == offset {
+            self._buffer[index - 1].end += size;
             return;
         }
 
         // 3. Collide with right
-        if self._segments[index].start == offset + size {
-            self._segments[index].start = offset;
+        if self._buffer[index].start == offset + size {
+            self._buffer[index].start = offset;
             return;
         }
 
         // 4. new fragment
-        self._segments = self._segments[0 .. index] ~ [FreeSegment(offset, offset + size)] ~ self._segments[index .. $];
+        self:.insertAt(index, FreeSegment(offset, offset + size));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Insert a free segment at a place, the segments after it moved one place right, the buffer doubled when full
+     * */
+    fn insertAt(mut self, index: usize, seg: FreeSegment) {
+        if self._len == self._buffer.len {
+            let dmut larger = copy [FreeSegment(0us, 0us); 2us * self._buffer.len + 4us];
+            for i in 0us .. self._len {
+                larger[i] = self._buffer[i];
+            }
+
+            self._buffer = alias larger;
+        }
+
+        let mut i = self._len;
+        while i > index {
+            self._buffer[i] = self._buffer[i - 1us];
+            i -= 1us;
+        }
+
+        self._buffer[index] = seg;
+        self._len += 1us;
+    }
+
+    /**
+     * Remove the free segment at a place, the segments after it moved one place left
+     * */
+    fn removeAt(mut self, index: usize) {
+        for i in index .. self._len - 1us {
+            self._buffer[i] = self._buffer[i + 1us];
+        }
+
+        self._len -= 1us;
     }
 
     impl Streamable;

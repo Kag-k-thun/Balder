@@ -10,6 +10,8 @@ use balder::scene::node::node3D::visual::{material, mesh};
 use balder::scene::utils::{casters, draw_stats, motion, shadow_map};
 use balder::utils::log;
 
+use std::algorithm::comparison;
+
 use ::vulkan::core;
 
 /**
@@ -57,6 +59,11 @@ pub def OBJECT_BOX_EXTENT = 96us;
  * object between the two (see MotionTracker)
  * */
 pub def OBJECT_PREV_WORLD = 112us;
+
+/**
+ * The number of meshes placed in the pool of a shader under which the geometries given back are not swept
+ * */
+def MIN_SWEEP = 16us;
 
 /**
  * The geometry of a mesh placed in the pool of a shader, shared by the instances drawing it
@@ -297,8 +304,13 @@ pub class ShaderGroup {
     // The geometry of the instances
     let dmut _geometry: &GeometryPool;
 
-    // The geometry of the meshes placed in the pool, by uniq id of their mesh
+    // The geometry of the meshes placed in the pool, by uniq id of their mesh, those given back forgotten by the sweeps
+    // of place
     let dmut _meshes: [usize => &SharedGeometry] = copy [];
+
+    // The number of meshes from which place sweeps the geometries given back, twice the geometries alive at the last
+    // sweep, so the placements cost a constant time on average
+    let mut _sweepAt: usize = MIN_SWEEP;
 
     // The worlds, the cross-fades and the materials of the instances
     let dmut _objects: &ObjectStorage;
@@ -314,6 +326,11 @@ pub class ShaderGroup {
 
     // The instances casting shadows, and their draws in the views of the shadow maps
     let dmut _casters: &ShadowCasters;
+
+    // The instances of a batch seen and their distances to the eye, given to the batch by sort, kept from a sort to the
+    // next
+    let dmut _sortOwners: [usize] = [];
+    let dmut _sortDistances: [f32] = [];
 
     /*!
      * ====================================================================================================
@@ -431,18 +448,28 @@ pub class ShaderGroup {
             if g:.acquire() { return alias g; }
         }
 
-        // the geometries given back are forgotten
+        if self._meshes.len >= self._sweepAt {
+            self:.sweepMeshes();
+        }
+
+        let (vertices, indices) = mesh.compact(material);
+        let dmut g = copy SharedGeometry(alias self._geometry:.alloc(vertices, indices));
+        self._meshes[mesh.uid] = alias g;
+
+        alias g
+    }
+
+    /**
+     * Forget the geometries given back to the pool, the next sweep waiting for twice as many meshes as remain
+     * */
+    fn sweepMeshes(mut self) {
         let dmut alive: [usize => &SharedGeometry] = copy [];
         for uid, dmut g in alias self._meshes {
             if !g.isFreed() { alive[uid] = alias g; }
         }
 
-        let (vertices, indices) = mesh.compact(material);
-        let dmut g = copy SharedGeometry(alias self._geometry:.alloc(vertices, indices));
-        alive[mesh.uid] = alias g;
         self._meshes = alias alive;
-
-        alias g
+        self._sweepAt = max(MIN_SWEEP, 2us * alive.len);
     }
 
     /**
@@ -468,21 +495,32 @@ pub class ShaderGroup {
      * */
     pub fn sort(mut self, eye: vec3) {
         for _, dmut b in alias self._batches {
-            for uid, dmut n in alias b.nodes {
-                if n.culled { continue; }
-
-                let sphere = n:.boundingSphere();
-                b.draws:.setDistance(uid, (sphere.center - eye).length() - sphere.radius);
+            if self._sortOwners.len < b.nodes.len {
+                self._sortOwners = copy [0us; 2us * b.nodes.len];
+                self._sortDistances = copy [0.0f; 2us * b.nodes.len];
             }
+
+            let mut n = 0us;
+            for uid, dmut node in alias b.nodes {
+                if node.culled { continue; }
+
+                let sphere = node:.boundingSphere();
+                self._sortOwners[n] = uid;
+                self._sortDistances[n] = (sphere.center - eye).length() - sphere.radius;
+                n += 1us;
+            }
+
+            // the distances given under one lock of the batch, the rendering thread building it meanwhile
+            b.draws:.setDistances(self._sortOwners[0us .. n], self._sortDistances[0us .. n]);
         }
     }
 
     /**
-     * Write the worlds the last frame drew in the slots of the instances moving, for the frame being submitted (see
-     * MotionTracker::advanceFrame)
+     * @returns: the worlds of the frame before of the instances moving, advanced at the submission of each frame (see
+     * FrameMotion)
      * */
-    pub fn advanceFrame(mut self) {
-        self._motion:.advanceFrame();
+    pub fn getMotion(mut self)-> dmut &MotionTracker {
+        alias self._motion
     }
 
     /**
@@ -868,6 +906,7 @@ pub class ShaderGroup {
         self._casters:.stopAll(alias window);
         self._batches = copy [];
         self._meshes = copy [];
+        self._sweepAt = MIN_SWEEP;
         window:.retire(alias self._camera);
         window:.retire(alias self._geometry);
         window:.retire(alias self._objects);
