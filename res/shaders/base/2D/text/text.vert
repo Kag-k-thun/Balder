@@ -20,7 +20,19 @@ struct Object {
 
     // The rectangle the shape is cut to, its corners in CSS pixels
     vec4 scissors;
+
+    // The widths of the ring the shape is drawn as (top, bottom, left, right), in CSS pixels, the whole shape being
+    // drawn when they are all 0
+    vec4 edges;
+
+    // The rectangle the shape is drawn in, its corners in CSS pixels, and the radii of its corners clockwise from the
+    // top left one
+    vec4 box;
+    vec4 radii;
     int level;
+
+    // The standard deviation of the gaussian blurring the box, in CSS pixels, a sharp box when it is 0
+    float blur;
 };
 
 layout (std430, set = 0, binding = 0) readonly buffer Objects {
@@ -39,12 +51,11 @@ out gl_PerVertex {
     vec4 gl_Position;
 };
 
-// The scissors of a shape in framebuffer pixels, truncated like the scissors of vkCmdSetScissor were: .xy its offset,
-// .zw its extent
+// The scissors of a shape in framebuffer pixels, the pixels whose centre is in their rectangle as the rasterizer covers
+// a quad, its corners being snapped to the subpixel precision of the rasterizer before: .xy its offset, .zw its extent
 ivec4 framebufferScissors (vec4 scissors) {
-    vec2 start = max (vec2 (0), scissors.xy * window.ratio);
-    vec2 extent = max (vec2 (0), scissors.zw * window.ratio - start);
-    return ivec4 (ivec2 (start), ivec2 (extent));
+    vec4 corners = max (vec4 (0), ceil (round (scissors * window.ratio.xyxy * 256.0) / 256.0 - 0.5));
+    return ivec4 (corners.xy, max (vec2 (0), corners.zw - corners.xy));
 }
 
 void main () {

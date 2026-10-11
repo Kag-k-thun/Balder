@@ -715,10 +715,19 @@ Every widget reads these properties. An inherited property passes from a widget 
 | `image-color` | a colour |  |  |
 | `image-fill` | true or false |  |  |
 | `image-keep-ratio` | true or false |  |  |
-| `border-width` | a length in px |  | yes |
+| `border-top-width` | a length in px |  | yes |
+| `border-right-width` | a length in px |  | yes |
+| `border-bottom-width` | a length in px |  | yes |
+| `border-left-width` | a length in px |  | yes |
+| `border-width` | 1 to 4 lengths in px, in the order of CSS, setting `border-top-width`, `border-right-width`, `border-bottom-width`, `border-left-width` |  | yes |
 | `border-color` | a colour |  |  |
-| `radius` | a length in px |  |  |
+| `radius-top-left` | a length in px |  |  |
+| `radius-top-right` | a length in px |  |  |
+| `radius-bottom-right` | a length in px |  |  |
+| `radius-bottom-left` | a length in px |  |  |
+| `radius` | 1 to 4 lengths in px, clockwise from the top left corner, in the order of CSS, setting `radius-top-left`, `radius-top-right`, `radius-bottom-right`, `radius-bottom-left` |  |  |
 | `border` | a width in px and a colour, in any order, either one optional, setting `border-width`, `border-color` |  | yes |
+| `shadow` | none, or an offset to the right and to the bottom, an optional blur and spread in px, and a colour |  |  |
 | `margin-top` | a length, in px or % |  | yes |
 | `margin-right` | a length, in px or % |  | yes |
 | `margin-bottom` | a length, in px or % |  | yes |

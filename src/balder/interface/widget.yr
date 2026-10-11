@@ -7,7 +7,7 @@ use balder::interface::_;
 use balder::interface::font::{chain, layout};
 use balder::interface::loader::parser;
 use balder::interface::shape;
-use balder::interface::shape::text;
+use balder::interface::shape::{rounded, text};
 use balder::interface::style::conditions;
 use balder::interface::widget::sizing;
 use balder::interface::widget::layout::{flex, menu};
@@ -35,7 +35,8 @@ pub enum WidgetShapeKind: u8
 | BORDER     = 2
 | TEXT       = 3
 | SELECTION  = 4
-| IMAGE      = 5;
+| IMAGE      = 5
+| SHADOW     = 6;
 
 pub class WidgetShape {
     pub let dmut shape : (&Shape)? = none;
@@ -87,6 +88,10 @@ pub class Widget {
     prot { // scissors defines the size of parent widget to avoid displaying shapes outside the correct bounding box
         let mut _scissorPos : vec2 = vec2 ();
         let mut _scissorSize : vec2 = vec2 ();
+
+        // The area a shadow of the widget spreads over past its scissors, the scissors of the layout placing it
+        let mut _overflowPos : vec2 = vec2 ();
+        let mut _overflowSize : vec2 = vec2 ();
     }
 
     // The depth of the widget (for the rendering order)
@@ -101,7 +106,6 @@ pub class Widget {
         let mut _currentBackImage : [c8] = "";
 
         let mut _currentBackColor : vec4 = vec4 ();
-        let mut _currentBorderColor : vec4 = vec4 ();
 
         let mut _hasBackground : bool = true;
         let mut _hasBorder : bool = true;
@@ -612,12 +616,23 @@ pub class Widget {
     }
 
     /**
-     * Set the scissors of the shape to cut every pixel drawn outside
+     * Set the scissors of the shape to cut every pixel drawn outside, a shadow being cut to them as well
      * */
     @{final}
     pub fn setScissors (mut self, pos : vec2, size : vec2) {
+        self:.setScissors (pos, size, pos, size);
+    }
+
+    /**
+     * Set the scissors of the shape to cut every pixel drawn outside, and the area a shadow of the widget spreads over
+     * past them, the scissors of the layout placing it
+     * */
+    @{final}
+    pub fn setScissors (mut self, pos : vec2, size : vec2, overflowPos : vec2, overflowSize : vec2) {
         self._scissorPos = pos;
         self._scissorSize = size;
+        self._overflowPos = overflowPos;
+        self._overflowSize = overflowSize;
 
         self:.onUpdateScissors ();
         self:.applyStyle ();
@@ -640,8 +655,9 @@ pub class Widget {
         match kind {
             WidgetShapeKind::TEXT => { (self._absolutePosition, self._absoluteSize) }
             WidgetShapeKind::BORDER => { (self._absolutePostMarginPosition, self._absolutePostMarginSize) }
-            WidgetShapeKind::BACKGROUND => { (self._absolutePostBorderPosition, self._absolutePostBorderSize) }
+            WidgetShapeKind::BACKGROUND => { (self._absolutePostMarginPosition, self._absolutePostMarginSize) }
             WidgetShapeKind::IMAGE => { self.computeBackgroundImageSize () }
+            WidgetShapeKind::SHADOW => { self.computeShadowSize () }
             _ => { (self._absoluteFullPosition, self._absoluteFullSize) }
         }
     }
@@ -655,6 +671,20 @@ pub class Widget {
 
 
         (sciPos, sciEnd - sciPos)
+    }
+
+    /**
+     * @returns: the quad of the shadow of the widget, its box grown by the reach of its blur, three standard deviations
+     * of its gaussian
+     * */
+    fn computeShadowSize (self)-> (vec2, vec2) {
+        if let Ok (shadow) = self._currentStyle.shadow._1 {
+            let box = self.getShadowBox (shadow);
+            let reach = 1.5f * shadow.blur;
+            return (box.pos - makeVec2 (reach, reach), box.size + makeVec2 (2.0f * reach, 2.0f * reach));
+        }
+
+        (self._absolutePostMarginPosition, vec2 ())
     }
 
     fn computeBackgroundImageSize (self)-> (vec2, vec2) {
@@ -1479,7 +1509,6 @@ pub class Widget {
 
         self._currentBackImage = "";
         self._currentBackColor = vec4 ();
-        self._currentBorderColor = vec4 ();
     }
 
     impl Disposable {
@@ -1647,10 +1676,11 @@ pub class Widget {
         if self._hasBackground {
             self:.loadBackTexture ();
             self:.loadBackColor ();
+            self:.loadShadow ();
         }
 
         if self._hasBorder {
-            self:.loadBorderColor ();
+            self:.loadBorder ();
         }
 
         for kind in WidgetShapeKind::__members__ {
@@ -1744,16 +1774,27 @@ pub class Widget {
     }
 
     /**
-     * Load the border color shape
+     * Load the shadow shape, cast under the border box when the style sets a shadow
      * */
     @{final}
-    prv fn loadBorderColor (mut self) {
-        if self._currentBorderColor != self._currentStyle.getColor (WidgetShapeKind::BORDER) {
-            self._currentBorderColor = self._currentStyle.getColor (WidgetShapeKind::BORDER);
+    prv fn loadShadow (mut self) {
+        if !(self._currentStyle.shadow._1).hasValue {
+            self:.removeShape (WidgetShapeKind::SHADOW);
+        } else if WidgetShapeKind::SHADOW !in self._shapes {
+            self:.registerColorShape (WidgetShapeKind::SHADOW);
+        }
+    }
 
-            if WidgetShapeKind::BORDER !in self._shapes {
-                self:.registerColorShape (WidgetShapeKind::BORDER);
-            }
+    /**
+     * Load the border shape, a ring of the widths of the sides of the border drawn over the background, none when they
+     * are all 0
+     * */
+    @{final}
+    prv fn loadBorder (mut self) {
+        if self.getBorderWidths () == vec4 () {
+            self:.removeShape (WidgetShapeKind::BORDER);
+        } else if WidgetShapeKind::BORDER !in self._shapes {
+            self:.registerColorShape (WidgetShapeKind::BORDER);
         }
     }
 
@@ -1764,9 +1805,12 @@ pub class Widget {
     prv fn applyStyle (mut self, kind : WidgetShapeKind, dmut ws : &Shape) {
         let (pos, size) = self.getShapePositionAndSize (kind);
 
-        // the ink of a glyph overhangs its advance (italics, accents), so a text is only cut to the scissors of the widget
+        // the ink of a glyph overhangs its advance (italics, accents), so a text is only cut to the scissors of the
+        // widget, and a shadow spreads past them over its layout
         let (sciPos, sciSize) = if kind == WidgetShapeKind::TEXT {
             (self._scissorPos, self._scissorSize)
+        } else if kind == WidgetShapeKind::SHADOW {
+            (self._overflowPos, self._overflowSize)
         } else {
             self.getScissors (pos, size)
         };
@@ -1780,6 +1824,22 @@ pub class Widget {
 
             ws:.setColor (self._currentStyle.getColor (kind));            
             ws:.setLevel (self.getDepth (kind));
+            match kind {
+                WidgetShapeKind::BACKGROUND => { ws:.setBox (self.getBorderBox ()); }
+                WidgetShapeKind::BORDER => {
+                    ws:.setBox (self.getBorderBox ());
+                    ws:.setEdges (self.getBorderWidths ());
+                }
+                WidgetShapeKind::IMAGE => { ws:.setBox (self.getBorderBox ().inset (self.getBorderWidths ())); }
+                WidgetShapeKind::SHADOW => {
+                    if let Ok (shadow) = self._currentStyle.shadow._1 {
+                        ws:.setBox (self.getShadowBox (shadow));
+                        ws:.setBlur (shadow.blur / 2.0f);
+                    }
+                }
+                _ => {}
+            }
+
             ws:.show ();
         }
     }
@@ -1877,13 +1937,15 @@ pub class Widget {
         self._absolutePostBorderSize = self._absolutePostMarginSize;
         self._absolutePostBorderPosition = self._absolutePostMarginPosition;
 
-        let border = self.getBorderWidth ();
+        let border = self.getBorderWidths ();
 
-        self._absolutePostBorderSize.x -= 2.0f * border;
-        self._absolutePostBorderPosition.x += border;
+        self._absolutePostBorderSize.y -= border.x;
+        self._absolutePostBorderPosition.y += border.x;
+        self._absolutePostBorderSize.y -= border.y;
 
-        self._absolutePostBorderSize.y -= 2.0f * border;
-        self._absolutePostBorderPosition.y += border;
+        self._absolutePostBorderSize.x -= border.z;
+        self._absolutePostBorderPosition.x += border.z;
+        self._absolutePostBorderSize.x -= border.w;
     }
 
     /**
@@ -1910,8 +1972,9 @@ pub class Widget {
      * */
     fn getDepth (self, kind : WidgetShapeKind)-> u32 {
         match kind {
-            WidgetShapeKind::BORDER => { self._depth - 4 }
-            WidgetShapeKind::BACKGROUND => { self._depth - 3 }
+            WidgetShapeKind::SHADOW => { self._depth - 5 }
+            WidgetShapeKind::BACKGROUND => { self._depth - 4 }
+            WidgetShapeKind::BORDER => { self._depth - 3 }
             WidgetShapeKind::IMAGE => { self._depth - 2 }
             WidgetShapeKind::SELECTION => { self._depth - 1 }
             WidgetShapeKind::TEXT => { self._depth }
@@ -1939,17 +2002,32 @@ pub class Widget {
     @{final}
     pub fn getFrame (self, container : vec2)-> vec2 {
         let padding = self.getPaddings (container);
-        let border = 2.0f * self.getBorderWidth ();
-        makeVec2 (border + padding.z + padding.w, border + padding.x + padding.y)
+        let border = self.getBorderWidths ();
+        makeVec2 (border.z + border.w + padding.z + padding.w, border.x + border.y + padding.x + padding.y)
     }
 
     /**
-     * @returns: the line width of the border, in pixels
+     * @returns: the widths of the sides of the border in pixels (top, bottom, left, right)
      * */
-    fn getBorderWidth (self)-> f32 {
-        if self._currentStyle.borderWidth.0 {
-            cast!f32 (self._currentStyle.borderWidth.1)
-        } else { 0.0f }
+    fn getBorderWidths (self)-> vec4 {
+        self._currentStyle.getBorderWidths ()
+    }
+
+    /**
+     * @returns: the border box, rounded at its corners by the radii of the style fitted to its size
+     * */
+    fn getBorderBox (self)-> RoundedBox {
+        let box = RoundedBox (self._absolutePostMarginPosition, self._absolutePostMarginSize,
+                              radii-> self._currentStyle.getRadii ());
+        box.fitted ()
+    }
+
+    /**
+     * @returns: the box of a shadow of the widget, its border box moved by the offset of the shadow and grown by its
+     * spread
+     * */
+    fn getShadowBox (self, shadow : BoxShadow)-> RoundedBox {
+        self.getBorderBox ().moved (shadow.offset).spread (shadow.spread)
     }
 
     /**
