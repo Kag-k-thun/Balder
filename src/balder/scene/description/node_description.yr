@@ -1,0 +1,367 @@
+in node_description;
+
+use balder::core::error;
+use balder::math::{utils, vector};
+use balder::scene::description::kind;
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{group, light, solid};
+use balder::scene::node::node3D::visual::{_, material::_};
+
+use std::config::_;
+
+/**
+ * A node of a scene, as a scene file describes it: its kind, its name, its transform, what its kind draws or shines,
+ * and the nodes under it
+ * @info:
+ * =====
+ * A node is a table of entries in a scene file, the nodes under it in its array of tables 'children':
+ * ```toml
+ * [[node]]
+ * name = "table"
+ * type = "group"            # group, model, cube, sphere, plane or light
+ * position = [0, 0, 0]      # in the space of the parent
+ * rotation = [0, 90, 0]     # in degrees, along the X, the Y and the Z axes
+ * scale = [1, 1, 1]
+ *
+ * [[node.children]]
+ * name = "top"
+ * type = "cube"
+ * color = [0.5, 0.3, 0.1]   # the base colour of a cube, a sphere or a plane, or the colour of a light
+ * roughness = 0.6
+ * metallic = 0.0
+ * ```
+ * A model reads 'file' (a project path, 'res:/...') and 'lods' (true by default); a light reads 'light' (direction,
+ * point or spot), 'color', 'intensity', 'direction', 'range', 'inner-angle', 'outer-angle' (in degrees) and 'shadows'.
+ * Every entry but 'name' and 'type' is optional.
+ * ====
+ * */
+pub record NodeDescription {
+
+    // The name of the node, among the children of its parent
+    pub let mut name: [c8];
+
+    // What the node is
+    pub let mut kind: NodeKind;
+
+    // The position of the node, in the space of its parent
+    pub let mut position: vec3 = vec3();
+
+    // The angles of the rotation of the node along the X, the Y and the Z axes, in radian
+    pub let mut rotation: vec3 = vec3();
+
+    // The scale of the node along its own axes
+    pub let mut scale: vec3 = makeVec3(1.0f, 1.0f, 1.0f);
+
+    // The project path of the file of a model
+    pub let mut file: [c8] = "";
+
+    // True to build the levels of detail of the meshes of a model
+    pub let mut lods: bool = true;
+
+    // The material of a cube, a sphere or a plane
+    pub let mut material: MaterialConfig = MaterialConfig();
+
+    // The type of a light
+    pub let mut light: LightType = LightType::DIRECTION;
+
+    // The colour of a light
+    pub let mut color: vec3 = makeVec3(1.0f, 1.0f, 1.0f);
+
+    // The power of a light (see Light::intensity)
+    pub let mut intensity: f32 = 1.0f;
+
+    // The direction a direction or a spot light shines along
+    pub let mut direction: vec3 = makeVec3(0.0f, -1.0f, 0.0f);
+
+    // The distance at which the light of a point or a spot light fades out
+    pub let mut range: f32 = 10.0f;
+
+    // The angles between the axis of the cone of a spot light and the edges of its full light and of its light, in
+    // degrees
+    pub let mut innerAngle: f32 = 20.0f;
+    pub let mut outerAngle: f32 = 30.0f;
+
+    // True when a light casts shadows
+    pub let mut shadows: bool = false;
+
+    // The nodes under the node, in order
+    pub let mut children: [NodeDescription] = [];
+
+    /**
+     * A node of a kind, at the origin of its parent, of the defaults of its kind
+     * */
+    pub self (name: [c8], kind: NodeKind)
+        with name = name
+        , kind = kind
+    {}
+
+    /**
+     * Read a node from its table in a scene file
+     * @params:
+     *    - cfg: the table of the node
+     *    - where: the place of the table, quoted in the errors
+     * @throws:
+     *    - &BalderError: if the table misses the name or the type of the node, or holds an entry the node does not read
+     *                    or an entry of the wrong type
+     * */
+    pub self (cfg: &Config, where: [c8])
+        with name = ""
+        , kind = NodeKind::GROUP
+        throws BalderError
+    {
+        let d = if let table: &Dict = cfg { table } else {
+            throw copy BalderError(where ~ " must be a table");
+        };
+
+        let name = readName(d, where);
+        let at = where ~ " '" ~ name ~ "'";
+        let kind = if let Ok(Str(value-> k)) = d["type"]? {
+            if let Ok(found) = kindNamed(k) { found } else {
+                throw copy BalderError(at ~ " has the type '" ~ k ~ "', none of group, model, cube, sphere, plane or light");
+            }
+        } else {
+            throw copy BalderError(at ~ " must have a type, a string");
+        };
+
+        self.name = name;
+        self.kind = kind;
+        for key, value in d[] {
+            self:.readEntry(key, value, at);
+        }
+
+        if kind == NodeKind::MODEL && self.file.len == 0us {
+            throw copy BalderError(at ~ " is a model without a file");
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          BUILD          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the node under a parent, then the nodes under it
+     * @returns: the node created
+     * @throws:
+     *    - &BalderError: if the file of a model cannot be loaded
+     * */
+    pub fn build(self, dmut parent: &Node)-> dmut &Node3D
+        throws BalderError
+    {
+        let dmut node = alias self.create(alias parent);
+        node:.setTransform(self.position, self.rotation, self.scale);
+        for c in self.children {
+            c.build(alias node);
+        }
+
+        alias node
+    }
+
+    /**
+     * @returns: the node of the kind of the description, under a parent, its own nodes not created yet
+     * */
+    fn create(self, dmut parent: &Node)-> dmut &Node3D
+        throws BalderError
+    {
+        if self.kind == NodeKind::GROUP {
+            return copy Group3D(self.name, alias parent);
+        }
+
+        if self.kind == NodeKind::MODEL {
+            return copy SolidObjectModel::fromFile(self.name, alias parent, self.file, lods-> self.lods);
+        }
+
+        if self.kind == NodeKind::CUBE {
+            return alias self.createMesh(alias parent, cubeMesh());
+        }
+
+        if self.kind == NodeKind::SPHERE {
+            return alias self.createMesh(alias parent, sphereMesh());
+        }
+
+        if self.kind == NodeKind::PLANE {
+            return alias self.createMesh(alias parent, planeMesh());
+        }
+
+        let dmut l = copy Light(self.name, alias parent, castShadow-> self.shadows);
+        l.type = self.light;
+        l.color = self.color;
+        l.intensity = self.intensity;
+        l.direction = self.direction;
+        l.range = self.range;
+        l.innerAngle = self.innerAngle;
+        l.outerAngle = self.outerAngle;
+        alias l
+    }
+
+    /**
+     * @returns: a mesh drawing a primitive with the material of the description, under a parent
+     * */
+    fn createMesh(self, dmut parent: &Node, mesh: (MeshArray, [u32]))-> dmut &Node3D
+        throws BalderError
+    {
+        let dmut material = copy ConstantMaterial(self.material);
+        copy IndexedMesh3D(self.name, alias parent, LodChain(mesh._1), mesh._0, alias material)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          READ          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read an entry of the table of the node
+     * @params:
+     *    - at: the node, quoted in the errors
+     * */
+    fn readEntry(mut self, key: [c8], value: &Config, at: [c8])
+        throws BalderError
+    {
+        let what = at ~ " " ~ key;
+        match key {
+            "name" => {}
+            "type" => {}
+            "position"    => { self.position = readVector(value, what); }
+            "rotation"    => {
+                let r = readVector(value, what);
+                self.rotation = makeVec3(radian(r.x), radian(r.y), radian(r.z));
+            }
+            "scale"       => { self.scale = readVector(value, what); }
+            "file"        => { self.file = readString(value, what); }
+            "lods"        => { self.lods = readBool(value, what); }
+            "color"       => {
+                let c = readVector(value, what);
+                self.color = c;
+                self.material.baseColor = c;
+            }
+            "roughness"   => { self.material.roughness = readNumber(value, what); }
+            "metallic"    => { self.material.metallic = readNumber(value, what); }
+            "light"       => { self.light = readLightType(value, what); }
+            "intensity"   => { self.intensity = readNumber(value, what); }
+            "direction"   => { self.direction = readVector(value, what); }
+            "range"       => { self.range = readNumber(value, what); }
+            "inner-angle" => { self.innerAngle = readNumber(value, what); }
+            "outer-angle" => { self.outerAngle = readNumber(value, what); }
+            "shadows"     => { self.shadows = readBool(value, what); }
+            "children"    => { self.children = readNodes(value, at ~ " children"); }
+            _ => {
+                throw copy BalderError(at ~ " has an unexpected entry " ~ key);
+            }
+        }
+    }
+
+}
+
+/**
+ * Read an array of tables of nodes
+ * @params:
+ *    - cfg: the array of tables
+ *    - where: the place of the array, quoted in the errors
+ * @returns: the nodes, in the order of their tables
+ * @throws:
+ *    - &BalderError: if cfg is not an array of tables, or one of the tables is not a node
+ * */
+pub fn readNodes(cfg: &Config, where: [c8])-> [NodeDescription]
+    throws BalderError
+{
+    let arr = if let a: &Array = cfg { a } else {
+        throw copy BalderError(where ~ " must be an array of tables, [[...]]");
+    };
+
+    let mut nodes: [NodeDescription] = [];
+    for i, n in arr[] {
+        nodes ~= [NodeDescription(n, where ~ " #" ~ std::conv::to!{[c8]} (i + 1us))];
+    }
+
+    nodes
+}
+
+/**
+ * @returns: the name of the node of a table, valid for a node (see isValidName)
+ * @throws:
+ *    - &BalderError: if the table has no name, or not a valid one
+ * */
+fn readName(d: &Dict, where: [c8])-> [c8]
+    throws BalderError
+{
+    if let Ok(Str(value-> n)) = d["name"]? {
+        if isValidName(n) { return n; }
+        throw copy BalderError(where ~ " has the name '" ~ n ~ "', empty or holding a '/'");
+    }
+
+    throw copy BalderError(where ~ " must have a name, a string");
+}
+
+/**
+ * @returns: the number of an entry, an integer or a float
+ * */
+fn readNumber(cfg: &Config, what: [c8])-> f32
+    throws BalderError
+{
+    match cfg {
+        Float(value-> f) => { return cast!f32(f); }
+        Int(value-> i)   => { return cast!f32(i); }
+        _ => {
+            throw copy BalderError(what ~ " must be a number");
+        }
+    }
+}
+
+/**
+ * @returns: the vector of an entry, an array of three numbers
+ * */
+fn readVector(cfg: &Config, what: [c8])-> vec3
+    throws BalderError
+{
+    if let a: &Array = cfg {
+        let n = a[];
+        if n.len == 3us {
+            return makeVec3(readNumber(n[0], what), readNumber(n[1], what), readNumber(n[2], what));
+        }
+    }
+
+    throw copy BalderError(what ~ " must be an array of three numbers");
+}
+
+/**
+ * @returns: the string of an entry
+ * */
+fn readString(cfg: &Config, what: [c8])-> [c8]
+    throws BalderError
+{
+    if let Str(value-> s) = cfg { return s; }
+    throw copy BalderError(what ~ " must be a string");
+}
+
+/**
+ * @returns: the boolean of an entry
+ * */
+fn readBool(cfg: &Config, what: [c8])-> bool
+    throws BalderError
+{
+    if let Bool(value-> b) = cfg { return b; }
+    throw copy BalderError(what ~ " must be true or false");
+}
+
+/**
+ * @returns: the type of light an entry names, direction, point or spot
+ * */
+fn readLightType(cfg: &Config, what: [c8])-> LightType
+    throws BalderError
+{
+    match readString(cfg, what) {
+        "direction" => { return LightType::DIRECTION; }
+        "point"     => { return LightType::POINT; }
+        "spot"      => { return LightType::SPOT; }
+        _ => {
+            throw copy BalderError(what ~ " must be direction, point or spot");
+        }
+    }
+}
