@@ -1,7 +1,7 @@
 in skin;
 
 use balder::core::error;
-use balder::math::matrix;
+use balder::math::{bounds, matrix, vector};
 use balder::scene::animation::{skeleton, utils};
 
 use ::assimp::mesh;
@@ -11,6 +11,8 @@ use ::assimp::mesh;
  * and MeshArray.weights)
  * @info: a vertex at a pose of the skeleton is the sum of its bind position moved by the matrix of each of its joints
  * (jointMatrices) times its weight
+ * @info: the weights of a vertex summing to one, a vertex at a pose lies in the hull of its bind position moved by each
+ * of its joints: within the boxes of the vertices of its joints moved with them (see poseBounds)
  * */
 pub record Skin {
 
@@ -21,15 +23,26 @@ pub record Skin {
     // as placed in the model, in the space of the joint
     pub let inverseBinds: [mat4];
 
+    // For each joint, the box of the vertices it moves (with a weight above zero), in the space of the joint
+    let mut _boxes: [Aabb] = [];
+
+    // The box of the vertices no joint moves (no weight), left at their bind position
+    let mut _unweighted: Aabb = Aabb();
+
     /**
      * @params:
      *    - joints: the joint of the skeleton for each index a vertex gives
      *    - inverseBinds: the inverse of the transformation of each joint in the model at the bind pose
+     *    - positions: the bind position of each vertex, in the model, bounding the poses (see poseBounds)
+     *    - bones: the four indices in the joints of each vertex
+     *    - weights: the weight of each of them, summing to one, or all zero for a vertex no joint moves
      * */
-    pub self (joints: [usize] = [], inverseBinds: [mat4] = [])
+    pub self (joints: [usize] = [], inverseBinds: [mat4] = [], positions: [vec3] = [], bones: [vec4] = [], weights: [vec4] = [])
         with joints = joints
         , inverseBinds = inverseBinds
-    {}
+    {
+        self:.boundJoints(positions, bones, weights);
+    }
 
     /**
      * The skin of a mesh imported by assimp, its bones joints of a skeleton
@@ -44,7 +57,10 @@ pub record Skin {
         with joints = (unsafe { readSkinJoints(mesh, skeleton) })
         , inverseBinds = (unsafe { readInverseBinds(mesh, placement) })
         throws BalderError
-    {}
+    {
+        let (bones, weights) = unsafe { readSkinWeights(mesh) };
+        self:.boundJoints(unsafe { readPlacedPositions(mesh, placement) }, bones, weights);
+    }
 
     /**
      * @returns: the matrix moving the vertices from their bind position for each joint of the skin
@@ -58,6 +74,53 @@ pub record Skin {
         }
 
         matrices
+    }
+
+    /**
+     * @returns: a box enclosing the vertices at a pose of the skeleton, in the model: the box of the vertices of each
+     * joint moved with the joint, merged with those of the other joints and of the vertices no joint moves
+     * @info: a vertex moved by several joints lies between its positions moved by each of them, so within the box
+     * @params:
+     *    - globals: the transformation of each joint of the skeleton in the model (see Skeleton.globalMatrices)
+     * */
+    pub fn poseBounds(self, globals: [mat4])-> Aabb {
+        let mut box = self._unweighted;
+        for i, j in self.joints {
+            box = box.merged(self._boxes[i].transformed(globals[j]));
+        }
+
+        box
+    }
+
+    /**
+     * Compute the box of the vertices of each joint in its space, and of the vertices no joint moves
+     * @params:
+     *    - positions: the bind position of each vertex, in the model
+     *    - bones: the four indices in the joints of each vertex
+     *    - weights: the weight of each of them
+     * */
+    fn boundJoints(mut self, positions: [vec3], bones: [vec4], weights: [vec4]) {
+        let dmut boxes = copy [Aabb(); self.joints.len];
+        let mut unweighted = Aabb();
+        for v, p in positions {
+            let point = Aabb(p, p);
+            let w = if v < weights.len { weights[v] } else { vec4() };
+            let b = if v < bones.len { bones[v] } else { vec4() };
+            if w.x + w.y + w.z + w.w <= 0.0f {
+                unweighted = unweighted.merged(point);
+                continue;
+            }
+
+            for k in [(b.x, w.x), (b.y, w.y), (b.z, w.z), (b.w, w.w)] if k._1 > 0.0f {
+                let i = cast!usize(cast!u32(k._0));
+                if i < boxes.len {
+                    boxes[i] = boxes[i].merged(point.transformed(self.inverseBinds[i]));
+                }
+            }
+        }
+
+        self._boxes = boxes;
+        self._unweighted = unweighted;
     }
 
 }
