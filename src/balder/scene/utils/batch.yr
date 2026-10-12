@@ -4,10 +4,10 @@ use balder::core::{_, application::_};
 use balder::core::config::shader::_;
 use balder::core::driver::cmd_alloc;
 use balder::core::shader::{_, buffers::_};
-use balder::math::{matrix, vector};
+use balder::math::{bounds, matrix, vector};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
-use balder::scene::utils::{casters, cluster_slot, draw_stats, motion, shadow_map};
+use balder::scene::utils::{casters, cluster_slot, draw_stats, motion, shadow_map, skinned_instance, skinning};
 use balder::utils::log;
 
 use std::algorithm::comparison;
@@ -95,6 +95,12 @@ class SharedGeometry {
     // The number of clusters of the geometry
     pub let nbClusters: u32;
 
+    // The skinning of the shader holding the weights of the bind vertices of a skinned geometry, none for a rigid one
+    let dmut _skinning: (&GroupSkinning)? = none;
+
+    // The weights of the first bind vertex of a skinned geometry in the skinning of the shader
+    pub let mut firstWeight: u32 = 0u32;
+
     // The number of instances drawing the geometry, the range being given back to the pool with the last one
     let mut _users: usize = 1us;
 
@@ -110,6 +116,24 @@ class SharedGeometry {
         , _clusters = alias clusters
         , firstCluster = firstCluster
         , nbClusters = nbClusters
+    {}
+
+    /**
+     * The geometry of a skinned mesh, its bind vertices skinned into the vertices of each instance, which have their own
+     * clusters
+     * @params:
+     *    - range: the range placed for a first instance, its bind vertices
+     *    - clusters: the clusters of the shader
+     *    - skinning: the skinning of the shader
+     *    - firstWeight: the weights of the first bind vertex in the skinning (see GroupSkinning.placeWeights)
+     * */
+    pub self skinned(dmut range: &GeometryRange, dmut clusters: &ObjectStorage, dmut skinning: &GroupSkinning, firstWeight: u32)
+        with range = alias range
+        , _clusters = alias clusters
+        , firstCluster = 0u32
+        , nbClusters = 0u32
+        , _skinning = (alias skinning)?
+        , firstWeight = firstWeight
     {}
 
     /**
@@ -148,6 +172,10 @@ class SharedGeometry {
                 if self.nbClusters != 0u32 {
                     self._clusters:.free(self.firstCluster, count-> cast!usize(self.nbClusters));
                 }
+
+                if let Ok(dmut sk) = alias self._skinning {
+                    sk:.freeWeights(self.firstWeight, self.range.nbVertices);
+                }
             }
         }
     }
@@ -184,6 +212,13 @@ pub class SceneDraws {
     // True once the slot and the geometry were given back
     let mut _freed: bool = false;
 
+    // The skinning of the shader and the place of the instance in it, when the instance is skinned
+    let dmut _skinning: (&GroupSkinning)? = none;
+    let mut _skin: (SkinnedInstance)? = none;
+
+    // The clusters of the shader, the own clusters of a skinned instance among them
+    let dmut _clusters: (&ObjectStorage)? = none;
+
     pub self (dmut objects: &ObjectStorage,
               dmut motion: &MotionTracker,
               dmut batch: &InstanceBatch,
@@ -199,6 +234,30 @@ pub class SceneDraws {
         , slot = slot
         , _inPlace = inPlace
     {}
+
+    /**
+     * The place of a skinned instance, drawing its own vertices and its own clusters
+     * @params:
+     *    - skinning: the skinning of the shader
+     *    - skin: the place of the instance in the skinning
+     *    - clusters: the clusters of the shader, holding those of the instance
+     * */
+    pub self skinned(dmut objects: &ObjectStorage,
+                     dmut motion: &MotionTracker,
+                     dmut batch: &InstanceBatch,
+                     dmut geometry: &SharedGeometry,
+                     dmut casters: &ShadowCasters,
+                     slot: u32,
+                     inPlace: bool,
+                     dmut skinning: &GroupSkinning,
+                     skin: SkinnedInstance,
+                     dmut clusters: &ObjectStorage)
+        with self(alias objects, alias motion, alias batch, alias geometry, alias casters, slot, inPlace)
+    {
+        self._skinning = (alias skinning)?;
+        self._skin = skin?;
+        self._clusters = (alias clusters)?;
+    }
 
     /*!
      * ====================================================================================================
@@ -216,11 +275,74 @@ pub class SceneDraws {
     }
 
     /**
-     * @returns: the slot of the first cluster of the geometry of the instance in the clusters of its shader, the clusters
-     * of a level of its mesh following it from the first cluster of the level
+     * @returns: the first vertex the draws of the instance read: the first vertex of its geometry in the pool, or its own
+     * first vertex in the skinned vertices of its shader when it is skinned
+     * */
+    pub fn getVertexOffset(self)-> u32 {
+        if let Ok(skin) = self._skin {
+            return skin.target;
+        }
+
+        self._geometry.range.vertexOffset
+    }
+
+    /**
+     * @returns: the slot of the first cluster of the instance in the clusters of its shader, those of its geometry or its
+     * own when it is skinned, the clusters of a level of its mesh following it from the first cluster of the level
      * */
     pub fn getFirstCluster(self)-> u32 {
+        if let Ok(skin) = self._skin {
+            return skin.firstCluster;
+        }
+
         self._geometry.firstCluster
+    }
+
+    /**
+     * @returns: true iif the instance is skinned, drawing its own vertices
+     * */
+    pub fn isSkinned(self)-> bool {
+        self._skin.hasValue
+    }
+
+    /**
+     * Place the joints of a skinned instance at a pose, drawn without motion by the next frame
+     * @params:
+     *    - matrices: the matrix of each joint of its skin (see Skin.jointMatrices)
+     * */
+    pub fn placeJoints(mut self, matrices: [mat4]) {
+        if let Ok(skin) = self._skin {
+            if let Ok(dmut sk) = alias self._skinning {
+                sk:.placeJoints(skin, matrices);
+            }
+        }
+    }
+
+    /**
+     * Move the joints of a skinned instance to a pose, the next frame drawing its motion from the pose the last frame drew
+     * @params:
+     *    - matrices: the matrix of each joint of its skin (see Skin.jointMatrices)
+     * */
+    pub fn setJoints(mut self, matrices: [mat4]) {
+        if let Ok(skin) = self._skin {
+            if let Ok(dmut sk) = alias self._skinning {
+                sk:.moveJoints(skin, matrices);
+            }
+        }
+    }
+
+    /**
+     * Cull the clusters of a skinned instance with a box enclosing its poses, in the space of the positions of its mesh
+     * */
+    pub fn setPoseBox(mut self, box: Aabb) {
+        if let Ok(skin) = self._skin {
+            if let Ok(dmut clusters) = alias self._clusters {
+                for c in 0u32 .. skin.nbClusters {
+                    clusters:.setData(skin.firstCluster + c, CLUSTER_CENTER, makeVec4(box.center, 0.0f));
+                    clusters:.setData(skin.firstCluster + c, CLUSTER_EXTENT, makeVec4(box.extent, 0.0f));
+                }
+            }
+        }
     }
 
     /**
@@ -291,6 +413,18 @@ pub class SceneDraws {
             self._freed = true;
             self._motion:.forget(self.slot);
             self._objects:.free(self.slot);
+            if let Ok(skin) = self._skin {
+                if let Ok(dmut sk) = alias self._skinning {
+                    sk:.free(skin);
+                }
+
+                if let Ok(dmut clusters) = alias self._clusters {
+                    if skin.nbClusters != 0u32 {
+                        clusters:.free(skin.firstCluster, count-> cast!usize(skin.nbClusters));
+                    }
+                }
+            }
+
             self._geometry:.release();
         }
     }
@@ -336,6 +470,9 @@ pub class ShaderGroup {
     // The shader
     let dmut _shader: &RefCount!{&Shader};
 
+    // The configuration of the shader, the layout of its vertices
+    let _config: &RasterShaderConfig;
+
     // The descriptor set of the camera
     let dmut _camera: &DescriptorSet;
 
@@ -368,6 +505,10 @@ pub class ShaderGroup {
     // The instances casting shadows, and their draws in the views of the shadow maps
     let dmut _casters: &ShadowCasters;
 
+    // The skinning of the instances when the shader draws skinned vertices (the [skin] variant of a shader), none when
+    // it draws rigid ones
+    let dmut _skinning: (&GroupSkinning)? = none;
+
     // The instances of a batch seen and their distances to the eye, given to the batch by sort, kept from a sort to the
     // next
     let dmut _sortOwners: [usize] = [];
@@ -389,6 +530,7 @@ pub class ShaderGroup {
      * */
     prv self (dmut shader: &RefCount!{&Shader}, cfg: &RasterShaderConfig, dmut objects: &ObjectStorage)
         with _shader = alias shader
+        , _config = cfg
         , _camera = shader:.get():.allocateDescriptorSet(DescriptorContext::CAMERA)
         , _geometry = copy GeometryPool(alias shader:.get():.getDevice(), vertexStride(cfg))
         , _objects = alias objects
@@ -421,6 +563,40 @@ pub class ShaderGroup {
      * */
     pub fn isEmpty(self)-> bool {
         self._batches.len == 0us
+    }
+
+    /**
+     * Skin the instances of the shader, which draws skinned vertices: the skin pass moves their vertices before they are
+     * drawn
+     * @assume: no instance is registered yet
+     * @params:
+     *    - skin: the shader of the skin pass (DefaultShaders::SKINNING_3D)
+     * @throws: when the vertices of the shader cannot be skinned (no position of the frame before)
+     * */
+    pub fn skinWith(mut self, dmut skin: &ComputeShader)
+        throws BalderError
+    {
+        let dmut sk = copy GroupSkinning(alias skin, self._config);
+        self._skinning = (alias sk)?;
+    }
+
+    /**
+     * @returns: true iif the shader draws skinned vertices, skinned by the skin pass
+     * */
+    pub fn isSkinned(self)-> bool {
+        self._skinning.hasValue
+    }
+
+    /**
+     * @returns: the matrices of the frame before of the joints of the skinned instances moving, none when the shader draws
+     * rigid vertices
+     * */
+    pub fn getJointMotion(mut self)-> dmut (&MotionTracker)? {
+        if let Ok(dmut sk) = alias self._skinning {
+            return (alias sk:.getMotion())?;
+        }
+
+        none
     }
 
     /**
@@ -457,7 +633,7 @@ pub class ShaderGroup {
             alias b
         };
 
-        let dmut geometry = self:.place(mesh, material);
+        let dmut geometry = self:.place(mesh);
         let slot = {
             self._objects:.alloc()
         } catch {
@@ -467,6 +643,31 @@ pub class ShaderGroup {
             }
         };
 
+        let inPlace = self._shader:.get():.getDevice().isMultiDraw();
+        if let Ok(dmut sk) = alias self._skinning {
+            let skin = {
+                self:.skinInstance(alias sk, node, mesh, geometry)
+            } catch {
+                err => {
+                    self._objects:.free(slot);
+                    geometry:.release();
+                    throw err;
+                }
+            };
+
+            batch.nodes[node.uid] = alias node;
+            return copy SceneDraws::skinned(alias self._objects,
+                                            alias self._motion,
+                                            alias batch.draws,
+                                            alias geometry,
+                                            alias self._casters,
+                                            slot,
+                                            inPlace,
+                                            alias sk,
+                                            skin,
+                                            alias self._clusters);
+        }
+
         batch.nodes[node.uid] = alias node;
         copy SceneDraws(alias self._objects,
                         alias self._motion,
@@ -474,17 +675,62 @@ pub class ShaderGroup {
                         alias geometry,
                         alias self._casters,
                         slot,
-                        self._shader:.get():.getDevice().isMultiDraw())
+                        inPlace)
     }
 
     /**
-     * @returns: the geometry of a mesh in the pool, with its clusters, placed unless an instance drawing it placed it
-     * already
+     * Skin an instance: its own vertices and joints in the skinning of the shader, and its own clusters, placed at its
+     * vertices and culled with its box until it sets the box of its poses
+     * @params:
+     *    - skinning: the skinning of the shader
+     *    - node: the instance
+     *    - mesh: its geometry, skinned
+     *    - geometry: its geometry placed in the pool, its bind vertices and their weights
+     * @returns: the place of the instance in the skinning
+     * */
+    fn skinInstance(mut self, dmut skinning: &GroupSkinning, node: &VisualInstance3D, mesh: &MeshGeometry, geometry: &SharedGeometry)-> SkinnedInstance
+        throws BalderError
+    {
+        let nbJoints = if let Ok(skin) = mesh.skin { cast!u32(skin.joints.len) } else { 0u32 };
+        let clusters = mesh.clusters;
+        let first = if clusters.len == 0us { 0u32 } else {
+            self._clusters:.alloc(count-> clusters.len)
+        };
+
+        let instance = {
+            skinning:.add(node.uid,
+                          geometry.range.vertexOffset,
+                          geometry.range.nbVertices,
+                          geometry.firstWeight,
+                          nbJoints,
+                          first,
+                          cast!u32(clusters.len))
+        } catch {
+            err => {
+                if clusters.len != 0us {
+                    self._clusters:.free(first, count-> clusters.len);
+                }
+
+                throw err;
+            }
+        };
+
+        for i, c in clusters {
+            self._clusters:.setData!{ClusterSlot} (first + cast!u32(i), 0us,
+                                                   ClusterSlot::skinned(c, geometry.range.firstIndex, instance.target, node.aabb));
+        }
+
+        instance
+    }
+
+    /**
+     * @returns: the geometry of a mesh in the pool, with its clusters (with the weights of its bind vertices when the
+     * shader draws skinned vertices, each instance having its own clusters), placed unless an instance drawing it placed
+     * it already
      * @params:
      *    - mesh: the mesh
-     *    - material: the material of the instance, giving the layout of the vertices
      * */
-    fn place(mut self, mesh: &MeshGeometry, material: &Material)-> dmut &SharedGeometry
+    fn place(mut self, mesh: &MeshGeometry)-> dmut &SharedGeometry
         throws BalderError
     {
         if let Ok(dmut g) = alias self._meshes[mesh.uid] {
@@ -495,8 +741,24 @@ pub class ShaderGroup {
             self:.sweepMeshes();
         }
 
-        let (vertices, indices) = mesh.compact(material);
+        let (vertices, indices) = mesh.compact(self._config);
         let dmut range = self._geometry:.alloc(vertices, indices);
+
+        if let Ok(dmut sk) = alias self._skinning {
+            let firstWeight = {
+                let (bones, weights) = mesh.skinWeights();
+                sk:.placeWeights(bones, weights)
+            } catch {
+                err => {
+                    range:.dispose();
+                    throw err;
+                }
+            };
+
+            let dmut g = copy SharedGeometry::skinned(alias range, alias self._clusters, alias sk, firstWeight);
+            self._meshes[mesh.uid] = alias g;
+            return alias g;
+        }
 
         let clusters = mesh.clusters;
         let first = if clusters.len == 0us { 0u32 } else {
@@ -622,6 +884,9 @@ pub class ShaderGroup {
      * */
     pub fn release(mut self, dmut window: &Window, material: &Material, node: &VisualInstance3D) {
         self._casters:.remove(node.uid);
+        if let Ok(dmut sk) = alias self._skinning {
+            sk:.forget(node.uid);
+        }
 
         let key = material.getBatchKey();
         if let Ok(dmut b) = alias self._batches[key] {
@@ -781,11 +1046,38 @@ pub class ShaderGroup {
     }
 
     /**
+     * Record the skinning of the skinned instances of the shader for a frame, nothing when it draws rigid vertices
+     * @assume: the skin shader is bound
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command buffer of the skin pass
+     *    - skin: the skin shader
+     * */
+    pub fn dispatchSkin(mut self, frame: u32, cmd: VkCommandBuffer, dmut skin: &ComputeShader) {
+        if let Ok(dmut sk) = alias self._skinning {
+            if let Ok(rest) = self._geometry.getVertexBuffer() {
+                sk:.dispatch(frame, cmd, alias skin, rest);
+            }
+        }
+    }
+
+    /**
+     * Bind the vertices and the indices the draws of a frame read: those of the pool, the vertices skinned for the frame
+     * in place of the vertices of the pool when the shader draws skinned vertices
+     * */
+    fn selectGeometry(self, frame: u32, cmd: VkCommandBuffer) {
+        self._geometry.select(cmd);
+        if let Ok(sk) = self._skinning {
+            sk.select(frame, cmd);
+        }
+    }
+
+    /**
      * Record the multi-draws of the material keys with the pipeline selected
      * */
     fn drawBatches(mut self, frame: u32, dmut cmd: &IndexedDrawCommandAllocator, late: bool) {
         self._camera.select(frame, cmd.getCommandBuffer());
-        self._geometry.select(cmd.getCommandBuffer());
+        self.selectGeometry(frame, cmd.getCommandBuffer());
 
         for _, dmut b in alias self._batches {
             if b.count == 0u32 { continue; }
@@ -890,7 +1182,7 @@ pub class ShaderGroup {
             if !sh.hasShadow() { return; }
 
             sh.selectShadow(cmd.getCommandBuffer());
-            self._geometry.select(cmd.getCommandBuffer());
+            self.selectGeometry(frame, cmd.getCommandBuffer());
             self._casters:.draw(map, frame, alias cmd, view);
         }
     }
@@ -962,6 +1254,11 @@ pub class ShaderGroup {
         }
 
         self._casters:.stopAll(alias window);
+        if let Ok(dmut sk) = alias self._skinning {
+            sk:.retire(alias window);
+            self._skinning = none;
+        }
+
         self._batches = copy [];
         self._meshes = copy [];
         self._sweepAt = MIN_SWEEP;

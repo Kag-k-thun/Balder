@@ -1,0 +1,137 @@
+#version 450 core
+
+// The skin pass of a scene (see GroupSkinning): the vertices of each skinned instance moved from their bind position by
+// the joints of its skin, into the vertices the frame draws (see SkinnedVertices), one thread per vertex and one dispatch
+// per instance:
+//    - the position, the normal and the tangent are moved by the sum of the matrices of the joints of the vertex times
+//      their weights (linear blend skinning), the position the frame before by the matrices the frame before drew the
+//      joints with, the g-buffer writing the motion between the two
+//    - the other floats of the vertex (its texture coordinates...) are copied as they are
+// A vertex no joint moves (its weights all zero) stays at its bind position
+
+layout (local_size_x = 64) in;
+
+// The vertices of the geometry pool of the shader drawing the instances, each 'stride' floats as the shader reads them,
+// the bind vertices of the instances among them
+layout (std430, set = 0, binding = 0) readonly buffer Rest {
+    float rest [];
+};
+
+// The four joints moving a bind vertex, indices in the joints of its skin, and their weights (see SkinWeightSlot)
+struct SkinWeight {
+    vec4 weights;
+    uvec4 joints;
+};
+
+layout (std430, set = 0, binding = 1) readonly buffer Weights {
+    SkinWeight weights [];
+};
+
+// A joint of a skinned instance (see GroupSkinning): the matrix moving the vertices from their bind position, and the one
+// the frame before drew them with
+struct Joint {
+    mat4 current;
+    mat4 previous;
+};
+
+layout (std430, set = 0, binding = 2) readonly buffer Joints {
+    Joint joints [];
+};
+
+// The vertices the frame draws, laid out as the bind vertices
+layout (std430, set = 0, binding = 3) writeonly buffer Skinned {
+    float skinned [];
+};
+
+layout (push_constant) uniform Push {
+    // The first bind vertex of the instance in the pool
+    uint source;
+
+    // The first vertex of the instance in the vertices drawn
+    uint target;
+
+    // The number of vertices of the instance
+    uint count;
+
+    // The weights of the first bind vertex of the instance
+    uint firstWeight;
+
+    // The first joint of the instance
+    uint firstJoint;
+
+    // The number of floats of a vertex
+    uint stride;
+
+    // The offset in floats of the normal and of the tangent in a vertex, negative when the vertices have none
+    int normals;
+    int tangents;
+
+    // The offset in floats of the position the frame before drew the vertex at
+    uint previous;
+
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} push;
+
+vec3 readVec3 (uint at) {
+    return vec3 (rest [at], rest [at + 1u], rest [at + 2u]);
+}
+
+void writeVec3 (uint at, vec3 v) {
+    skinned [at] = v.x;
+    skinned [at + 1u] = v.y;
+    skinned [at + 2u] = v.z;
+}
+
+/**
+ * @returns: the vector normalized, as it is when it has no length
+ * */
+vec3 normalized (vec3 v) {
+    float len = length (v);
+    return len > 0.0 ? v / len : v;
+}
+
+void main () {
+    uint v = gl_GlobalInvocationID.x;
+    if (v >= push.count) return;
+
+    uint src = (push.source + v) * push.stride;
+    uint dst = (push.target + v) * push.stride;
+    for (uint i = 0u; i < push.stride; i++) {
+        skinned [dst + i] = rest [src + i];
+    }
+
+    SkinWeight w = weights [push.firstWeight + v];
+    if (dot (w.weights, vec4 (1.0)) <= 0.0) {
+        writeVec3 (dst + push.previous, readVec3 (src));
+        return;
+    }
+
+    mat4 current = mat4 (0.0);
+    mat4 previous = mat4 (0.0);
+    for (int k = 0; k < 4; k++) {
+        if (w.weights [k] <= 0.0) continue;
+
+        Joint j = joints [push.firstJoint + w.joints [k]];
+        current += j.current * w.weights [k];
+        previous += j.previous * w.weights [k];
+    }
+
+    vec4 position = vec4 (readVec3 (src), 1.0);
+    writeVec3 (dst, (current * position).xyz);
+    writeVec3 (dst + push.previous, (previous * position).xyz);
+
+    // the normals turn with the cofactor of the matrix, which keeps them perpendicular to the surface under a non uniform
+    // scale and keeps their side under a mirror
+    mat3 linear = mat3 (current);
+    if (push.normals >= 0) {
+        mat3 cofactor = mat3 (cross (linear [1], linear [2]), cross (linear [2], linear [0]), cross (linear [0], linear [1]));
+        writeVec3 (dst + uint (push.normals), normalized (cofactor * readVec3 (src + uint (push.normals))));
+    }
+
+    // the tangents lie in the surface, turned as its positions are, their handedness copied
+    if (push.tangents >= 0) {
+        writeVec3 (dst + uint (push.tangents), normalized (linear * readVec3 (src + uint (push.tangents))));
+    }
+}

@@ -1,0 +1,370 @@
+in skinning;
+
+mod ::utils;
+
+use balder::core::_;
+use balder::core::application::window;
+use balder::core::config::shader::_;
+use balder::core::memory::buffer;
+use balder::core::shader::{_, buffers::_};
+use balder::math::{matrix, vector};
+use balder::scene::utils::{motion, skin_weight_slot, skinned_instance};
+
+use std::algorithm::comparison;
+
+use ::vulkan::core;
+
+/**
+ * The size of the slot of a joint in the joints of the skinned instances of a shader: the matrix moving the vertices from
+ * their bind position (mat4), and the one the frame before drew them with (mat4)
+ * */
+pub def JOINT_STRIDE = 128us;
+
+/**
+ * The offset of the matrix of a joint in its slot
+ * */
+pub def JOINT_MATRIX = 0us;
+
+/**
+ * The offset of the matrix the frame before drew a joint with in its slot, the skin pass moving the position the frame
+ * before drew the vertices at with it
+ * */
+pub def JOINT_PREVIOUS = 64us;
+
+/**
+ * The push constant of the skin pass, the instance it skins (see skinning.comp)
+ * */
+@data
+record SkinPush {
+
+    // The first bind vertex of the instance in the pool, its first vertex drawn, its number of vertices
+    pub let source: u32 = 0u32;
+    pub let target: u32 = 0u32;
+    pub let count: u32 = 0u32;
+
+    // The weights of its first bind vertex, its first joint
+    pub let firstWeight: u32 = 0u32;
+    pub let firstJoint: u32 = 0u32;
+
+    // The number of floats of a vertex, the offset of its normal and of its tangent (negative when it has none), and of
+    // the position the frame before drew it at
+    pub let stride: u32 = 0u32;
+    pub let normals: i32 = -1;
+    pub let tangents: i32 = -1;
+    pub let previous: u32 = 0u32;
+
+    pub let pad0: u32 = 0u32;
+    pub let pad1: u32 = 0u32;
+    pub let pad2: u32 = 0u32;
+}
+
+/**
+ * The skinning of the instances of a shader drawing skinned vertices (the [skin] variant of a raster shader): the weights
+ * of the bind vertices of its geometries, the joints of its instances, and the vertices each frame draws, written by the
+ * skin pass of the scene from the bind vertices of the geometry pool of the shader
+ * @info: the joints of an instance hold their matrices of the frame before too (see MotionTracker), so the vertices
+ * drawn hold the position the frame before drew them at, the g-buffer writing the motion of the pose
+ * @info: the skin pass skins every instance at each frame, whether the camera sees it or not (the shadows may see it)
+ * */
+@final
+pub class GroupSkinning {
+
+    // The vertices the frames draw
+    let dmut _vertices: &SkinnedVertices;
+
+    // The four joints moving each bind vertex and their weights, a run of slots per geometry
+    let dmut _weights: &ObjectStorage;
+
+    // The joints of the instances, a run of slots per instance
+    let dmut _joints: &ObjectStorage;
+
+    // The matrices of the frame before of the joints moving
+    let dmut _motion: &MotionTracker;
+
+    // The descriptor set of the skin pass
+    let dmut _set: &DescriptorSet;
+
+    // The number of floats of a vertex, the offsets of its normal and of its tangent (negative when it has none), and of
+    // its position the frame before
+    let _stride: u32;
+    let _normals: i32;
+    let _tangents: i32;
+    let _previous: u32;
+
+    // The instances skinned by the skin pass, by uniq id
+    let dmut _instances: [usize => SkinnedInstance] = copy [];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - skin: the shader of the skin pass (DefaultShaders::SKINNING_3D), loaded
+     *    - cfg: the configuration of the shader drawing the skinned vertices, their layout
+     *    - joints: the slots of the joints, followed by the motion of those moving
+     * @throws: when the vertices of the shader hold no position of the frame before (VertexEntry::PREVIOUS)
+     * */
+    prv self (dmut skin: &ComputeShader, cfg: &RasterShaderConfig, dmut joints: &ObjectStorage)
+        with _vertices = copy SkinnedVertices(alias skin:.getDevice(), utils::vertexStride(cfg))
+        , _weights = copy ObjectStorage(alias skin:.getDevice(), SKIN_WEIGHT_STRIDE)
+        , _joints = alias joints
+        , _motion = copy MotionTracker(alias joints, JOINT_MATRIX, JOINT_PREVIOUS)
+        , _set = skin:.allocateDescriptorSet(DescriptorContext::OBJECT)
+        , _stride = utils::vertexStride(cfg)
+        , _normals = utils::floatOffset(cfg, VertexEntry::NORMALS)
+        , _tangents = utils::floatOffset(cfg, VertexEntry::TANGENTS)
+        , _previous = cast!u32(utils::floatOffset(cfg, VertexEntry::PREVIOUS))
+        throws BalderError
+    {
+        if utils::floatOffset(cfg, VertexEntry::PREVIOUS) < 0 {
+            throw copy BalderError("The skinned vertices of the shader " ~ cfg.name ~ " hold no position of the frame before");
+        }
+    }
+
+    /**
+     * @params:
+     *    - skin: the shader of the skin pass (DefaultShaders::SKINNING_3D), loaded
+     *    - cfg: the configuration of the shader drawing the skinned vertices, their layout
+     * @throws: when the vertices of the shader hold no position of the frame before (VertexEntry::PREVIOUS)
+     * */
+    pub self (dmut skin: &ComputeShader, cfg: &RasterShaderConfig)
+        with self(alias skin, cfg, copy ObjectStorage(alias skin:.getDevice(), JOINT_STRIDE))
+        throws BalderError
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the matrices of the frame before of the joints moving, advanced at the submission of each frame (see
+     * FrameMotion)
+     * */
+    pub fn getMotion(mut self)-> dmut &MotionTracker {
+        alias self._motion
+    }
+
+    /**
+     * @returns: true iif no instance is skinned
+     * */
+    pub fn isEmpty(self)-> bool {
+        self._instances.len == 0us
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          WEIGHTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Place the weights of the bind vertices of a geometry, shared by the instances drawing it
+     * @params:
+     *    - bones: the indices of the four joints of each vertex in the joints of its skin
+     *    - weights: their weights
+     * @returns: the slot of the weights of the first vertex, the others following it
+     * */
+    pub fn placeWeights(mut self, bones: [vec4], weights: [vec4])-> u32
+        throws BalderError
+    {
+        if bones.len == 0us || bones.len != weights.len {
+            throw copy BalderError("A skinned geometry needs four joints and their weights for each vertex");
+        }
+
+        let first = self._weights:.alloc(count-> bones.len);
+        for i in 0us .. bones.len {
+            self._weights:.setData!{SkinWeightSlot} (first + cast!u32(i), 0us, SkinWeightSlot(bones[i], weights[i]));
+        }
+
+        first
+    }
+
+    /**
+     * Give back the weights of the bind vertices of a geometry, the last instance drawing it gone
+     * @warning: through a retire, the recordings in use may still skin with them
+     * */
+    pub fn freeWeights(mut self, first: u32, count: u32) {
+        self._weights:.free(first, count-> cast!usize(count));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSTANCES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Skin an instance from the next recordings: its vertices drawn and its joints are reserved, its joints at the bind
+     * pose (the identity)
+     * @params:
+     *    - uid: the uniq id of the instance
+     *    - source: the first bind vertex of its geometry in the pool of the shader
+     *    - nbVertices: the number of vertices of its geometry
+     *    - firstWeight: the weights of the first bind vertex of its geometry (see placeWeights)
+     *    - nbJoints: the number of joints of its skin
+     *    - firstCluster: the first of its own clusters in the clusters of the shader
+     *    - nbClusters: the number of its clusters
+     * @returns: the place of the instance, to free once not drawn anymore, after forget
+     * */
+    pub fn add(mut self,
+               uid: usize,
+               source: u32,
+               nbVertices: u32,
+               firstWeight: u32,
+               nbJoints: u32,
+               firstCluster: u32,
+               nbClusters: u32)-> SkinnedInstance
+        throws BalderError
+    {
+        if nbJoints == 0u32 {
+            throw copy BalderError("A skinned instance needs the joints of its skin");
+        }
+
+        let target = self._vertices:.alloc(nbVertices);
+        let firstJoint = {
+            self._joints:.alloc(count-> cast!usize(nbJoints))
+        } catch {
+            err => {
+                self._vertices:.free(target, nbVertices);
+                throw err;
+            }
+        };
+
+        let instance = SkinnedInstance(source-> source,
+                                       nbVertices-> nbVertices,
+                                       firstWeight-> firstWeight,
+                                       target-> target,
+                                       firstJoint-> firstJoint,
+                                       nbJoints-> nbJoints,
+                                       firstCluster-> firstCluster,
+                                       nbClusters-> nbClusters);
+
+        self:.placeJoints(instance, copy [mat4(); nbJoints]);
+        self._instances[uid] = instance;
+        instance
+    }
+
+    /**
+     * Stop skinning an instance from the next recordings, its place being freed once they no longer draw it (see free)
+     * */
+    pub fn forget(mut self, uid: usize) {
+        self._instances:.remove(uid);
+    }
+
+    /**
+     * Give back the vertices and the joints of an instance
+     * @warning: through a retire, the recordings in use may still skin and draw it
+     * */
+    pub fn free(mut self, instance: SkinnedInstance) {
+        self._motion:.forgetRun(instance.firstJoint);
+        self._joints:.free(instance.firstJoint, count-> cast!usize(instance.nbJoints));
+        self._vertices:.free(instance.target, instance.nbVertices);
+    }
+
+    /**
+     * Place the joints of an instance at a pose, drawn without motion by the next frame (a new instance)
+     * @params:
+     *    - matrices: the matrix of each joint of its skin (see Skin.jointMatrices), as many as its joints
+     * */
+    pub fn placeJoints(mut self, instance: SkinnedInstance, matrices: [mat4]) {
+        self._motion:.placeRun(instance.firstJoint, matrices[0us .. min(matrices.len, cast!usize(instance.nbJoints))]);
+    }
+
+    /**
+     * Move the joints of an instance to a pose, the next frame drawing the motion of its vertices from the pose the last
+     * frame drew
+     * @params:
+     *    - matrices: the matrix of each joint of its skin (see Skin.jointMatrices), as many as its joints
+     * */
+    pub fn moveJoints(mut self, instance: SkinnedInstance, matrices: [mat4]) {
+        self._motion:.moveRun(instance.firstJoint, matrices[0us .. min(matrices.len, cast!usize(instance.nbJoints))]);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DRAWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Bind the vertices a frame draws as the vertex buffer of the next draws, in place of the vertices of the pool
+     * */
+    pub fn select(self, frame: u32, cmd: VkCommandBuffer) {
+        self._vertices.select(frame, cmd);
+    }
+
+    /**
+     * Record the skinning of the instances for a frame, one dispatch per instance
+     * @assume: the skin shader is bound, the frame is not in flight (its descriptor set is written)
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command buffer of the skin pass
+     *    - skin: the skin shader
+     *    - rest: the vertex buffer of the geometry pool of the shader, holding the bind vertices
+     * */
+    pub fn dispatch(mut self, frame: u32, cmd: VkCommandBuffer, dmut skin: &ComputeShader, rest: &Buffer) {
+        if self._instances.len == 0us { return; }
+
+        let groupSize = skin.getGroupSizes()[0];
+        if groupSize == 0u32 { return; }
+
+        if let Ok(target) = self._vertices.getBuffer(frame) {
+            self._set:.setBuffer(UniformNames::REST, rest, frame);
+            self._set:.setBuffer(UniformNames::WEIGHTS, self._weights.getBuffer(), frame);
+            self._set:.setBuffer(UniformNames::JOINTS, self._joints.getBuffer(), frame);
+            self._set:.setBuffer(UniformNames::SKINNED, target, frame);
+            self._set.select(frame, cmd);
+
+            for _, i in self._instances {
+                skin:.setPush(cmd,
+                              UniformNames::SKIN,
+                              SkinPush(source-> i.source,
+                                       target-> i.target,
+                                       count-> i.nbVertices,
+                                       firstWeight-> i.firstWeight,
+                                       firstJoint-> i.firstJoint,
+                                       stride-> self._stride,
+                                       normals-> self._normals,
+                                       tangents-> self._tangents,
+                                       previous-> self._previous));
+                vkCmdDispatch(cmd, (i.nbVertices + groupSize - 1u32) / groupSize, 1u32, 1u32);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retire the buffers and the descriptor set of the skinning
+     * @params:
+     *    - window: the window retiring them, the recordings in use still skinning with them
+     * */
+    pub fn retire(mut self, dmut window: &Window) {
+        self._instances = copy [];
+        window:.retire(alias self._vertices);
+        window:.retire(alias self._weights);
+        window:.retire(alias self._joints);
+        window:.retire(alias self._set);
+    }
+}

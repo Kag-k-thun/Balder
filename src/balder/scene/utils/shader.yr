@@ -2,7 +2,7 @@ in shader;
 
 use balder::utils;
 use balder::core::{_, driver::_};
-use balder::core::application::window;
+use balder::core::application::{refcount, window};
 use balder::core::config::shader;
 use balder::core::shader;
 use balder::core::shader::buffers::_;
@@ -18,7 +18,11 @@ use std::time::dur;
 
 use ::vulkan::core;
 
-
+/**
+ * The suffix of the name of the motion tracker of the joints of a shader drawing skinned vertices, after the name of the
+ * shader (see FrameMotion)
+ * */
+def JOINTS_SUFFIX = "#joints";
 
 /**
  * A shadow map drawn, the shaders drawing their casters in its subpass
@@ -58,6 +62,10 @@ pub record ShaderNodeScene {
     // The drawable nodes
     let dmut _nodes : [usize => &VisualInstance3D] = copy [];
 
+    // The name of the shader drawing each drawable node, by uniq id (the skin variant of the shader of its material for a
+    // skinned node)
+    let dmut _shaderOf : [usize => [c8]] = copy [];
+
     // The drawable nodes in a hierarchy of their world boxes, and those seen by the camera
     let dmut _visibility : VisibilityScene = VisibilityScene ();
 
@@ -91,6 +99,14 @@ pub record ShaderNodeScene {
 
         // The depth pyramid of the deferred, loaded with the cull pass
         let dmut _pyramid : (&DepthPyramid)? = none;
+
+    }
+
+    prv { // Skinning
+
+        // The shader of the skin pass, moving the vertices of the skinned nodes before they are drawn, loaded with the
+        // first shader drawing skinned vertices
+        let dmut _skin : (&RefCount!{&Shader})? = none;
 
     }
 
@@ -366,7 +382,14 @@ pub record ShaderNodeScene {
     pub fn register (mut self, dmut material : &Material, dmut node : &VisualInstance3D, mesh : &MeshGeometry)-> dmut &SceneDraws
         throws BalderError
     {
-        let shCfg = material.shaderConfig;
+        let shCfg = if !mesh.skin.hasValue {
+            material.shaderConfig
+        } else if let Ok (skinned) = material.shaderConfig.skin {
+            skinned
+        } else {
+            throw copy BalderError ("The shader " ~ material.shaderConfig.name ~ " draws no skinned vertices (no [skin] table)");
+        };
+
         if shCfg.name !in self._groups {
             if let Ok (dmut win) = alias self._window {
                 if let Ok (dmut sub) = alias self._subpass {
@@ -382,6 +405,17 @@ pub record ShaderNodeScene {
                         g:.setCamera (cam);
                     }
 
+                    if mesh.skin.hasValue {
+                        {
+                            g:.skinWith (alias self:.loadSkin (alias win));
+                        } catch {
+                            err => {
+                                g:.retire (alias win);
+                                throw err;
+                            }
+                        }
+                    }
+
                     if self._gpuCulling {
                         if let Ok (dmut c) = alias self._cull {
                             let dmut cullShader = alias c:.getShader ();
@@ -392,6 +426,9 @@ pub record ShaderNodeScene {
                     self:.castAllShadows (alias g);
                     self._groups [shCfg.name] = alias g;
                     self._motion:.track (shCfg.name, alias g:.getMotion ());
+                    if let Ok (dmut joints) = alias g:.getJointMotion () {
+                        self._motion:.track (shCfg.name ~ JOINTS_SUFFIX, alias joints);
+                    }
                 }
             }
         }
@@ -399,6 +436,7 @@ pub record ShaderNodeScene {
         if let Ok (dmut g) = alias self._groups [shCfg.name] {
             let dmut draws = g:.register (alias material, alias node, mesh);
             self._nodes [node.uid] = alias node;
+            self._shaderOf [node.uid] = dcopy shCfg.name;
             self._visibility:.insert (alias node);
             return alias draws;
         }
@@ -411,15 +449,17 @@ pub record ShaderNodeScene {
      * node
      * */
     pub fn release (mut self, material : &Material, node : &VisualInstance3D) {
+        let name = if let Ok (n) = self._shaderOf [node.uid] { n } else { material.shaderConfig.name };
         self._nodes:.remove (node.uid);
+        self._shaderOf:.remove (node.uid);
         self._visibility:.remove (node);
 
-        let name = material.shaderConfig.name;
         if let Ok (dmut win) = alias self._window {
             if let Ok (dmut g) = alias self._groups [name] {
                 g:.release (alias win, material, node);
                 if g.isEmpty () {
                     self._motion:.forget (name);
+                    self._motion:.forget (name ~ JOINTS_SUFFIX);
                     g:.retire (alias win);
                     self._groups:.remove (name);
                 }
@@ -833,6 +873,34 @@ pub record ShaderNodeScene {
     }
 
     /**
+     * @returns: true iif a shader draws skinned vertices, the skin pass moving them before the frame draws them
+     * */
+    pub fn hasSkinned (self)-> bool {
+        for _, g in self._groups {
+            if g.isSkinned () { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * Record the skin pass of a frame: the vertices of the skinned nodes moved by their joints, one dispatch per node
+     * @params:
+     *    - frame: the frame being recorded
+     *    - cmd: the command buffer of the skin pass
+     * */
+    pub fn recordSkin (mut self, frame : u32, cmd : VkCommandBuffer) {
+        if let Ok (dmut skin) = alias self._skin {
+            if let Ok (dmut sh : &ComputeShader) = (alias skin:.get ())? {
+                sh.select (cmd);
+                for _, dmut g in alias self._groups {
+                    g:.dispatchSkin (frame, cmd, alias sh);
+                }
+            }
+        }
+    }
+
+    /**
      * Lay out the draws of the nodes for the recording of a frame, before the passes of the deferred are recorded
      * */
     pub fn prepare (mut self, frame : u32) {
@@ -976,6 +1044,26 @@ pub record ShaderNodeScene {
     }
 
     /**
+     * @returns: the shader of the skin pass, loaded the first time
+     * */
+    fn loadSkin (mut self, dmut win : &Window)-> dmut &ComputeShader
+        throws BalderError
+    {
+        if !self._skin.hasValue {
+            let dmut shader = win:.loadResource!{&ComputeShader} (DefaultShaders::SKINNING_3D);
+            self._skin = (alias shader)?;
+        }
+
+        if let Ok (dmut skin) = alias self._skin {
+            if let Ok (dmut sh : &ComputeShader) = (alias skin:.get ())? {
+                return alias sh;
+            }
+        }
+
+        throw copy BalderError ("The skin shader is not a compute shader");
+    }
+
+    /**
      * Load the depth pyramid of the depth of the deferred
      * */
     fn loadPyramid (mut self, dmut win : &Window)-> dmut &DepthPyramid
@@ -1001,6 +1089,7 @@ pub record ShaderNodeScene {
     impl Disposable {
         pub over dispose (mut self) {
             self._nodes = copy [];
+            self._shaderOf = copy [];
             self._visibility:.clear ();
 
             if let Ok (dmut win) = alias self._window {
@@ -1017,6 +1106,10 @@ pub record ShaderNodeScene {
                 }
             }
 
+            if let Ok (dmut skin) = alias self._skin {
+                skin:.dispose ();
+            }
+
             self._groups = copy [];
             self._fading = [];
             self._lodRequests = copy [];
@@ -1025,6 +1118,7 @@ pub record ShaderNodeScene {
             self._shadowMaps = copy [];
             self._cull = none;
             self._pyramid = none;
+            self._skin = none;
             self._gpuCulling = false;
             self._materials:.dispose ();
             self._directionLights:.dispose ();

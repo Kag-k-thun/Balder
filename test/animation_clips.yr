@@ -1,7 +1,7 @@
 in animation_clips;
 
 use balder::core::error;
-use balder::math::{matrix, quaternion, utils, vector};
+use balder::math::{bounds, matrix, quaternion, utils, vector};
 use balder::scene::animation::_;
 
 use std::math;
@@ -152,4 +152,127 @@ __test a_skin_moves_its_vertices_from_their_bind_position {
     poses[1us].rotation = Quaternion::fromAxisAngle(1.5707964f, makeVec3(0.0f, 0.0f, 1.0f));
     let joints = skin.jointMatrices(skeleton.globalMatrices(poses));
     assert (near((joints[0us] * makeVec4(3.0f, 0.0f, 0.0f, 1.0f)).xyz, makeVec3(2.0f, 1.0f, 0.0f)));
+}
+
+/**
+ * @returns: true iif a box encloses a point, give or take the rounding errors (a vertex moved by one joint is a corner of
+ * the box of the joint)
+ * */
+fn encloses(box: Aabb, p: vec3)-> bool {
+    let e = 0.0001f;
+    box.min.x - e <= p.x && box.min.y - e <= p.y && box.min.z - e <= p.z
+    && p.x <= box.max.x + e && p.y <= box.max.y + e && p.z <= box.max.z + e
+}
+
+/**
+ * @returns: the vertex at a bind position moved by the joints of a skin, linearly blended by their weights
+ * */
+fn skinned(skin: Skin, globals: [mat4], position: vec3, bones: vec4, weights: vec4)-> vec3 {
+    let joints = skin.jointMatrices(globals);
+    let mut result = vec3();
+    for k in [(bones.x, weights.x), (bones.y, weights.y), (bones.z, weights.z), (bones.w, weights.w)] if k._1 > 0.0f {
+        result = result + (joints[cast!usize(cast!u32(k._0))] * makeVec4(position, 1.0f)).xyz * k._1;
+    }
+
+    result
+}
+
+/**
+ * @returns: the skin of the arm binding the elbow and the hand at their rest pose, its vertices along the forearm and
+ * past the hand, their weights shared between the two joints, the last one moved by no joint
+ * */
+fn forearm(skeleton: &Skeleton)-> (Skin, [vec3], [vec4], [vec4]) {
+    let rest = skeleton.restMatrices();
+    let positions = copy [makeVec3(2.0f, 0.2f, 0.0f), makeVec3(2.5f, -0.2f, 0.1f), makeVec3(3.0f, 0.0f, -0.1f),
+                          makeVec3(3.5f, 0.1f, 0.0f), makeVec3(0.5f, 0.0f, 0.0f)];
+    let bones = copy [makeVec4(0.0f, 1.0f, 0.0f, 0.0f), makeVec4(0.0f, 1.0f, 0.0f, 0.0f), makeVec4(0.0f, 1.0f, 0.0f, 0.0f),
+                      makeVec4(1.0f, 0.0f, 0.0f, 0.0f), vec4()];
+    let weights = copy [makeVec4(1.0f, 0.0f, 0.0f, 0.0f), makeVec4(0.5f, 0.5f, 0.0f, 0.0f), makeVec4(0.2f, 0.8f, 0.0f, 0.0f),
+                        makeVec4(1.0f, 0.0f, 0.0f, 0.0f), vec4()];
+    let skin = Skin(joints-> copy [1us, 2us],
+                    inverseBinds-> copy [rest[1us].inversed(), rest[2us].inversed()],
+                    positions-> positions,
+                    bones-> bones,
+                    weights-> weights);
+
+    (skin, positions, bones, weights)
+}
+
+/**
+ * The box of a pose encloses the vertices moved to it, those moved by several joints too, and the vertices no joint
+ * moves where they are
+ * */
+__test the_box_of_a_pose_encloses_its_skinned_vertices {
+    let skeleton = arm();
+    let (skin, positions, bones, weights) = forearm(skeleton);
+
+    // at rest, the box is the box of the vertices
+    let mut bind = Aabb();
+    for p in positions { bind = bind.merged(Aabb(p, p)); }
+    assert (skin.poseBounds(skeleton.restMatrices()).contains(bind));
+
+    for angle in [0.4f, 1.5707964f, 3.0f, -2.0f] {
+        let dmut poses = copy skeleton.rest;
+        poses[1us].rotation = Quaternion::fromAxisAngle(angle, makeVec3(0.0f, 0.0f, 1.0f));
+        poses[2us].rotation = Quaternion::fromAxisAngle(-angle, makeVec3(0.0f, 1.0f, 0.0f));
+        let globals = skeleton.globalMatrices(poses);
+
+        let box = skin.poseBounds(globals);
+        for v, p in positions {
+            let moved = if weights[v].x + weights[v].y + weights[v].z + weights[v].w > 0.0f {
+                skinned(skin, globals, p, bones[v], weights[v])
+            } else { p };
+
+            assert (encloses(box, moved));
+        }
+    }
+}
+
+/**
+ * The box of a clip encloses its poses at its keys and at its ends, and grows past the box of the rest pose
+ * */
+__test the_box_of_a_clip_encloses_its_poses {
+    let skeleton = arm();
+    let (skin, _, _, _) = forearm(skeleton);
+    let up = makeVec3(0.0f, 0.0f, 1.0f);
+    let bend = JointChannel("elbow", rotation-> Track!{Quaternion}(times-> copy [0.0f, 0.4f, 1.0f],
+                                                                   values-> copy [Quaternion(),
+                                                                                  Quaternion::fromAxisAngle(1.5707964f, up),
+                                                                                  Quaternion::fromAxisAngle(3.0f, up)]));
+    let clip = copy AnimationClip("bend", 1.0f, copy [bend]);
+
+    let box = clip.bounds(skeleton, skin);
+    for t in [0.0f, 0.4f, 1.0f] {
+        assert (box.contains(skin.poseBounds(skeleton.globalMatrices(clip.sample(skeleton, t)))));
+    }
+
+    assert (!skin.poseBounds(skeleton.restMatrices()).contains(box));
+}
+
+
+/**
+ * Sampled, placed and moved into buffers, the poses are those sampled, placed and moved anew, the buffers written again
+ * at each pose
+ * */
+__test the_poses_written_into_buffers_are_the_poses_returned {
+    let skeleton = arm();
+    let (skin, _, _, _) = forearm(skeleton);
+    let up = makeVec3(0.0f, 0.0f, 1.0f);
+    let bend = JointChannel("elbow", rotation-> Track!{Quaternion}(times-> copy [0.0f, 1.0f],
+                                                                   values-> copy [Quaternion(), Quaternion::fromAxisAngle(1.5707964f, up)]));
+    let clip = copy AnimationClip("bend", 1.0f, copy [bend]);
+
+    let dmut poses = copy [JointPose(); skeleton.len];
+    let dmut globals = copy [mat4(); skeleton.len];
+    let dmut joints = copy [mat4(); skin.joints.len];
+    for t in [0.25f, 0.75f, 0.0f] {
+        clip.sampleInto(skeleton, t, alias poses);
+        skeleton.globalMatricesInto(poses, alias globals);
+        skin.jointMatricesInto(globals, alias joints);
+
+        let expected = skin.jointMatrices(skeleton.globalMatrices(clip.sample(skeleton, t)));
+        for i, m in expected {
+            assert (near(joints[i], m));
+        }
+    }
 }

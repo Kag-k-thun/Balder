@@ -1,0 +1,128 @@
+#version 450 core
+
+// The vertex shader of pbr.vert for skinned vertices, the [skin] variant of pbr.toml
+
+layout (location = 0) in vec3 inPosition;
+layout (location = 1) in vec3 inNormals;
+
+// The tangent, along the growing u of the texture coordinates, and in w the handedness of the tangent space (see the
+// fragment shader)
+layout (location = 2) in vec4 inTangents;
+layout (location = 3) in vec2 inUV;
+
+// The position the frame before drew the vertex at, the vertices being skinned by the skin pass of the scene before
+// they are drawn (see skin.comp): the motion of a skinned vertex is the one of its object and of its pose
+layout (location = 4) in vec3 inPrevious;
+
+// The projection is offset by the jitter of the frame (a temporal anti-aliasing), the view-projections are not
+layout(set = 1, binding = 0) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+    float exposure;
+
+    // The view-projection the frame before drew with
+    mat4 prevViewProj;
+
+    // What the g-buffer shows instead of the materials (see DebugView), 0 for the materials
+    uint debugView;
+} camera;
+
+// The data of an object, in the slot given by the words of its instances (see the draws of IndexedMesh3D)
+struct Object {
+    mat4 model;
+
+    // The progress of the cross-fade between two levels of detail of the mesh, from 0 to 1
+    float fade;
+
+    // The index of the material of the object in the composition pass
+    uint material;
+
+    // The level of detail drawn alone or fading in, and in the high 16 bits the level fading out
+    uint lod;
+
+    // The center and the half size along each axis of the box enclosing the object in world space, read by the cull
+    // pass of the scene (an empty box has a negative extent)
+    vec4 boxCenter;
+    vec4 boxExtent;
+
+    // The world the frame before drew the object with, the motion of its pixels being written in the g-buffer
+    mat4 previousModel;
+};
+
+layout (std430, set = 0, binding = 0) readonly buffer Objects {
+    Object objects [];
+};
+
+// The word of each instance drawn: the slot of its object above the two low bits, and in them the role of the draw
+layout (std430, set = 0, binding = 1) readonly buffer Instances {
+    uint instances [];
+};
+
+layout (location = 0) out vec3 outNormals;
+layout (location = 1) out vec2 outUV;
+
+// The cross-fade of the draw: .x its progress, .y the role of the draw, the two low bits of its word (0 for a level
+// drawn alone, 1 for the outgoing level of a cross-fade, 2 for the incoming one)
+layout (location = 2) flat out vec2 outFade;
+
+// The material of the object
+layout (location = 3) flat out uint outMaterial;
+
+// The tangent in world space, its handedness in w
+layout (location = 4) out vec4 outTangents;
+
+// The position in the clip space of the camera, unjittered, at this frame and at the frame before, the fragment shader
+// writing the motion between the two
+layout (location = 5) out vec4 outCurrent;
+layout (location = 6) out vec4 outPrevious;
+
+// The debug view of the camera (see DebugView), the word of the instance, the slot of the cluster the command draws
+// (NO_CLUSTER when the command draws a whole level, culled on the CPU) and the level of detail of the draw
+layout (location = 7) flat out uvec4 outDebug;
+
+// The mark of the second word of the instance of a command drawing a cluster (see the cull pass)
+const uint CLUSTER_DRAW = 0x80000000u;
+
+// The cluster of a command drawing a whole level
+const uint NO_CLUSTER = 0xffffffffu;
+
+// The role of the draw of the outgoing level of a cross-fade, in the low bits of its word
+const uint OUTGOING_DRAW = 1u;
+
+// Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
+out gl_PerVertex {
+    invariant vec4 gl_Position;
+};
+
+void main () {    
+    uint word = instances [gl_InstanceIndex];
+    Object object = objects [word >> 2];
+
+    vec4 viewPos = camera.view * object.model * vec4 (inPosition, 1.0);
+    outCurrent = camera.viewProj * object.model * vec4 (inPosition, 1.0);
+    outPrevious = camera.prevViewProj * object.previousModel * vec4 (inPrevious, 1.0);
+    gl_Position = camera.proj * viewPos;
+    
+    // the normals of the object turned into world space, by the inverse transpose of its world so a non uniform scale
+    // keeps them perpendicular to its surface
+    outNormals = transpose (inverse (mat3 (object.model))) * inNormals;
+
+    // the tangents lie in the surface, turned by its world as its positions are
+    outTangents = vec4 (mat3 (object.model) * inTangents.xyz, inTangents.w);
+    outUV = inUV;
+    outFade = vec2 (object.fade, float (word & 3u));
+    outMaterial = object.material;
+
+    // the cull pass writes the slot of the cluster after the word of the instance of its commands, marked, as no word of
+    // an instance is
+    uint cluster = NO_CLUSTER;
+    if (camera.debugView != 0u) {
+        uint next = instances [gl_InstanceIndex + 1];
+        if ((next & CLUSTER_DRAW) != 0u) cluster = next & ~CLUSTER_DRAW;
+    }
+
+    uint level = (word & 3u) == OUTGOING_DRAW ? object.lod >> 16 : object.lod & 0xffffu;
+    outDebug = uvec4 (camera.debugView, word, cluster, level);
+}
