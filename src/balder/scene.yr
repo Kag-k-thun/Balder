@@ -11,7 +11,7 @@ pub mod ::description;
 
 use balder::utils;
 use balder::core::{_, application::_};
-use balder::core::driver::{cmd_alloc, graph};
+use balder::core::driver::{cmd_alloc, graph, subpass};
 use balder::core::shader::texture;
 use balder::math::{bounds, vector};
 use balder::scene::node;
@@ -50,6 +50,8 @@ def DRAWS        = "draws";
 def LATE_DRAWS   = "late_draws";
 def CULL_STATE   = "cull_state";
 def HZB          = "hzb";
+def SKIN         = "skin";
+def SKINNED      = "skinned";
 
 /*!
  * ====================================================================================================
@@ -109,6 +111,10 @@ pub class Scene {
 
     // The shadows of the point and spot lights casting shadows, in the tiles of an atlas, and the subpass drawing it
     let dmut _localShadow : LocalShadowScene = LocalShadowScene ();
+
+    // The subpass of the skin pass, moving the vertices of the skinned instances before the g-buffer and the shadow maps
+    // draw them
+    let dmut _skin : (&ComputeSubpass)? = none;
     
     prot { // Aspect 
 
@@ -285,12 +291,24 @@ pub class Scene {
         throws BalderError
     {
         let dmut pipeline = self._window:.getVulkanPipeline ();
-        for b in copy [DRAWS, LATE_DRAWS, CULL_STATE, HZB] {
+        for b in copy [DRAWS, LATE_DRAWS, CULL_STATE, HZB, SKINNED] {
             pipeline:.importBuffer (self.named (b));
         }
 
         let deferred = self.named (DEFERRED);
         let attachments = self.gbufferUses ();
+
+        // the vertices of the skinned instances, moved in a subpass of their own that the g-buffer and the shadow maps
+        // wait for, enabled while an instance is skinned
+        let dmut skin = copy ComputeSubpass (alias self._window:.getVulkanDevice (), self.named (SKIN), 1u32, 1u32, 1u32);
+        pipeline:.registerSubPass (self.named (SKIN), alias skin);
+        self._skin = (alias skin)?;
+
+        pipeline:.declarePass (GraphPass (name-> self.named (SKIN),
+                                          submission-> self.named (SKIN),
+                                          kind-> PassKind::COMPUTE,
+                                          uses-> copy [ResourceUse (resource-> self.named (SKINNED), usage-> Usage::STORAGE_WRITE)],
+                                          recording-> (&self:.recordSkin)?));
 
         pipeline:.declarePass (GraphPass (name-> self.named (CULL),
                                           submission-> deferred,
@@ -302,7 +320,8 @@ pub class Scene {
         pipeline:.declarePass (GraphPass (name-> self.named (GBUFFER),
                                           submission-> deferred,
                                           uses-> copy [ResourceUse (resource-> self.named (DRAWS), usage-> Usage::INDIRECT),
-                                                       ResourceUse (resource-> self.named (DRAWS), usage-> Usage::VERTEX_READ)] ~ attachments,
+                                                       ResourceUse (resource-> self.named (DRAWS), usage-> Usage::VERTEX_READ),
+                                                       self.skinnedUse ()] ~ attachments,
                                           recording-> (&self:.recordGbuffer)?));
 
         pipeline:.declarePass (GraphPass (name-> self.named (PYRAMID),
@@ -323,7 +342,8 @@ pub class Scene {
         pipeline:.declarePass (GraphPass (name-> self.named (LATE_GBUFFER),
                                           submission-> deferred,
                                           uses-> copy [ResourceUse (resource-> self.named (LATE_DRAWS), usage-> Usage::INDIRECT),
-                                                       ResourceUse (resource-> self.named (LATE_DRAWS), usage-> Usage::VERTEX_READ)] ~ attachments,
+                                                       ResourceUse (resource-> self.named (LATE_DRAWS), usage-> Usage::VERTEX_READ),
+                                                       self.skinnedUse ()] ~ attachments,
                                           recording-> (&self:.recordLateGbuffer)?));
 
         self._occlusion:.declare (self.named (COMPOSE));
@@ -341,6 +361,14 @@ pub class Scene {
                                                           ResourceUse (resource-> self._occlusion.image (self._name), usage-> Usage::SAMPLED_COMPUTE, optional-> true),
                                                           ResourceUse (resource-> self.named (RADIANCE), usage-> Usage::STORAGE_WRITE)],
                                           recording-> (&self:.recordCompose)?));
+    }
+
+    /**
+     * @returns: the use of the skinned vertices by a pass drawing the instances, dropped while no instance is skinned (the
+     * skin pass disabled)
+     * */
+    fn skinnedUse (self)-> ResourceUse {
+        ResourceUse (resource-> self.named (SKINNED), usage-> Usage::VERTEX_INPUT, optional-> true)
     }
 
     /**
@@ -365,11 +393,23 @@ pub class Scene {
             (self._shaderToNode.cullsOnGpu (), self._shaderToNode.cullsOccluded ())
         };
 
+        self:.enableSkin ();
         let dmut pipeline = self._window:.getVulkanPipeline ();
         pipeline:.enablePass (self.named (CULL), gpu);
         pipeline:.enablePass (self.named (PYRAMID), occlusion);
         pipeline:.enablePass (self.named (LATE_CULL), occlusion);
         pipeline:.enablePass (self.named (LATE_GBUFFER), occlusion);
+    }
+
+    /**
+     * Enable the skin pass while an instance is skinned, its subpass not submitted otherwise
+     * */
+    fn enableSkin (mut self) {
+        let skinned = atomic self {
+            self._shaderToNode.hasSkinned ()
+        };
+
+        self._window:.getVulkanPipeline ():.enablePass (self.named (SKIN), skinned);
     }
 
     /**
@@ -920,6 +960,20 @@ pub class Scene {
     }
 
     /**
+     * Record the skin pass: the vertices of the skinned instances moved by their joints, for the g-buffer and the shadow
+     * maps of the frame
+     * */
+    fn recordSkin (mut self) {
+        if let Ok (dmut skin) = alias self._skin {
+            let frame = skin.getCurrentFrame ();
+            let cmd = skin.getDrawingCommandBuffer ();
+            atomic self {
+                self._shaderToNode:.recordSkin (frame, cmd);
+            }
+        }
+    }
+
+    /**
      * Record the cull pass of the instances culled on the GPU, writing the commands of the g-buffer
      * */
     fn recordCull (mut self) {
@@ -1271,6 +1325,7 @@ pub class Scene {
             self._shaderToNode:.register (alias material, alias node, mesh)
         };
 
+        self:.enableSkin ();
         self._window:.redrawPipeline ();
         alias draws
     }
@@ -1310,6 +1365,7 @@ pub class Scene {
             self._shaderToNode:.release (material, node);
         }
 
+        self:.enableSkin ();
         self._window:.redrawPipeline ();
     }
     
@@ -1483,7 +1539,8 @@ pub class Scene {
 
             self._window:.getVulkanPipeline ():.declarePass (GraphPass (name-> sname,
                                                                         submission-> sname,
-                                                                        uses-> copy [ResourceUse (resource-> atlas, usage-> Usage::DEPTH_ATTACHMENT)],
+                                                                        uses-> copy [ResourceUse (resource-> atlas, usage-> Usage::DEPTH_ATTACHMENT),
+                                                                                     self.skinnedUse ()],
                                                                         recording-> (&self:.recordShadow)?),
                                                              before-> self.named (COMPOSE));
         } catch {
@@ -1577,7 +1634,8 @@ pub class Scene {
 
             self._window:.getVulkanPipeline ():.declarePass (GraphPass (name-> sname,
                                                                         submission-> sname,
-                                                                        uses-> copy [ResourceUse (resource-> atlas, usage-> Usage::DEPTH_ATTACHMENT)],
+                                                                        uses-> copy [ResourceUse (resource-> atlas, usage-> Usage::DEPTH_ATTACHMENT),
+                                                                                     self.skinnedUse ()],
                                                                         recording-> (&self:.recordLocalShadow)?),
                                                              before-> self.named (COMPOSE));
         } catch {
@@ -1802,9 +1860,15 @@ pub class Scene {
 
         if self._width != 0u32 && self._height != 0u32 {
             let dmut pipeline = self._window:.getVulkanPipeline ();
-            for b in copy [DRAWS, LATE_DRAWS, CULL_STATE, HZB] {
+            for b in copy [DRAWS, LATE_DRAWS, CULL_STATE, HZB, SKINNED] {
                 pipeline:.removeResource (self.named (b));
             }
+        }
+
+        if let Ok (dmut skin) = alias self._skin {
+            self._window:.getVulkanPipeline ():.removeSubPass (self.named (SKIN));
+            self._window:.retire (alias skin);
+            self._skin = none;
         }
     }
 
