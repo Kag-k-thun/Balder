@@ -1,0 +1,155 @@
+in animation_clips;
+
+use balder::core::error;
+use balder::math::{matrix, quaternion, utils, vector};
+use balder::scene::animation::_;
+
+use std::math;
+
+/**
+ * @returns: true iif two matrices are equal, give or take the rounding errors
+ * */
+fn near(a: mat4, b: mat4)-> bool {
+    let d = a - b;
+    let cols = [makeVec4(d.a1, d.b1, d.c1, d.d1), makeVec4(d.a2, d.b2, d.c2, d.d2),
+                makeVec4(d.a3, d.b3, d.c3, d.d3), makeVec4(d.a4, d.b4, d.c4, d.d4)];
+    for c in cols {
+        if c.length() > 0.0001f { return false; }
+    }
+
+    true
+}
+
+/**
+ * @returns: true iif two vectors are equal, give or take the rounding errors
+ * */
+fn near(a: vec3, b: vec3)-> bool {
+    (a - b).length() < 0.0001f
+}
+
+/**
+ * @returns: an arm of three joints along x, the shoulder at the root, the elbow at 2 and the hand at 1 from the elbow
+ * */
+fn arm()-> &Skeleton
+    throws BalderError
+{
+    copy Skeleton(copy ["shoulder", "elbow", "hand"],
+                  copy [none, (0us)?, (1us)?],
+                  copy [JointPose(), JointPose(translation-> makeVec3(2.0f, 0.0f, 0.0f)),
+                        JointPose(translation-> makeVec3(1.0f, 0.0f, 0.0f))])
+}
+
+__test a_track_holds_its_ends_and_goes_linearly_between_its_keys {
+    let track = Track!{vec3}(times-> copy [1.0f, 2.0f, 4.0f],
+                             values-> copy [makeVec3(0.0f, 0.0f, 0.0f), makeVec3(2.0f, 0.0f, 0.0f), makeVec3(2.0f, 4.0f, 0.0f)]);
+    assert (near(track.sample(0.0f), makeVec3(0.0f, 0.0f, 0.0f)));
+    assert (near(track.sample(1.5f), makeVec3(1.0f, 0.0f, 0.0f)));
+    assert (near(track.sample(2.0f), makeVec3(2.0f, 0.0f, 0.0f)));
+    assert (near(track.sample(3.0f), makeVec3(2.0f, 2.0f, 0.0f)));
+    assert (near(track.sample(9.0f), makeVec3(2.0f, 4.0f, 0.0f)));
+
+    let stepped = Track!{vec3}(times-> track.times, values-> track.values, stepped-> true);
+    assert (near(stepped.sample(1.9f), makeVec3(0.0f, 0.0f, 0.0f)));
+    assert (near(stepped.sample(3.9f), makeVec3(2.0f, 0.0f, 0.0f)));
+
+    assert (Track!{vec3}().isEmpty && !track.isEmpty);
+}
+
+__test a_rotation_track_turns_spherically_between_its_keys {
+    let up = makeVec3(0.0f, 1.0f, 0.0f);
+    let track = Track!{Quaternion}(times-> copy [0.0f, 1.0f],
+                                   values-> copy [Quaternion(), Quaternion::fromAxisAngle(1.6f, up)]);
+    let quarter = track.sample(0.25f);
+    assert (abs(quarter.dot(Quaternion::fromAxisAngle(0.4f, up))) > 0.99999f);
+}
+
+__test a_pose_gives_its_matrix_back {
+    let pose = JointPose(translation-> makeVec3(1.0f, -2.0f, 3.0f),
+                         rotation-> Quaternion::fromAxisAngle(0.9f, makeVec3(1.0f, 1.0f, 0.0f)),
+                         scale-> makeVec3(2.0f, 0.5f, 1.5f));
+    let m = pose.matrix();
+    assert (near(m, translation(pose.translation) * pose.rotation.matrix() * scaling(pose.scale)));
+
+    let back = JointPose::fromMatrix(m);
+    assert (near(back.translation, pose.translation));
+    assert (near(back.scale, pose.scale));
+    assert (abs(back.rotation.dot(pose.rotation)) > 0.99999f);
+    assert (near(back.matrix(), m));
+
+    // a mirror gets a negative scale along x
+    let mirror = m * scaling(makeVec3(1.0f, 1.0f, -1.0f));
+    let mirrored = JointPose::fromMatrix(mirror);
+    assert (mirrored.scale.x < 0.0f);
+    assert (near(mirrored.matrix(), mirror));
+}
+
+__test a_skeleton_places_each_joint_after_its_parent {
+    let skeleton = arm();
+    assert (skeleton.len == 3us);
+    assert (skeleton.find("elbow").hasValue && !skeleton.find("knee").hasValue);
+
+    let globals = skeleton.restMatrices();
+    assert (near((globals[2us] * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz, makeVec3(3.0f, 0.0f, 0.0f)));
+
+    // the shoulder turning a quarter about z, the hand goes up
+    let dmut poses = copy skeleton.rest;
+    poses[0us] = JointPose(rotation-> Quaternion::fromAxisAngle(1.5707964f, makeVec3(0.0f, 0.0f, 1.0f)));
+    let turned = skeleton.globalMatrices(poses);
+    assert (near((turned[2us] * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz, makeVec3(0.0f, 3.0f, 0.0f)));
+
+    // the placement moves the roots, and the joints under them
+    let placed = copy Skeleton(skeleton.names, skeleton.parents, skeleton.rest, placement-> scaling(makeVec3(2.0f, 2.0f, 2.0f)));
+    assert (near((placed.restMatrices()[2us] * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz, makeVec3(6.0f, 0.0f, 0.0f)));
+}
+
+__test a_joint_before_its_parent_is_refused {
+    let thrown = {
+        copy Skeleton(copy ["hand", "elbow"], copy [(1us)?, none], copy [JointPose(), JointPose()]);
+        false
+    } catch {
+        _: &BalderError => { true }
+    };
+
+    assert (thrown);
+}
+
+__test a_clip_moves_the_joints_it_names_and_leaves_the_others_at_rest {
+    let skeleton = arm();
+    let up = makeVec3(0.0f, 0.0f, 1.0f);
+    let bend = JointChannel("elbow", rotation-> Track!{Quaternion}(times-> copy [0.0f, 1.0f],
+                                                                   values-> copy [Quaternion(), Quaternion::fromAxisAngle(1.5707964f, up)]));
+    let stray = JointChannel("tail", translation-> Track!{vec3}(times-> copy [0.0f], values-> copy [makeVec3(9.0f, 9.0f, 9.0f)]));
+    let clip = copy AnimationClip("bend", 1.0f, copy [bend, stray]);
+
+    let poses = clip.sample(skeleton, 1.0f);
+    assert (poses.len == 3us);
+
+    // the elbow turns, keeping the translation of its rest pose; the shoulder and the hand stay at rest
+    assert (near(poses[1us].translation, makeVec3(2.0f, 0.0f, 0.0f)));
+    assert (abs(poses[1us].rotation.dot(Quaternion::fromAxisAngle(1.5707964f, up))) > 0.99999f);
+    assert (near(poses[0us].matrix(), mat4()) && near(poses[2us].matrix(), skeleton.rest[2us].matrix()));
+
+    let hand = (skeleton.globalMatrices(poses)[2us] * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    assert (near(hand, makeVec3(2.0f, 1.0f, 0.0f)));
+
+    // halfway, the elbow turns an eighth
+    let half = clip.sample(skeleton, 0.5f);
+    assert (abs(half[1us].rotation.dot(Quaternion::fromAxisAngle(0.7853982f, up))) > 0.99999f);
+}
+
+__test a_skin_moves_its_vertices_from_their_bind_position {
+    let skeleton = arm();
+    let rest = skeleton.restMatrices();
+
+    // the skin binds the elbow and the hand, in this order, at their rest pose
+    let skin = Skin(joints-> copy [1us, 2us], inverseBinds-> copy [rest[1us].inversed(), rest[2us].inversed()]);
+    for m in skin.jointMatrices(rest) {
+        assert (near(m, mat4()));
+    }
+
+    // the elbow turning a quarter, a vertex bound to the elbow at the hand turns about the elbow
+    let dmut poses = copy skeleton.rest;
+    poses[1us].rotation = Quaternion::fromAxisAngle(1.5707964f, makeVec3(0.0f, 0.0f, 1.0f));
+    let joints = skin.jointMatrices(skeleton.globalMatrices(poses));
+    assert (near((joints[0us] * makeVec4(3.0f, 0.0f, 0.0f, 1.0f)).xyz, makeVec3(2.0f, 1.0f, 0.0f)));
+}
