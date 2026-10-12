@@ -4,8 +4,9 @@ use balder::core::shader::buffers::objects;
 use balder::math::matrix;
 
 /**
- * A run of objects followed together (the joints of a skinned instance), the worlds the last frame drew kept in a buffer
- * allocated once, written again in place at each frame while the run moves
+ * A run of objects followed together (the joints of a skinned instance), the worlds the last frame drew and the worlds
+ * last written in the slots kept in buffers allocated once, written again in place while the run moves
+ * @info: locked on its own, so moving a run never waits for the frame advancing the others
  * */
 @final
 class MovingRun {
@@ -16,12 +17,16 @@ class MovingRun {
     // The world the last frame submitted drew, of each object of the run
     pub let dmut drawn: [mat4];
 
+    // The world last written in the slot of each object of the run, the one the next frame draws
+    pub let dmut next: [mat4];
+
     // True while the run is followed, a frame drawing it moved
     pub let mut moving: bool = false;
 
     pub self (first: u32, count: usize)
         with first = first
         , drawn = copy [mat4(); count]
+        , next = copy [mat4(); count]
     {}
 }
 
@@ -45,7 +50,8 @@ pub class MotionTracker {
     // The world the last frame submitted drew, of each slot followed
     let dmut _moving: [u32 => mat4] = copy [];
 
-    // The runs of objects followed together (see moveRun), by their first slot, and in a list walked at each frame
+    // The runs of objects followed together (see moveRun), by their first slot, and in a list walked at each frame, a
+    // new list being built when a run is made or forgotten
     let dmut _runs: [u32 => &MovingRun] = copy [];
     let dmut _runList: [&MovingRun] = [];
 
@@ -94,9 +100,13 @@ pub class MotionTracker {
      *    - worlds: the world of each object, from the first one
      * */
     pub fn placeRun(mut self, first: u32, worlds: [mat4]) {
-        atomic self {
-            let dmut run = self:.runOf(first, worlds.len);
+        let dmut run = self:.runOf(first, worlds.len);
+        atomic run {
             run.moving = false;
+            for i, w in worlds {
+                run.next[i] = w;
+            }
+
             self._objects:.setRun(first, self._world, worlds);
             self._objects:.setRun(first, self._previous, worlds);
         }
@@ -111,14 +121,19 @@ pub class MotionTracker {
      *    - worlds: the world of each object, from the first one
      * */
     pub fn moveRun(mut self, first: u32, worlds: [mat4]) {
-        atomic self {
-            let dmut run = self:.runOf(first, worlds.len);
+        let dmut run = self:.runOf(first, worlds.len);
+        atomic run {
+            // the worlds in the slots are the ones the last frame drew
             if !run.moving {
-                for i in 0us .. run.drawn.len {
-                    run.drawn[i] = self._objects.getData!{mat4} (first + cast!u32(i), self._world);
+                for i in 0us .. run.next.len {
+                    run.drawn[i] = run.next[i];
                 }
 
                 run.moving = true;
+            }
+
+            for i, w in worlds {
+                run.next[i] = w;
             }
 
             self._objects:.setRun(first, self._world, worlds);
@@ -132,10 +147,11 @@ pub class MotionTracker {
      * */
     pub fn forgetRun(mut self, first: u32) {
         atomic self {
-            if first !in self._runs { return; }
-
-            self._runs:.remove(first);
-            self:.listRuns();
+            if let Ok(dmut run) = alias self._runs[first] {
+                self:.stopRun(alias run);
+                self._runs:.remove(first);
+                self:.listRuns();
+            }
         }
     }
 
@@ -154,23 +170,13 @@ pub class MotionTracker {
      * anymore
      * */
     pub fn advanceFrame(mut self) {
+        // the runs are advanced one at a time under their own lock, a run moved meanwhile waiting for itself only
+        let dmut runs = atomic self { alias self._runList };
+        for dmut run in alias runs {
+            self:.advanceRun(alias run);
+        }
+
         atomic self {
-            // the runs write the worlds the last frame drew, and keep the worlds this frame draws in place
-            for dmut run in alias self._runList if run.moving {
-                self._objects:.setFrameRun(run.first, self._previous, run.drawn);
-
-                let mut moved = false;
-                for i in 0us .. run.drawn.len {
-                    let world = self._objects.getData!{mat4} (run.first + cast!u32(i), self._world);
-                    if world != run.drawn[i] {
-                        run.drawn[i] = world;
-                        moved = true;
-                    }
-                }
-
-                run.moving = moved;
-            }
-
             // nothing moving, nothing to write
             if self._moving.len == 0us { return; }
 
@@ -188,19 +194,55 @@ pub class MotionTracker {
     }
 
     /**
+     * Write the worlds the last frame drew in the slots of a run moving, for the frame being submitted, and keep the
+     * worlds this frame draws; the run is not followed anymore once a frame drew it without moving
+     * */
+    fn advanceRun(mut self, dmut run: &MovingRun) {
+        atomic run {
+            if !run.moving { return; }
+
+            self._objects:.setFrameRun(run.first, self._previous, run.drawn);
+
+            let mut moved = false;
+            for i in 0us .. run.next.len if run.next[i] != run.drawn[i] {
+                run.drawn[i] = run.next[i];
+                moved = true;
+            }
+
+            run.moving = moved;
+        }
+    }
+
+    /**
      * @returns: the run of objects starting at a slot, followed from now on, made the first time (or again when its
-     * length changed)
-     * @atomic
+     * length changed) with the worlds already in its slots
      * */
     fn runOf(mut self, first: u32, count: usize)-> dmut &MovingRun {
-        if let Ok(dmut run) = alias self._runs[first] {
-            if run.drawn.len == count { return alias run; }
-        }
+        atomic self {
+            if let Ok(dmut run) = alias self._runs[first] {
+                if run.next.len == count { return alias run; }
+                self:.stopRun(alias run);
+            }
 
-        let dmut run = copy MovingRun(first, count);
-        self._runs[first] = alias run;
-        self:.listRuns();
-        alias run
+            let dmut run = copy MovingRun(first, count);
+            for i in 0us .. count {
+                run.next[i] = self._objects.getData!{mat4} (first + cast!u32(i), self._world);
+            }
+
+            self._runs[first] = alias run;
+            self:.listRuns();
+            return alias run;
+        }
+    }
+
+    /**
+     * Stop advancing a run replaced or forgotten, a frame advancing the list it was taken from writing its slots no more
+     * @atomic
+     * */
+    fn stopRun(mut self, dmut run: &MovingRun) {
+        atomic run {
+            run.moving = false;
+        }
     }
 
     /**
