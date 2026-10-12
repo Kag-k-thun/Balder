@@ -1,0 +1,433 @@
+in inspector_panel;
+
+use main::{command, editor, lighting, outline};
+use main::command::{light, rename, transform};
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface;
+use balder::interface::widget;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget::button::check;
+use balder::interface::widget::text::_;
+use balder::math::{_, utils};
+use balder::scene::edit;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::light;
+use balder::scene::node::node3D::transform;
+
+// The path of the inspector in the interface of the editor, then of its panels, of an object and of a light
+def INSPECTOR = "BODY/MAIN/INSPECTOR";
+def OBJECT = "BODY/MAIN/INSPECTOR/OBJECT";
+def LIGHT = "BODY/MAIN/INSPECTOR/LIGHT";
+
+// The rows of the transform in the panel of an object, then the fields of the axes in each row
+def ROWS = ["POSITION", "ROTATION", "SCALE"];
+def AXES = ["X", "Y", "Z"];
+
+// The class of a panel or of a row the node inspected does not use, displayed none (see inspector.style)
+def ABSENT = "absent";
+
+// The settings of a light a field of its panel changes (see withSetting)
+def SET_DIRECTION = 0u32;
+def SET_COLOR = 1u32;
+def SET_INTENSITY = 2u32;
+def SET_RANGE = 3u32;
+def SET_INNER = 4u32;
+def SET_OUTER = 5u32;
+def SET_SHADOWS = 6u32;
+
+/**
+ * The inspector of the node selected last, on the right of the editor, mounted under the behavior 'inspector': its name,
+ * then the panel of its kind, in fields refreshed when the node moves. The panel of an object (a mesh, a model, a
+ * group) holds its position, its rotation (in degrees) and its scale; the panel of a light its position, its direction,
+ * its colour, its intensity, its range, its cone and its shadows, the fields its type does not use being absent
+ * @info: a name validated renames the node inspected; a field changed gives its value to every node selected of the
+ * kind of the panel, each keeping its other settings; every change goes through the commands of the editor
+ * */
+pub class InspectorPanel over Behavior {
+
+    // The interface holding the fields
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the slots of the selection and of the node inspected are emitted in
+    let dmut _box: &SlotEmitter;
+
+    // Shows a message in the status bar
+    let _status: dg ([c8])-> void;
+
+    // The editor of the scene, once bound
+    let dmut _editor: (&SceneEditor)? = none;
+
+    // The node inspected, the one selected last, none when none is
+    let dmut _node: (&Node3D)? = none;
+
+    /**
+     * @params:
+     *    - gui: the interface holding the fields
+     *    - box: the mailbox the slots of the selection and of the node inspected are emitted in
+     *    - status: shows a message in the status bar
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, status: dg ([c8])-> void)
+        with _gui = alias gui
+        , _box = alias box
+        , _status = status
+    {
+        self:.slot("renamed", &self:.onRenamed);
+        self:.slot("moved", &self:.onMoved);
+        self:.slot("turned", &self:.onTurned);
+        self:.slot("scaled", &self:.onScaled);
+        self:.slot("aimed", &self:.onAimed);
+        self:.slot("colored", &self:.onColored);
+        self:.slot("intensified", &self:.onIntensified);
+        self:.slot("ranged", &self:.onRanged);
+        self:.slot("narrowed", &self:.onNarrowed);
+        self:.slot("widened", &self:.onWidened);
+        self:.slot("shadowed", &self:.onShadowed);
+    }
+
+    /**
+     * Inspect the nodes selected in the scene of an editor, once the interface is loaded
+     * */
+    pub fn bind(mut self, dmut editor: &SceneEditor) {
+        let dmut scene = alias editor.scene;
+        let dmut selection = alias scene.selection;
+        selection:.changed():.connect(alias self._box, &self:.onSelectionChanged);
+        editor:.edited():.connect(alias self._box, &self:.onEdited);
+        self._editor = (alias editor)?;
+
+        self:.onSelectionChanged();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSPECTING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Inspect the node selected last
+     * */
+    fn onSelectionChanged(mut self) {
+        let dmut last: (&Node3D)? = none;
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            let dmut nodes = alias selection.nodes;
+            if nodes.len != 0us {
+                last = (alias nodes[$ - 1us])?;
+            }
+        }
+
+        self:.inspect(alias last);
+    }
+
+    /**
+     * Refresh the fields after a command, a renaming changing the name shown
+     * */
+    fn onEdited(mut self, _: &EditCommand) {
+        self:.refresh();
+    }
+
+    /**
+     * Inspect a node, its fields refreshed each time it moves
+     * */
+    fn inspect(mut self, dmut node: (&Node3D)?) {
+        if let Ok(dmut old) = alias self._node {
+            old:.transformationChanged():.disconnect(&self:.refresh);
+        }
+
+        if let Ok(dmut n) = alias node {
+            n:.transformationChanged():.connect(alias self._box, &self:.refresh);
+        }
+
+        self._node = alias node;
+        self:.refresh();
+    }
+
+    /**
+     * Write the name and the settings of the node inspected in the fields, without emitting their signals, the panel of
+     * its kind present and the other absent
+     * */
+    fn refresh(mut self) {
+        let (kind, name) = if let Ok(n) = self._node { (kindOf(n), n.name.file()) } else { ("Nothing selected", "") };
+        if let Ok(dmut l: &Label) = self._gui:.find(INSPECTOR ~ "/KIND") {
+            l:.setText(kind);
+        }
+
+        if let Ok(dmut input: &InputText) = self._gui:.find(INSPECTOR ~ "/NAME") {
+            input:.setText(name);
+        }
+
+        let isLight = if let Ok(_: &Light) = self._node { true } else { false };
+        self:.setPresent(OBJECT, self._node.hasValue && !isLight);
+        self:.setPresent(LIGHT, isLight);
+
+        if let Ok(l: &Light) = self._node {
+            self:.refreshLight(l);
+        } else if let Ok(n) = self._node {
+            self:.refreshObject(n);
+        }
+    }
+
+    /**
+     * Write the transform of an object in its panel
+     * */
+    fn refreshObject(mut self, node: &Node3D) {
+        let r = node.rotation;
+        let values = [node.position, makeVec3(degree(r.x), degree(r.y), degree(r.z)), node.scale];
+        for i, row in ROWS {
+            self:.setAxes(OBJECT ~ "/" ~ row, values[i]);
+        }
+    }
+
+    /**
+     * Write the settings of a light in its panel, the rows its type does not use absent
+     * */
+    fn refreshLight(mut self, light: &Light) {
+        let type = light.type;
+        self:.setPresent(LIGHT ~ "/PLACE", type != LightType::DIRECTION);
+        self:.setPresent(LIGHT ~ "/AIM", type != LightType::POINT);
+        self:.setPresent(LIGHT ~ "/RANGE", type != LightType::DIRECTION);
+        self:.setPresent(LIGHT ~ "/CONE", type == LightType::SPOT);
+
+        self:.setAxes(LIGHT ~ "/PLACE/POSITION", light.position);
+        self:.setAxes(LIGHT ~ "/AIM/DIRECTION", light.direction);
+        self:.setAxes(LIGHT ~ "/COLOR", light.color);
+        self:.setNumber(LIGHT ~ "/INTENSITY", light.intensity);
+        self:.setNumber(LIGHT ~ "/RANGE", light.range);
+        self:.setNumber(LIGHT ~ "/CONE/INNER", light.innerAngle);
+        self:.setNumber(LIGHT ~ "/CONE/OUTER", light.outerAngle);
+
+        if let Ok(dmut c: &CheckBox) = self._gui:.find(LIGHT ~ "/SHADOWS") {
+            c:.setChecked(light.castShadow);
+        }
+    }
+
+    /**
+     * Write a vector in a row of three spin boxes (see AxisRow)
+     * */
+    fn setAxes(mut self, row: [c8], value: vec3) {
+        for j, axis in AXES {
+            if let Ok(dmut s: &SpinBox) = self._gui:.find(row ~ "/" ~ axis) {
+                s:.setValue(component(value, j));
+            }
+        }
+    }
+
+    /**
+     * Write a number in the spin box of a row (see NumberRow)
+     * */
+    fn setNumber(mut self, row: [c8], value: f32) {
+        if let Ok(dmut s: &SpinBox) = self._gui:.find(row ~ "/VALUE") {
+            s:.setValue(value);
+        }
+    }
+
+    /**
+     * Make a panel or a row present, or absent, taking no room
+     * */
+    fn setPresent(mut self, path: [c8], present: bool) {
+        if let Ok(dmut w) = alias self._gui:.find(path) {
+            let mut classes: [[c8]] = [];
+            for c in w.getClasses() if c != ABSENT {
+                classes ~= [c];
+            }
+
+            if !present { classes ~= [ABSENT]; }
+            w:.setClasses(classes);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          EDITING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The name was validated: the node inspected is renamed
+     * */
+    fn onRenamed(mut self, name: [c8]) {
+        if let Ok(dmut n) = alias self._node {
+            self:.run(copy RenameCommand(alias n, name));
+        }
+
+        // a name refused is written back
+        self:.refresh();
+    }
+
+    /**
+     * A field of the position changed: every node selected takes the value along its axis
+     * @params:
+     *    - axis: 0 for X, 1 for Y, 2 for Z
+     * */
+    fn onMoved(mut self, axis: u32, value: f32) {
+        self:.transformSelection(0u32, axis, value);
+    }
+
+    /**
+     * A field of the rotation changed, in degrees: every node selected takes the angle along its axis
+     * */
+    fn onTurned(mut self, axis: u32, value: f32) {
+        self:.transformSelection(1u32, axis, radian(value));
+    }
+
+    /**
+     * A field of the scale changed: every node selected takes the factor along its axis
+     * */
+    fn onScaled(mut self, axis: u32, value: f32) {
+        self:.transformSelection(2u32, axis, value);
+    }
+
+    /**
+     * A field of the direction of a light changed: every light selected takes the value along its axis
+     * */
+    fn onAimed(mut self, axis: u32, value: f32) {
+        self:.editLights(SET_DIRECTION, axis, value);
+    }
+
+    /**
+     * A field of the colour of a light changed, 0 for its red, 1 for its green, 2 for its blue
+     * */
+    fn onColored(mut self, axis: u32, value: f32) {
+        self:.editLights(SET_COLOR, axis, value);
+    }
+
+    fn onIntensified(mut self, value: f32) {
+        self:.editLights(SET_INTENSITY, 0u32, value);
+    }
+
+    fn onRanged(mut self, value: f32) {
+        self:.editLights(SET_RANGE, 0u32, value);
+    }
+
+    fn onNarrowed(mut self, value: f32) {
+        self:.editLights(SET_INNER, 0u32, value);
+    }
+
+    fn onWidened(mut self, value: f32) {
+        self:.editLights(SET_OUTER, 0u32, value);
+    }
+
+    fn onShadowed(mut self, casts: bool) {
+        self:.editLights(SET_SHADOWS, 0u32, if casts { 1.0f } else { 0.0f });
+    }
+
+    /**
+     * Give each light selected a value of a setting, through a command, the other settings of each one kept
+     * @params:
+     *    - setting: the setting changed, SET_DIRECTION to SET_SHADOWS
+     *    - axis: the component of a vector (the direction, the colour) changed
+     *    - value: the value, 0 or 1 for the shadows
+     * */
+    fn editLights(mut self, setting: u32, axis: u32, value: f32) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let dmut scene = alias e.scene;
+        let dmut selection = alias scene.selection;
+
+        let dmut lights: [&Light] = [];
+        let mut settings: [LightSettings] = [];
+        for dmut n in alias selection.nodes {
+            if let dmut l: &Light = alias n {
+                settings ~= [withSetting(LightSettings(l), setting, axis, value)];
+                lights ~= [alias l];
+            }
+        }
+
+        if lights.len != 0us {
+            self:.run(copy LightCommand(alias lights, settings));
+        }
+
+        // a value refused (a null direction...) is written back
+        self:.refresh();
+    }
+
+    /**
+     * Give each node selected a value along an axis of its position, its rotation or its scale, through a command
+     * @params:
+     *    - row: 0 for the position, 1 for the rotation (in radian), 2 for the scale
+     *    - axis: 0 for X, 1 for Y, 2 for Z
+     * */
+    fn transformSelection(mut self, row: u32, axis: u32, value: f32) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let dmut scene = alias e.scene;
+        let dmut selection = alias scene.selection;
+
+        let mut edits: [TransformEdit] = [];
+        for dmut n in alias selection.nodes {
+            let t = NodeTransform(n);
+            let after = if row == 0u32 {
+                NodeTransform(withComponent(t.position, axis, value), t.rotation, t.scale)
+            } else if row == 1u32 {
+                NodeTransform(t.position, withComponent(t.rotation, axis, value), t.scale)
+            } else {
+                NodeTransform(t.position, t.rotation, withComponent(t.scale, axis, value))
+            };
+
+            edits ~= [TransformEdit(alias n, after)];
+        }
+
+        if edits.len != 0us {
+            self:.run(copy TransformCommand(edits));
+        }
+    }
+
+    /**
+     * Change the scene through the editor, telling in the status bar why the change failed
+     * */
+    fn run(mut self, dmut command: &EditCommand) {
+        if let Ok(dmut e) = alias self._editor {
+            {
+                e:.execute(alias command);
+            } catch {
+                err: &BalderError => {
+                    self._status(err.msg);
+                }
+            }
+        }
+    }
+
+}
+
+/**
+ * @returns: a component of a vector, 0 for x, 1 for y, 2 for z
+ * */
+fn component(v: vec3, axis: usize)-> f32 {
+    if axis == 0us { v.x } else if axis == 1us { v.y } else { v.z }
+}
+
+/**
+ * @returns: a vector whose component along an axis is replaced
+ * @params:
+ *    - axis: 0 for x, 1 for y, 2 for z
+ * */
+fn withComponent(v: vec3, axis: u32, value: f32)-> vec3 {
+    if axis == 0u32 {
+        makeVec3(value, v.y, v.z)
+    } else if axis == 1u32 {
+        makeVec3(v.x, value, v.z)
+    } else {
+        makeVec3(v.x, v.y, value)
+    }
+}
+
+/**
+ * @returns: the settings of a light, one of them changed
+ * @params:
+ *    - setting: the setting changed, SET_DIRECTION to SET_SHADOWS
+ *    - axis: the component changed of a vector setting (the direction, the colour)
+ *    - value: the value, 0 or 1 for the shadows
+ * */
+fn withSetting(s: LightSettings, setting: u32, axis: u32, value: f32)-> LightSettings {
+    LightSettings(if setting == SET_COLOR { withComponent(s.color, axis, value) } else { s.color },
+                  if setting == SET_INTENSITY { value } else { s.intensity },
+                  if setting == SET_DIRECTION { withComponent(s.direction, axis, value) } else { s.direction },
+                  if setting == SET_RANGE { value } else { s.range },
+                  if setting == SET_INNER { value } else { s.innerAngle },
+                  if setting == SET_OUTER { value } else { s.outerAngle },
+                  if setting == SET_SHADOWS { value != 0.0f } else { s.castShadow })
+}
