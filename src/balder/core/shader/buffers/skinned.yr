@@ -1,0 +1,217 @@
+in skinned;
+
+use balder::core::{dispose, error, memory::_};
+use balder::core::driver::device;
+
+use std::algorithm::comparison;
+
+use ::vulkan::core;
+
+#if DEBUG
+use balder::utils::log;
+#end
+
+/**
+ * The smallest number of vertices a buffer of the skinned vertices holds
+ * */
+def MIN_VERTICES = 4096us;
+
+/**
+ * The vertices of the skinned instances of a shader, moved by the joints of their skin: the skin pass of each frame
+ * writes them from their bind position, and the frame draws them, each instance holding a range of vertices, its draws
+ * placed by the vertex offset of the range and the first index of its geometry in the pool of the shader
+ * @info: each frame in flight has its own buffer, the ranges at the same offsets in each, so the skin pass of a frame
+ * never writes the vertices a frame in flight still draws
+ * @info: a buffer full is replaced by a larger one, without its content: the next skin pass of its frame writes every
+ * range again, the recordings binding the replaced one being done again (requested by its retire)
+ * */
+@final
+pub class SkinnedVertices {
+
+    // The device the buffers are allocated on
+    let dmut _device: &VulkanDevice;
+
+    // The number of floats of a vertex
+    let _stride: u32;
+
+    // The buffer of each frame in flight, none before a first range is placed
+    let dmut _buffers: [&Buffer] = [];
+
+    // The vertices in use
+    let dmut _slots: &SegmentList = copy SegmentList(0us);
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CTOR/DTOR          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create empty buffers, allocated by the first range
+     * @params:
+     *    - device: the device the buffers are allocated on
+     *    - stride: the number of floats of a vertex, as the shader drawing them reads them
+     * */
+    pub self (dmut device: &VulkanDevice, stride: u32)
+        with _device = alias device
+        , _stride = stride
+    {}
+
+    // Disposing from the collector races with the GPU and with the device teardown, the object has to be retired
+#if DEBUG
+    __dtor(mut self) {
+        if self._buffers.len != 0us {
+            log::warn #("Dispose", self.__typeinfo__.name, "collected without being retired");
+        }
+    }
+#end
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of floats of a vertex
+     * */
+    pub fn getStride(self)-> u32 {
+        self._stride
+    }
+
+    /**
+     * @returns: the buffer of the vertices drawn by a frame, none before a first range is placed
+     * */
+    pub fn getBuffer(self, frame: u32)-> (&Buffer)? {
+        atomic self {
+            if cast!usize(frame) < self._buffers.len {
+                return (self._buffers[frame])?;
+            }
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          ALLOCATION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reserve the vertices of an instance, enlarging the buffers when no run of free vertices is long enough
+     * @params:
+     *    - count: the number of vertices of the instance
+     * @returns: the first vertex of the range, the vertex offset of the draws of the instance
+     * */
+    pub fn alloc(mut self, count: u32)-> u32
+        throws BalderError
+    {
+        if count == 0u32 {
+            throw copy BalderError("Cannot place an instance without vertices in the skinned vertices");
+        }
+
+        atomic self {
+            if let Ok(offset) = self._slots:.alloc(cast!usize(count), 1us) { return cast!u32(offset); }
+
+            let capacity = max(max(self._slots.getSize() * 2us, self._slots.getReservedEnd() + cast!usize(count)), MIN_VERTICES);
+            self:.replaceBuffers(capacity);
+            self._slots:.grow(capacity);
+
+            if let Ok(offset) = self._slots:.alloc(cast!usize(count), 1us) { return cast!u32(offset); }
+        }
+
+        throw copy BalderError("Failed to reserve a range of skinned vertices");
+    }
+
+    /**
+     * Give back the vertices of an instance
+     * @warning: through a retire, the recordings in use may still draw them
+     * */
+    pub fn free(mut self, offset: u32, count: u32) {
+        atomic self {
+            if self._buffers.len == 0us { return; }
+
+            self._slots:.free(cast!usize(offset), cast!usize(count));
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Bind the vertices of a frame as the vertex buffer of the next draws
+     * */
+    pub fn select(self, frame: u32, cmd: VkCommandBuffer) {
+        if let Ok(b) = self.getBuffer(frame) {
+            let buffer = b.getVulkanBuffer();
+            let offset = 0u64;
+            vkCmdBindVertexBuffers(cmd, 0u32, 1u32, &buffer, &offset);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Replace the buffers by buffers of 'capacity' vertices, the replaced ones retired
+     * @atomic
+     * */
+    fn replaceBuffers(mut self, capacity: usize)
+        throws BalderError
+    {
+        let dmut larger: [&Buffer] = [];
+        for _ in 0u32 .. self._device.getNbFrames() {
+            let dmut b = self._device
+                :.getMemoryAllocator()
+                :.allocBuffer(capacity * cast!usize(self._stride) * f32::size,
+                              cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                                       | VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
+                              cast!u32(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+            larger ~= [alias b];
+        }
+
+        for dmut o in alias self._buffers {
+            self._device:.retire(&o:.dispose);
+        }
+
+        self._buffers = alias larger;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            atomic self {
+                for dmut b in alias self._buffers {
+                    b:.dispose();
+                }
+
+                self._buffers = [];
+                self._slots = copy SegmentList(0us);
+            }
+        }
+    }
+}
