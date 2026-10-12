@@ -1,0 +1,453 @@
+in activity;
+
+use main::{command, editor, inspector_panel, naming, outline_panel, project, viewport};
+use main::command::{add, duplicate, open, remove, transform};
+use balder::core::{_, application::_};
+use balder::interface::dialog;
+use balder::interface::widget::{layout::d3scene, text::label, tree::view};
+use balder::math::vector;
+use balder::scene::{description::_, editable};
+use balder::scene::gizmo::mode;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::light;
+use balder::utils::log;
+
+use std::io;
+use std::fs::path;
+
+use ::sdl3::_;
+
+// The scene a new scene starts from, under the directory of the editor
+def NEW_SCENE = "scenes/new.toml";
+
+
+/**
+ * The editor of Balder: the outline of the scene on the left, the viewport in the middle, the inspector of the node
+ * selected on the right, under a menu bar adding, copying and removing nodes, above a status bar
+ * @info: every change of the scene is a command run through the SceneEditor; the viewport, focused by a click, takes the
+ * keys W, E and R (the gizmo), Delete, Ctrl+D and F
+ * */
+pub class EditorActivity over Activity {
+
+    // The editor of the scene, once the interface is loaded
+    let dmut _editor: (&SceneEditor)? = none;
+
+    // The viewport of the scene, once the interface is loaded
+    let dmut _viewport: (&EditorViewport)? = none;
+
+    // The status bar
+    let dmut _status: (&Label)? = none;
+
+    // The directory of the file chosen last, the file dialogs starting from it
+    let mut _directory: [c8] = "";
+
+    pub self (uid: usize, dmut app: &Application, dmut window: &Window)
+        with super(uid, alias app, alias window)
+    {}
+
+    over onStart(mut self) {
+        self.input:.quit():.connect(self.box, &self:.onQuit);
+        self._directory = editorFile("scenes");
+
+        // the slots the 'on-…' attributes of editor.gui name: the menus, the outline and the inspector
+        self:.slot("scene::new", &self:.onNewClicked);
+        self:.slot("scene::open", &self:.onOpenClicked);
+        self:.slot("scene::quit", &self:.onQuitClicked);
+        self:.slot("add::cube", &self:.onAddCube);
+        self:.slot("add::sphere", &self:.onAddSphere);
+        self:.slot("add::plane", &self:.onAddPlane);
+        self:.slot("add::model", &self:.onAddModel);
+        self:.slot("add::group", &self:.onAddGroup);
+        self:.slot("add::direction", &self:.onAddDirectionLight);
+        self:.slot("add::point", &self:.onAddPointLight);
+        self:.slot("add::spot", &self:.onAddSpotLight);
+        self:.slot("edit::duplicate", &self:.onDuplicateClicked);
+        self:.slot("edit::delete", &self:.onDeleteClicked);
+        self:.slot("edit::frame", &self:.onFrameClicked);
+        self:.slot("gizmo::translate", &self:.onTranslateClicked);
+        self:.slot("gizmo::rotate", &self:.onRotateClicked);
+        self:.slot("gizmo::scale", &self:.onScaleClicked);
+
+        let dmut outline = copy OutlinePanel();
+        self:.behavior("outline", alias outline);
+        let dmut inspector = copy InspectorPanel(alias self.gui, alias self.box, &self:.setStatus);
+        self:.behavior("inspector", alias inspector);
+
+        self.gui:.getRegistry():.register(EditorViewport::schema());
+        println(self.gui:.loadStyleFile(editorFile("ui/editor.style"))?);
+        println(self.gui:.loadGUIFile(editorFile("ui/editor.gui"))?);
+
+        if let Ok(dmut l: &Label) = self.gui:.find("BODY/STATUS") {
+            self._status = (alias l)?;
+        }
+
+        if let Ok(dmut w: &Scene3DLayout) = self.gui:.find("BODY/MAIN/VIEW") {
+            if let Ok(dmut s: &EditableScene) = alias w:.getScene() {
+                let dmut e = copy SceneEditor(alias s);
+                e:.edited():.connect(self.box, &self:.onEdited);
+                self._editor = (alias e)?;
+            }
+        }
+
+        if let Ok(dmut v: &EditorViewport) = self.gui:.find("BODY/MAIN/VIEW/GIZMO") {
+            v:.keyPressed():.connect(self.box, &self:.onViewportKey);
+            v:.transformed():.connect(self.box, &self:.onGizmoTransformed);
+            self._viewport = (alias v)?;
+        }
+
+        if let Ok(dmut e) = alias self._editor {
+            if let Ok(dmut t: &TreeView) = self.gui:.find("BODY/MAIN/OUTLINE/TREE") {
+                if let Ok(dmut v) = alias self._viewport {
+                    outline:.bind(alias t, alias e, alias v, alias self.box);
+                }
+            }
+
+            inspector:.bind(alias e);
+        } else {
+            log::error #("Editor", "The viewport of the editor has no editable scene");
+            return;
+        }
+
+        let scene = startScene();
+        self:.openScene(if scene.len == 0us { editorFile(NEW_SCENE) } else { scene });
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCENE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onNewClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.openScene(editorFile(NEW_SCENE));
+        }
+    }
+
+    fn onOpenClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut d = copy FileDialog(FileDialogMode::OPEN, directory-> self._directory, filters-> sceneExtensions(),
+                                     title-> "Open a scene");
+        d:.answered():.connect(self.box, &self:.onSceneChosen);
+        self:.openDialog(alias d);
+    }
+
+    fn onSceneChosen(mut self, path: ([c8])?) {
+        if let Ok(p) = path {
+            self._directory = Path(p).parent().toStr();
+            self:.openScene(p);
+        }
+    }
+
+    /**
+     * Replace the nodes of the scene by those of a scene file, the viewport looking at them
+     * */
+    fn openScene(mut self, path: [c8]) {
+        {
+            let description = copy SceneDescription::fromFile(path);
+            self:.run(copy OpenCommand(description, Path(path).file()));
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to open the scene", err);
+                self:.setStatus(err.msg);
+            }
+        }
+    }
+
+    fn onQuitClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.onQuit();
+        }
+    }
+
+    fn onQuit(mut self) {
+        self.app:.close(alias self);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          ADD          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onAddCube(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addPrimitive("cube", NodeKind::CUBE); }
+    }
+
+    fn onAddSphere(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addPrimitive("sphere", NodeKind::SPHERE); }
+    }
+
+    fn onAddPlane(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addPrimitive("plane", NodeKind::PLANE); }
+    }
+
+    fn onAddGroup(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.add(NodeDescription("group", NodeKind::GROUP), lift-> 0.0f);
+        }
+    }
+
+    fn onAddModel(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut d = copy FileDialog(FileDialogMode::OPEN, directory-> self._directory, filters-> modelExtensions(),
+                                     title-> "Add a model");
+        d:.answered():.connect(self.box, &self:.onModelChosen);
+        self:.openDialog(alias d);
+    }
+
+    fn onModelChosen(mut self, path: ([c8])?) {
+        if let Ok(p) = path {
+            self._directory = Path(p).parent().toStr();
+
+            let mut model = NodeDescription(Path(p).stripExtension().file(), NodeKind::MODEL);
+            model.file = p;
+            self:.add(model, lift-> 0.0f);
+        }
+    }
+
+    fn onAddDirectionLight(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let mut sun = NodeDescription("sun", NodeKind::LIGHT);
+        sun.direction = makeVec3(-0.3f, -1.0f, -0.2f);
+        self:.add(sun, lift-> 3.0f);
+    }
+
+    fn onAddPointLight(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let mut lamp = NodeDescription("lamp", NodeKind::LIGHT);
+        lamp.light = LightType::POINT;
+        lamp.intensity = 5.0f;
+        lamp.range = 8.0f;
+        self:.add(lamp, lift-> 2.0f);
+    }
+
+    fn onAddSpotLight(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let mut spot = NodeDescription("spot", NodeKind::LIGHT);
+        spot.light = LightType::SPOT;
+        spot.intensity = 25.0f;
+        spot.range = 15.0f;
+        self:.add(spot, lift-> 4.0f);
+    }
+
+    /**
+     * Add a cube, a sphere or a plane, a little grey and rough
+     * */
+    fn addPrimitive(mut self, name: [c8], kind: NodeKind) {
+        let mut d = NodeDescription(name, kind);
+        d.material.baseColor = makeVec3(0.8f, 0.8f, 0.8f);
+        d.material.roughness = 0.6f;
+        self:.add(d, lift-> 0.0f);
+    }
+
+    /**
+     * Add a node under the root of the scene, on the surface seen at the centre of the viewport, or at the point the
+     * camera looks at when there is none
+     * @params:
+     *    - lift: the height of the node above that point (a light hanging over it...)
+     * */
+    fn add(mut self, description: NodeDescription, lift: f32) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let lookedAt = if let Ok(v) = self._viewport { v.orbit.target } else { vec3() };
+
+        let mut d = description;
+        d.position = e:.placement(lookedAt) + makeVec3(0.0f, lift, 0.0f);
+
+        let dmut scene = alias e.scene;
+        self:.run(copy AddCommand(d, alias scene:.getRootNode()));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          EDIT          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onDuplicateClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.duplicateSelection(); }
+    }
+
+    fn onDeleteClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.deleteSelection(); }
+    }
+
+    fn onFrameClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.frameSelection(); }
+    }
+
+    fn duplicateSelection(mut self) {
+        let dmut nodes = alias self:.selectedNodes();
+        if nodes.len != 0us {
+            self:.run(copy DuplicateCommand(alias nodes));
+        }
+    }
+
+    fn deleteSelection(mut self) {
+        let dmut nodes = alias self:.selectedNodes();
+        if nodes.len != 0us {
+            self:.run(copy RemoveCommand(alias nodes));
+        }
+    }
+
+    /**
+     * Look at the nodes selected, or at every node of the scene when none is
+     * */
+    fn frameSelection(mut self) {
+        let dmut nodes = alias self:.selectedNodes();
+        if nodes.len == 0us {
+            if let Ok(dmut e) = alias self._editor {
+                let dmut scene = alias e.scene;
+                for _, dmut c in alias scene:.getRootNode():.getChilds() if let dmut n: &Node3D = alias c {
+                    if !isEditorNode(n) { nodes ~= [alias n]; }
+                }
+            }
+        }
+
+        if let Ok(dmut v) = alias self._viewport {
+            v:.frame(alias nodes);
+        }
+    }
+
+    /**
+     * @returns: the nodes selected, in a list of their own
+     * */
+    fn selectedNodes(mut self)-> dmut [&Node3D] {
+        let dmut nodes: [&Node3D] = [];
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            for dmut n in alias selection.nodes {
+                nodes ~= [alias n];
+            }
+        }
+
+        alias nodes
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          GIZMO          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onTranslateClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.setGizmoMode(GizmoMode::TRANSLATE); }
+    }
+
+    fn onRotateClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.setGizmoMode(GizmoMode::ROTATE); }
+    }
+
+    fn onScaleClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.setGizmoMode(GizmoMode::SCALE); }
+    }
+
+    fn setGizmoMode(mut self, mode: GizmoMode) {
+        if let Ok(dmut v) = alias self._viewport {
+            v.mode = mode;
+        }
+    }
+
+    /**
+     * A drag of the gizmo moved the nodes selected: the change is recorded as a command
+     * */
+    fn onGizmoTransformed(mut self) {
+        if let Ok(v) = self._viewport {
+            self:.run(copy TransformCommand(v.edits, applied-> true));
+        }
+    }
+
+    /**
+     * The keys the viewport takes besides those of the gizmo: Delete removes the nodes selected, Ctrl+D copies them, F
+     * looks at them
+     * */
+    fn onViewportKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
+        let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
+        if key == SDLK_DELETE || key == SDLK_BACKSPACE {
+            self:.deleteSelection();
+        } else if key == SDLK_D && ctrl {
+            self:.duplicateSelection();
+        } else if key == SDLK_F && !ctrl {
+            self:.frameSelection();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          COMMANDS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Change the scene through the editor, telling in the status bar why the change failed
+     * */
+    fn run(mut self, dmut command: &EditCommand) {
+        if let Ok(dmut e) = alias self._editor {
+            {
+                e:.execute(alias command);
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "The change failed", err);
+                    self:.setStatus(err.msg);
+                }
+            }
+        }
+    }
+
+    /**
+     * Tell in the status bar what a command changed
+     * */
+    fn onEdited(mut self, command: &EditCommand) {
+        self:.setStatus(command.describe());
+    }
+
+    /**
+     * Open a dialog over the editor
+     * */
+    fn openDialog(mut self, dmut d: &Dialog) {
+        {
+            d:.open(DialogMode::OVERLAY, alias self.gui);
+        } catch {
+            err => {
+                log::error #("Editor", "Failed to open the dialog", err);
+                self:.setStatus("The dialog could not be opened");
+            }
+        }
+    }
+
+    fn setStatus(mut self, msg: [c8]) {
+        if let Ok(dmut status) = alias self._status {
+            status:.setText(msg);
+        }
+    }
+}
+
+/**
+ * @returns: the extensions of the scene files, the files the dialog opening a scene lists
+ * */
+fn sceneExtensions()-> [[c8]] {
+    copy ["toml"]
+}
+
+/**
+ * @returns: the extensions of the models the importer reads, the files the dialog adding a model lists
+ * */
+fn modelExtensions()-> [[c8]] {
+    copy ["gltf", "glb", "obj", "fbx", "dae", "ply", "stl"]
+}
