@@ -80,6 +80,7 @@ draws it bold.
 | `STORAGE_READ`, `STORAGE_WRITE`, `STORAGE_READ_WRITE` | compute | compute shader | general |
 | `INDIRECT` | raster | draw indirect | buffers only |
 | `VERTEX_READ` | raster | vertex shader | buffers only |
+| `VERTEX_INPUT` | raster | vertex input | buffers only (vertices a compute pass wrote) |
 
 A pass may use a resource several ways (`INDIRECT` and `VERTEX_READ` of the same commands), in the same layout. A
 `STORAGE_WRITE` overwrites the image, which is transitioned from `undefined`.
@@ -134,6 +135,9 @@ occlusion (`./demo --shadows --occlusion --ambient-occlusion`):
 ```mermaid
 flowchart LR
     transfers((transfers))
+    subgraph skin
+        skin_pass[skin]
+    end
     subgraph deferred
         cull --> gbuffer --> pyramid --> late_cull --> late_gbuffer
     end
@@ -152,9 +156,10 @@ flowchart LR
     subgraph screen
         widgets[screen]
     end
-    transfers -. all commands .-> deferred
-    transfers -. all commands .-> shadow
-    transfers -. all commands .-> local_shadow
+    transfers -. all commands .-> skin
+    skin -. vertex input .-> deferred
+    skin -. vertex input .-> shadow
+    skin -. vertex input .-> local_shadow
     deferred -. compute shader .-> occlusion
     deferred -. compute shader .-> compose
     occlusion -. compute shader .-> compose
@@ -165,6 +170,7 @@ flowchart LR
 
 | Resource | Owner | Written by | Read by |
 |---|---|---|---|
+| `skinned` | imported buffers (the vertices of each frame, see `SkinnedVertices`) | the skin pass, while an instance is skinned | the g-buffers and the shadow maps (vertex input, optional) |
 | `draws`, `late_draws` | imported buffers | the cull passes | the g-buffers (indirect, vertices) |
 | `cull_state` | imported buffers | both cull passes | both cull passes |
 | `hzb` | imported buffer (the depth pyramid) | the pyramid | the late cull pass |
@@ -178,6 +184,50 @@ flowchart LR
 | `post_taa_history` | persistent (`R16G16B16A16_SFLOAT`, storage) | the copy of the blend | the resolve of the next frame |
 | `post_bloom_mip<k>`, `post_bloom_up<k>` | transient (`R16G16B16A16_SFLOAT`, storage, 2^k times smaller) | the downsampling and the upsampling passes of the bloom | the next pass of the bloom |
 | `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the last pass of the post-process chain, the tone mapping without effects in display space | the screen |
+
+## Skinning
+
+A mesh whose vertices are moved by the joints of a skeleton (a `Skin`, read by `SolidObjectModel` from a glTF or an
+FBX file) is skinned on the GPU, once per frame, before anything draws it:
+
+- **Shaders.** The raster shaders of the materials describe their skinned variant in a `[skin]` table of their file:
+  the vertex entries the skinned vertices add (`[skin.vertex]`, the `previous` position) and the passes replacing those
+  of the same stage (`[skin.pass.vertex]`, a vertex shader reading `inPrevious` for the motion vectors). The variant
+  (`RasterShaderConfig.skin`, named `<shader>#skin`) keeps the fragment pass, the depth prepass (which draws the shadows
+  too) and the sets of the shader, and has a `ShaderGroup` of its own. `color.toml`, `texture.toml` and `pbr.toml` have
+  one; a skinned mesh whose material has none is refused.
+- **Buffers.** The group of a skinned variant holds a `GroupSkinning`: the weights of the four joints of each bind
+  vertex (`SkinWeightSlot`, per geometry), the joints of each instance (`JOINT_STRIDE`: the matrix and the one the frame
+  before drew, advanced by a `MotionTracker` as the worlds are), and the vertices the frames draw (`SkinnedVertices`, one
+  buffer per frame in flight, a range per instance). The bind vertices stay in the geometry pool, read as a storage
+  buffer.
+- **The skin pass** (`skin_<scene>`, a compute subpass of its own, enabled while an instance is skinned) dispatches
+  `skinning.comp` once per instance, one thread per vertex: the position, the normal (by the cofactor) and the tangent
+  blended by the joint matrices and the weights, the position of the frame before by the matrices of the frame before,
+  the other floats copied. The g-buffers and the shadow maps read `skinned` at their vertex input (`VERTEX_INPUT`,
+  optional), so they wait for it by a semaphore; each draw of a skinned instance binds the vertices of its frame and
+  places itself at its own vertex offset, the indices those of its geometry.
+- **Bounds.** Each joint of a skin keeps the box of the vertices it moves, in its own space; the box of a pose is the
+  union of those boxes moved with their joints (`Skin.poseBounds`), which encloses every vertex since a skinned vertex is
+  a convex blend of its positions moved by each joint. A skinned instance has its own clusters, culled with the box of
+  its poses and never by their cone. `IndexedMesh3D.pose` grows the box of the mesh when a pose leaves it, so the
+  culling stays right at every frame; `AnimationClip.bounds` gives the box of the poses of a clip (sampled at its keys
+  and at least 30 times a second), which `SolidObjectModel.fitClip` sets up front so the box does not change while the
+  clip plays.
+
+```
+let dmut fox = copy SolidObjectModel::fromFile ("fox", scene:.getRootNode (), "res:/models/fox/Fox.gltf");
+let walk = library:.find ("res:/models/fox/Fox.gltf", "Walk");
+fox:.fitClip (walk);
+...
+// at each tick
+if let Ok (skeleton) = fox.skeleton () {
+    fox:.pose (walk.sample (skeleton, time));
+}
+```
+
+The demo plays a clip of its model with `./demo --model res:/models/fox/Fox.gltf --clip Walk` (a Mixamo export plays
+`--clip mixamo.com`).
 
 ## The shadows of the point and spot lights
 
