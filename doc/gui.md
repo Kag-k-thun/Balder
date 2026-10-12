@@ -28,6 +28,30 @@ self.gui:.loadGUIFile ("res:/config/app.gui")?;
 - An error names the file, the line and the column, and says what was expected:
   `example/form/form.gui:5:32: unknown attribute 'len' of 'InputText' under 'LinearLayout'`.
 
+### Hot reload
+
+In a debug build, a file loaded with `watching-> true` is loaded again when it is saved, with the window running:
+
+```
+self.gui:.loadStyleFile ("res:/config/app.style", watching-> true)?;
+self.gui:.loadGUIFile ("res:/config/app.gui", watching-> true)?;
+self.gui:.reloaded ():.connect (self.box, &self:.onContentLoaded);
+```
+
+- The files a watched file imports are watched with it, and so are the `@style` sheets of the components of a watched
+  `.gui` file. `loadComponents` takes `watching` too.
+- A `.style` file saved runs the cascade again: the sheets of every file are added again in the order the files were
+  loaded, so its rules keep their place, and the widgets are restyled and repainted where their style changed.
+- A `.gui` file saved builds the content again, its components read again from their files, and emits `reloaded`
+  once the new content is set. The widgets the activity found in the former content are disposed with it, and the
+  instances it created by code are gone: the slot of `reloaded` finds them and creates them again, as after the first
+  load.
+- A file that cannot be read or decoded any more keeps its last good version: the error is logged, located in the
+  file, and the window goes on with the sheets or the content it had until the file is saved again.
+- The files are watched through inotify, a thread waiting for the writes in their directories, so a file saved through
+  a temporary one renamed over it is seen as well. The changes run in the thread of the activity, from the slot
+  emitter of the widget manager. A release build watches nothing, `watching` being ignored.
+
 ## Lexical rules
 
 - Spaces and line breaks separate the tokens. Comments are `// to the end of the line` and `/* … */`.

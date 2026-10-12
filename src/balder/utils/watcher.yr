@@ -1,0 +1,277 @@
+in watcher;
+
+use balder::core::dispose;
+use balder::core::application::signal;
+use balder::utils::path;
+
+use std::conv;
+use std::fs::path;
+
+use ::core::concurrency::pipes::{ipipe, opipe};
+
+use ::etc::c::{files, poll};
+
+extern (C) fn inotify_init1(flags: i32)-> i32;
+extern (C) fn inotify_add_watch(fd: i32, pathname: *c8, mask: u32)-> i32;
+extern (C) fn read(fd: i32, dmut buf: *void, count: usize)-> i64;
+
+// The flags of the inotify instance: reads that return at once when no event is left, a descriptor closed on exec
+def IN_NONBLOCK = 0o4000;
+def IN_CLOEXEC = 0o2000000;
+
+// The events watched in a directory: a file written then closed, a file renamed into it (an editor saving through a
+// temporary file)
+def IN_CLOSE_WRITE = 0x8u32;
+def IN_MOVED_TO = 0x80u32;
+
+// The size of the header of an inotify event, before its name: wd, mask, cookie and len
+def EVENT_HEADER = 16us;
+
+// The size of the buffer the events are read in, room for several events with a name of NAME_MAX bytes
+def EVENT_BUFFER = 4096us;
+
+/**
+ * The files of an application watched for changes, the kernel notifying the writes in their directories (inotify)
+ * @info:
+ * =====
+ * The directories of the files are watched rather than the files: an editor saving a file through a temporary one
+ * renamed over it replaces the file, and a watch on the file itself would be lost with it. A write closed or a rename
+ * into the directory of a watched file emits changed, the events of the other files of the directory being dropped.
+ *
+ * A thread waits for the events from the first file watched until dispose; changed is emitted from it, its slots
+ * running in the thread of the emitter they are connected with.
+ * ====
+ * @example:
+ * ```
+ * let dmut watcher = copy FileWatcher();
+ * watcher:.changed():.connect(alias box, &self:.onFileChanged); // run when box is emitted
+ * watcher:.watch("res:/gui/app.style");
+ * ```
+ * */
+@final
+pub class FileWatcher {
+
+    // Emitted with the path of a file watched, as it was added, when it was written or replaced
+    let dmut _changed: &Signal!{[c8]} = copy Signal!{[c8]} ();
+
+    // The inotify instance, -1 until a file is watched, or when it cannot be created
+    let mut _fd: i32 = -1;
+
+    // The epoll instance the thread waits on, for the events of the inotify instance and the closing of the trigger
+    let mut _epoll: i32 = -1;
+
+    // The pipe whose writing end is closed to stop the thread
+    let dmut _triggerI: (&IPipe)? = none;
+    let dmut _triggerO: (&OPipe)? = none;
+
+    // The thread waiting for the events
+    let mut _th: (future-> void)? = none;
+
+    // The directories watched, by their watch descriptor
+    let mut _dirs: [i32 => mut [c8]] = copy [];
+
+    // The watch descriptors of the directories watched, by directory
+    let dmut _watches: [[c8] => i32] = copy [];
+
+    // The paths of the files watched as they were added, by their path in the directory watched
+    let mut _files: [[c8] => mut [c8]] = copy [];
+
+    /**
+     * Create a watcher watching no file
+     * */
+    pub self () {}
+
+    /**
+     * @returns: the signal emitted with the path of a file watched, as it was added, when it was written or replaced,
+     * from the thread of the watcher
+     * */
+    pub fn changed(mut self)-> dmut &Signal!{[c8]} {
+        alias self._changed
+    }
+
+    /**
+     * Watch a file, a file already watched being kept, the thread waiting for the events being started with the first
+     * one
+     * @params:
+     *    - path: the path of the file, qualified (res:/) or not
+     * @info: a file whose directory cannot be watched is never reported
+     * */
+    pub fn watch(mut self, path: [c8]) {
+        let complete = projectPath(path);
+        let dir = FileWatcher::dirOf(complete);
+        let key = dir ~ "/" ~ complete.file();
+
+        atomic self {
+            if key in self._files { return; }
+            if self._fd == -1 && !self:.start() { return; }
+
+            if dir !in self._watches {
+                let wd = inotify_add_watch(self._fd, dir.toStringZ(), IN_CLOSE_WRITE | IN_MOVED_TO);
+                if wd == -1 { return; }
+
+                self._watches[dir] = wd;
+                self._dirs[wd] = dir;
+            }
+
+            self._files[key] = path;
+        }
+    }
+
+    /**
+     * Create the inotify instance, and start the thread waiting for its events
+     * @returns: false if the instance cannot be created
+     * */
+    fn start(mut self)-> bool {
+        self._fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if self._fd == -1 { return false; }
+
+        let dmut ends: [i32 ; 2] = [0, 0];
+        self._epoll = epoll_create1(0);
+        if self._epoll == -1 || files::pipe(ends.ptr) != 0 {
+            self:.release();
+            return false;
+        }
+
+        self._triggerI = (copy IPipe(pipe-> ends[0]))?;
+        self._triggerO = (copy OPipe(pipe-> ends[1]))?;
+
+        let mut event = epoll_event();
+        event.events = EPOLLIN | EPOLLHUP;
+        event.data.fd = self._fd;
+        epoll_ctl(self._epoll, EPOLL_CTL_ADD, self._fd, &event);
+
+        event.data.fd = ends[0];
+        epoll_ctl(self._epoll, EPOLL_CTL_ADD, ends[0], &event);
+
+        self._th = (spawn self:.listen())?;
+        true
+    }
+
+    /**
+     * Main function of the thread: wait for the events of the inotify instance until the trigger is closed
+     * */
+    fn listen(mut self) {
+        loop {
+            let mut event = epoll_event();
+            // interrupted by a signal (the collector stopping the threads) when it returns -1
+            if epoll_wait(self._epoll, &event, 1, -1) > 0 {
+                if event.data.fd != self._fd { break; }
+
+                for f in self:.drain() {
+                    self._changed:.emit(f);
+                }
+            }
+        }
+    }
+
+    /**
+     * Read the events pending, without blocking
+     * @returns: the files watched they report, each one once, as they were added
+     * */
+    fn drain(mut self)-> [[c8]] {
+        let mut result: [[c8]] = [];
+        let dmut buf = copy [0u8; EVENT_BUFFER];
+        loop {
+            let n = read(self._fd, cast!{*void}(alias buf.ptr), buf.len);
+            if n <= 0i64 { break; }
+
+            atomic self {
+                let mut i = 0us;
+                while i + EVENT_HEADER <= cast!usize(n) {
+                    let wd = cast!i32(FileWatcher::u32At(buf, i));
+                    let len = cast!usize(FileWatcher::u32At(buf, i + 12us));
+                    if let Ok(dir) = self._dirs[wd] {
+                        let key = dir ~ "/" ~ FileWatcher::nameAt(buf, i + EVENT_HEADER, len);
+                        if let Ok(path) = self._files[key] && path !in result {
+                            result ~= [path];
+                        }
+                    }
+
+                    i += EVENT_HEADER + len;
+                }
+            }
+        }
+
+        result
+    }
+
+    /**
+     * Close the descriptors of the watcher, the thread being stopped
+     * */
+    fn release(mut self) {
+        if let Ok(dmut i) = alias self._triggerI { i:.dispose(); }
+        if self._epoll != -1 { files::close(self._epoll); }
+        if self._fd != -1 { files::close(self._fd); }
+
+        self._triggerI = none;
+        self._epoll = -1;
+        self._fd = -1;
+        self._dirs = copy [];
+        self._watches = copy [];
+        self._files = copy [];
+    }
+
+    impl Disposable {
+
+        /**
+         * Stop the thread and stop watching the files, a file watched again starting another thread
+         * */
+        pub over dispose(mut self) {
+            let th = atomic self {
+                // closing the writing end of the trigger wakes the thread up with a hang up
+                if let Ok(dmut o) = alias self._triggerO { o:.dispose(); }
+                self._triggerO = none;
+
+                let th = self._th;
+                self._th = none;
+                th
+            };
+
+            if let Ok(t) = th {
+                t.value;
+            }
+
+            atomic self {
+                self:.release();
+            }
+        }
+    }
+}
+
+/**
+ * The helpers of the watcher
+ * */
+mod FileWatcher {
+
+    /**
+     * @returns: the directory of a file, "." for a file named without directory
+     * */
+    pub fn dirOf(file: Path)-> [c8] {
+        let dir = file.parent().toStr();
+        if dir == "" { "." } else { dir }
+    }
+
+    /**
+     * @returns: the unsigned integer of 32 bits at an offset of the events read, in the byte order of the machine
+     * (little endian)
+     * */
+    pub fn u32At(buf: [u8], offset: usize)-> u32 {
+        cast!u32(buf[offset])
+            | (cast!u32(buf[offset + 1us]) << 8u32)
+            | (cast!u32(buf[offset + 2us]) << 16u32)
+            | (cast!u32(buf[offset + 3us]) << 24u32)
+    }
+
+    /**
+     * @returns: the name of an event, len bytes at an offset of the events read, padded with null bytes
+     * */
+    pub fn nameAt(buf: [u8], offset: usize, len: usize)-> [c8] {
+        let mut name = "";
+        for j in offset .. offset + len {
+            if buf[j] == 0u8 { break; }
+            name = name ~ [cast!c8(buf[j])];
+        }
+
+        name
+    }
+}

@@ -11,17 +11,18 @@ pub mod ::drawer;
 pub mod ::shape;
 
 
-use balder::utils;
 use balder::core::{_, application::_};
 use balder::interface::_;
 use balder::interface::loader::registry;
-use balder::interface::loader::registry::behavior;
+use balder::interface::loader::registry::{behavior, library};
 use balder::interface::style::conditions;
 use balder::interface::widget::focus;
 use balder::interface::widget::layout;
 use balder::interface::widget::layout::overlay;
 use balder::math::vector;
 use balder::scene::utils::post::registry;
+use balder::utils;
+use balder::utils::watcher;
 
 use std::math;
 use std::fs::path;
@@ -64,8 +65,25 @@ pub class WidgetManager {
     // The widget types the .gui files can use
     let dmut _registry : &WidgetRegistry = copy WidgetRegistry ();
 
-    // The style sheets of the components already loaded, by their path
-    let mut _componentStyles : [[c8]] = [];
+    // The style files loaded, the application ones and those of the components, in the order they were loaded, with
+    // the sheets of their last good version
+    let mut _styleSources : [StyleSource] = [];
+
+    // The .gui file of the content and the slots its `on-…` attributes name, loaded again when it changes, none when
+    // the content is not watched
+    let mut _contentSource : ([c8], &Behavior)? = none;
+
+    // The files whose components loadComponents loaded, read again when the content is loaded again
+    let mut _componentFiles : [[c8]] = [];
+
+    // The .gui files watched, the content and the component files loaded with watching and the files they import
+    let mut _guiFiles : [[c8]] = [];
+
+    // The watcher of the files loaded with watching, in a debug build, its changes run by the slot emitter of the manager
+    let dmut _watcher : &FileWatcher = copy FileWatcher ();
+
+    // Emitted when the content was loaded again from its file, which changed
+    let dmut _reloaded : (&Signal!{()})? = none;
 
     // The kinds of post effects the 3D scenes of the .gui files can name
     let dmut _postRegistry : &PostRegistry = copy PostRegistry ();
@@ -145,6 +163,7 @@ pub class WidgetManager {
         input:.keyPressed ():.connect (alias self._box, &self:.onKeyPressed);
         input:.windowResized ():.connect (alias self._box, &self:.onWindowResize);
         input:.windowScaleChanged ():.connect (alias self._box, &self:.onWindowScaleChange);
+        self._watcher:.changed ():.connect (alias self._box, &self:.onFileChanged);
 
         {
             self._drawer:.configure ();
@@ -177,15 +196,17 @@ pub class WidgetManager {
      * @params:
      *    - path: the path of the file, qualified (res:/) or not
      *    - set: true to make the widgets the content of the manager, disposing the current one
+     *    - watching: with set, in a debug build, true to load the content again when the file or a file it imports
+     *                changes (reloaded), and the sheets of its components when they change
      * @returns: the root widget
      * @throws: when a file cannot be read, its widgets cannot be created, an `on-…` attribute names no slot or a slot
      * whose parameters do not take its arguments then the payload of the signal, or the sheet of a component cannot be
      * decoded, naming the file, the line and the column
      * */
-    pub fn loadGUIFile (mut self, path : [c8], set : bool = true)-> dmut &Widget
+    pub fn loadGUIFile (mut self, path : [c8], set : bool = true, watching : bool = false)-> dmut &Widget
         throws BalderError
     {
-        self:.loadGUIFile (path, self._behavior, set-> set)
+        self:.loadGUIFile (path, self._behavior, set-> set, watching-> watching)
     }
 
     /**
@@ -195,17 +216,19 @@ pub class WidgetManager {
      *    - path: the path of the file, qualified (res:/) or not
      *    - behavior: the slots the `on-…` attributes of the file name
      *    - set: true to make the widgets the content of the manager, disposing the current one
+     *    - watching: with set, in a debug build, true to load the content again when the file or a file it imports
+     *                changes (reloaded), and the sheets of its components when they change
      * @returns: the root widget
      * @throws: as loadGUIFile
      * */
-    pub fn loadGUIFile (mut self, path : [c8], behavior : &Behavior, set : bool = true)-> dmut &Widget
+    pub fn loadGUIFile (mut self, path : [c8], behavior : &Behavior, set : bool = true, watching : bool = false)-> dmut &Widget
         throws BalderError
     {
         let doc = readGuiFile (path);
         let tree = self._registry:.unfold (doc, path);
         let dmut w = self._registry.instantiate (alias self, tree, behavior, alias self:.slotBox ());
         {
-            self:.loadComponentStyles ();
+            self:.loadComponentStyles (watching-> watching && set);
         } catch {
             e : &BalderError => {
                 w:.dispose ();
@@ -215,6 +238,10 @@ pub class WidgetManager {
 
         if set {
             self:.setContent (alias w);
+            if watching {
+                self._contentSource = (path, behavior)?;
+                self:.watchGui (path);
+            }
         }
 
         alias w
@@ -225,19 +252,16 @@ pub class WidgetManager {
      * widgets already loaded being computed again
      * @params:
      *    - path: the path of the file, qualified (res:/) or not
+     *    - watching: in a debug build, true to load the file again when it or a sheet it imports changes, its rules
+     *                keeping their place in the cascade, and the sheets of its last good version kept when it cannot be
+     *                decoded any more
      * @throws: when a file cannot be read, or a sheet cannot be decoded, naming the file, the line and the column; no
      * sheet is added then
      * */
-    pub fn loadStyleFile (mut self, path : [c8])
+    pub fn loadStyleFile (mut self, path : [c8], watching : bool = false)
         throws BalderError
     {
-        let dmut loader = SheetLoader (self._registry);
-        let sheets = loader:.load (path);
-        for sheet in sheets {
-            sheet.registerFonts (alias self._fontManager:.getRegistry ());
-            self._styleManager:.addSheet (sheet);
-        }
-
+        self:.addStyle (self:.readStyle (path, SheetOrigin::APPLICATION, watching));
         for dmut root in alias self:.getRoots () {
             root:.reloadStyle (deep-> true);
         }
@@ -248,14 +272,24 @@ pub class WidgetManager {
      * being a library of widgets, and the style sheets of the components (@style) the first time a file names them
      * @params:
      *    - path: the path of the file, qualified (res:/) or not
+     *    - watching: in a debug build, true to load the content again when the file or a file it imports changes, if
+     *                the content is watched (loadGUIFile), and the sheets of its components when they change
      * @throws: when a file cannot be read or loaded, or the sheet of a component cannot be decoded
      * */
-    pub fn loadComponents (mut self, path : [c8])
+    pub fn loadComponents (mut self, path : [c8], watching : bool = false)
         throws BalderError
     {
         let doc = readGuiFile (path);
         self._registry:.load (doc, path);
-        self:.loadComponentStyles ();
+        if path !in self._componentFiles {
+            self._componentFiles ~= [path];
+        }
+
+        if watching {
+            self:.watchGui (path);
+        }
+
+        self:.loadComponentStyles (watching-> watching);
     }
 
     /**
@@ -355,27 +389,22 @@ pub class WidgetManager {
     /**
      * Load the style sheets of the components the .gui files name with @style that are not loaded yet, at the origin of
      * the components, under the sheets of the application whatever their specificity
+     * @params:
+     *    - watching: true to watch the sheets loaded, and the files they import
      * @throws: when a sheet cannot be read or decoded; the sheets loaded before it stay
      * */
-    fn loadComponentStyles (mut self)
+    fn loadComponentStyles (mut self, watching : bool)
         throws BalderError
     {
         let mut added = false;
         for path in self._registry.getLibrary ().getStyles () {
             let mut loaded = false;
-            for l in self._componentStyles {
-                if l == path { loaded = true; break; }
+            for s in self._styleSources {
+                if s.path == path && s.origin == SheetOrigin::COMPONENT { loaded = true; break; }
             }
 
             if !loaded {
-                let dmut loader = SheetLoader (self._registry);
-                let sheets = loader:.load (path);
-                for sheet in sheets {
-                    sheet.registerFonts (alias self._fontManager:.getRegistry ());
-                    self._styleManager:.addSheet (sheet, origin-> SheetOrigin::COMPONENT);
-                }
-
-                self._componentStyles ~= [path];
+                self:.addStyle (self:.readStyle (path, SheetOrigin::COMPONENT, watching));
                 added = true;
             }
         }
@@ -384,6 +413,66 @@ pub class WidgetManager {
             for dmut root in alias self:.getRoots () {
                 root:.reloadStyle (deep-> true);
             }
+        }
+    }
+
+    /**
+     * Load a .style file and the sheets it imports, registering the fonts of their @font-face blocks
+     * @params:
+     *    - origin: where the sheets come from
+     *    - watching: true to watch the file and those it imports
+     * @returns: the file loaded, its sheets not added yet
+     * @throws: when a file cannot be read, or a sheet cannot be decoded
+     * */
+    fn readStyle (mut self, path : [c8], origin : SheetOrigin, watching : bool)-> StyleSource
+        throws BalderError
+    {
+        let dmut loader = SheetLoader (self._registry);
+        let sheets = loader:.load (path);
+        for sheet in sheets {
+            sheet.registerFonts (alias self._fontManager:.getRegistry ());
+        }
+
+        if watching {
+            for f in loader.getFiles () {
+                self:.watchFile (f);
+            }
+        }
+
+        StyleSource (path, origin, sheets, loader.getFiles (), watching)
+    }
+
+    /**
+     * Add the sheets of a style file after those already added
+     * */
+    fn addStyle (mut self, source : StyleSource) {
+        self._styleSources ~= [source];
+        for sheet in source.sheets {
+            self._styleManager:.addSheet (sheet, origin-> source.origin);
+        }
+    }
+
+    /**
+     * Watch a .gui file loaded and the files it imports
+     * */
+    fn watchGui (mut self, path : [c8]) {
+        for f in self._registry.getLibrary ().filesOf (path) {
+            if f !in self._guiFiles {
+                self._guiFiles ~= [f];
+            }
+
+            self:.watchFile (f);
+        }
+    }
+
+    /**
+     * Watch a file in a debug build, a release build watching none
+     * */
+    fn watchFile (mut self, path : [c8]) {
+        cte if __version!DEBUG {
+            self._watcher:.watch (path);
+        } else {
+            path;
         }
     }
 
@@ -404,6 +493,7 @@ pub class WidgetManager {
             w:.dispose ();
         }
 
+        self._contentSource = none;
         root:.onAttach (none);
         self._content = (alias root)?;
         self:.updateWidgets ();
@@ -643,6 +733,21 @@ pub class WidgetManager {
     }
 
     /**
+     * @returns: the signal emitted when the content was loaded again from its watched .gui file (loadGUIFile), which
+     * changed: the widgets found in the former content are disposed, and the instances created by code are gone
+     * */
+    pub fn reloaded (mut self)-> dmut &Signal!{()} {
+        if let Ok (dmut s) = alias self._reloaded {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{()} ();
+        self._reloaded = (alias s)?;
+
+        alias s
+    }
+
+    /**
      * @returns: the position of the mouse in the window, in CSS pixels
      * */
     pub fn getMousePosition (self)-> vec2 {
@@ -682,6 +787,130 @@ pub class WidgetManager {
         self._drawer:.commit ();
         if let Ok ((w, h)) = laidOut {
             self._window:.laidOut (w, h);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          HOT RELOAD          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Slot of the watcher, run by the slot emitter of the manager: load the content again when a .gui file it reads
+     * changed, the sheets of a .style file that changed otherwise
+     * @params:
+     *    - path: the file that changed
+     * */
+    fn onFileChanged (mut self, path : [c8]) {
+        if path in self._guiFiles {
+            self:.reloadContent ();
+        } else {
+            self:.reloadStyles (path);
+        }
+    }
+
+    /**
+     * Load the watched style files reading a file that changed again, and add the sheets of every file again in the
+     * order they were loaded, the styles of the widgets being computed again
+     * @info: a file that cannot be loaded keeps the sheets of its last good version, the error being logged
+     * @params:
+     *    - changed: the file that changed
+     * */
+    fn reloadStyles (mut self, changed : [c8]) {
+        let mut sources : [StyleSource] = [];
+        let mut reloaded = false;
+        for s in self._styleSources {
+            if s.watched && changed in s.files {
+                {
+                    sources ~= [self:.readStyle (s.path, s.origin, true)];
+                    reloaded = true;
+                    log::info #("WidgetManager", "Reloaded", s.path);
+                } catch {
+                    e : &BalderError => {
+                        log::error #("WidgetManager", "Failed to reload", s.path, "keeping its last version:", e.msg);
+                        sources ~= [s];
+                    }
+                }
+            } else {
+                sources ~= [s];
+            }
+        }
+
+        if reloaded {
+            self._styleSources = [];
+            self._styleManager:.clear ();
+            for s in sources {
+                self:.addStyle (s);
+            }
+
+            for dmut root in alias self:.getRoots () {
+                root:.reloadStyle (deep-> true);
+            }
+        }
+    }
+
+    /**
+     * Load the content again from its watched .gui file, the components being read again from their files, and emit
+     * reloaded
+     * @info: when a file cannot be loaded, the content and the components stay as they were, the error being logged
+     * */
+    fn reloadContent (mut self) {
+        if let Ok ((path, behavior)) = self._contentSource {
+            {
+                let dmut library = copy Library ();
+                for f in self._componentFiles {
+                    library:.load (readGuiFile (f), f);
+                }
+
+                let doc = readGuiFile (path);
+                let dmut former = self._registry:.setLibrary (alias library);
+                let dmut w = {
+                    let tree = self._registry:.unfold (doc, path);
+                    self._registry.instantiate (alias self, tree, behavior, alias self:.slotBox ())
+                } catch {
+                    e : &BalderError => {
+                        self._registry:.setLibrary (alias former);
+                        throw e;
+                    }
+                };
+
+                {
+                    self:.loadComponentStyles (watching-> true);
+                } catch {
+                    e : &BalderError => {
+                        w:.dispose ();
+                        self._registry:.setLibrary (alias former);
+                        throw e;
+                    }
+                }
+
+                // the widgets of the former content are disposed with it
+                self:.setFocus (none);
+                self._anchor = none;
+                self._clickedW = [none ; 3];
+                self._wasHover = false;
+
+                self:.setContent (alias w);
+                self._contentSource = (path, behavior)?;
+                self:.watchGui (path);
+                for f in self._componentFiles {
+                    if f in self._guiFiles {
+                        self:.watchGui (f);
+                    }
+                }
+
+                log::info #("WidgetManager", "Reloaded", path);
+                if let Ok (dmut s) = alias self._reloaded {
+                    s:.emit ();
+                }
+            } catch {
+                e : &BalderError => {
+                    log::error #("WidgetManager", "Failed to reload", path, "keeping the content as it is:", e.msg);
+                }
+            }
         }
     }
 
@@ -752,6 +981,7 @@ pub class WidgetManager {
                 self._content = none;
             }
 
+            self._watcher:.dispose ();
             self._fontManager:.dispose ();
             self._drawer:.dispose ();
         }
