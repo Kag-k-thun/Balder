@@ -1,0 +1,293 @@
+in utils;
+
+use balder::core::error;
+use balder::math::{matrix, quaternion, vector};
+use balder::scene::animation::{clip, joint_channel, joint_pose, skeleton, track};
+
+use ::assimp::_;
+
+/**
+ * Assimp gives no rate to the ticks of the animations of some files: their ticks are taken as 25 per second, as assimp
+ * does
+ * */
+def DEFAULT_TICKS_PER_SECOND = 25.0f;
+
+/**
+ * @returns: a matrix of assimp as a matrix of Balder, both naming their cells by their row (a to d) and their column (1
+ * to 4)
+ * */
+pub fn toMat4(m: aiMatrix4x4)-> mat4 {
+    mat4(a1-> m.a1, a2-> m.a2, a3-> m.a3, a4-> m.a4,
+         b1-> m.b1, b2-> m.b2, b3-> m.b3, b4-> m.b4,
+         c1-> m.c1, c2-> m.c2, c3-> m.c3, c4-> m.c4,
+         d1-> m.d1, d2-> m.d2, d3-> m.d3, d4-> m.d4)
+}
+
+/**
+ * @returns: a vector of assimp as a vector of Balder
+ * */
+pub fn toVec3(v: aiVector3D)-> vec3 {
+    makeVec3(v.x, v.y, v.z)
+}
+
+/**
+ * @returns: a quaternion of assimp as a quaternion of Balder
+ * */
+pub fn toQuaternion(q: aiQuaternion)-> Quaternion {
+    Quaternion(x-> q.x, y-> q.y, z-> q.z, w-> q.w)
+}
+
+/**
+ * @returns: a string of assimp as a string of Balder
+ * */
+pub fn toName(s: aiString)-> [c8] {
+    copy s.data[0 .. s.len]
+}
+
+/**
+ * @returns: the rate of the ticks of an animation imported by assimp, in ticks per second
+ * */
+@unsafe
+pub fn tickRate(anim: *aiAnimation)-> f64 {
+    let rate = anim.ticksPerSecond();
+    if rate > 0.0 { rate } else { DEFAULT_TICKS_PER_SECOND }
+}
+
+/**
+ * @returns: the track of the translation or the scale of a joint, its keys timed in seconds
+ * @info: a cubic spline (glTF) is read as linear, assimp giving its values without their tangents
+ * @params:
+ *    - keys: the keys of the channel
+ *    - count: the number of keys
+ *    - ticksPerSecond: the rate of the times of the keys
+ * */
+@unsafe
+pub fn readVectorTrack(keys: *aiVectorKey, count: u32, ticksPerSecond: f64)-> Track!{vec3} {
+    let dmut times = copy [0.0f; count];
+    let dmut values = copy [vec3(); count];
+    for i in 0u32 .. count {
+        times[i] = cast!f32(keys[i].mTime / ticksPerSecond);
+        values[i] = toVec3(keys[i].mValue);
+    }
+
+    let stepped = count > 0u32 && keys[0u32].mInterpolation == aiAnimInterpolation::STEP;
+    Track!{vec3}(times-> times, values-> values, stepped-> stepped)
+}
+
+/**
+ * @returns: the track of the rotation of a joint, its keys timed in seconds
+ * @info: a cubic spline (glTF) is read as spherical linear, assimp giving its values without their tangents
+ * @params:
+ *    - keys: the keys of the channel
+ *    - count: the number of keys
+ *    - ticksPerSecond: the rate of the times of the keys
+ * */
+@unsafe
+pub fn readRotationTrack(keys: *aiQuatKey, count: u32, ticksPerSecond: f64)-> Track!{Quaternion} {
+    let dmut times = copy [0.0f; count];
+    let dmut values = copy [Quaternion(); count];
+    for i in 0u32 .. count {
+        times[i] = cast!f32(keys[i].mTime / ticksPerSecond);
+        values[i] = toQuaternion(keys[i].mValue).normalized();
+    }
+
+    let stepped = count > 0u32 && keys[0u32].mInterpolation == aiAnimInterpolation::STEP;
+    Track!{Quaternion}(times-> times, values-> values, stepped-> stepped)
+}
+
+/**
+ * @returns: the clips of the animations of a scene imported by assimp
+ * */
+@unsafe
+pub fn readClips(scene: *aiScene)-> dmut [&AnimationClip] {
+    let dmut clips: [&AnimationClip] = [];
+    for i in 0u32 .. scene.numAnimations() {
+        clips = clips ~ [copy AnimationClip(scene.animations()[i])];
+    }
+
+    alias clips
+}
+
+/**
+ * @returns: the channels of an animation imported by assimp, their keys timed in seconds
+ * */
+@unsafe
+pub fn readChannels(anim: *aiAnimation)-> [JointChannel] {
+    let rate = tickRate(anim);
+    let dmut result: [JointChannel] = [];
+    for i in 0u32 .. anim.numChannels() {
+        result = result ~ [JointChannel(anim.channels()[i], rate)];
+    }
+
+    result
+}
+
+/**
+ * @returns: the joints of a scene imported by assimp, the nodes its meshes name as bones and the nodes above them, a
+ * parent before its children:
+ *    - 0: the names of the joints
+ *    - 1: the parent of each joint, none for a root
+ *    - 2: the pose of each joint relative to its parent, the transformation of its node
+ * */
+@unsafe
+pub fn readJoints(scene: *aiScene)-> ([[c8]], [(usize)?], [JointPose]) {
+    let dmut boneNames: [[c8] => bool] = copy [];
+    for m in 0u32 .. (*scene).mNumMeshes {
+        let mesh = scene.meshes()[m];
+        for b in 0u32 .. mesh.numBones() {
+            boneNames[toName(mesh.bones()[b].name())] = true;
+        }
+    }
+
+    // the nodes depth first, in the order of the file
+    let noParent: (usize)? = none;
+    let mut nodes: [*aiNode] = [];
+    let mut nodeParents: [(usize)?] = [];
+    let mut stack: [(*aiNode, (usize)?)] = copy [(scene.rootNode(), noParent)];
+    while stack.len > 0us {
+        let (node, parent) = stack[stack.len - 1us];
+        stack = stack[0us .. stack.len - 1us];
+
+        let index = nodes.len;
+        nodes = nodes ~ [node];
+        nodeParents = nodeParents ~ [parent];
+
+        let count = (*node).mNumChildren;
+        for j in 0u32 .. count {
+            stack = stack ~ [(node.children()[count - 1u32 - j], (index)?)];
+        }
+    }
+
+    // a node is a joint when it is a bone, or when a joint is below it
+    let dmut kept = copy [false; nodes.len];
+    for j in 0us .. nodes.len {
+        let i = nodes.len - 1us - j;
+        if boneNames[toName(nodes[i].name())].hasValue {
+            kept[i] = true;
+        }
+
+        if kept[i] {
+            if let Ok(p) = nodeParents[i] {
+                kept[p] = true;
+            }
+        }
+    }
+
+    let dmut jointOf = copy [0us; nodes.len];
+    let mut names: [[c8]] = [];
+    let dmut parents: [(usize)?] = [];
+    let dmut rest: [JointPose] = [];
+    for i in 0us .. nodes.len {
+        if !kept[i] {
+            continue;
+        }
+
+        let mut parent = noParent;
+        if let Ok(p) = nodeParents[i] {
+            parent = (jointOf[p])?;
+        }
+
+        jointOf[i] = names.len;
+        names = names ~ [toName(nodes[i].name())];
+        parents = parents ~ [parent];
+        rest = rest ~ [JointPose::fromMatrix(toMat4(nodes[i].transformation()))];
+    }
+
+    (names, parents, rest)
+}
+
+/**
+ * @returns: the joint of a skeleton of each bone of a mesh imported by assimp
+ * @throws:
+ *    - BalderError: when a bone is not a joint of the skeleton
+ * */
+@unsafe
+pub fn readSkinJoints(mesh: *aiMesh, skeleton: &Skeleton)-> [usize]
+    throws BalderError
+{
+    let dmut joints = copy [0us; mesh.numBones()];
+    for b in 0u32 .. mesh.numBones() {
+        let name = toName(mesh.bones()[b].name());
+        if let Ok(j) = skeleton.find(name) {
+            joints[b] = j;
+        } else {
+            throw copy BalderError("The bone " ~ name ~ " is not a joint of the skeleton");
+        }
+    }
+
+    joints
+}
+
+/**
+ * @returns: the inverse bind matrix of each bone of a mesh imported by assimp, taking a vertex of the mesh as placed in
+ * the model in the space of the bone
+ * @params:
+ *    - placement: the transformation placing the vertices of the mesh in the model, applied to them when loaded
+ * */
+@unsafe
+pub fn readInverseBinds(mesh: *aiMesh, placement: mat4)-> [mat4] {
+    // the offset matrix of assimp takes a vertex as the file gives it, before its placement
+    let unplace = placement.inversed();
+    let dmut inverses = copy [mat4(); mesh.numBones()];
+    for b in 0u32 .. mesh.numBones() {
+        inverses[b] = toMat4(mesh.bones()[b].offsetMatrix()) * unplace;
+    }
+
+    inverses
+}
+
+/**
+ * @returns: the four bones moving each vertex of a mesh imported by assimp and their weights, those weighing most when
+ * more move it, their weights summing to one:
+ *    - 0: the indices of the bones in the mesh (Skin.joints), as floats
+ *    - 1: the weight of each of them, zero for an index not used
+ * */
+@unsafe
+pub fn readSkinWeights(mesh: *aiMesh)-> ([vec4], [vec4]) {
+    let dmut vertexBones = copy [vec4(); mesh.numVertices()];
+    let dmut vertexWeights = copy [vec4(); mesh.numVertices()];
+    for b in 0u32 .. mesh.numBones() {
+        let bone = mesh.bones()[b];
+        for k in 0u32 .. bone.numWeights() {
+            let w = bone.weights()[k];
+            let (vb, vw) = withWeight(vertexBones[w.mVertexId], vertexWeights[w.mVertexId], cast!f32(b), w.mWeight);
+            vertexBones[w.mVertexId] = vb;
+            vertexWeights[w.mVertexId] = vw;
+        }
+    }
+
+    for i in 0us .. vertexWeights.len {
+        let w = vertexWeights[i];
+        let sum = w.x + w.y + w.z + w.w;
+        if sum > 0.0f {
+            vertexWeights[i] = w / sum;
+        }
+    }
+
+    (vertexBones, vertexWeights)
+}
+
+/**
+ * @returns: the bones of a vertex and their weights with one more bone, replacing the one weighing least when it
+ * weighs less than the new one
+ * */
+fn withWeight(bones: vec4, weights: vec4, bone: f32, weight: f32)-> (vec4, vec4) {
+    let mut least = 0us, mut leastWeight = weights.x;
+    if weights.y < leastWeight { least = 1us; leastWeight = weights.y; }
+    if weights.z < leastWeight { least = 2us; leastWeight = weights.z; }
+    if weights.w < leastWeight { least = 3us; leastWeight = weights.w; }
+
+    if weight <= leastWeight {
+        return (bones, weights);
+    }
+
+    let mut b = bones, mut w = weights;
+    match least {
+        0us => { b.x = bone; w.x = weight; }
+        1us => { b.y = bone; w.y = weight; }
+        2us => { b.z = bone; w.z = weight; }
+        _   => { b.w = bone; w.w = weight; }
+    }
+
+    (b, w)
+}

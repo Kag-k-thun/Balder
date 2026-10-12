@@ -1,0 +1,164 @@
+in animation_import;
+
+use balder::core::error;
+use balder::math::{matrix, vector};
+use balder::scene::{_, animation::_};
+use balder::scene::node;
+use balder::scene::node::node3D::{solid, visual::_};
+use balder::utils::path;
+
+use std::{conv, math};
+
+use ::assimp::_;
+
+// The fox of the glTF samples, skinned, with three clips
+def FOX = "res:/models/fox/Fox.gltf";
+
+/**
+ * A root with no scene, for the models of the tests to hang from
+ * */
+class Root over Node {
+
+    pub self ()
+        with super("")
+    {}
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+}
+
+/**
+ * @returns: true iif two matrices are equal, give or take the rounding errors
+ * */
+fn near(a: mat4, b: mat4)-> bool {
+    let d = a - b;
+    let cols = [makeVec4(d.a1, d.b1, d.c1, d.d1), makeVec4(d.a2, d.b2, d.c2, d.d2),
+                makeVec4(d.a3, d.b3, d.c3, d.d3), makeVec4(d.a4, d.b4, d.c4, d.d4)];
+    for c in cols {
+        if c.length() > 0.0001f { return false; }
+    }
+
+    true
+}
+
+__test the_clips_of_a_file_are_read_once {
+    let dmut library = copy AnimationLibrary();
+    let clips = library:.load(FOX);
+    assert (clips.len == 3us);
+    assert (clips[0us].name == "Survey" && clips[1us].name == "Walk" && clips[2us].name == "Run");
+    assert (abs(clips[0us].duration - 3.4166667f) < 0.0001f);
+    assert (abs(clips[1us].duration - 0.7083333f) < 0.0001f);
+    assert (abs(clips[2us].duration - 1.1583333f) < 0.0001f);
+    for c in clips {
+        assert (c.channels.len == 20us);
+    }
+
+    // the clips are shared, the file read once
+    assert (library:.load(FOX)[1us] is clips[1us]);
+    assert (library:.find(FOX, "Run") is clips[2us]);
+
+    let thrown = {
+        library:.find(FOX, "Fly");
+        false
+    } catch {
+        _: &BalderError => { true }
+    };
+
+    assert (thrown);
+}
+
+__test the_vertices_of_a_skinned_mesh_weigh_four_bones_at_most {
+    let mut vertices = 0us, mut bound = 0us;
+    unsafe {
+        let scene = aiImportFile(projectPath(FOX).toStr().toStringZ(),
+                                 aiPostProcessSteps::TargetRealtime_Quality | aiPostProcessSteps::ConvertToLeftHanded);
+        {
+            let mesh = scene.meshes()[0u32];
+            let (bones, weights) = readSkinWeights(mesh);
+            vertices = cast!usize(mesh.numVertices());
+            for i, w in weights {
+                let b = bones[i];
+                if abs(w.x + w.y + w.z + w.w - 1.0f) < 0.0001f && b.x < 24.0f && b.y < 24.0f && b.z < 24.0f && b.w < 24.0f {
+                    bound += 1us;
+                }
+            }
+        } exit {
+            aiReleaseImport(scene);
+        }
+    }
+
+    // every vertex weighs one in all, from the 24 bones of the fox
+    assert (vertices == 462us && bound == vertices);
+}
+
+__test a_skinned_model_keeps_its_skeleton_and_the_skins_of_its_meshes {
+    let dmut root = copy Root();
+    let dmut fox = copy SolidObjectModel::fromFile("fox", alias root, FOX, lods-> false);
+    assert (fox.skeleton().hasValue);
+
+    let dmut library = copy AnimationLibrary();
+    let walk = library:.find(FOX, "Walk");
+    if let Ok(skeleton) = fox.skeleton() {
+        // the bones of the fox, under the root of the file and the root of the fox
+        assert (skeleton.len == 26us);
+        assert (!skeleton.parents[0us].hasValue);
+        for i, p in skeleton.parents {
+            if let Ok(parent) = p {
+                assert (parent < i);
+            }
+        }
+
+        // the clips find each joint they move
+        for c in library:.load(FOX) {
+            for ch in c.channels {
+                assert (skeleton.find(ch.joint).hasValue);
+            }
+        }
+
+        let dmut nodes: [&Node] = [];
+        fox:.getAllNodes(ref nodes);
+
+        let mut skins = 0us;
+        for dmut n in alias nodes if let dmut mesh: &IndexedMesh3D = alias n {
+            let geometry = mesh.mesh;
+
+            // the model fits its unit box, standing on the origin
+            assert (abs(geometry.aabb.min.y) < 0.0001f);
+
+            if let Ok(skin) = geometry.skin {
+                skins += 1us;
+                assert (skin.joints.len == 24us);
+
+                // at rest, the joints leave the vertices where they are drawn
+                for m in skin.jointMatrices(skeleton.restMatrices()) {
+                    assert (near(m, mat4()));
+                }
+
+                // walking, they move them
+                let mut moved = false;
+                for m in skin.jointMatrices(skeleton.globalMatrices(walk.sample(skeleton, 0.3f))) {
+                    if !near(m, mat4()) { moved = true; }
+                }
+
+                assert (moved);
+            }
+        }
+
+        assert (skins == 1us);
+    }
+
+    // a copy shares the skeleton
+    let dmut copied = copy SolidObjectModel::copyOf("copy", alias root, alias fox);
+    if let Ok(a) = fox.skeleton() {
+        if let Ok(b) = copied.skeleton() {
+            assert (a is b);
+        }
+    }
+}
+
+__test a_rigid_model_has_no_skeleton {
+    let dmut root = copy Root();
+    let dmut cube = copy SolidObjectModel::fromFile("cube", alias root, "res:/models/cube/cube.obj", lods-> false);
+    assert (!cube.skeleton().hasValue);
+}
