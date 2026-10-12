@@ -3,6 +3,7 @@ in solid;
 use balder::math::_;
 use balder::core::error;
 use balder::core::config::shader::entry;
+use balder::scene::animation::{skeleton, skin, utils};
 use balder::scene::node::node3D::visual::{_, material::_};
 use balder::utils::log;
 
@@ -12,8 +13,12 @@ use ::std::{conv, fs::_};
 
 /**
  * A solid object model is a 3D model containing multiple meshes
+ * @info: the meshes of a skinned model keep the bones of their vertices, a skeleton giving the joints moving them
  * */
 pub class SolidObjectModel over Node3D {
+
+    // The joints of the model when its meshes are skinned, none for a rigid model
+    let mut _skeleton : (&Skeleton)? = none;
 
     /*!
      * ====================================================================================================
@@ -37,19 +42,27 @@ pub class SolidObjectModel over Node3D {
         let filePath = balder::utils::path::projectPath (path);
 
         unsafe {
-            // the transformations of the nodes are applied to their meshes, placed in the model as the file places them
-            let sceneAI = aiImportFile (filePath.toStr ().toStringZ (),
-                                        aiPostProcessSteps::TargetRealtime_Quality
-                                        | aiPostProcessSteps::ConvertToLeftHanded
-                                        | aiPostProcessSteps::PreTransformVertices);
+            let mut sceneAI = aiImportFile (filePath.toStr ().toStringZ (),
+                                            aiPostProcessSteps::TargetRealtime_Quality
+                                            | aiPostProcessSteps::ConvertToLeftHanded);
 
             if sceneAI == null {
                 throw copy BalderError ("Failed to load model from file " ~ filePath.toStr ());
             }
 
             {
+                // the transformations of the nodes of a rigid model are applied to their meshes, merged by material;
+                // the meshes of a skinned model keep their bones, which pre-transforming them would drop
+                let skinned = self.hasBones (sceneAI);
+                if !skinned {
+                    sceneAI = aiApplyPostProcessing (sceneAI, aiPostProcessSteps::PreTransformVertices);
+                    if sceneAI == null {
+                        throw copy BalderError ("Failed to load model from file " ~ filePath.toStr ());
+                    }
+                }
+
                 let dir = filePath.parent ();
-                let (mins, maxs) = self.computeMinMax (sceneAI.rootNode (), sceneAI);
+                let (mins, maxs) = self.computeMinMax (sceneAI.rootNode (), sceneAI, mat4 ());
                 let dimension = (maxs - mins);
                 let centroid = (maxs + mins) / 2.0f;
                 
@@ -60,8 +73,12 @@ pub class SolidObjectModel over Node3D {
                 let loadTransform = math::utils::scaling (scale) *  
                     math::utils::translation (position);
                 
+                if skinned {
+                    self._skeleton = (copy Skeleton (sceneAI, loadTransform))?;
+                }
+
                 let root = sceneAI.rootNode ();
-                self:.processSolidNode (root, sceneAI, dir, loadTransform, lods);
+                self:.processSolidNode (root, sceneAI, dir, loadTransform, mat4 (), lods);
                                                                      
             } exit {
                 aiReleaseImport (sceneAI);
@@ -75,10 +92,11 @@ pub class SolidObjectModel over Node3D {
      * @info: the meshes of a model uploaded before the copy released their vertices, the copy drawing the geometry they
      * placed while they are in the scene; a model copied before entering the scene keeps them for its copies
      * @params:
-     *    - model: the model to draw again, its meshes drawn with copies of their materials
+     *    - model: the model to draw again, its meshes drawn with copies of their materials, its skeleton shared
      * */
     pub self copyOf (name : [c8], dmut parent : &Node, dmut model : &SolidObjectModel)
         with super (name, alias parent)
+        , _skeleton = model._skeleton
     {
         for _, dmut c in alias model._childs if let dmut mesh : &IndexedMesh3D = alias c {
             let chName = "mesh_" ~ std::conv::to!{[c8]} (self._childs.len);
@@ -107,6 +125,13 @@ pub class SolidObjectModel over Node3D {
     pub over onExit (mut self, dmut _ : &Scene) {}
 
     /**
+     * @returns: the joints of the model when its meshes are skinned (see MeshGeometry.skin), none for a rigid model
+     * */
+    pub fn skeleton (self)-> (&Skeleton)? {
+        self._skeleton
+    }
+
+    /**
      * Draw every mesh of the model at a level of detail whatever the camera, or none to select it from the camera
      * */
     pub fn forceLod (mut self, level : (usize)?) {
@@ -124,24 +149,41 @@ pub class SolidObjectModel over Node3D {
      */
 
     /**
+     * @returns: true iif a mesh of the scene has bones
+     * */
+    @unsafe
+    fn hasBones (self, scene : *aiScene)-> bool {
+        for i in 0u32 .. (*scene).mNumMeshes {
+            if scene.meshes () [i].numBones () > 0u32 {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /**
      * Compute the bounds of the scene
+     * @params:
+     *    - parent: the transformation of the parent of the node in the scene
      * @returns:
      * - 0: the minimum bound
      * - 1: the maximum bound
      */
     @unsafe
-    fn computeMinMax (self, node : *aiNode, scene : *aiScene)-> (vec3, vec3) {
+    fn computeMinMax (self, node : *aiNode, scene : *aiScene, parent : mat4)-> (vec3, vec3) {
+        let placement = parent * toMat4 (node.transformation ());
         let mut min = vec3 (), mut max = vec3 ();
         for i in 0 .. node.numMeshes () {
             let mesh = scene.meshes () [i];
-            let (aux_min, aux_max) = self.computeMinMax (mesh);
+            let (aux_min, aux_max) = self.computeMinMax (mesh, placement);
             min = self.updateMin (min, aux_min);
             max = self.updateMax (max, aux_max);
         }
 
         for i in 0 .. (*node).mNumChildren {
             let child = node.children () [i];
-            let (aux_min, aux_max) = self.computeMinMax (child, scene);
+            let (aux_min, aux_max) = self.computeMinMax (child, scene, placement);
             min = self.updateMin (min, aux_min);
             max = self.updateMax (max, aux_max);
         }
@@ -151,13 +193,17 @@ pub class SolidObjectModel over Node3D {
 
     /**
      * Compute the bound of a mesh
+     * @params:
+     *    - placement: the transformation of the node of the mesh in the scene
      */
     @unsafe
-    fn computeMinMax (self, mesh : *aiMesh)-> (vec3, vec3) {
+    fn computeMinMax (self, mesh : *aiMesh, placement : mat4)-> (vec3, vec3) {
         let mut min = vec3 (), mut max = vec3 ();
         for i in 0u32 .. mesh.numVertices () {
-            min = self.updateMin (min, mesh.vertices () [i]);
-            max = self.updateMax (max, mesh.vertices () [i]);
+            let v = mesh.vertices () [i];
+            let p = (placement * makeVec4 (v.x, v.y, v.z, 1.0f)).xyz;
+            min = self.updateMin (min, p);
+            max = self.updateMax (max, p);
         }
 
         (min, max)
@@ -196,27 +242,34 @@ pub class SolidObjectModel over Node3D {
     /**
      * Read all the meshes and material inside a node and its childs, and register the meshes inside the solid object
      * @info: the window resource manager is used to load Managed resources (e.g. textures)
+     * @params:
+     *    - loadTransform: the transformation placing the scene in the unit box of the model
+     *    - parent: the transformation of the parent of the node in the scene
      * */
     @unsafe
-    fn processSolidNode (mut self, node : *aiNode, scene : *aiScene, dir : Path, loadTransform : mat4, lods : bool)
+    fn processSolidNode (mut self, node : *aiNode, scene : *aiScene, dir : Path, loadTransform : mat4, parent : mat4, lods : bool)
         throws BalderError
     {
+        let nodeTransform = parent * toMat4 (node.transformation ());
         for i in 0 .. node.numMeshes () {
             let mesh = scene.meshes ()[i];
-            self:.processSolidMesh (mesh, scene, dir, loadTransform, lods);
+            self:.processSolidMesh (mesh, scene, dir, loadTransform, nodeTransform, lods);
         }
 
         for i in 0 .. (*node).mNumChildren {
             let child = node.children ()[i];
-            self:.processSolidNode (child, scene, dir, loadTransform, lods);
+            self:.processSolidNode (child, scene, dir, loadTransform, nodeTransform, lods);
         }
     }
 
     /**
      * Read a mesh and its associated material, and build its levels of detail
+     * @params:
+     *    - loadTransform: the transformation placing the scene in the unit box of the model
+     *    - nodeTransform: the transformation of the node of the mesh in the scene
      * */
     @unsafe
-    fn processSolidMesh (mut self, mesh : *aiMesh, scene : *aiScene, dir : Path, loadTransform : mat4, lods : bool)
+    fn processSolidMesh (mut self, mesh : *aiMesh, scene : *aiScene, dir : Path, loadTransform : mat4, nodeTransform : mat4, lods : bool)
         throws BalderError
     {        
         let dmut material = if scene.numMaterials () > mesh.materialIndex () {
@@ -227,7 +280,14 @@ pub class SolidObjectModel over Node3D {
             alias mt
         };
 
-        let array = self:.loadSolidMeshVertices (mesh, material, loadTransform);
+        let array = self:.loadSolidMeshVertices (mesh, material, loadTransform, nodeTransform);
+        let mut skin : (Skin)? = none;
+        if let Ok (skeleton) = self._skeleton {
+            if mesh.numBones () > 0u32 {
+                skin = (Skin (mesh, skeleton, loadTransform * nodeTransform))?;
+            }
+        }
+
         let dmut indices = copy [0u32 ; 3 * mesh.numFaces ()];
         
         for i in 0u32 .. mesh.numFaces () {
@@ -250,7 +310,8 @@ pub class SolidObjectModel over Node3D {
                                          alias self,
                                          chain,
                                          array,
-                                         alias material);            
+                                         alias material,
+                                         skin-> skin);
     }
 
     /*!
@@ -383,9 +444,20 @@ pub class SolidObjectModel over Node3D {
     
     /**
      * Process a solid mesh whose material is a simple color material
+     * @params:
+     *    - loadTransform: the transformation placing the scene in the unit box of the model, a uniform scale and a
+     *                     translation
+     *    - nodeTransform: the transformation of the node of the mesh in the scene, the identity once pre-transformed
      * */
     @unsafe
-    fn loadSolidMeshVertices (mut self, mesh : *aiMesh, material : &Material, loadTransform : mat4)-> MeshArray {
+    fn loadSolidMeshVertices (mut self, mesh : *aiMesh, material : &Material, loadTransform : mat4, nodeTransform : mat4)-> MeshArray {
+        let placement = loadTransform * nodeTransform;
+
+        // the normals and the tangents turn with the node, the uniform scale of the load leaving their directions
+        let turned = !(nodeTransform == mat4 ());
+        let normalMatrix = nodeTransform.mat3 ().inversed ().transposed ();
+        let tangentMatrix = nodeTransform.mat3 ();
+
         let mut array = MeshArray ();
         array.positions = copy [vec3 () ; mesh.numVertices ()];
         if mesh.normals () != null && VertexEntry::NORMALS in material.shaderConfig.entries {
@@ -411,19 +483,29 @@ pub class SolidObjectModel over Node3D {
             array.colors = copy [vec3 () ; mesh.numVertices ()];
         }
 
+        // the bones of the vertices are kept whatever the material, for the skeleton to move them
+        if mesh.numBones () > 0u32 && self._skeleton.hasValue {
+            let (bones, weights) = readSkinWeights (mesh);
+            array.bones = copy bones;
+            array.weights = copy weights;
+        }
+
         for i in 0 .. mesh.numVertices () {
             let pos = mesh.vertices ()[i];
             let v = makeVec4 (pos.x, pos.y, pos.z, 1.0f);
-            array.positions [i] = (loadTransform * v).xyz;            
-            
+            array.positions [i] = (placement * v).xyz;
+
             if array.normals.len > i {
                 let norm = mesh.normals () [i];
-                array.normals [i] = makeVec3 (norm.x, norm.y, norm.z);
+                let normal = makeVec3 (norm.x, norm.y, norm.z);
+                array.normals [i] = if turned { (normalMatrix * normal).normalized () } else { normal };
             }
 
             if array.tangents.len > i {
                 let tan = mesh.tangents () [i];
-                array.tangents [i] = makeVec4 (tan.x, tan.y, tan.z, handedness [i]);
+                let tangent = makeVec3 (tan.x, tan.y, tan.z);
+                array.tangents [i] = makeVec4 (if turned { (tangentMatrix * tangent).normalized () } else { tangent },
+                                               handedness [i]);
             }
 
             if array.textureUVs.len > i {
