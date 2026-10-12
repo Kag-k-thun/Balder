@@ -14,6 +14,7 @@ def INDIRECT = 0x00000002u32; // VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT
 def VERTEX   = 0x00000008u32; // VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
 def TESTS    = 0x00000300u32; // VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
 def ALL      = 0x00010000u32; // VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+def INPUT    = 0x00000004u32; // VK_PIPELINE_STAGE_VERTEX_INPUT_BIT
 
 def SHADER_WRITE = 0x00000040u32; // VK_ACCESS_SHADER_WRITE_BIT
 def DEPTH_WRITE  = 0x00000400u32; // VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
@@ -87,6 +88,46 @@ fn sceneGraph()-> dmut &RenderGraph
                              kind-> PassKind::COMPUTE,
                              uses-> copy [uses("radiance", Usage::SAMPLED_COMPUTE), uses("output", Usage::STORAGE_WRITE)]));
 
+    alias g
+}
+
+/**
+ * @returns: the graph of the skinned instances of a scene: the skin pass writing their vertices in a subpass of its
+ * own, read by the vertex input of the g-buffer and of the shadow map, then the screen
+ * @params:
+ *    - skinning: false to disable the skin pass, as while no instance is skinned
+ * */
+fn skinGraph(skinning: bool)-> dmut &RenderGraph
+    throws BalderError
+{
+    let dmut g = copy RenderGraph("screen");
+    g:.addSubmission("screen");
+    g:.addSubmission("skin");
+    g:.addSubmission("deferred");
+    g:.addSubmission("shadow");
+
+    g:.createImage("atlas", ImageDesc(width-> 64u32, height-> 64u32, depth-> true));
+    g:.createImage("albedo", ImageDesc(width-> 32u32, height-> 32u32));
+    g:.createImage("depth", ImageDesc(width-> 32u32, height-> 32u32, depth-> true));
+    g:.importImage("output");
+    g:.importBuffer("skinned");
+
+    g:.declarePass(GraphPass(name-> "screen", submission-> "screen", uses-> copy [uses("output", Usage::SAMPLED_FRAGMENT)]));
+    g:.declarePass(GraphPass(name-> "skin",
+                             submission-> "skin",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [uses("skinned", Usage::STORAGE_WRITE)]));
+    g:.declarePass(GraphPass(name-> "gbuffer",
+                             submission-> "deferred",
+                             uses-> copy [uses("skinned", Usage::VERTEX_INPUT, optional-> true),
+                                          uses("albedo", Usage::COLOR_ATTACHMENT),
+                                          uses("depth", Usage::DEPTH_ATTACHMENT)]));
+    g:.declarePass(GraphPass(name-> "shadow",
+                             submission-> "shadow",
+                             uses-> copy [uses("atlas", Usage::DEPTH_ATTACHMENT),
+                                          uses("skinned", Usage::VERTEX_INPUT, optional-> true)]));
+
+    g:.enablePass("skin", skinning);
     alias g
 }
 
@@ -715,4 +756,53 @@ __test incompatible_images_do_not_share {
                                 span("c", 1us, 2us, 10us, typeBits-> 3u32)]);
 
     assert (members(slots) == "a|b|c");
+}
+
+/**
+ * The g-buffer and the shadow map wait for the skin pass at the vertex input of their draws, the skin pass waiting for
+ * the transfers
+ * */
+__test the_skinned_vertices_are_read_by_the_vertex_input_of_the_draws {
+    let g = skinGraph(true);
+    let s = g.compile();
+    assert (submissionNames(s) == ["skin", "deferred", "shadow", "screen"]);
+
+    let skin = indexOf(s, "skin");
+    for reader in ["deferred", "shadow"] {
+        let e = edgeOf(s, skin, indexOf(s, reader));
+        assert (e.stage == INPUT);
+        assert (e.resources == ["skinned"]);
+        assert (edgeOf(s, TRANSFER, indexOf(s, reader)).stage == 0u32);
+    }
+
+    assert (edgeOf(s, TRANSFER, skin).stage == ALL);
+}
+
+/**
+ * While no instance is skinned, the skin pass is disabled and the draws read no skinned vertex
+ * */
+__test the_draws_read_no_skinned_vertex_while_the_skin_pass_is_disabled {
+    let g = skinGraph(false);
+    let s = g.compile();
+    assert (submissionNames(s) == ["deferred", "shadow", "screen"]);
+    assert (edgeOf(s, TRANSFER, indexOf(s, "deferred")).stage == ALL);
+    assert (edgeOf(s, TRANSFER, indexOf(s, "shadow")).stage == ALL);
+}
+
+/**
+ * The vertex input reads buffers, in the draws of raster passes only
+ * */
+__test the_vertex_input_reads_buffers_in_raster_passes {
+    let dmut compute = skinGraph(true);
+    compute:.declarePass(GraphPass(name-> "reader",
+                                   submission-> "deferred",
+                                   kind-> PassKind::COMPUTE,
+                                   uses-> copy [uses("skinned", Usage::VERTEX_INPUT)]));
+    assert (fails(compute));
+
+    let dmut image = skinGraph(true);
+    image:.declarePass(GraphPass(name-> "reader",
+                                 submission-> "deferred",
+                                 uses-> copy [uses("albedo", Usage::VERTEX_INPUT)]));
+    assert (fails(image));
 }
