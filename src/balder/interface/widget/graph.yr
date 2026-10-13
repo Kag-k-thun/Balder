@@ -1,11 +1,12 @@
 in graph;
 
-use balder::utils;
 use balder::core::dispose;
 use balder::interface::{drawer, shape, style};
 use balder::interface::loader::registry::schema;
 use balder::interface::widget::text::label;
 use balder::math::vector;
+use balder::utils;
+use balder::utils::clock;
 
 use std::{format, unit};
 use std::algorithm::comparison;
@@ -87,10 +88,12 @@ pub record FrameSeries {
 }
 
 /**
- * A graph of the last frames of the window, three graphs one above the other: the time the CPU and the GPU spent on
- * each frame, and the device memory held by the window; each bar stands for a frame, the newest on the right, and each
- * graph has a line at its scale, the frame budget for the times and the memory of the device for the memory
- * @info: the parts cpu, gpu and memory style the label of each graph, its bars being drawn in the text colour of the part
+ * A graph of the last frames of the window, four graphs one above the other: the time the CPU and the GPU spent on
+ * each frame, the CPU time of the longest tick of the activity during each frame, and the device memory held by the
+ * window; each bar stands for a frame, the newest on the right, and each graph has a line at its scale, the frame
+ * budget for the times and the memory of the device for the memory
+ * @info: the parts cpu, gpu, activity and memory style the label of each graph, its bars being drawn in the text colour
+ * of the part
  * */
 pub class FrameGraph over Widget {
 
@@ -100,6 +103,10 @@ pub class FrameGraph over Widget {
     // The graph of the time the GPU spent on the frames, in milliseconds
     let dmut _gpu: &GraphLane;
 
+    // The graph of the CPU time of the thread ticking the widgets (the activity) during its longest tick of each
+    // frame, in milliseconds
+    let dmut _activity: &GraphLane;
+
     // The graph of the device memory, in megabytes, its top being the memory of the device
     let dmut _memory: &GraphLane;
 
@@ -108,6 +115,13 @@ pub class FrameGraph over Widget {
 
     // The index of the last frame measured, a new one adding a bar to each graph
     let mut _lastFrame: u64 = 0u64;
+
+    // The CPU time of the ticking thread at the last tick, none when the last tick was not measured
+    let mut _tickCpu: (Duration)? = none;
+
+    // The CPU time of the longest tick since the last frame measured, and the time that tick lasted
+    let mut _peakCpu: Duration = dur::micros(0u64);
+    let mut _peakTick: Duration = dur::micros(0u64);
 
     /*!
      * ====================================================================================================
@@ -121,6 +135,7 @@ pub class FrameGraph over Widget {
         with super(alias manager, id, "FrameGraph")
         , _cpu = copy GraphLane(alias manager, "cpu", makeVec4(0.18f, 0.77f, 0.62f, 1.0f))
         , _gpu = copy GraphLane(alias manager, "gpu", makeVec4(0.30f, 0.60f, 0.99f, 1.0f))
+        , _activity = copy GraphLane(alias manager, "activity", makeVec4(0.74f, 0.55f, 1.0f, 1.0f))
         , _memory = copy GraphLane(alias manager, "memory", makeVec4(0.83f, 0.60f, 0.13f, 1.0f))
     {}
 
@@ -141,6 +156,7 @@ pub class FrameGraph over Widget {
             let dmut drawer = self._manager:.getShapeDrawer();
             self._cpu:.setNbFrames(alias drawer, self._nbFrames);
             self._gpu:.setNbFrames(alias drawer, self._nbFrames);
+            self._activity:.setNbFrames(alias drawer, self._nbFrames);
             self._memory:.setNbFrames(alias drawer, self._nbFrames);
             self:.onUpdateSize();
         }
@@ -167,10 +183,12 @@ pub class FrameGraph over Widget {
         let dmut drawer = self._manager:.getShapeDrawer();
         self._cpu:.setNbFrames(alias drawer, self._nbFrames);
         self._gpu:.setNbFrames(alias drawer, self._nbFrames);
+        self._activity:.setNbFrames(alias drawer, self._nbFrames);
         self._memory:.setNbFrames(alias drawer, self._nbFrames);
 
         self._cpu:.attach((self)?);
         self._gpu:.attach((self)?);
+        self._activity:.attach((self)?);
         self._memory:.attach((self)?);
     }
 
@@ -178,18 +196,21 @@ pub class FrameGraph over Widget {
         let style = self.getStyle();
         self._cpu:.applyStyle(style);
         self._gpu:.applyStyle(style);
+        self._activity:.applyStyle(style);
         self._memory:.applyStyle(style);
     }
 
     over onHide(mut self) {
         self._cpu:.hide();
         self._gpu:.hide();
+        self._activity:.hide();
         self._memory:.hide();
     }
 
     over onShow(mut self) {
         self._cpu:.show();
         self._gpu:.show();
+        self._activity:.show();
         self._memory:.show();
     }
 
@@ -203,7 +224,7 @@ pub class FrameGraph over Widget {
 
     over onUpdateSize(mut self) {
         let gap = GRAPH_GAP;
-        let h = max(0.0f, (self._absoluteSize.y - 2.0f * gap) / 3.0f);
+        let h = max(0.0f, (self._absoluteSize.y - 3.0f * gap) / 4.0f);
         let size = makeVec2(self._absoluteSize.x, h);
 
         let mut pos = self._absolutePosition;
@@ -211,6 +232,9 @@ pub class FrameGraph over Widget {
 
         pos.y += h + gap;
         self._gpu:.place(pos, size, self._depth);
+
+        pos.y += h + gap;
+        self._activity:.place(pos, size, self._depth);
 
         pos.y += h + gap;
         self._memory:.place(pos, size, self._depth);
@@ -222,6 +246,7 @@ pub class FrameGraph over Widget {
         let (sciPos, sciSize) = self.getScissors(self._absolutePosition, self._absoluteSize);
         self._cpu:.setScissors(sciPos, sciSize);
         self._gpu:.setScissors(sciPos, sciSize);
+        self._activity:.setScissors(sciPos, sciSize);
         self._memory:.setScissors(sciPos, sciSize);
     }
 
@@ -239,9 +264,16 @@ pub class FrameGraph over Widget {
 
     /**
      * Add the frames presented since the last tick to the graphs, the last one only: a tick lasts less than a frame
+     * @params:
+     *    - delta: the time since the last tick started, the time the last tick lasted when the ticks are late
      * */
-    pub over onTick(mut self, _: Duration) {
-        if !self._attached || !self.isDrawn() { return; }
+    pub over onTick(mut self, delta: Duration) {
+        if !self._attached || !self.isDrawn() {
+            self._tickCpu = none;
+            return;
+        }
+
+        self:.measureTick(delta);
 
         let dmut window = self._manager:.getWindow();
         let stats = window.getFrameStats();
@@ -256,7 +288,31 @@ pub class FrameGraph over Widget {
 
         self._cpu:.push(cpu, budget, format("CPU {:.2} ms", cpu));
         self._gpu:.push(gpu, budget, format("GPU {:.2} ms", gpu));
+
+        let activity = toMillis(self._peakCpu);
+        self._activity:.push(activity, budget, format("Activity {:.2} ms, tick {:.2} ms", activity, toMillis(self._peakTick)));
+        self._peakCpu = dur::micros(0u64);
+        self._peakTick = dur::micros(0u64);
         self._memory:.push(memory, available, format("Memory {} / {}", writeSize(stats.memory), writeSize(stats.available)));
+    }
+
+    /**
+     * Measure the CPU time the ticking thread used since the last tick, the work of the last tick, keeping the longest
+     * one since the last frame measured
+     * @params:
+     *    - delta: the time since the last tick started
+     * */
+    fn measureTick(mut self, delta: Duration) {
+        let now = threadCpuTime();
+        if let Ok(last) = self._tickCpu {
+            let cpu = now - last;
+            if cpu > self._peakCpu {
+                self._peakCpu = cpu;
+                self._peakTick = delta;
+            }
+        }
+
+        self._tickCpu = (now)?;
     }
 
     /*!
@@ -272,7 +328,7 @@ pub class FrameGraph over Widget {
     }
 
     prot over measureContentHeights(mut self, _: f32)-> (f32, f32) {
-        (3.0f * GRAPH_HEIGHT + 2.0f * GRAPH_GAP, 3.0f * GRAPH_HEIGHT + 2.0f * GRAPH_GAP)
+        (4.0f * GRAPH_HEIGHT + 3.0f * GRAPH_GAP, 4.0f * GRAPH_HEIGHT + 3.0f * GRAPH_GAP)
     }
 
     /*!
@@ -289,6 +345,7 @@ pub class FrameGraph over Widget {
                 let dmut drawer = self._manager:.getShapeDrawer();
                 self._cpu:.dispose(alias drawer);
                 self._gpu:.dispose(alias drawer);
+                self._activity:.dispose(alias drawer);
                 self._memory:.dispose(alias drawer);
             }
 
@@ -309,7 +366,7 @@ pub mod FrameGraph {
         copy WidgetSchema("FrameGraph",
                           |dmut m, id|-> dmut &Widget => copy FrameGraph(alias m, id),
                           attributes-> copy [copy Setter!{&FrameGraph, usize}("frames", |dmut g, n| => { g:.setNbFrames(n); })],
-                          parts-> copy ["cpu", "gpu", "memory"])
+                          parts-> copy ["cpu", "gpu", "activity", "memory"])
     }
 }
 
