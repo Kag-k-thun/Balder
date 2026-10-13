@@ -8,7 +8,7 @@ use balder::math::{bounds, matrix, vector};
 use balder::scene::node::node3D::visual;
 use balder::scene::node::node3D::visual::{material, mesh};
 use balder::scene::utils::{casters, cluster_slot, draw_stats, motion, shadow_map, skinned_instance, skinning};
-use balder::utils::log;
+use balder::utils::{dense_map, log};
 
 use std::algorithm::comparison;
 
@@ -337,10 +337,9 @@ pub class SceneDraws {
     pub fn setPoseBox(mut self, box: Aabb) {
         if let Ok(skin) = self._skin {
             if let Ok(dmut clusters) = alias self._clusters {
-                for c in 0u32 .. skin.nbClusters {
-                    clusters:.setData(skin.firstCluster + c, CLUSTER_CENTER, makeVec4(box.center, 0.0f));
-                    clusters:.setData(skin.firstCluster + c, CLUSTER_EXTENT, makeVec4(box.extent, 0.0f));
-                }
+                let count = cast!usize(skin.nbClusters);
+                clusters:.fillRun(skin.firstCluster, count, CLUSTER_CENTER, makeVec4(box.center, 0.0f));
+                clusters:.fillRun(skin.firstCluster, count, CLUSTER_EXTENT, makeVec4(box.extent, 0.0f));
             }
         }
     }
@@ -443,7 +442,7 @@ class MaterialBatch {
     pub let dmut draws: &InstanceBatch;
 
     // The instances
-    pub let dmut nodes: [usize => &VisualInstance3D] = copy [];
+    pub let dmut nodes: &DenseMap!{usize, dmut &VisualInstance3D} = copy DenseMap!{usize, dmut &VisualInstance3D}();
 
     // The number of draws laid out by the recording of the current frame
     pub let mut count: u32 = 0u32;
@@ -497,7 +496,7 @@ pub class ShaderGroup {
     let dmut _motion: &MotionTracker;
 
     // The draws of the instances by material key
-    let dmut _batches: [[c8] => &MaterialBatch] = copy [];
+    let dmut _batches: &DenseMap!{[c8], dmut &MaterialBatch} = copy DenseMap!{[c8], dmut &MaterialBatch}();
 
     // The cull shader of the scene when the instances are culled on the GPU, none when they are culled on the CPU
     let dmut _cull: (&ComputeShader)? = none;
@@ -621,7 +620,7 @@ pub class ShaderGroup {
         throws BalderError
     {
         let key = material.getBatchKey();
-        let dmut batch = if let Ok(dmut b) = alias self._batches[key] {
+        let dmut batch = if let Ok(dmut b) = alias self._batches:[key] {
             alias b
         } else {
             let dmut set = self._shader:.get():.allocateDescriptorSet(DescriptorContext::OBJECT);
@@ -800,7 +799,7 @@ pub class ShaderGroup {
      * */
     pub fn drawStats(self)-> DrawStats {
         let mut stats = DrawStats();
-        for _, b in self._batches {
+        for b in self._batches.values {
             let (commands, instances, triangles) = b.draws.getDrawn();
             if commands != 0u32 { stats.multiDraws += 1us; }
 
@@ -818,18 +817,18 @@ pub class ShaderGroup {
      *    - eye: the position of the camera
      * */
     pub fn sort(mut self, eye: vec3) {
-        for _, dmut b in alias self._batches {
+        for dmut b in alias self._batches.values {
             if self._sortOwners.len < b.nodes.len {
                 self._sortOwners = copy [0us; 2us * b.nodes.len];
                 self._sortDistances = copy [0.0f; 2us * b.nodes.len];
             }
 
             let mut n = 0us;
-            for uid, dmut node in alias b.nodes {
+            for dmut node in alias b.nodes.values {
                 if node.culled { continue; }
 
                 let sphere = node:.boundingSphere();
-                self._sortOwners[n] = uid;
+                self._sortOwners[n] = node.uid;
                 self._sortDistances[n] = (sphere.center - eye).length() - sphere.radius;
                 n += 1us;
             }
@@ -855,13 +854,13 @@ pub class ShaderGroup {
      * */
     pub fn setCulling(mut self, dmut window: &Window, dmut cull: (&ComputeShader)?) {
         self._cull = alias cull;
-        for key, dmut b in alias self._batches {
+        for i, dmut b in alias self._batches.values {
             if self._cull.hasValue {
                 {
                     self:.cullOnGpu(alias b);
                 } catch {
                     err => {
-                        log::error #("Scene", "Failed to cull the draws of the material on the GPU", key, err);
+                        log::error #("Scene", "Failed to cull the draws of the material on the GPU", self._batches.keys[i], err);
                     }
                 }
             } else {
@@ -889,7 +888,7 @@ pub class ShaderGroup {
         }
 
         let key = material.getBatchKey();
-        if let Ok(dmut b) = alias self._batches[key] {
+        if let Ok(dmut b) = alias self._batches:[key] {
             b.nodes:.remove(node.uid);
             b.draws:.remove(node.uid);
             if b.nodes.len == 0us {
@@ -919,11 +918,11 @@ pub class ShaderGroup {
      *    - frame: the frame being recorded
      * */
     pub fn layout(mut self, frame: u32) {
-        for key, dmut b in alias self._batches {
+        for i, dmut b in alias self._batches.values {
             {
                 b.draws:.begin(frame);
-                for uid, n in b.nodes {
-                    b.draws:.add(frame, uid, n.getDraws());
+                for n in b.nodes.values {
+                    b.draws:.add(frame, n.uid, n.getDraws());
                 }
 
                 b.count = b.draws:.end(frame);
@@ -937,7 +936,7 @@ pub class ShaderGroup {
                 }
             } catch {
                 err => {
-                    log::error #("Scene", "Failed to lay out the draws of the material", key, err);
+                    log::error #("Scene", "Failed to lay out the draws of the material", self._batches.keys[i], err);
                     b.count = 0u32;
                 }
             }
@@ -949,7 +948,7 @@ pub class ShaderGroup {
      * @assume: the draws of the frame are laid out
      * */
     pub fn clearCounters(mut self, dmut cmd: &CullCommandAllocator) {
-        for _, b in self._batches {
+        for b in self._batches.values {
             cmd:.clear(b.draws);
         }
     }
@@ -966,7 +965,7 @@ pub class ShaderGroup {
      * */
     pub fn cullObjects(mut self, frame: u32, dmut cmd: &CullCommandAllocator, width: f32, height: f32, minPixels: f32) {
         if let Ok(dmut shader) = alias self._cull {
-            for _, b in self._batches {
+            for b in self._batches.values {
                 if let Ok(set) = b.cullSet {
                     set.select(frame, cmd.getCommandBuffer());
                     cmd:.cullObjects(alias shader, b.draws, width, height, minPixels);
@@ -990,7 +989,7 @@ pub class ShaderGroup {
      * */
     pub fn cullClusters(mut self, frame: u32, dmut cmd: &CullCommandAllocator, late: bool, width: f32, height: f32, levels: u32) {
         if let Ok(dmut shader) = alias self._cull {
-            for _, b in self._batches {
+            for b in self._batches.values {
                 if let Ok(set) = b.cullSet {
                     set.select(frame, cmd.getCommandBuffer());
                     cmd:.cullClusters(alias shader, b.draws, late, width, height, levels);
@@ -1004,7 +1003,7 @@ pub class ShaderGroup {
      * @assume: the commands are written
      * */
     pub fn readBack(mut self, dmut cmd: &CullCommandAllocator) {
-        for _, b in self._batches {
+        for b in self._batches.values {
             cmd:.readBack(b.draws);
         }
     }
@@ -1079,7 +1078,7 @@ pub class ShaderGroup {
         self._camera.select(frame, cmd.getCommandBuffer());
         self.selectGeometry(frame, cmd.getCommandBuffer());
 
-        for _, dmut b in alias self._batches {
+        for dmut b in alias self._batches.values {
             if b.count == 0u32 { continue; }
 
             let culled = b.draws.isCulled(frame);
@@ -1245,7 +1244,7 @@ pub class ShaderGroup {
      *    - window: the window retiring the resources, the recordings in use still drawing with them
      * */
     pub fn retire(mut self, dmut window: &Window) {
-        for _, dmut b in alias self._batches {
+        for dmut b in alias self._batches.values {
             window:.retire(alias b.set);
             window:.retire(alias b.draws);
             if let Ok(dmut set) = alias b.cullSet {
@@ -1259,7 +1258,7 @@ pub class ShaderGroup {
             self._skinning = none;
         }
 
-        self._batches = copy [];
+        self._batches:.clear();
         self._meshes = copy [];
         self._sweepAt = MIN_SWEEP;
         window:.retire(alias self._camera);
