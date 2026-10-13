@@ -795,7 +795,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `cpu`, `gpu`, `memory`
+- **Parts:** `cpu`, `gpu`, `activity`, `memory`
 - **Properties:** none
 
 ### `GridLayout`
