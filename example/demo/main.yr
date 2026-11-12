@@ -102,6 +102,24 @@ lazy mut __MODEL__: [mut [c8]] = copy [""];
 lazy mut __CLIP__: [mut [c8]] = copy [""];
 
 /**
+ * The clip the skinned subjects and model playing the clip of '--clip' play over their upper body, from the joint of
+ * '--layer-joint' down (the Survey of res:/models/fox/Fox.gltf...), set by '--layer', empty for none ('U' fading it in
+ * and out)
+ * */
+lazy mut __LAYER__: [mut [c8]] = copy [""];
+
+/**
+ * The highest joint of the upper body the clip of '--layer' plays on, set by '--layer-joint' (the spine of the fox by
+ * default)
+ * */
+lazy mut __LAYER_JOINT__: [mut [c8]] = copy ["b_Spine01_02"];
+
+/**
+ * The time of the cross-fades between two clips ('C') and of the fades of the layer of '--layer' ('U'), in seconds
+ * */
+def CLIP_FADE = 0.3f;
+
+/**
  * The exposure of the camera at the start, in stops, set by '--exposure' ('Page Up' and 'Page Down' changing it)
  * */
 lazy dmut __EXPOSURE__ = copy [0.0f];
@@ -144,15 +162,17 @@ class MyActivity over Activity {
     let mut _eye: vec3                  = makeVec3(0.0f, 0.0f, 0.0f);
     let dmut _subject: (&Node3D)?       = none;
 
-    // The clips of the files of the models, the models playing the clip of '--clip' in a loop, the clip each plays, and
-    // the time of the clips they are at
-    let dmut _library: &AnimationLibrary  = copy AnimationLibrary();
-    let dmut _players: [&SolidObjectModel] = [];
-    let mut _playerClips: [&AnimationClip] = [];
-    let mut _clipTime: f32                 = 0.0f;
-
-    // The poses the players are moved to, sampled again in place for each of them at each update
-    let dmut _poses: [JointPose] = [];
+    // The clips of the files of the models, the models playing the clip of '--clip', the player of each, the clips of
+    // its file and the index of the one it plays ('C' cross-fading to the next), and the layer of '--layer' of each and
+    // its clip, none when its file has not the clip or its skeleton the joint ('U' fading them in and out)
+    let dmut _library: &AnimationLibrary          = copy AnimationLibrary();
+    let dmut _animated: [&SolidObjectModel]        = [];
+    let dmut _animators: [&AnimationPlayer]        = [];
+    let mut _fileClips: [[&AnimationClip]]         = [];
+    let dmut _clipIndices: [usize]                 = [];
+    let mut _upperLayers: [(usize)?]               = [];
+    let mut _upperClips: [(&AnimationClip)?]       = [];
+    let mut _upperOn: bool                         = true;
     let dmut _camSpeed: (f32, f32, f32) = (0.0f, 0.0f, 100.0f);
     let dmut _forward: vec3             = makeVec3(0.0f, 0.0f, 0.0f);
     let dmut _right: vec3               = makeVec3(0.0f, 0.0f, 0.0f);
@@ -210,6 +230,8 @@ class MyActivity over Activity {
         self.input:.keyboard(KeyInfo(SDLK_L, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleGrading);
         self.input:.keyboard(KeyInfo(SDLK_F, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleFxaa);
         self.input:.keyboard(KeyInfo(SDLK_M, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleTaa);
+        self.input:.keyboard(KeyInfo(SDLK_C, KeyEvent::DOWN)):.connect(self.box, &self:.onCycleClip);
+        self.input:.keyboard(KeyInfo(SDLK_U, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleUpperLayer);
 
         self.input:.mouseMotion():.connect(self.box, &self:.onMouseMove);
 
@@ -306,7 +328,7 @@ class MyActivity over Activity {
         // the keys of the gizmo change its mode and its space
         self:.showPicking();
 
-        self:.playClip(_delta_);
+        self:.animate(_delta_);
 
         if self._camSpeed._0 != 0.0f || self._camSpeed._1 != 0.0f {
             let speed = cast!f32(_delta_.allMillis) / self._camSpeed._2;
@@ -802,41 +824,107 @@ class MyActivity over Activity {
     }
 
     /**
-     * Make a skinned model play the clip of '--clip' in a loop, when its file has it, its boxes fit to the clip
+     * Make a skinned model play the clip of '--clip' in a loop, when its file has it, its boxes fit to the clip, and the
+     * clip of '--layer' over its upper body, when its file has it and its skeleton the joint of '--layer-joint'
      * @params:
      *    - model: the model
      *    - path: the file of the model, holding its clips
      * */
     fn play(mut self, dmut model: &SolidObjectModel, path: [c8]) {
-        if __CLIP__[0] == "" || !model.skeleton().hasValue { return; }
+        if __CLIP__[0] == "" { return; }
 
-        {
-            let clip = self._library:.find(path, __CLIP__[0]);
-            model:.fitClip(clip);
-            self._players ~= [alias model];
-            self._playerClips ~= [clip];
-        } catch {
-            err: &BalderError => {
-                log::warn #("Main", "The model", model.name, "plays no clip", err);
+        if let Ok(skeleton) = model.skeleton() {
+            {
+                let clip = self._library:.find(path, __CLIP__[0]);
+                let clips = self._library:.load(path);
+                model:.fitClip(clip);
+
+                let dmut player = copy AnimationPlayer(skeleton);
+                player:.play(clip);
+
+                let mut index = 0us;
+                for i, c in clips {
+                    if c.name == clip.name { index = i; }
+                }
+
+                let (layer, upper) = self:.playUpperLayer(alias player, skeleton, path);
+                self._animated ~= [alias model];
+                self._animators ~= [alias player];
+                self._fileClips ~= [clips];
+                self._clipIndices ~= [index];
+                self._upperLayers ~= [layer];
+                self._upperClips ~= [upper];
+            } catch {
+                err: &BalderError => {
+                    log::warn #("Main", "The model", model.name, "plays no clip", err);
+                }
             }
         }
     }
 
     /**
-     * Move the models playing the clip of '--clip' along it, in a loop
+     * Make a player play the clip of '--layer' on a layer over the upper body of its skeleton, from the joint of
+     * '--layer-joint' down
+     * @returns:
+     *    - 0: the index of the layer, none when there is no '--layer', or the file or the skeleton lacks the clip or the
+     *         joint
+     *    - 1: the clip of the layer
      * */
-    fn playClip(mut self, delta: Duration) {
-        self._clipTime += cast!f32(delta.allMicros) / 1000000.0f;
-        for i, dmut model in alias self._players {
-            let clip = self._playerClips[i];
-            if let Ok(skeleton) = model.skeleton() {
-                if self._poses.len != skeleton.len {
-                    self._poses = copy skeleton.rest;
-                }
+    fn playUpperLayer(mut self, dmut player: &AnimationPlayer, skeleton: &Skeleton, path: [c8])-> ((usize)?, (&AnimationClip)?) {
+        if __LAYER__[0] == "" { return (none, none); }
 
-                let time = if clip.duration > 0.0f { self._clipTime % clip.duration } else { 0.0f };
-                clip.sampleInto(skeleton, time, alias self._poses);
-                model:.pose(self._poses);
+        {
+            let clip = self._library:.find(path, __LAYER__[0]);
+            let mask = JointMask::fromJoint(skeleton, __LAYER_JOINT__[0]);
+            let layer = player:.addLayer(mask-> (mask)?);
+            player:.play(clip, layer-> layer);
+            return ((layer)?, (clip)?);
+        } catch {
+            err: &BalderError => {
+                log::warn #("Main", "The skinned models play no clip over their upper body", err);
+            }
+        }
+
+        (none, none)
+    }
+
+    /**
+     * Move the players of the skinned models along the time elapsed, and the models to their poses
+     * */
+    fn animate(mut self, delta: Duration) {
+        for i, dmut model in alias self._animated {
+            self._animators[i]:.advance(delta);
+            model:.pose(self._animators[i].poses);
+        }
+    }
+
+    /**
+     * Cross-fade the skinned models to the next clip of their file, in a loop, the box of their meshes growing with the
+     * poses of the clip
+     * */
+    fn onCycleClip(mut self, _: KeyInfo) {
+        for i, clips in self._fileClips {
+            if clips.len > 1us {
+                let next = (self._clipIndices[i] + 1us) % clips.len;
+                self._clipIndices[i] = next;
+                self._animators[i]:.play(clips[next], fade-> CLIP_FADE);
+                log::info #("Main", "The model", self._animated[i].name, "cross-fades to the clip", clips[next].name);
+            }
+        }
+    }
+
+    /**
+     * Fade the clip of '--layer' over the upper body of the skinned models in or out
+     * */
+    fn onToggleUpperLayer(mut self, _: KeyInfo) {
+        self._upperOn = !self._upperOn;
+        for i, layer in self._upperLayers {
+            if let Ok(l) = layer {
+                if !self._upperOn {
+                    self._animators[i]:.stop(fade-> CLIP_FADE, layer-> l);
+                } else if let Ok(clip) = self._upperClips[i] {
+                    self._animators[i]:.play(clip, fade-> CLIP_FADE, layer-> l);
+                }
             }
         }
     }
@@ -987,7 +1075,9 @@ fn readArguments(args: [[c8]])-> bool {
         :.option!{[c8]} ("subject", comments-> "the model (glTF, OBJ...) of the three subjects in front and of the crowd (res:/models/suzanne/Suzanne.gltf by default)")
         :.option!{[c8]} ("crowd", comments-> "the number of subjects on a side of a crowd behind the three in front (none by default)")
         :.option!{[c8]} ("model", comments-> "a model (glTF, OBJ...) to place beside the subjects (none by default)")
-        :.option!{[c8]} ("clip", comments-> "the clip the skinned subjects and model play in a loop, those whose file has it (Walk for res:/models/fox/Fox.gltf...), none by default")
+        :.option!{[c8]} ("clip", comments-> "the clip the skinned subjects and model play in a loop, those whose file has it (Walk for res:/models/fox/Fox.gltf...), 'C' cross-fading to the next clip of their file (none by default)")
+        :.option!{[c8]} ("layer", comments-> "a clip the skinned models playing --clip play over their upper body (Survey for the fox...), 'U' fading it in and out (none by default)")
+        :.option!{[c8]} ("layer-joint", comments-> "the highest joint of the upper body --layer plays on (b_Spine01_02, the spine of the fox, by default)")
         :.flag("cpu-cull", comments-> "cull the instances on the CPU from the start, 'G' toggling it (on the GPU by default, when the device allows it)")
         :.flag("occlusion", comments-> "cull the instances hidden behind others when culled on the GPU, 'O' toggling it (off by default)")
         :.flag("shadows", comments-> "the lights cast shadows, the sun, the lamps and the spot, 'H' toggling them (off by default)")
@@ -1022,6 +1112,14 @@ fn readArguments(args: [[c8]])-> bool {
 
         if let Ok(Str(value-> clip)) = cfg["clip"]? {
             __CLIP__[0] = clip;
+        }
+
+        if let Ok(Str(value-> layer)) = cfg["layer"]? {
+            __LAYER__[0] = layer;
+        }
+
+        if let Ok(Str(value-> joint)) = cfg["layer-joint"]? {
+            __LAYER_JOINT__[0] = joint;
         }
 
         if let Ok(Str(value-> side)) = cfg["crowd"]? {
