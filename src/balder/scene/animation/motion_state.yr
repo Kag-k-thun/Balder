@@ -1,0 +1,298 @@
+in motion_state;
+
+use balder::scene::animation::{clip, event, motion, parameters};
+
+/**
+ * A motion being played, where it is in the motion and how it moves along it (see AnimationLayer)
+ * @info: the length of a blend space changes with the parameters of the player (see refresh): its time is then moved to
+ * keep its place in the motion, so its clips stay in step as it speeds up or slows down
+ * */
+pub record MotionState {
+
+    // The motion played
+    pub let motion: &AnimationMotion;
+
+    // The time in the motion, in seconds, in [0, duration] (see advance)
+    pub let mut time: f32;
+
+    // The length of the motion at the parameters of its last refresh, in seconds
+    pub let mut duration: f32;
+
+    // The clip of the motion signalling its events at the parameters of its last refresh (see AnimationMotion.leadingClip)
+    pub let mut leading: &AnimationClip;
+
+    // The speed the time moves at, 1 for the speed of the motion, negative to play it backwards
+    pub let mut speed: f32;
+
+    // True when the motion starts again at its end (at its start when played backwards)
+    pub let looping: bool;
+
+    // The part the motion takes in the pose of its layer, in [0, 1], against the other motions of the layer (see
+    // AnimationLayer.poseInto)
+    pub let mut weight: f32;
+
+    // The change of the weight a second, positive while the motion fades in, negative while it fades out, 0 once faded
+    pub let mut fade: f32;
+
+    // How much of the motion was played since it started, 1 for the whole motion once: it grows with each loop, and stops
+    // at 1 for a motion played once (see AnimationTransition.exitTime)
+    pub let mut played: f32 = 0.0f;
+
+    /**
+     * @params:
+     *    - motion: the motion played
+     *    - parameters: the parameters of the player, giving the length of the motion
+     *    - time: the time in the motion, in seconds
+     *    - speed: the speed the time moves at, negative to play the motion backwards
+     *    - looping: true for the motion to start again at its end
+     *    - weight: the part the motion takes in the pose of its layer, in [0, 1]
+     *    - fade: the change of the weight a second, positive to fade the motion in, negative to fade it out
+     * */
+    pub self (motion: &AnimationMotion, parameters: &AnimationParameters, time: f32 = 0.0f, speed: f32 = 1.0f,
+              looping: bool = true, weight: f32 = 1.0f, fade: f32 = 0.0f)
+        with motion = motion
+        , time = time
+        , duration = motion.motionDuration(parameters)
+        , leading = motion.leadingClip(parameters)
+        , speed = speed
+        , looping = looping
+        , weight = weight
+        , fade = fade
+    {}
+
+    /**
+     * @returns: true iif the motion fades out, leaving its layer once its weight reaches 0
+     * */
+    @field
+    pub fn fadingOut(self)-> bool {
+        self.fade < 0.0f
+    }
+
+    /**
+     * @returns: the place of the time in the motion, 0 at its start and 1 at its end, 0 for a motion of no duration
+     * */
+    @field
+    pub fn normalizedTime(self)-> f32 {
+        if self.duration <= 0.0f { 0.0f } else { self.time / self.duration }
+    }
+
+    /**
+     * Read the length and the leading clip of the motion again at the parameters of the player, the time moved to keep
+     * its place in the motion when the length changed (a blend space whose clips are mixed otherwise)
+     * @params:
+     *    - parameters: the parameters of the player
+     * */
+    pub fn refresh(mut self, parameters: &AnimationParameters) {
+        let duration = self.motion.motionDuration(parameters);
+        if duration != self.duration {
+            self.time = if duration <= 0.0f || self.duration <= 0.0f { 0.0f } else { self.time * duration / self.duration };
+            self.duration = duration;
+        }
+
+        self.leading = self.motion.leadingClip(parameters);
+    }
+
+    /**
+     * Change the weight of the motion along its fade, the weight held in [0, 1], the fade ending at 1 (faded in)
+     * @params:
+     *    - seconds: the time elapsed, in seconds
+     * */
+    pub fn fadeAlong(mut self, seconds: f32) {
+        if self.fade == 0.0f { return; }
+
+        self.weight += self.fade * seconds;
+        if self.weight >= 1.0f {
+            self.weight = 1.0f;
+            self.fade = 0.0f;
+        } else if self.weight < 0.0f {
+            self.weight = 0.0f;
+        }
+    }
+
+    /**
+     * Move the time to a time of the motion, wrapped in [0, duration) when the motion loops, held in [0, duration]
+     * otherwise, a motion of no duration staying at 0; no event is crossed
+     * @params:
+     *    - time: the time in the motion, in seconds
+     * */
+    pub fn place(mut self, time: f32) {
+        let duration = self.duration;
+        if duration <= 0.0f {
+            self.time = 0.0f;
+        } else if self.looping {
+            // % keeps the sign of the time, so a time below 0 wraps to the end of the motion
+            let wrapped = time % duration;
+            self.time = if wrapped < 0.0f { wrapped + duration } else { wrapped };
+        } else if time < 0.0f {
+            self.time = 0.0f;
+        } else if time > duration {
+            self.time = duration;
+        } else {
+            self.time = time;
+        }
+    }
+
+    /**
+     * Move the time along the motion at the speed of the state, signalling each event of its leading clip it crosses, in
+     * the order it crosses them: forward from t0 to t1 the events in [t0, t1), backward those in (t1, t0], so an event at
+     * the bound of two advances is crossed by one of them only
+     * @info:
+     *    - the events of the leading clip are placed in the motion as the clip is (an event at the half of the clip at the
+     *      half of the motion)
+     *    - in a loop, the time wraps at the end of the motion (forward, staying in [0, duration)) or at its start
+     *      (backward, staying in (0, duration]); the loops a long advance covers whole are skipped, their events not
+     *      signalled
+     *    - played once, the time stops at the end of the motion (its start backward), the event at that end crossed by
+     *      the advance reaching it, and by none after
+     *    - a motion of no duration stays at 0, crossing nothing
+     * @params:
+     *    - seconds: the time elapsed, in seconds
+     *    - crossed: called with each event crossed
+     * @returns: true iif the motion, played once, reached its end at this advance (not at an earlier one)
+     * */
+    pub fn advance(mut self, seconds: f32, crossed: dg (AnimationEvent)-> void)-> bool {
+        let duration = self.duration;
+        if duration <= 0.0f {
+            self.time = 0.0f;
+            return false;
+        }
+
+        let distance = seconds * self.speed;
+        let moved = if distance < 0.0f { -distance } else { distance };
+        self.played += moved / duration;
+        if !self.looping && self.played > 1.0f {
+            self.played = 1.0f;
+        }
+
+        if distance > 0.0f {
+            self:.forward(distance, duration, crossed)
+        } else if distance < 0.0f {
+            self:.backward(-distance, duration, crossed)
+        } else {
+            false
+        }
+    }
+
+    /**
+     * Move the time forward along the motion (see advance)
+     * @params:
+     *    - distance: the time to move by, in seconds, positive
+     *    - duration: the length of the motion, positive
+     *    - crossed: called with each event crossed
+     * @returns: true iif the motion, played once, reached its end at this advance
+     * */
+    fn forward(mut self, distance: f32, duration: f32, crossed: dg (AnimationEvent)-> void)-> bool {
+        let from = self.time;
+        if !self.looping {
+            if from >= duration { return false; }
+
+            let to = from + distance;
+            if to < duration {
+                self.crossForward(from, to, false, crossed);
+                self.time = to;
+                return false;
+            }
+
+            self.crossForward(from, duration, true, crossed);
+            self.time = duration;
+            return true;
+        }
+
+        let left = if distance > duration { distance % duration } else { distance };
+        let to = from + left;
+        if to < duration {
+            self.crossForward(from, to, false, crossed);
+            self.time = to;
+        } else {
+            // the end of the motion is crossed, the time wrapping to its start
+            self.crossForward(from, duration, false, crossed);
+            self.crossForward(0.0f, to - duration, false, crossed);
+            self.time = to - duration;
+        }
+
+        false
+    }
+
+    /**
+     * Move the time backward along the motion (see advance)
+     * @params:
+     *    - distance: the time to move back by, in seconds, positive
+     *    - duration: the length of the motion, positive
+     *    - crossed: called with each event crossed
+     * @returns: true iif the motion, played once, reached its start at this advance
+     * */
+    fn backward(mut self, distance: f32, duration: f32, crossed: dg (AnimationEvent)-> void)-> bool {
+        let from = self.time;
+        if !self.looping {
+            if from <= 0.0f { return false; }
+
+            let to = from - distance;
+            if to > 0.0f {
+                self.crossBackward(from, to, false, crossed);
+                self.time = to;
+                return false;
+            }
+
+            self.crossBackward(from, 0.0f, true, crossed);
+            self.time = 0.0f;
+            return true;
+        }
+
+        let left = if distance > duration { distance % duration } else { distance };
+        let to = from - left;
+        if to > 0.0f {
+            self.crossBackward(from, to, false, crossed);
+            self.time = to;
+        } else {
+            // the start of the motion is crossed, the time wrapping to its end
+            self.crossBackward(from, 0.0f, true, crossed);
+            self.crossBackward(duration, to + duration, false, crossed);
+            self.time = to + duration;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the ratio of the times of the motion to those of its leading clip, 0 when the clip has no duration (its
+     * events then crossed by no advance)
+     * */
+    fn eventScale(self)-> f32 {
+        if self.leading.duration <= 0.0f { 0.0f } else { self.duration / self.leading.duration }
+    }
+
+    /**
+     * Signal the events of the leading clip in [from, to) of the motion, or in [from, to] when closed, in the order of
+     * their times
+     * */
+    fn crossForward(self, from: f32, to: f32, closed: bool, crossed: dg (AnimationEvent)-> void) {
+        let scale = self.eventScale();
+        if scale == 0.0f { return; }
+
+        for e in self.leading.events {
+            let t = e.time * scale;
+            if t >= from && (t < to || (closed && t == to)) {
+                crossed(e);
+            }
+        }
+    }
+
+    /**
+     * Signal the events of the leading clip in (to, from] of the motion, or in [to, from] when closed, from the latest to
+     * the earliest
+     * */
+    fn crossBackward(self, from: f32, to: f32, closed: bool, crossed: dg (AnimationEvent)-> void) {
+        let scale = self.eventScale();
+        if scale == 0.0f { return; }
+
+        let events = self.leading.events;
+        for i in 0us .. events.len {
+            let e = events[events.len - 1us - i];
+            let t = e.time * scale;
+            if t <= from && (t > to || (closed && t == to)) {
+                crossed(e);
+            }
+        }
+    }
+
+}
