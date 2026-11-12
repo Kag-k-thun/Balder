@@ -1,0 +1,242 @@
+in blend_space_2d;
+
+use balder::core::error;
+use balder::math::vector;
+use balder::scene::animation::{clip, joint_pose, motion, parameters, skeleton};
+
+use std::conv;
+
+/**
+ * A motion mixing clips placed on a plane by two parameters of the player: the speed of an actor sideways and forward,
+ * an idle at (0, 0), walks forward and backward at (0, ±1.5), strafes at (±1.5, 0), the velocity of the actor choosing
+ * between them
+ * @info:
+ *    - the weights are those of gradient band interpolation (Johansen, 2009): each clip weighs the least, over the other
+ *      clips, of how far the parameters are from it towards the other one, so a clip weighs 1 at its position and 0 at
+ *      the positions of the others, the weights summing to 1 everywhere, beyond the clips too
+ *    - the clips play in step, as those of a BlendSpace1D
+ * @example:
+ * ```
+ * let dmut strafe = copy BlendSpace2D("side", "forward");
+ * strafe:.addClip(idle, makeVec2(0.0f, 0.0f));
+ * strafe:.addClip(walk, makeVec2(0.0f, 1.5f));
+ * strafe:.addClip(left, makeVec2(-1.5f, 0.0f));
+ * strafe:.addClip(right, makeVec2(1.5f, 0.0f));
+ * ```
+ * */
+@final
+pub class BlendSpace2D over AnimationMotion {
+
+    // The parameters of the player placing the motion between its clips, along x and along y
+    let _parameterX: [c8];
+    let _parameterY: [c8];
+
+    // The clips, in the order they were added
+    let mut _clips: [&AnimationClip] = [];
+
+    // The position of each clip on the plane of the parameters
+    let mut _positions: [vec2] = [];
+
+    /**
+     * An empty blend space, to which clips are added (see addClip)
+     * @params:
+     *    - x: the name of the parameter of the player along x (see AnimationParameters.value)
+     *    - y: the name of the parameter along y
+     * */
+    pub self (x: [c8], y: [c8])
+        with super()
+        , _parameterX = x
+        , _parameterY = y
+    {}
+
+    /**
+     * @returns: the name of the parameter along x
+     * */
+    @field
+    pub fn parameterX(self)-> [c8] {
+        self._parameterX
+    }
+
+    /**
+     * @returns: the name of the parameter along y
+     * */
+    @field
+    pub fn parameterY(self)-> [c8] {
+        self._parameterY
+    }
+
+    /**
+     * @returns: the clips, in the order they were added
+     * */
+    @field
+    pub fn clips(self)-> [&AnimationClip] {
+        self._clips
+    }
+
+    /**
+     * @returns: the position of each clip on the plane of the parameters
+     * */
+    @field
+    pub fn positions(self)-> [vec2] {
+        self._positions
+    }
+
+    /**
+     * Place a clip at values of the parameters
+     * @params:
+     *    - clip: the clip, played alone when the parameters are at its position
+     *    - position: the values of the parameters at which the clip plays alone
+     * @throws:
+     *    - BalderError: when a clip is already at that position
+     * */
+    pub fn addClip(mut self, clip: &AnimationClip, position: vec2)
+        throws BalderError
+    {
+        for p in self._positions {
+            if p.x == position.x && p.y == position.y {
+                throw copy BalderError("The blend space of " ~ self._parameterX ~ " and " ~ self._parameterY
+                                       ~ " has already a clip at " ~ position.x.to![c8]() ~ ", " ~ position.y.to![c8]());
+            }
+        }
+
+        self._clips ~= [clip];
+        self._positions ~= [position];
+    }
+
+    /**
+     * @returns: the weight of a clip at values of the parameters, in [0, 1], the weights of the clips summing to 1 (to 0
+     * when the blend space has no clip)
+     * @params:
+     *    - index: the index of the clip, in the order they were added
+     *    - value: the values of the parameters
+     * */
+    pub fn weight(self, index: usize, value: vec2)-> f32 {
+        let total = self.total(value);
+        if total <= 0.0f {
+            return if index == self.nearest(value) { 1.0f } else { 0.0f };
+        }
+
+        self.influence(index, value) / total
+    }
+
+    /**
+     * @returns: the mean of the lengths of the clips by their weights at the values of the parameters
+     * */
+    pub over motionDuration(self, parameters: &AnimationParameters)-> f32 {
+        let value = self.valueOf(parameters);
+        let mut duration = 0.0f;
+        for i, c in self._clips {
+            duration += c.duration * self.weight(i, value);
+        }
+
+        duration
+    }
+
+    /**
+     * @returns: the clip weighing the most at the values of the parameters, the first added of those weighing as much
+     * @throws: an out of array panic when the blend space has no clip (a motion needs one)
+     * */
+    pub over leadingClip(self, parameters: &AnimationParameters)-> &AnimationClip {
+        let value = self.valueOf(parameters);
+        let mut best = 0us;
+        let mut most = -1.0f;
+        for i in 0us .. self._clips.len {
+            let w = self.weight(i, value);
+            if w > most {
+                most = w;
+                best = i;
+            }
+        }
+
+        self._clips[best]
+    }
+
+    /**
+     * Write the pose of the skeleton at a time of the motion, the clips weighing something at the values of the
+     * parameters sampled at the same place in their lengths and blended by their weights; the rest pose when the blend
+     * space has no clip
+     * */
+    pub over sampleMotionInto(self, skeleton: &Skeleton, time: f32, parameters: &AnimationParameters,
+                              dmut poses: [JointPose], dmut scratch: [JointPose]) {
+        let rest = skeleton.rest;
+        for j in 0us .. poses.len { poses[j] = rest[j]; }
+
+        let duration = self.motionDuration(parameters);
+        let phase = if duration <= 0.0f { 0.0f } else { time / duration };
+        let value = self.valueOf(parameters);
+
+        // each clip blended by its part of the weights so far, so the pose is their weighted mean
+        let mut sum = 0.0f;
+        for i, c in self._clips {
+            let w = self.weight(i, value);
+            if w > 0.0f {
+                sum += w;
+                if sum == w {
+                    c.sampleInto(skeleton, phase * c.duration, alias poses);
+                } else {
+                    c.sampleInto(skeleton, phase * c.duration, alias scratch);
+                    let part = w / sum;
+                    for j in 0us .. poses.len {
+                        poses[j] = poses[j].blended(scratch[j], part);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: the values of the parameters of the blend space
+     * */
+    fn valueOf(self, parameters: &AnimationParameters)-> vec2 {
+        makeVec2(parameters.value(self._parameterX), parameters.value(self._parameterY))
+    }
+
+    /**
+     * @returns: the influence of a clip at values of the parameters before the weights are normalized: the least, over
+     * the other clips, of 1 minus how far the values went from the clip towards the other one, held at 0 or above
+     * */
+    fn influence(self, index: usize, value: vec2)-> f32 {
+        let p = self._positions[index];
+        let mut h = 1.0f;
+        for j, q in self._positions {
+            if j != index {
+                let towards = q - p;
+                let t = 1.0f - (value - p).dot(towards) / towards.dot(towards);
+                if t < h { h = t; }
+            }
+        }
+
+        if h < 0.0f { 0.0f } else { h }
+    }
+
+    /**
+     * @returns: the sum of the influences of the clips at values of the parameters
+     * */
+    fn total(self, value: vec2)-> f32 {
+        let mut total = 0.0f;
+        for i in 0us .. self._clips.len {
+            total += self.influence(i, value);
+        }
+
+        total
+    }
+
+    /**
+     * @returns: the index of the clip nearest to values of the parameters, taking the weights where no clip has an
+     * influence (it cannot happen with distinct positions, the guard of a division by 0)
+     * */
+    fn nearest(self, value: vec2)-> usize {
+        let mut best = 0us;
+        let mut closest = -1.0f;
+        for i, p in self._positions {
+            let d = (value - p).length();
+            if closest < 0.0f || d < closest {
+                closest = d;
+                best = i;
+            }
+        }
+
+        best
+    }
+
+}
