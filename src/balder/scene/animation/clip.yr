@@ -1,8 +1,8 @@
 in clip;
 
 use balder::core::error;
-use balder::math::bounds;
-use balder::scene::animation::{event, joint_channel, joint_pose, motion, parameters, skeleton, skin, utils};
+use balder::math::{bounds, vector};
+use balder::scene::animation::{event, joint_channel, joint_pose, motion, parameters, root_motion, skeleton, skin, utils};
 
 use std::algorithm::sorting;
 
@@ -29,7 +29,10 @@ pub class AnimationClip over AnimationMotion {
     pub let duration: f32;
 
     // The keys of the joints the clip moves
-    pub let channels: [JointChannel];
+    let mut _channels: [JointChannel];
+
+    // The motion taken out of the root of the skeleton (see extractRootMotion)
+    let mut _rootMotion: RootMotion = RootMotion();
 
     // The events of the clip, sorted by time (see addEvent)
     let mut _events: [AnimationEvent] = [];
@@ -44,7 +47,7 @@ pub class AnimationClip over AnimationMotion {
         with super()
         , name = name
         , duration = duration
-        , channels = channels
+        , _channels = channels
     {}
 
     /**
@@ -54,7 +57,7 @@ pub class AnimationClip over AnimationMotion {
         with super()
         , name = (unsafe { toName(anim.name()) })
         , duration = (unsafe { cast!f32(anim.duration() / tickRate(anim)) })
-        , channels = (unsafe { readChannels(anim) })
+        , _channels = (unsafe { readChannels(anim) })
     {}
 
     /**
@@ -156,6 +159,82 @@ pub class AnimationClip over AnimationMotion {
         }
 
         self._events ~= [AnimationEvent(time, name)];
+    }
+
+    /**
+     * Take the motion of the root of a skeleton out of the clip, so that it plays in place, and keep it as the root
+     * motion of the clip, for the actor to move the model by it (a walk moving the hips forward, a turn turning them): the
+     * drift of the root and of the joints above it (the nodes assimp adds above the root of a FBX...) along x and z, and
+     * their turn about y, from their first key to their last, are taken out linearly over their keys, so that the clip
+     * loops in place, the sway of the root kept
+     * @info:
+     *    - the keys of the joints are in the space of their parent, which keeps y up; their drift is moved to the space
+     *      of the model by the rest pose of the skeleton
+     *    - the clip is shared by all who play it: they all play it in place; a second extraction finds no motion left
+     * @params:
+     *    - skeleton: a skeleton the clip moves, giving the joints above the root and their place in the model
+     *    - root: the name of the root joint, the hips of a character
+     * @throws:
+     *    - BalderError: when the skeleton has no joint of that name
+     * */
+    pub fn extractRootMotion(mut self, skeleton: &Skeleton, root: [c8])
+        throws BalderError
+    {
+        let mut above: [bool] = [];
+        if let Ok(r) = skeleton.find(root) {
+            let dmut chain = copy [false; skeleton.len];
+            let mut joint = (r)?;
+            while joint.hasValue {
+                if let Ok(j) = joint {
+                    chain[j] = true;
+                    joint = skeleton.parents[j];
+                }
+            }
+
+            above = chain;
+        } else {
+            throw copy BalderError(f"The skeleton has no joint {root}, the root of the clip {self.name}");
+        }
+
+        let globals = skeleton.restMatrices();
+        let rest = skeleton.rest;
+        let dmut channels = copy self._channels;
+        let mut velocity = self._rootMotion.velocity;
+        let mut turn = self._rootMotion.turn;
+        for i in 0us .. channels.len {
+            let c = channels[i];
+            if let Ok(j) = skeleton.find(c.joint) && above[j] {
+                let (translation, drift) = withoutDrift(c.translation);
+                let (rotation, angle) = withoutTurn(c.rotation);
+                if self.duration > 0.0f {
+                    // the keys of the joint are in the space of its parent in the model
+                    let parent = globals[j] * rest[j].matrix().inversed();
+                    velocity = velocity + (parent * makeVec4(drift, 0.0f)).xyz / self.duration;
+                    turn += angle / self.duration;
+                }
+
+                channels[i] = JointChannel(c.joint, translation-> translation, rotation-> rotation, scale-> c.scale);
+            }
+        }
+
+        self._channels = channels;
+        self._rootMotion = RootMotion(velocity-> velocity, turn-> turn);
+    }
+
+    /**
+     * @returns: the keys of the joints the clip moves
+     * */
+    @field
+    pub fn channels(self)-> [JointChannel] {
+        self._channels
+    }
+
+    /**
+     * @returns: the motion taken out of the root of the skeleton, none (zero) until it is (see extractRootMotion)
+     * */
+    @field
+    pub fn rootMotion(self)-> RootMotion {
+        self._rootMotion
     }
 
     /**
