@@ -1,6 +1,7 @@
 in layer;
 
-use balder::scene::animation::{event, joint_mask, joint_pose, motion, motion_state, parameters, skeleton};
+use balder::core::error;
+use balder::scene::animation::{event, joint_mask, joint_pose, motion, motion_state, parameters, skeleton, state, state_machine};
 
 /**
  * A layer of an animation player: the motions it plays (clips, blend spaces), the motion played last (its current motion)
@@ -11,6 +12,8 @@ use balder::scene::animation::{event, joint_mask, joint_pose, motion, motion_sta
  *      layer adds to it the motion of its clips from their first pose (a breath, a flinch)
  *    - only the current motion signals its events and its end, the motions fading out being silent, so that a
  *      cross-fade between two walks does not double the footsteps
+ *    - a layer running a state machine plays the motion of its current state, and cross-fades to the motion of the
+ *      next state when a transition fires (see playMachine)
  * */
 @final
 pub class AnimationLayer {
@@ -29,6 +32,12 @@ pub class AnimationLayer {
 
     // True when the current motion fades out too, the layer stopping
     let mut _stopping: bool = false;
+
+    // The state machine the layer runs, none when it plays motions on its own
+    let mut _machine: (&AnimationStateMachine)? = none;
+
+    // The index of the state of the machine the layer is in
+    let mut _state: usize = 0us;
 
     /*!
      * ====================================================================================================
@@ -112,6 +121,26 @@ pub class AnimationLayer {
     }
 
     /**
+     * @returns: the state machine the layer runs, none when it plays motions on its own
+     * */
+    @field
+    pub fn machine(self)-> (&AnimationStateMachine)? {
+        self._machine
+    }
+
+    /**
+     * @returns: the state of the machine the layer is in, none when it runs no machine
+     * */
+    @field
+    pub fn state(self)-> (AnimationState)? {
+        if let Ok(m) = self._machine {
+            return (m.states[self._state])?;
+        }
+
+        none
+    }
+
+    /**
      * @returns: true iif the layer plays a motion, its current one or one fading out
      * */
     @field
@@ -129,7 +158,8 @@ pub class AnimationLayer {
 
     /**
      * Play a motion from its start (from its end when played backwards), the motion becoming the current one, fading in
-     * over a time as the motions played before it fade out over the same time, the weights of all summing to the same
+     * over a time as the motions played before it fade out over the same time, the weights of all summing to the same;
+     * the layer no longer runs its state machine
      * @params:
      *    - motion: the motion played, a clip or a blend space
      *    - parameters: the parameters of the player
@@ -139,15 +169,60 @@ pub class AnimationLayer {
      * */
     pub fn play(mut self, motion: &AnimationMotion, parameters: &AnimationParameters, looping: bool = true,
                 speed: f32 = 1.0f, fade: f32 = 0.0f) {
+        self._machine = none;
         self:.start(motion, parameters, looping, speed, fade);
     }
 
     /**
-     * Stop the motions of the layer, fading them out over a time, the layer playing nothing once they faded out
+     * Run a state machine, entering its entry state, its motion cross-fading from the motions the layer played; at each
+     * advance, a transition from the current state firing on the parameters of the player cross-fades to the next state
+     * @params:
+     *    - machine: the machine run
+     *    - parameters: the parameters of the player
+     *    - fade: the time of the cross-fade to the entry state, in seconds, 0 to replace the motions played at once
+     * */
+    pub fn playMachine(mut self, machine: &AnimationStateMachine, parameters: &AnimationParameters, fade: f32 = 0.0f) {
+        self._machine = (machine)?;
+        if machine.states.len == 0us {
+            self:.stop(fade-> fade);
+            return;
+        }
+
+        self:.enter(machine.entry, parameters, fade);
+    }
+
+    /**
+     * Move the state machine the layer runs to a state of a name, whatever its transitions, cross-fading to its motion
+     * @params:
+     *    - name: the name of the state
+     *    - parameters: the parameters of the player
+     *    - fade: the time of the cross-fade, in seconds, 0 to enter the state at once
+     * @throws:
+     *    - BalderError: when the layer runs no state machine, or the machine has no state of that name
+     * */
+    pub fn enterState(mut self, name: [c8], parameters: &AnimationParameters, fade: f32 = 0.0f)
+        throws BalderError
+    {
+        if let Ok(m) = self._machine {
+            if let Ok(index) = m.find(name) {
+                self:.enter(index, parameters, fade);
+                return;
+            }
+
+            throw copy BalderError("The state machine has no state " ~ name);
+        }
+
+        throw copy BalderError("The layer runs no state machine, it cannot enter the state " ~ name);
+    }
+
+    /**
+     * Stop the motions of the layer, fading them out over a time, the layer playing nothing once they faded out, and
+     * running its state machine no more
      * @params:
      *    - fade: the time of the fade, in seconds, 0 to stop at once
      * */
     pub fn stop(mut self, fade: f32 = 0.0f) {
+        self._machine = none;
         if fade <= 0.0f {
             self._states = [];
         } else {
@@ -183,19 +258,22 @@ pub class AnimationLayer {
 
     /**
      * Move the motions of the layer along a time elapsed, at their speeds, their weights along their fades, the motions
-     * faded out leaving the layer; only the current motion signals the events it crosses and its end
+     * faded out leaving the layer; only the current motion signals the events it crosses and its end; then, when the
+     * layer runs a state machine, the first transition firing from its state cross-fades to the next state, consuming
+     * its triggers
      * @params:
      *    - seconds: the time elapsed, in seconds
      *    - parameters: the parameters of the player, the lengths of the blend spaces read again from them
      *    - crossed: called with each event the current motion crosses
      *    - ended: called with the current motion when, played once, it reaches its end
      * */
-    pub fn advance(mut self, seconds: f32, parameters: &AnimationParameters, crossed: dg (AnimationEvent)-> void,
+    pub fn advance(mut self, seconds: f32, dmut parameters: &AnimationParameters, crossed: dg (AnimationEvent)-> void,
                    ended: dg (&AnimationMotion)-> void) {
         if self._states.len == 0us { return; }
 
         let hasCurrent = self.current.hasValue;
         let last = self._states.len - 1us;
+        let before = self._states[last].played;
         let mut faded = 0us;
         for i in 0us .. self._states.len {
             // the states are records, written back by index
@@ -226,6 +304,10 @@ pub class AnimationLayer {
             }
 
             self._states = alias kept;
+        }
+
+        if hasCurrent {
+            self:.transit(before, alias parameters);
         }
     }
 
@@ -274,7 +356,7 @@ pub class AnimationLayer {
     }
 
     /**
-     * Play a motion, the current one fading in as the others fade out (see play)
+     * Play a motion, the current one fading in as the others fade out (see play), keeping the state machine of the layer
      * */
     fn start(mut self, motion: &AnimationMotion, parameters: &AnimationParameters, looping: bool, speed: f32, fade: f32) {
         let duration = motion.motionDuration(parameters);
@@ -288,6 +370,40 @@ pub class AnimationLayer {
         }
 
         self._stopping = false;
+    }
+
+    /**
+     * Enter a state of the machine of the layer, cross-fading to its motion
+     * @params:
+     *    - index: the index of the state in the machine
+     *    - parameters: the parameters of the player
+     *    - fade: the time of the cross-fade, in seconds
+     * */
+    fn enter(mut self, index: usize, parameters: &AnimationParameters, fade: f32) {
+        if let Ok(m) = self._machine {
+            let state = m.states[index];
+            self:.start(state.motion, parameters, state.looping, state.speed, fade);
+            self._state = index;
+        }
+    }
+
+    /**
+     * Fire the first transition of the state machine of the layer from its state, if any, at the end of an advance,
+     * entering the next state and consuming the triggers of the transition
+     * @params:
+     *    - before: how much of the current motion was played before the advance
+     *    - parameters: the parameters of the player
+     * */
+    fn transit(mut self, before: f32, dmut parameters: &AnimationParameters) {
+        if let Ok(m) = self._machine {
+            if let Ok(current) = self.current {
+                if let Ok(t) = m.firing(self._state, current, before, parameters) {
+                    let transition = m.transitions[t];
+                    transition.consumeTriggers(alias parameters);
+                    self:.enter(transition.to, parameters, transition.fade);
+                }
+            }
+        }
     }
 
     /**

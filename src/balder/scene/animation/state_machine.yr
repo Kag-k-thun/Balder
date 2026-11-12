@@ -1,0 +1,221 @@
+in state_machine;
+
+use balder::core::error;
+use balder::scene::animation::{condition, motion, motion_state, parameters, state, transition};
+
+/**
+ * The states of the animation of an actor and the transitions between them: a layer of an animation player running the
+ * machine plays the motion of its current state, and cross-fades to the motion of another state when a transition from
+ * it fires, on the parameters the actor sets (see AnimationPlayer.playMachine)
+ * @info:
+ *    - a machine is an asset: it holds no current state, each layer running it has its own, so every fox of a herd runs
+ *      the same machine
+ *    - at each advance of a layer, at most one transition fires, the first of the transitions from any state (none
+ *      firing towards the current state), then of those from the current state, in the order they were added
+ * @example:
+ * ```
+ * let dmut machine = copy AnimationStateMachine();
+ * machine:.addState("locomotion", locomotion);              // a BlendSpace1D of the speed
+ * machine:.addState("jump", jump, looping-> false);
+ * machine:.addTransitionFromAny("jump", copy [AnimationCondition::triggered("jump")], fade-> 0.1f);
+ * machine:.addTransition("jump", "locomotion", exitTime-> (0.9f)?);
+ *
+ * player:.playMachine(machine);
+ * player:.parameters():.trigger("jump");
+ * ```
+ * */
+@final
+pub class AnimationStateMachine {
+
+    // The states, the entry first unless set otherwise
+    let mut _states: [AnimationState] = [];
+
+    // The transitions, in the order they were added
+    let mut _transitions: [AnimationTransition] = [];
+
+    // The index of the state a layer starts the machine in
+    let mut _entry: usize = 0us;
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the states, by their indices
+     * */
+    @field
+    pub fn states(self)-> [AnimationState] {
+        self._states
+    }
+
+    /**
+     * @returns: the transitions, in the order they were added
+     * */
+    @field
+    pub fn transitions(self)-> [AnimationTransition] {
+        self._transitions
+    }
+
+    /**
+     * @returns: the index of the state a layer starts the machine in, the first state added unless set otherwise
+     * */
+    @field
+    pub fn entry(self)-> usize {
+        self._entry
+    }
+
+    /**
+     * @returns: the index of the state of a name, none when the machine has no such state
+     * */
+    pub fn find(self, name: [c8])-> (usize)? {
+        for i, s in self._states {
+            if s.name == name { return (i)?; }
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          GRAPH          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add a state, the first one added being the entry of the machine
+     * @params:
+     *    - name: the name of the state, unique in the machine
+     *    - motion: the motion played in the state, a clip or a blend space
+     *    - looping: true for the motion to start again at its end, false to hold its last pose
+     *    - speed: the speed of the motion, negative to play it backwards
+     * @returns: the index of the state
+     * @throws:
+     *    - BalderError: when the machine has already a state of that name
+     * */
+    pub fn addState(mut self, name: [c8], motion: &AnimationMotion, looping: bool = true, speed: f32 = 1.0f)-> usize
+        throws BalderError
+    {
+        if self.find(name).hasValue {
+            throw copy BalderError("The state machine has already a state " ~ name);
+        }
+
+        self._states ~= [AnimationState(name, motion, looping, speed)];
+        self._states.len - 1us
+    }
+
+    /**
+     * Start the layers running the machine in a state
+     * @throws:
+     *    - BalderError: when the machine has no state of that name
+     * */
+    pub fn entry(mut self, name: [c8])
+        throws BalderError
+    {
+        self._entry = self.indexOf(name);
+    }
+
+    /**
+     * Add a transition from a state to another, firing when all its conditions are met, and the motion of the state left
+     * reached its exit time when it has one
+     * @params:
+     *    - from: the name of the state left
+     *    - to: the name of the state entered
+     *    - conditions: the conditions on the parameters of the player (see AnimationCondition)
+     *    - fade: the time of the cross-fade, in seconds, 0 to enter the state at once
+     *    - exitTime: how much of the motion of the state left must be played for the transition to fire, 1 for the whole
+     *      motion, 0.5 for the half of each loop..., none for the transition to fire as soon as its conditions are met
+     * @throws:
+     *    - BalderError: when the machine has no state of those names, or the transition has neither a condition nor an
+     *      exit time (it would fire at each advance)
+     * */
+    pub fn addTransition(mut self, from: [c8], to: [c8], conditions: [AnimationCondition] = [], fade: f32 = 0.2f,
+                         exitTime: (f32)? = none)
+        throws BalderError
+    {
+        if conditions.len == 0us && !exitTime.hasValue {
+            throw copy BalderError("The transition from " ~ from ~ " to " ~ to ~ " has neither a condition nor an exit time");
+        }
+
+        let source = self.indexOf(from);
+        let target = self.indexOf(to);
+        self._transitions ~= [AnimationTransition((source)?, target, conditions, fade, exitTime)];
+    }
+
+    /**
+     * Add a transition from any state to a state, firing when all its conditions are met, but from the state it enters
+     * @params:
+     *    - to: the name of the state entered
+     *    - conditions: the conditions on the parameters of the player (see AnimationCondition)
+     *    - fade: the time of the cross-fade, in seconds, 0 to enter the state at once
+     * @throws:
+     *    - BalderError: when the machine has no state of that name, or the transition has no condition
+     * */
+    pub fn addTransitionFromAny(mut self, to: [c8], conditions: [AnimationCondition], fade: f32 = 0.2f)
+        throws BalderError
+    {
+        if conditions.len == 0us {
+            throw copy BalderError("The transition from any state to " ~ to ~ " has no condition");
+        }
+
+        self._transitions ~= [AnimationTransition(none, self.indexOf(to), conditions, fade, none)];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          RUNNING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the index of the transition firing from a state at an advance of its motion, the first of those from any
+     * state then of those from the state, none when none fires
+     * @params:
+     *    - current: the index of the state the layer is in
+     *    - state: the motion of the state, advanced
+     *    - before: how much of the motion was played before the advance (see MotionState.played)
+     *    - parameters: the parameters of the player
+     * */
+    pub fn firing(self, current: usize, state: MotionState, before: f32, parameters: &AnimationParameters)-> (usize)? {
+        for i, t in self._transitions {
+            if !t.from.hasValue && t.to != current && t.fires(state, before, parameters) {
+                return (i)?;
+            }
+        }
+
+        for i, t in self._transitions {
+            if let Ok(from) = t.from {
+                if from == current && t.fires(state, before, parameters) {
+                    return (i)?;
+                }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the index of the state of a name
+     * @throws:
+     *    - BalderError: when the machine has no state of that name
+     * */
+    fn indexOf(self, name: [c8])-> usize
+        throws BalderError
+    {
+        if let Ok(i) = self.find(name) {
+            return i;
+        }
+
+        throw copy BalderError("The state machine has no state " ~ name);
+    }
+
+}
