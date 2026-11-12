@@ -1,0 +1,372 @@
+in pack;
+
+use balder::core::error;
+use balder::math::vector;
+use balder::scene::animation::_;
+use balder::scene::node::node3D::_;
+use balder::scene::node;
+
+use std::{fs, math};
+
+/**
+ * The root joint of the Mixamo skeletons, its motion taken out of the clips (see AnimationClip.extractRootMotion)
+ * */
+def ROOT = "mixamorig:Hips";
+
+/**
+ * The speed under which the character stands still, in metres a second
+ * */
+pub def IDLE_SPEED = 0.1f;
+
+/**
+ * The time of the cross-fades between the states of the character, in seconds
+ * */
+def FADE = 0.25f;
+
+/**
+ * How much of a jump is played before the character lands back into idle or its motion
+ * */
+def JUMP_EXIT = 0.85f;
+
+/**
+ * The gap between the facing of the camera and the one of the character standing still, in degrees, past which the
+ * character turns to face the camera again
+ * */
+def TURN_GAP = 45.0f;
+
+/**
+ * A Mixamo pack: the character of its directory (X Bot.fbx) and its clips, played in place by a state machine, their
+ * root motion giving the speeds the character moves at and turns at, so that its feet do not slide
+ * @info: the files are known by their names, as Mixamo names them, case aside:
+ *    - idle, walking and running; left and right strafe (running), left and right strafe walk(ing)
+ *    - left and right turn, left and right turn 90, turning the character standing still
+ *    - jump, standing, and running jump
+ * the states of the machine:
+ *    - idle, while the character stands still
+ *    - forward, a blend space of the walk, the run and the strafes placed at their velocities, sideways and forward
+ *    - backward, the same blend space played backwards, its velocity mirrored (see AnimationParameters "side" and
+ *      "forward" set by the activity)
+ *    - a state per turn, from idle when the gap between the camera and the character passes TURN_GAP (the "gap"
+ *      parameter, in degrees, positive to the right), the widest turn first
+ *    - jump and running jump, from any state on the "jump" trigger, the running one while the character moves
+ * */
+pub class Pack {
+
+    // The name of the directory of the pack
+    let _name: [c8];
+
+    // The character of the pack, and its animation
+    let dmut _model: &SolidObjectModel;
+    let dmut _player: (&AnimationPlayer)? = none;
+
+    // The speeds the clips move the character at, in metres a second: forward walking and running, sideways walking and
+    // running
+    let mut _walk: f32 = 1.5f;
+    let mut _run: f32 = 4.0f;
+    let mut _strafeWalk: f32 = 1.3f;
+    let mut _strafeRun: f32 = 0.0f;
+
+    // The states turning the character standing still, and the rate each turns it at, in degrees a second, positive to
+    // the right
+    let mut _turns: [([c8], f32)] = [];
+
+    /**
+     * Load the character of a pack and its clips, its state machine built from the clips it has
+     * @params:
+     *    - dir: the directory of the pack
+     *    - parent: the node the character hangs from
+     *    - height: the height of the character, in metres
+     * @throws:
+     *    - BalderError: when the character cannot be read, or has no skeleton, or the pack has no idle nor walk
+     * */
+    pub self (dir: [c8], dmut parent: &Node, height: f32)
+        with _name = nameOf(dir)
+        , _model = copy SolidObjectModel::fromFile(nameOf(dir), alias parent, dir ~ "/X Bot.fbx", lods-> false)
+        throws BalderError
+    {
+        self._model.scale *= height;
+        if let Ok(skeleton) = self._model.skeleton() {
+            let dmut library = copy AnimationLibrary();
+            let mut clips: [([c8], &AnimationClip)] = [];
+            {
+                for entry in walkDir(Path(dir)) {
+                    let file = entry.path.toStr();
+                    if entry.kind == FsEntryKind::DIR || nameOf(file) == "x bot.fbx" { continue; }
+
+                    library:.extractRootMotion(file, skeleton, ROOT);
+                    clips ~= [(nameOf(file), library:.load(file)[0us])];
+                }
+            } catch {
+                err: &BalderError => {
+                    throw err;
+                }
+                _: &FsError => {
+                    throw copy BalderError("Failed to read the directory of the pack " ~ dir);
+                }
+            }
+
+            self:.play(skeleton, clips, height);
+        } else {
+            throw copy BalderError("The character of the pack " ~ dir ~ " has no skeleton");
+        }
+    }
+
+    /**
+     * @returns: the name of the directory of the pack
+     * */
+    @field
+    pub fn name(self)-> [c8] {
+        self._name
+    }
+
+    /**
+     * @returns: the character of the pack
+     * */
+    pub fn model(mut self)-> dmut &SolidObjectModel {
+        alias self._model
+    }
+
+    /**
+     * @returns: the animation of the character
+     * */
+    pub fn player(mut self)-> dmut &AnimationPlayer {
+        if let Ok(dmut p) = alias self._player {
+            return alias p;
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: the name of the state of the animation of the character
+     * */
+    @field
+    pub fn state(self)-> [c8] {
+        if let Ok(p) = self._player {
+            if let Ok(s) = p.layers[0us].state {
+                return s.name;
+            }
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: the velocity the keys held ask for, in metres a second, sideways (to the right) and forward: the speeds
+     * of the clips of the pack along each way, a diagonal no faster than a straight line
+     * @params:
+     *    - side: -1 to the left, 1 to the right, 0 for neither
+     *    - front: -1 backward, 1 forward, 0 for neither
+     *    - running: true to run, at the speeds of the running clips, those the pack has
+     * */
+    pub fn velocityOf(self, side: f32, front: f32, running: bool)-> vec2 {
+        let length = sqrt(side * side + front * front);
+        if length == 0.0f { return vec2(); }
+
+        let forward = if running { self._run } else { self._walk };
+        let sideways = if running && self._strafeRun > 0.0f { self._strafeRun } else { self._strafeWalk };
+        makeVec2(side * sideways, front * forward) / length
+    }
+
+    /**
+     * @returns: the rate the current state turns the character at, in degrees a second, positive to the right, 0 when
+     * it does not turn it
+     * */
+    @field
+    pub fn turnRate(self)-> f32 {
+        let state = self.state;
+        for t in self._turns {
+            if t._0 == state { return t._1; }
+        }
+
+        0.0f
+    }
+
+    /**
+     * Build the state machine of the character from the clips of the pack and play it
+     * @params:
+     *    - skeleton: the skeleton of the character
+     *    - clips: the clips of the pack, by the names of their files, lower case
+     *    - height: the height of the character, the scale of the root motion of the clips
+     * */
+    fn play(mut self, skeleton: &Skeleton, clips: [([c8], &AnimationClip)], height: f32)
+        throws BalderError
+    {
+        let dmut moving = copy BlendSpace2D("side", "forward");
+        let mut idle: (&AnimationClip)? = none;
+        let mut jump: (&AnimationClip)? = none;
+        let mut runningJump: (&AnimationClip)? = none;
+        let mut turns: [([c8], &AnimationClip, f32)] = [];
+        for c in clips {
+            let (name, clip) = (c._0, c._1);
+
+            // the root motion of the clip, in the model, along the right (-x) and the front (-z) of the character
+            let v = clip.rootMotion.velocity * height;
+            let at = makeVec2(-v.x, -v.z);
+            if name == "idle.fbx" {
+                idle = (clip)?;
+            } else if name == "jump.fbx" {
+                jump = (clip)?;
+            } else if name == "running jump.fbx" {
+                runningJump = (clip)?;
+            } else if contains(name, "turn") {
+                let degrees = clip.rootMotion.turn * 57.29578f;
+                turns ~= [(name[0us .. name.len - 4us], clip, degrees)];
+            } else if name == "walking.fbx" || name == "running.fbx" || contains(name, "strafe") {
+                moving:.addClip(clip, at);
+                if name == "walking.fbx" { self._walk = at.y; }
+                else if name == "running.fbx" { self._run = at.y; }
+                else if contains(name, "walk") { self._strafeWalk = abs(at.x); }
+                else { self._strafeRun = abs(at.x); }
+            }
+        }
+
+        let dmut machine = copy AnimationStateMachine();
+        if let Ok(i) = idle {
+            machine:.addState("idle", i);
+        } else {
+            throw copy BalderError("The pack " ~ self._name ~ " has no idle.fbx");
+        }
+
+        machine:.addState("forward", moving);
+        machine:.addState("backward", moving, speed-> -1.0f);
+
+        let moves = AnimationCondition::above("speed", IDLE_SPEED);
+        let stops = AnimationCondition::below("speed", IDLE_SPEED);
+        let back = AnimationCondition::isTrue("backward");
+        let front = AnimationCondition::isFalse("backward");
+        machine:.addTransition("idle", "forward", conditions-> copy [moves, front], fade-> FADE);
+        machine:.addTransition("idle", "backward", conditions-> copy [moves, back], fade-> FADE);
+        machine:.addTransition("forward", "backward", conditions-> copy [back], fade-> FADE);
+        machine:.addTransition("backward", "forward", conditions-> copy [front], fade-> FADE);
+        machine:.addTransition("forward", "idle", conditions-> copy [stops], fade-> FADE);
+        machine:.addTransition("backward", "idle", conditions-> copy [stops], fade-> FADE);
+
+        self:.addTurns(alias machine, turns);
+        self:.addJumps(alias machine, jump, runningJump);
+
+        let dmut player = copy AnimationPlayer(skeleton);
+        player:.playMachine(machine);
+        self._player = (alias player)?;
+    }
+
+    /**
+     * Add the turns to the state machine: entered from idle when the gap between the camera and the character passes
+     * the threshold of the turn, the widest turns first (a turn of 180 degrees past three quarters of it, the others past
+     * TURN_GAP), played once and left for idle, or for the motion when the character starts moving
+     * @params:
+     *    - machine: the state machine
+     *    - turns: the turns of the pack, by their names, with the angle each turns the character by, in degrees
+     * */
+    fn addTurns(mut self, dmut machine: &AnimationStateMachine, turns: [([c8], &AnimationClip, f32)])
+        throws BalderError
+    {
+        // the widest turns first, the gap matched by the first turn wide enough
+        let mut sorted: [([c8], &AnimationClip, f32)] = [];
+        for t in turns {
+            let mut at = sorted.len;
+            for i, s in sorted {
+                if angleOf(t) > angleOf(s) && at == sorted.len { at = i; }
+            }
+
+            sorted = sorted[0us .. at] ~ [t] ~ sorted[at .. $];
+        }
+
+        let moves = AnimationCondition::above("speed", IDLE_SPEED);
+        let still = AnimationCondition::below("speed", IDLE_SPEED);
+        for t in sorted {
+            let (name, clip, rate) = (t._0, t._1, t._2);
+            let angle = abs(rate * clip.duration);
+            let gap = if angle > 135.0f { angle * 0.75f } else { TURN_GAP };
+            let toward = if rate > 0.0f { AnimationCondition::above("gap", gap) } else { AnimationCondition::below("gap", -gap) };
+
+            machine:.addState(name, clip, looping-> false);
+            machine:.addTransition("idle", name, conditions-> copy [still, toward], fade-> FADE);
+            machine:.addTransition(name, "idle", fade-> FADE, exitTime-> (1.0f)?);
+            machine:.addTransition(name, "forward", conditions-> copy [moves], fade-> FADE);
+            self._turns ~= [(name, rate)];
+        }
+    }
+
+    /**
+     * Add the jumps the pack has to the state machine, entered from any state on the trigger of Space, left for idle or
+     * forward once played up to JUMP_EXIT:
+     *    - the running jump, when the character moves
+     *    - the standing jump, when it does not, or whenever there is no running jump (the activity stopping the
+     *      character through it, see standing)
+     * */
+    fn addJumps(mut self, dmut machine: &AnimationStateMachine, standing: (&AnimationClip)?, running: (&AnimationClip)?)
+        throws BalderError
+    {
+        let moves = AnimationCondition::above("speed", IDLE_SPEED);
+        let stops = AnimationCondition::below("speed", IDLE_SPEED);
+        let jump = AnimationCondition::triggered("jump");
+
+        if let Ok(r) = running {
+            machine:.addState("running jump", r, looping-> false);
+            machine:.addTransitionFromAny("running jump", copy [jump, moves], fade-> 0.1f);
+            landJump(alias machine, "running jump");
+        }
+
+        if let Ok(s) = standing {
+            machine:.addState("jump", s, looping-> false);
+            let conditions = if running.hasValue { copy [jump, stops] } else { copy [jump] };
+            machine:.addTransitionFromAny("jump", conditions, fade-> 0.1f);
+            landJump(alias machine, "jump");
+        }
+    }
+
+}
+
+/**
+ * Leave a jump for idle or forward, by the speed of the character, once played up to JUMP_EXIT
+ * */
+fn landJump(dmut machine: &AnimationStateMachine, state: [c8])
+    throws BalderError
+{
+    machine:.addTransition(state, "idle", conditions-> copy [AnimationCondition::below("speed", IDLE_SPEED)],
+                           fade-> FADE, exitTime-> (JUMP_EXIT)?);
+    machine:.addTransition(state, "forward", conditions-> copy [AnimationCondition::above("speed", IDLE_SPEED)],
+                           fade-> FADE, exitTime-> (JUMP_EXIT)?);
+}
+
+/**
+ * @returns: the angle a turn turns the character by, in degrees, whatever its way
+ * @params:
+ *    - turn: the name of the turn, its clip, and the rate it turns at, in degrees a second
+ * */
+fn angleOf(turn: ([c8], &AnimationClip, f32))-> f32 {
+    abs(turn._2 * (turn._1).duration)
+}
+
+/**
+ * @returns: the name of the file or the directory at the end of a path, in lower case
+ * */
+fn nameOf(path: [c8])-> [c8] {
+    let mut start = 0us;
+    for i, c in path {
+        if c == '/' { start = i + 1us; }
+    }
+
+    let upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ", lower = "abcdefghijklmnopqrstuvwxyz";
+    let dmut name = copy path[start .. $];
+    for i in 0us .. name.len {
+        for j, u in upper {
+            if name[i] == u { name[i] = lower[j]; }
+        }
+    }
+
+    name
+}
+
+/**
+ * @returns: true iif a text holds another
+ * */
+fn contains(text: [c8], part: [c8])-> bool {
+    if part.len > text.len { return false; }
+    for i in 0us .. text.len - part.len + 1us {
+        if text[i .. i + part.len] == part { return true; }
+    }
+
+    false
+}
