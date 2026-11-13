@@ -9,16 +9,35 @@ use balder::scene::editable;
 /**
  * The editor of a scene, the one entry point of its changes: each change is a command (see EditCommand) given to
  * execute, which applies it and emits edited
- * @info: the outline, the inspector and the status bar follow the changes through edited; an undo history will keep
- * the commands executed
+ * @info:
+ * =====
+ * The editor keeps the history of the commands executed: undo reverts the last command applied, redo applies again the
+ * last command undone, both emitting edited as execute does, so the outline, the inspector and the status bar follow
+ * them as any change. A command executed after commands undone drops them; an open starts the history again (see
+ * EditCommand::startsHistory). The position of the history when the scene was saved tells whether it has unsaved
+ * changes.
+ * ====
  * */
 pub class SceneEditor {
 
     // The scene edited
     let dmut _scene: &EditableScene;
 
-    // The signal emitted with each command that changed the scene
+    // The signal emitted with each command that changed the scene, executed, undone or redone
     let dmut _edited: &Signal!{&EditCommand} = copy Signal!{&EditCommand} ();
+
+    // The commands executed, in order: those before the position are applied, those from it undone, to be redone
+    let dmut _history: [&EditCommand] = [];
+
+    // The number of commands of the history applied
+    let mut _position: usize = 0us;
+
+    // The position of the history when the scene was opened or saved last, none once the commands undone since were
+    // dropped, the scene saved being out of reach
+    let mut _saved: (usize)? = (0us)?;
+
+    // The last change of the scene, in a few words
+    let mut _change: [c8] = "";
 
     /**
      * @params:
@@ -36,8 +55,16 @@ pub class SceneEditor {
         alias self._scene
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          HISTORY          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     /**
-     * Make a change of the scene, edited being emitted when it changed it
+     * Make a change of the scene, kept in the history, edited being emitted when it changed the scene
      * @returns: true iif the scene changed
      * @throws:
      *    - &BalderError: if the change cannot be made, the message telling why
@@ -45,18 +72,121 @@ pub class SceneEditor {
     pub fn execute(mut self, dmut command: &EditCommand)-> bool
         throws BalderError
     {
+        if command.startsHistory() {
+            // the nodes the commands before name are replaced, even when the command fails half way
+            self._history = [];
+            self._position = 0us;
+            self._saved = none;
+        }
+
         if !command:.apply(alias self._scene) { return false; }
 
+        if command.startsHistory() {
+            self._saved = (0us)?;
+        } else {
+            self:.push(alias command);
+        }
+
+        self._change = command.describe();
         self._edited:.emit(command);
         true
     }
 
     /**
-     * @returns: the signal emitted with each command that changed the scene
+     * Revert the last command applied, edited being emitted with it
+     * @returns: true iif a command was undone, false when there is none to undo
+     * */
+    pub fn undo(mut self)-> bool {
+        if self._position == 0us { return false; }
+
+        self._position -= 1us;
+        let dmut command = alias self._history[self._position];
+        command:.revert(alias self._scene);
+
+        self._change = "Undone: " ~ command.describe();
+        self._edited:.emit(command);
+        true
+    }
+
+    /**
+     * Apply again the last command undone, edited being emitted with it
+     * @returns: true iif a command was redone, false when there is none to redo, or when it changed nothing
+     * @throws:
+     *    - &BalderError: if the change cannot be made again (a model whose file is gone...), the command staying undone
+     * */
+    pub fn redo(mut self)-> bool
+        throws BalderError
+    {
+        if self._position == self._history.len { return false; }
+
+        let dmut command = alias self._history[self._position];
+        if !command:.apply(alias self._scene) { return false; }
+
+        self._position += 1us;
+        self._change = "Redone: " ~ command.describe();
+        self._edited:.emit(command);
+        true
+    }
+
+    /**
+     * Mark the scene as saved as it stands, the unsaved changes being those made from now on
+     * */
+    pub fn markSaved(mut self) {
+        self._saved = (self._position)?;
+    }
+
+    /**
+     * @returns: the command undo reverts, none when there is none
+     * */
+    @field
+    pub fn toUndo(self)-> (&EditCommand)? {
+        if self._position == 0us { return none; }
+        (self._history[self._position - 1us])?
+    }
+
+    /**
+     * @returns: the command redo applies again, none when there is none
+     * */
+    @field
+    pub fn toRedo(self)-> (&EditCommand)? {
+        if self._position == self._history.len { return none; }
+        (self._history[self._position])?
+    }
+
+    /**
+     * @returns: true iif the scene changed since it was opened or saved last, the history being elsewhere
+     * */
+    @field
+    pub fn unsaved(self)-> bool {
+        if let Ok(s) = self._saved {
+            return s != self._position;
+        }
+
+        true
+    }
+
+    /**
+     * @returns: the last change of the scene, in a few words, for the status bar: the command executed, undone or redone
+     * */
+    @field
+    pub fn change(self)-> [c8] {
+        self._change
+    }
+
+    /**
+     * @returns: the signal emitted with each command that changed the scene, executed, undone or redone
      * */
     pub fn edited(mut self)-> dmut &Signal!{&EditCommand} {
         alias self._edited
     }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          PLACEMENT          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
      * @returns: where a node added goes: the point of the surface seen at the centre of the image, or the point the
@@ -75,6 +205,23 @@ pub class SceneEditor {
         }
 
         lookedAt
+    }
+
+    /**
+     * Put a command applied in the history, after the commands applied, the commands undone being dropped
+     * */
+    fn push(mut self, dmut command: &EditCommand) {
+        if let Ok(s) = self._saved {
+            if s > self._position { self._saved = none; }
+        }
+
+        let dmut kept: [&EditCommand] = [];
+        for i in 0us .. self._position {
+            kept ~= [alias self._history[i]];
+        }
+
+        self._history = alias kept ~ [alias command];
+        self._position += 1us;
     }
 
 }
