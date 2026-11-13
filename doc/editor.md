@@ -34,10 +34,15 @@ gyllir build editor
 - **Menus**: *Scene* opens a new scene or a scene file and saves the scene (Ctrl+S) or saves it in another file
   (Ctrl+Shift+S), *Add* adds a cube, a sphere, a plane, a model read from a
   file, a group or a light where the centre of the viewport meets a surface (or at the point the camera looks at), and
-  *Edit* duplicates, deletes and frames the selection.
+  *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
+  frames the selection.
+- **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
+  scene is undone, the nodes selected before it being selected again; the steps of one field of the inspector (its
+  arrows clicked, its keys held, its wheel turned) are undone as one change. Opening a scene starts the history again.
 
 - **Saving**: a change marks the scene as unsaved, by a `*` in the title of the window and on the right of the status
-  bar, which tells the file of the scene, until it is saved. A new scene has no file yet: its first save asks for one,
+  bar, which tells the file of the scene, until it is saved; undoing the changes made since the last save marks it
+  saved again. A new scene has no file yet: its first save asks for one,
   given the extension `.scene` when it has none. New, Open and Quit (from the menu or by closing the window) ask
   whether to save the changes first, to discard them, or to do nothing.
 
@@ -46,20 +51,36 @@ scene, nor saved.
 
 ## Commands
 
-Every change of the scene is a command (`EditCommand`) run by `SceneEditor::execute`, which applies it and emits
-`edited`; the outline, the inspector and the status bar follow the changes from there. A drag of the gizmo moves the
-nodes while it lasts and is recorded as a `TransformCommand` once released. The commands are the place undo and redo
-go: each one knows the change it made.
+Every change of the scene is a command (`EditCommand`) run by `SceneEditor::execute`, which applies it, keeps it in
+its history and emits `edited`; the outline, the inspector and the status bar follow the changes from there. A drag of
+the gizmo moves the nodes while it lasts and is recorded as a `TransformCommand` once released.
 
-| Command | Change |
-|---|---|
-| `TransformCommand` | the transforms of nodes, typed in the inspector or dragged with the gizmo |
-| `LightCommand` | the settings of lights (colour, intensity, direction, range, cone, shadows), typed in the inspector |
-| `RenameCommand` | the name of a node, refused when a sibling has it |
-| `AddCommand` | a node built from its description, selected |
-| `RemoveCommand` | nodes and the nodes under them |
-| `DuplicateCommand` | copies of nodes beside them, sharing the geometry of their meshes, selected |
-| `OpenCommand` | the nodes of the scene replaced by those of a scene file |
+Each command reverts the change it made (`revert`), on the scene as it left it, and makes it again when applied anew,
+on the scene as it found it. `SceneEditor::undo` reverts the last command applied and `redo` applies again the last one
+undone, both emitting `edited` with it as `execute` does, so nothing else follows them in a way of its own. A command
+executed after commands undone drops them; an open starts the history again (`startsHistory`), and is not undone.
+
+- **Nodes are kept, not rebuilt.** A removal keeps the nodes it detached and their parents, an addition, a copy and an
+  open the nodes they built: undone or redone, they detach the nodes (`dispose`) or attach them again
+  (`Node::attach`, the nodes under them entering the scene after them). The other commands of the history keep naming
+  the same nodes, and a node keeps its uid, so its place among its siblings. The meshes of an `EditableScene` keep
+  their vertices once uploaded (`Scene.keepsVertices`), to enter it again.
+- **The selection** a command found is selected again when it is reverted.
+- **Merging.** A command executed right after another one may merge into it (`merge`), the two being undone as one: the
+  inspector names the field a change was typed in, and the changes of the same nodes in the same field merge
+  (`TransformEdit::extendedTo`). An undo, a redo or a save ends the merging.
+- **Unsaved changes.** The editor keeps the position of its history at the last save (`markSaved`): the scene has
+  unsaved changes while the history is elsewhere, and for good once the commands undone past that save are dropped.
+
+| Command | Change | Reverted by |
+|---|---|---|
+| `TransformCommand` | the transforms of nodes, typed in the inspector or dragged with the gizmo | the transforms before, merging the steps of one field |
+| `LightCommand` | the settings of lights (colour, intensity, direction, range, cone, shadows), typed in the inspector | the settings before, merging the steps of one field |
+| `RenameCommand` | the name of a node, refused when a sibling has it | the name before |
+| `AddCommand` | a node built from its description, selected | detaching the node |
+| `RemoveCommand` | nodes and the nodes under them | attaching them again under their parents |
+| `DuplicateCommand` | copies of nodes beside them, sharing the geometry of their meshes, selected | detaching the copies |
+| `OpenCommand` | the nodes of the scene replaced by those of a scene file | attaching the nodes replaced again |
 
 ## Scene files
 
