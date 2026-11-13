@@ -10,6 +10,7 @@ use balder::interface::widget::layout::d3scene::{gizmo, picker};
 use balder::scene::{animation::_, editable};
 use balder::scene::gizmo::{mode, space};
 use balder::scene::node::{_, node3D::_, node3D::camera, node3D::visual::_, node3D::visual::material::_};
+use balder::scene::node::node3D::camera::flight;
 use balder::scene::utils::post::tonemap::operator;
 use balder::utils;
 use balder::utils::path;
@@ -20,6 +21,11 @@ use vulkan;
 
 use std::{config, config::args, config::json, io, math, rand, time};
 use std::fs;
+
+/**
+ * The distance the flight of the camera is paced by, a pace of 1 flying 5 units a second (see CameraFlight)
+ * */
+def FLIGHT_DISTANCE = 5.0f;
 
 /**
  * The number of subjects on a side of the crowd standing behind the three in front, set by '--crowd'
@@ -152,9 +158,10 @@ class MyActivity over Activity {
     // The frames drawn before the render graph is written once, the scene being declared in it by then
     let mut _graphCountdown: u32 = 10u32;
 
-    // The first person camera: the eye looks along the direction of its yaw and its pitch, in degrees, toward -z at 0
-    let mut _movingCam: bool      = false;
-    let mut _camStart: (i32, i32) = (0, 0);
+    // The flight camera: the eye looks along the direction of its yaw and its pitch, in degrees, toward -z at 0, and
+    // flies while the right button is held, the mouse turning it by _camSens degrees a pixel
+    let mut _flying: bool         = false;
+    let mut _flight: CameraFlight = CameraFlight();
     let mut _yaw: f32             = 0.0f;
     let mut _pitch: f32           = -45.0f;
     let mut _camSens: f32         = 1.0f / 5.0f;
@@ -173,7 +180,6 @@ class MyActivity over Activity {
     let mut _upperLayers: [(usize)?]               = [];
     let mut _upperClips: [(&AnimationClip)?]       = [];
     let mut _upperOn: bool                         = true;
-    let dmut _camSpeed: (f32, f32, f32) = (0.0f, 0.0f, 100.0f);
     let dmut _forward: vec3             = makeVec3(0.0f, 0.0f, 0.0f);
     let dmut _right: vec3               = makeVec3(0.0f, 0.0f, 0.0f);
 
@@ -202,16 +208,10 @@ class MyActivity over Activity {
     over onStart(mut self) {
         self.input:.quit():.connect(self.box, &self:.onQuit);
 
-        // Connect the camera to the mouse events
+        // Connect the camera to the mouse events, the right button flying it (the widgets not seeing that button)
         self.input:.mouseWheel():.connect(self.box, &self:.onWheel);
-        self.input:.mouse(MouseInfo(SDL_BUTTON_MIDDLE, KeyEvent::DOWN)):.connect(self.box, &self:.onCameraEnter);
-        self.input:.mouse(MouseInfo(SDL_BUTTON_MIDDLE, KeyEvent::RELEASE)):.connect(self.box, &self:.onCameraExit);
-
-        self.input:.keyboard(KeyInfo(SDLK_Z, KeyEvent::ALL)):.connect(self.box, &self:.onMoveForward);
-        self.input:.keyboard(KeyInfo(SDLK_S, KeyEvent::ALL)):.connect(self.box, &self:.onMoveBackward);
-        self.input:.keyboard(KeyInfo(SDLK_Q, KeyEvent::ALL)):.connect(self.box, &self:.onMoveLeft);
-        self.input:.keyboard(KeyInfo(SDLK_D, KeyEvent::ALL)):.connect(self.box, &self:.onMoveRight);
-        self.input:.keyboard(KeyInfo(SDLK_LSHIFT, KeyEvent::ALL)):.connect(self.box, &self:.onShift);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::DOWN)):.connect(self.box, &self:.onTakeOff);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::RELEASE)):.connect(self.box, &self:.onLand);
 
         self.input:.keyboard(KeyInfo(SDLK_P, KeyEvent::DOWN)):.connect(self.box, &self:.onOpenAlert);
         self.input:.keyboard(KeyInfo(SDLK_G, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleCulling);
@@ -330,11 +330,8 @@ class MyActivity over Activity {
 
         self:.animate(_delta_);
 
-        if self._camSpeed._0 != 0.0f || self._camSpeed._1 != 0.0f {
-            let speed = cast!f32(_delta_.allMillis) / self._camSpeed._2;
-            self._eye += (self._camSpeed._0 * speed * self._forward) + (self._camSpeed._1 * speed * self._right);
-
-            self:.updateCamera();
+        if self._flying {
+            self:.fly(cast!f32(_delta_.allMicros) / 1000000.0f);
         }
     }
 
@@ -422,72 +419,72 @@ class MyActivity over Activity {
      * ====================================================================================================
      */
 
+    /**
+     * The wheel moves the eye forward or back, and changes the speed of the flight while the right button is held
+     * */
     pub fn onWheel(mut self, _: i32, _: i32, _: i32, w: i32) {
+        if self._flying {
+            self._flight:.faster(w);
+            return;
+        }
+
         self._eye += (cast!f32(w) / 2.0f) * self._forward;
         self:.updateCamera();
     }
 
-    pub fn onCameraEnter(mut self, x: i32, y: i32, _: MouseInfo) {
-        self._movingCam = true;
-        self._camStart = (x, y);
+    /**
+     * The right button takes off: the mouse is captured, its moves turning the eye, and the gizmo loses the focus, the
+     * keys of the flight not switching its mode
+     * */
+    pub fn onTakeOff(mut self, _: i32, _: i32, _: MouseInfo) {
+        self._flying = true;
+        self._flight:.stop();
+        self.gui:.setFocus(none);
+        self.window:.captureMouse(true);
     }
 
-    pub fn onCameraExit(mut self, _: i32, _: i32, _: MouseInfo) {
-        self._movingCam = false;
-        self._camStart = (0, 0);
+    /**
+     * Releasing the right button lands the eye where it is
+     * */
+    pub fn onLand(mut self, _: i32, _: i32, _: MouseInfo) {
+        self._flying = false;
+        self._flight:.stop();
+        self.window:.captureMouse(false);
     }
 
-    pub fn onMouseMove(mut self, x: i32, y: i32) {
-        if self._movingCam {
-            self._yaw += cast!f32(x - self._camStart._0) * self._camSens;
-            self._yaw %= 360.0f;
+    /**
+     * Flying, the moves of the mouse turn the eye
+     * */
+    pub fn onMouseMove(mut self, _: i32, _: i32, dx: f32, dy: f32) {
+        if !self._flying { return; }
 
-            self._pitch += cast!f32(self._camStart._1 - y) * self._camSens;
-            self._pitch = std::algorithm::comparison::clamp(self._pitch, -89.0f, 89.0f);
+        self._yaw = (self._yaw + dx * self._camSens) % 360.0f;
+        self._pitch = std::algorithm::comparison::clamp(self._pitch - dy * self._camSens, -89.0f, 89.0f);
+        self:.updateCamera();
+    }
 
-            self._camStart = (x, y);
+    /**
+     * Move the eye by the keys held: W and S forward and back, A and D to the left and the right, E and Q up and down,
+     * Shift faster; read by their place on the keyboard (scancodes), they are Z, Q, S and D on an AZERTY one
+     * @params:
+     *    - seconds: the time since the last move
+     * */
+    fn fly(mut self, seconds: f32) {
+        let keys = SDL_GetKeyboardState(null);
+        let up = makeVec3(0.0f, 1.0f, 0.0f);
+        let mut direction = vec3();
+        if held(keys, SDL_Scancode::SDL_SCANCODE_W) { direction = direction + self._forward; }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_S) { direction = direction - self._forward; }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_D) { direction = direction + self._right; }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_A) { direction = direction - self._right; }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_E) { direction = direction + up; }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_Q) { direction = direction - up; }
 
+        let fast = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0u16;
+        let offset = self._flight:.step(direction, FLIGHT_DISTANCE, fast, seconds);
+        if self._flight.isMoving() {
+            self._eye += offset;
             self:.updateCamera();
-        }
-    }
-
-    pub fn onMoveForward(mut self, info: KeyInfo) {
-        if info.type == KeyEvent::DOWN {
-            self._camSpeed._0 += 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
-            self._camSpeed._0 -= 0.5f;
-        }
-    }
-
-    pub fn onMoveBackward(mut self, info: KeyInfo) {
-        if info.type == KeyEvent::DOWN {
-            self._camSpeed._0 -= 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
-            self._camSpeed._0 += 0.5f;
-        }
-    }
-
-    pub fn onMoveLeft(mut self, info: KeyInfo) {
-        if info.type == KeyEvent::DOWN {
-            self._camSpeed._1 -= 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
-            self._camSpeed._1 += 0.5f;
-        }
-    }
-
-    pub fn onMoveRight(mut self, info: KeyInfo) {
-        if info.type == KeyEvent::DOWN {
-            self._camSpeed._1 += 0.5f;
-        } else if info.type == KeyEvent::RELEASE {
-            self._camSpeed._1 -= 0.5f;
-        }
-    }
-
-    pub fn onShift(mut self, info: KeyInfo) {
-        if info.type == KeyEvent::DOWN {
-            self._camSpeed._2 = 200.0f;
-        } else if info.type == KeyEvent::RELEASE {
-            self._camSpeed._2 = 100.0f;
         }
     }
 
@@ -525,6 +522,9 @@ class MyActivity over Activity {
      * Shade the ambient light by the ambient occlusion of the screen, or stop shading it
      * */
     fn onToggleAmbientOcclusion(mut self, _: KeyInfo) {
+        // the key A flies the camera to the left (Q on an AZERTY keyboard flies it down)
+        if self._flying { return; }
+
         if let Ok(dmut s) = alias self._scene {
             s.ambientOcclusion = !s.ambientOcclusion;
             log::info #("Main", "Ambient occlusion :", s.ambientOcclusion);
@@ -1000,8 +1000,8 @@ class MyActivity over Activity {
     }
 
     /**
-     * Place the camera at the eye, looking along the direction of the yaw and the pitch, 'Z' and 'S' moving the eye along
-     * it and 'Q' and 'D' to its right
+     * Place the camera at the eye, looking along the direction of the yaw and the pitch, the flight moving the eye along
+     * it and to its right
      * */
     fn updateCamera(mut self) {
         if let Ok(dmut cam) = alias self._cam {
@@ -1048,6 +1048,14 @@ class MyActivity over Activity {
 
         self._lights ~= [alias light, alias lamp, alias spot];
     }
+}
+
+/**
+ * @returns: true iif the key at a place of the keyboard is held
+ * */
+fn held(keys: *bool, code: SDL_Scancode)-> bool {
+    let index: u32 = code;
+    unsafe { keys[index] }
 }
 
 /**
