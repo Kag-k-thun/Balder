@@ -1,0 +1,236 @@
+in physics_bodies;
+
+use balder::core::application::signal;
+use balder::math::{bounds, vector};
+use balder::scene::physics;
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{body, empty};
+
+/**
+ * A root with no scene, for the nodes of the tests to hang from
+ * */
+class Root over Node {
+
+    pub self ()
+        with super::root ("")
+    {}
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+}
+
+/**
+ * The slots of the contacts of a body, recording the other bodies they are emitted with
+ * */
+class Recorder {
+
+    // The calls received, in order
+    let mut _calls: [[c8]] = [];
+
+    pub self () {}
+
+    pub fn onBegan(mut self, other: &PhysicsBody3D) {
+        self._calls ~= ["began " ~ other.name.file()];
+    }
+
+    pub fn onStayed(mut self, other: &PhysicsBody3D) {
+        self._calls ~= ["stayed " ~ other.name.file()];
+    }
+
+    pub fn onEnded(mut self, other: &PhysicsBody3D) {
+        self._calls ~= ["ended " ~ other.name.file()];
+    }
+
+    /**
+     * @returns: the calls received since the last call, forgotten
+     * */
+    pub fn take(mut self)-> [[c8]] {
+        let calls = self._calls;
+        self._calls = [];
+        calls
+    }
+
+}
+
+/**
+ * @returns: true iif bodies are named as expected, in any order
+ * */
+fn named(bodies: [&PhysicsBody3D], expected: [[c8]])-> bool {
+    if bodies.len != expected.len { return false; }
+
+    for name in expected {
+        let mut found = false;
+        for b in bodies if b.name.file() == name { found = true; }
+        if !found { return false; }
+    }
+
+    true
+}
+
+/**
+ * @returns: the name of the body a ray hits first, empty when it hits none
+ * */
+fn hitName(dmut physics: &ScenePhysics, ray: Ray, filter: QueryFilter = QueryFilter())-> [c8] {
+    if let Ok(hit) = physics:.raycast(ray, filter-> filter) { hit.body.name.file() } else { "" }
+}
+
+/**
+ * @returns: the handle of a body in the world, u32::max outside it
+ * */
+fn handleOf(b: &PhysicsBody3D)-> u32 {
+    if let Ok(h) = b.handle { h } else { u32::max }
+}
+
+/**
+ * Connect the slots of a recorder to the contacts of a body
+ * */
+fn listen(dmut body: &PhysicsBody3D, dmut box: &SlotEmitter, dmut recorder: &Recorder) {
+    body:.contactBegan():.connect(alias box, &recorder:.onBegan);
+    body:.contactStayed():.connect(alias box, &recorder:.onStayed);
+    body:.contactEnded():.connect(alias box, &recorder:.onEnded);
+}
+
+/**
+ * @returns: a box of side 2
+ * */
+fn cube()-> ColliderShape {
+    ColliderShape::box(makeVec3(2.0f, 2.0f, 2.0f))
+}
+
+__test a_body_registered_gets_a_handle_and_gives_it_back_removed {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("b", alias root, shape-> cube());
+    let dmut physics = copy ScenePhysics();
+    assert (!b.handle.hasValue);
+
+    physics:.register(alias b);
+    assert (b.handle.hasValue && physics.len == 1us);
+
+    // registered again, the body stays alone in the world
+    physics:.register(alias b);
+    assert (physics.len == 1us);
+
+    physics:.remove(alias b);
+    assert (!b.handle.hasValue && physics.len == 0us);
+}
+
+__test a_query_gives_the_nodes_of_the_bodies_it_hits {
+    let dmut root = copy Root();
+    let dmut ground = copy PhysicsBody3D("ground", alias root, shape-> ColliderShape::box(makeVec3(20.0f, 1.0f, 20.0f)));
+    ground.position = makeVec3(0.0f, -0.5f, 0.0f);
+    let dmut crate = copy PhysicsBody3D("crate", alias root, shape-> cube());
+    crate.position = makeVec3(4.0f, 1.0f, 0.0f);
+
+    let dmut physics = copy ScenePhysics();
+    physics:.register(alias ground);
+    physics:.register(alias crate);
+
+    let down = makeVec3(0.0f, -1.0f, 0.0f);
+    assert (hitName(alias physics, Ray(makeVec3(4.0f, 10.0f, 0.0f), down)) == "crate");
+    assert (hitName(alias physics, Ray(makeVec3(0.0f, 10.0f, 0.0f), down)) == "ground");
+    assert (hitName(alias physics, Ray(makeVec3(4.0f, 10.0f, 0.0f), down), filter-> QueryFilter(exclude-> copy [handleOf(crate)])) == "ground");
+
+    let all = physics:.raycastAll(Ray(makeVec3(4.0f, 10.0f, 0.0f), down));
+    assert (all.len == 2us && all[0].body.name.file() == "crate" && all[1].body.name.file() == "ground");
+
+    assert (named(physics:.overlapSphere(makeVec3(4.0f, 0.0f, 0.0f), 0.5f), copy ["crate", "ground"]));
+    assert (physics:.overlapBox(makeVec3(-4.0f, 3.0f, 0.0f), makeVec3(1.0f, 1.0f, 1.0f)).len == 0us);
+
+    if let Ok(hit) = physics:.sphereCast(makeVec3(-4.0f, 1.0f, 0.0f), 0.5f, makeVec3(1.0f, 0.0f, 0.0f), 20.0f) {
+        assert (hit.body.name.file() == "crate");
+    } else {
+        assert (false);
+    }
+}
+
+__test the_body_of_a_node_under_a_moved_parent_follows_its_world_transformation {
+    let dmut root = copy Root();
+    let dmut parent = copy Empty3D("parent", alias root);
+    parent.position = makeVec3(10.0f, 0.0f, 0.0f);
+    let dmut ball = copy PhysicsBody3D("ball", alias parent, shape-> ColliderShape::sphere(1.0f));
+
+    let dmut physics = copy ScenePhysics();
+    physics:.register(alias ball);
+
+    let down = makeVec3(0.0f, -1.0f, 0.0f);
+    assert (hitName(alias physics, Ray(makeVec3(10.0f, 10.0f, 0.0f), down)) == "ball");
+
+    // a scene places the body when the node moves (see Scene::onBodyMoved)
+    parent.position = makeVec3(20.0f, 0.0f, 0.0f);
+    physics:.moved(ball);
+    assert (hitName(alias physics, Ray(makeVec3(10.0f, 10.0f, 0.0f), down)) == "");
+    assert (hitName(alias physics, Ray(makeVec3(20.0f, 10.0f, 0.0f), down)) == "ball");
+}
+
+__test the_contacts_of_two_bodies_are_emitted_on_both_of_them {
+    let dmut root = copy Root();
+    let dmut wall = copy PhysicsBody3D("wall", alias root, shape-> cube());
+    let dmut ball = copy PhysicsBody3D("ball", alias root, shape-> ColliderShape::sphere(1.0f),
+                                       settings-> BodySettings(motion-> BodyMotion::KINEMATIC));
+    ball.position = makeVec3(5.0f, 0.0f, 0.0f);
+
+    let dmut box = copy SlotEmitter();
+    let dmut wallCalls = copy Recorder();
+    let dmut ballCalls = copy Recorder();
+    listen(alias wall, alias box, alias wallCalls);
+    listen(alias ball, alias box, alias ballCalls);
+
+    let dmut physics = copy ScenePhysics();
+    physics:.register(alias wall);
+    physics:.register(alias ball);
+
+    physics:.updateContacts();
+    box:.emit();
+    assert (wallCalls:.take().len == 0us && ballCalls:.take().len == 0us);
+
+    ball.position = makeVec3(1.5f, 0.0f, 0.0f);
+    physics:.moved(ball);
+    physics:.updateContacts();
+    box:.emit();
+    assert (wallCalls:.take() == ["began ball"] && ballCalls:.take() == ["began wall"]);
+    assert (named(physics:.contactsOf(wall), copy ["ball"]));
+
+    physics:.updateContacts();
+    box:.emit();
+    assert (wallCalls:.take() == ["stayed ball"] && ballCalls:.take() == ["stayed wall"]);
+
+    // leaving the world ends the contacts at once
+    physics:.remove(alias ball);
+    box:.emit();
+    assert (wallCalls:.take() == ["ended ball"] && ballCalls:.take() == ["ended wall"]);
+    assert (physics:.contactsOf(wall).len == 0us);
+}
+
+__test a_body_reshaped_or_put_in_another_layer_is_changed_in_the_world {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("b", alias root, shape-> ColliderShape::sphere(1.0f));
+    let dmut physics = copy ScenePhysics();
+    physics:.register(alias b);
+
+    let down = makeVec3(0.0f, -1.0f, 0.0f);
+    assert (hitName(alias physics, Ray(makeVec3(2.0f, 10.0f, 0.0f), down)) == "");
+
+    // a scene changes the body when the node is changed (see Scene::onBodyChanged)
+    b.shape = ColliderShape::sphere(3.0f);
+    physics:.changed(b);
+    assert (hitName(alias physics, Ray(makeVec3(2.0f, 10.0f, 0.0f), down)) == "b");
+
+    b.layer = 2u32;
+    b.mask = 4u32;
+    physics:.changed(b);
+    assert (physics.world.getSettings(handleOf(b)).mask == 4u32);
+    assert (hitName(alias physics, Ray(makeVec3(2.0f, 10.0f, 0.0f), down), filter-> QueryFilter(mask-> 1u32)) == "");
+    assert (hitName(alias physics, Ray(makeVec3(2.0f, 10.0f, 0.0f), down), filter-> QueryFilter(mask-> 2u32)) == "b");
+}
+
+__test the_bounds_of_a_body_enclose_its_collider_in_the_world {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("b", alias root, shape-> ColliderShape::capsule(0.5f, 3.0f));
+    b.position = makeVec3(0.0f, 2.0f, 0.0f);
+
+    let bounds = b:.bounds();
+    assert ((bounds.min - makeVec3(-0.5f, 0.5f, -0.5f)).length() < 0.001f);
+    assert ((bounds.max - makeVec3(0.5f, 3.5f, 0.5f)).length() < 0.001f);
+}

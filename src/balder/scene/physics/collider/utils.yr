@@ -1,0 +1,233 @@
+in utils;
+
+use balder::math::{bounds, matrix, vector};
+
+use std::algorithm::comparison;
+use std::math;
+
+/**
+ * @returns: a point of the space of a body in the world
+ * */
+pub fn pointTo(m: mat4, p: vec3)-> vec3 {
+    (m * makeVec4(p, 1.0f)).xyz
+}
+
+/**
+ * @returns: a component of a vector, 0 for x, 1 for y, 2 for z
+ * */
+pub fn component(v: vec3, axis: usize)-> f32 {
+    if axis == 0us { v.x } else if axis == 1us { v.y } else { v.z }
+}
+
+/**
+ * @returns: a shape that is not a mesh as a convex shape of the world, placed by a transformation (see Collider)
+ * */
+pub fn convexOf(shape: ColliderShape, m: mat4)-> Convex {
+    let centre = pointTo(m, vec3());
+    let x = (m * makeVec4(1.0f, 0.0f, 0.0f, 0.0f)).xyz;
+    let y = (m * makeVec4(0.0f, 1.0f, 0.0f, 0.0f)).xyz;
+    let z = (m * makeVec4(0.0f, 0.0f, 1.0f, 0.0f)).xyz;
+    match shape.kind {
+        ColliderKind::SPHERE => {
+            let scale = comparison::max(x.length(), comparison::max(y.length(), z.length()));
+            return Convex::sphere(centre, shape.radius * scale);
+        }
+        ColliderKind::CAPSULE => {
+            let half = y * (shape.height / 2.0f - shape.radius);
+            return Convex::capsule(centre + half, centre - half, shape.radius * comparison::max(x.length(), z.length()));
+        }
+        ColliderKind::MESH => {
+            return Convex::sphere(centre, 0.0f);
+        }
+        _ => {}
+    }
+
+    let h = shape.size / 2.0f;
+    Convex::box(centre, x * h.x, y * h.y, z * h.z)
+}
+
+/**
+ * @returns: the box enclosing a shape placed in the world by a transformation
+ * */
+pub fn worldBox(shape: ColliderShape, m: mat4)-> Aabb {
+    if shape.kind == ColliderKind::MESH {
+        return shape.localBox().transformed(m);
+    }
+
+    convexOf(shape, m).bounds
+}
+
+/**
+ * @returns: a ray of the world in the space of a body, its direction transformed without being normalized, so that a
+ * distance along it is the distance along the ray of the world
+ * */
+pub fn localRay(ray: Ray, inverse: mat4)-> Ray {
+    let mut local = ray;
+    local.origin = pointTo(inverse, ray.origin);
+    local.direction = (inverse * makeVec4(ray.direction, 0.0f)).xyz;
+    local
+}
+
+/**
+ * @returns: the hit of a ray starting inside a collider, at its origin
+ * */
+pub fn inside(ray: Ray)-> (SurfaceHit)? {
+    SurfaceHit(distance-> 0.0f, point-> ray.origin, normal-> -ray.direction)?
+}
+
+/**
+ * @returns: the point where a ray hits a sphere first
+ * */
+pub fn raySphere(ray: Ray, centre: vec3, radius: f32)-> (SurfaceHit)? {
+    let m = ray.origin - centre;
+    let c = m.dot(m) - radius * radius;
+    if c <= 0.0f { return inside(ray); }
+
+    let b = m.dot(ray.direction);
+    if b > 0.0f { return none; }
+
+    let disc = b * b - c;
+    if disc < 0.0f { return none; }
+
+    let t = -b - math::sqrt(disc);
+    if t > ray.length { return none; }
+
+    let point = ray.at(t);
+    SurfaceHit(distance-> t, point-> point, normal-> (point - centre) / radius)?
+}
+
+/**
+ * @info: the cylinder between the ends, then the spheres at the ends (Ericson, Real-Time Collision Detection, 5.3.7)
+ * @returns: the point where a ray hits a capsule first
+ * @params:
+ *    - p, q: the ends of the segment of the capsule
+ * */
+pub fn rayCapsule(ray: Ray, p: vec3, q: vec3, radius: f32)-> (SurfaceHit)? {
+    if distanceToSegment(ray.origin, p, q) <= radius { return inside(ray); }
+
+    let mut best = rayCylinder(ray, p, q, radius);
+    for end in [p, q] {
+        if let Ok(hit) = raySphere(ray, end, radius) {
+            let closer = if let Ok(b) = best { hit.distance < b.distance } else { true };
+            if closer { best = hit?; }
+        }
+    }
+
+    best
+}
+
+/**
+ * @returns: the point where a ray starting outside it hits the side of a cylinder between two points, none when it
+ * runs along its axis
+ * */
+pub fn rayCylinder(ray: Ray, p: vec3, q: vec3, radius: f32)-> (SurfaceHit)? {
+    let d = q - p, m = ray.origin - p, n = ray.direction;
+    let dd = d.dot(d), nd = n.dot(d), md = m.dot(d);
+
+    let a = dd - nd * nd;
+    if a <= 1.0e-8f * dd { return none; }
+
+    let c = dd * (m.dot(m) - radius * radius) - md * md;
+    let b = dd * m.dot(n) - nd * md;
+    let disc = b * b - a * c;
+    if disc < 0.0f { return none; }
+
+    let t = (-b - math::sqrt(disc)) / a;
+    if t < 0.0f || t > ray.length { return none; }
+
+    let s = md + t * nd;
+    if s < 0.0f || s > dd { return none; }
+
+    let point = ray.at(t);
+    SurfaceHit(distance-> t, point-> point, normal-> (point - (p + d * (s / dd))).normalized())?
+}
+
+/**
+ * @info: the slab test in the space of the box, the direction of the ray not normalized there so that the distances
+ * are those of the world, the normal of the face entered brought back by the transpose of the inverse transformation
+ * @returns: the point where a ray hits a box centred on the origin of its body first
+ * @params:
+ *    - half: the half sides of the box
+ *    - inverse: the transformation from the world to the space of the body
+ * */
+pub fn rayBox(ray: Ray, half: vec3, inverse: mat4)-> (SurfaceHit)? {
+    let local = localRay(ray, inverse);
+    let mut near = 0.0f;
+    let mut far = ray.length;
+    let mut axis = 3us;
+    let mut sign = 0.0f;
+    for i in 0us .. 3us {
+        let o = component(local.origin, i), d = component(local.direction, i), h = component(half, i);
+        if math::abs(d) < 1.0e-12f {
+            if o < -h || o > h { return none; }
+        } else {
+            let mut enter = (-h - o) / d;
+            let mut leave = (h - o) / d;
+            let mut s = -1.0f;
+            if enter > leave {
+                let t = enter;
+                enter = leave;
+                leave = t;
+                s = 1.0f;
+            }
+
+            if enter > near {
+                near = enter;
+                axis = i;
+                sign = s;
+            }
+
+            if leave < far { far = leave; }
+            if near > far { return none; }
+        }
+    }
+
+    if axis == 3us { return inside(ray); }
+
+    let face = makeVec3(if axis == 0us { sign } else { 0.0f }, if axis == 1us { sign } else { 0.0f },
+                        if axis == 2us { sign } else { 0.0f });
+    let normal = (inverse.mat3().transposed() * face).normalized();
+    SurfaceHit(distance-> near, point-> ray.at(near), normal-> normal)?
+}
+
+/**
+ * @returns: the point where a ray hits a triangle of a mesh first, by either of its faces
+ * */
+pub fn rayMesh(ray: Ray, shape: ColliderShape, m: mat4, inverse: mat4)-> (SurfaceHit)? {
+    if let Ok(hierarchy) = shape.hierarchy {
+        if let Ok(triangles) = shape.triangles {
+            let local = localRay(ray, inverse);
+            let hit = hierarchy.raycast(local, copy |index: usize, _: f32| {
+                if let Ok(distance) = triangles.getTriangle(index).intersect(local) { distance } else { f32::max }
+            });
+
+            if let Ok(h) = hit {
+                let t = triangles.getTriangle(h.id);
+                let a = pointTo(m, t.a);
+                let mut normal = (pointTo(m, t.b) - a).cross(pointTo(m, t.c) - a);
+                if normal.dot(normal) <= 1.0e-20f {
+                    normal = -ray.direction;
+                } else {
+                    normal = normal.normalized();
+                    if normal.dot(ray.direction) > 0.0f { normal = -normal; }
+                }
+
+                return SurfaceHit(distance-> h.distance, point-> ray.at(h.distance), normal-> normal)?;
+            }
+        }
+    }
+
+    none
+}
+
+/**
+ * @returns: the distance from a point to a segment
+ * */
+pub fn distanceToSegment(point: vec3, p: vec3, q: vec3)-> f32 {
+    let d = q - p;
+    let dd = d.dot(d);
+    if dd <= 0.0f { return (point - p).length(); }
+
+    let t = comparison::max(0.0f, comparison::min(1.0f, (point - p).dot(d) / dd));
+    (point - (p + d * t)).length()
+}

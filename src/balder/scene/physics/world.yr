@@ -1,0 +1,427 @@
+in world;
+
+mod ::utils;
+
+use balder::math::{bounds, matrix, quaternion, vector};
+
+use std::algorithm::sorting;
+
+/**
+ * The handle of no body
+ * */
+def NO_BODY = u32::max;
+
+/**
+ * A slot of the bodies of a world, holding a body or free
+ * */
+@data
+record WorldBody {
+
+    // The collider of the body, its shape placed in the world
+    pub let mut collider: Collider = Collider(ColliderShape(), mat4());
+
+    // How the body takes part in the physics of the world
+    pub let mut settings: BodySettings = BodySettings();
+
+    // True when the slot holds a body
+    pub let mut used: bool = false;
+
+    // The next free slot after a free one, NO_BODY for the last
+    pub let mut next: u32 = NO_BODY;
+
+}
+
+/**
+ * The bodies of a scene, their colliders placed in the world, the queries running on them, and the contacts between
+ * them
+ * @info:
+ * =====
+ * A body is known by its handle, the index of its slot, given back when it is added and free again once it is removed
+ * (a later body may get it). The world boxes of the colliders are kept in a bounding volume hierarchy, the broadphase of
+ * the queries and of the contacts, refit when a body moves.
+ *
+ * The queries (raycast, shapeCast, overlapShape...) need no solver: they test the colliders whose boxes the query
+ * reaches, a ray exactly, the shapes by the distance between their cores (see gjk). The contacts are updated on
+ * request (updateContacts, at each tick of a scene): the pairs of touching bodies one of which is kinematic or a
+ * trigger, as seen by the layers and the masks of the two, compared with those of the previous update. Two meshes
+ * never touch, nor two static bodies that are not triggers.
+ * ====
+ * */
+@final
+pub class PhysicsWorld {
+
+    // The slots of the bodies, by handle, the free ones included
+    let dmut _bodies: [WorldBody] = [];
+
+    // The first free slot, NO_BODY when there is none
+    let mut _free: u32 = NO_BODY;
+
+    // The number of bodies in the world
+    let mut _len: usize = 0us;
+
+    // The world boxes of the colliders, by handle
+    let dmut _bvh: &Bvh = copy Bvh();
+
+    // The pairs of bodies touching at the last update of the contacts (see utils::pairKey)
+    let dmut _contacts: [u64 => bool] = copy [];
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of bodies in the world
+     * */
+    @field
+    pub fn len(self)-> usize {
+        self._len
+    }
+
+    /**
+     * @returns: true iif a body of the world has a handle
+     * */
+    pub fn contains(self, handle: u32)-> bool {
+        cast!usize(handle) < self._bodies.len && self._bodies[handle].used
+    }
+
+    /**
+     * @returns: the collider of a body, its shape placed in the world
+     * @warning: the body is in the world (see contains)
+     * */
+    pub fn getCollider(self, handle: u32)-> Collider {
+        self._bodies[handle].collider
+    }
+
+    /**
+     * @returns: how a body takes part in the physics of the world
+     * @warning: the body is in the world (see contains)
+     * */
+    pub fn getSettings(self, handle: u32)-> BodySettings {
+        self._bodies[handle].settings
+    }
+
+    /**
+     * @returns: the handles of the bodies a body touched at the last update of the contacts
+     * */
+    pub fn contactsOf(self, handle: u32)-> [u32] {
+        let mut result: [u32] = [];
+        for key, _ in self._contacts {
+            if utils::firstOf(key) == handle { result ~= [utils::secondOf(key)]; }
+            else if utils::secondOf(key) == handle { result ~= [utils::firstOf(key)]; }
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          BODIES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add a body to the world
+     * @params:
+     *    - shape: the shape of its collider, in the space of the body
+     *    - transform: the transformation of the body, from its space to the world
+     *    - settings: how it takes part in the physics of the world
+     * @returns: the handle of the body
+     * */
+    pub fn add(mut self, shape: ColliderShape, transform: mat4, settings: BodySettings = BodySettings())-> u32 {
+        let handle = if self._free != NO_BODY {
+            let h = self._free;
+            self._free = self._bodies[h].next;
+            h
+        } else {
+            self._bodies = self._bodies ~ copy [WorldBody()];
+            cast!u32(self._bodies.len - 1us)
+        };
+
+        let collider = Collider(shape, transform);
+        self._bodies[handle] = WorldBody(collider-> collider, settings-> settings, used-> true);
+        self._bvh:.insert(cast!usize(handle), collider.bounds);
+        self._len += 1us;
+
+        handle
+    }
+
+    /**
+     * Remove a body from the world, its handle free for another body
+     * @info: the contacts of the body end at once, the next update of the contacts not reporting them, as its handle may
+     * be given to another body by then
+     * @returns: the contacts the body had at the last update of the contacts, ended; none when the world has no such body
+     * */
+    pub fn remove(mut self, handle: u32)-> [ContactEvent] {
+        if !self.contains(handle) { return []; }
+
+        let mut ended: [ContactEvent] = [];
+        for other in self.contactsOf(handle) {
+            let key = utils::pairKey(handle, other);
+            self._contacts:.remove(key);
+            ended ~= [ContactEvent(a-> utils::firstOf(key), b-> utils::secondOf(key), phase-> ContactPhase::ENDED)];
+        }
+
+        self._bvh:.remove(cast!usize(handle));
+        self._bodies[handle] = WorldBody(next-> self._free);
+        self._free = handle;
+        self._len -= 1us;
+
+        ended
+    }
+
+    /**
+     * Move a body, its collider placed again in the world
+     * @info: does nothing when the world has no such body
+     * */
+    pub fn setTransform(mut self, handle: u32, transform: mat4) {
+        if !self.contains(handle) { return; }
+
+        self:.place(handle, Collider(self._bodies[handle].collider.shape, transform));
+    }
+
+    /**
+     * Change the shape of the collider of a body
+     * @info: does nothing when the world has no such body
+     * */
+    pub fn setShape(mut self, handle: u32, shape: ColliderShape) {
+        if !self.contains(handle) { return; }
+
+        self:.place(handle, Collider(shape, self._bodies[handle].collider.transform));
+    }
+
+    /**
+     * Change how a body takes part in the physics of the world, its contacts following at the next update
+     * @info: does nothing when the world has no such body
+     * */
+    pub fn setSettings(mut self, handle: u32, settings: BodySettings) {
+        if !self.contains(handle) { return; }
+
+        self._bodies[handle].settings = settings;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          QUERIES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the body a ray hits first, the boxes of the bodies it enters visited closest first
+     * @returns: the hit, none when the ray misses every body the filter keeps
+     * */
+    pub fn raycast(self, ray: Ray, filter: QueryFilter = QueryFilter())-> (PhysicsHit)? {
+        let first = self._bvh.raycast(ray, copy |id: usize, _: f32| {
+            if !self.accepts(cast!u32(id), filter) {
+                f32::max
+            } else if let Ok(h) = self._bodies[id].collider.raycast(ray) {
+                h.distance
+            } else {
+                f32::max
+            }
+        });
+
+        if let Ok(f) = first {
+            if let Ok(h) = self._bodies[f.id].collider.raycast(ray) {
+                return utils::hitOf(cast!u32(f.id), h)?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Find every body a ray hits
+     * @returns: the hits, the closest first, a body being hit once, where the ray hits it first
+     * */
+    pub fn raycastAll(self, ray: Ray, filter: QueryFilter = QueryFilter())-> [PhysicsHit] {
+        let mut hits: [PhysicsHit] = [];
+        for id in self._bvh.alongRay(ray) if self.accepts(cast!u32(id), filter) {
+            if let Ok(h) = self._bodies[id].collider.raycast(ray) {
+                hits ~= [utils::hitOf(cast!u32(id), h)];
+            }
+        }
+
+        let dmut sorted = copy hits;
+        sorting::sort(alias sorted, |x, y| => { x.distance < y.distance });
+        sorted
+    }
+
+    /**
+     * Move a convex shape along a direction until it hits a body (see gjk::sweep)
+     * @params:
+     *    - shape: the shape moved, a box, a sphere or a capsule (a mesh hits nothing), in the space of the transformation
+     *    - transform: the transformation placing the shape in the world where it starts
+     *    - direction: the direction it moves along
+     *    - length: the distance it travels at most
+     * @returns: the body hit first, at the distance the shape travels to touch it, 0 for a body it starts touching; none
+     * when it hits no body the filter keeps
+     * */
+    pub fn shapeCast(self, shape: ColliderShape, transform: mat4, direction: vec3, length: f32,
+                     filter: QueryFilter = QueryFilter())-> (PhysicsHit)? {
+        if shape.kind == ColliderKind::MESH { return none; }
+
+        self.castConvex(Collider(shape, transform).convex(), direction, length, filter)
+    }
+
+    /**
+     * Move a sphere along a direction until it hits a body (see shapeCast)
+     * @params:
+     *    - origin: the centre of the sphere where it starts
+     * */
+    pub fn sphereCast(self, origin: vec3, radius: f32, direction: vec3, length: f32,
+                      filter: QueryFilter = QueryFilter())-> (PhysicsHit)? {
+        self.castConvex(Convex::sphere(origin, radius), direction, length, filter)
+    }
+
+    /**
+     * Find the bodies sharing a point with a shape, crossing a triangle of a mesh
+     * @params:
+     *    - shape: the shape, a box, a sphere or a capsule (a mesh overlaps nothing), in the space of the transformation
+     *    - transform: the transformation placing the shape in the world
+     * @returns: the handles of the bodies the filter keeps overlapping the shape, in no order
+     * */
+    pub fn overlapShape(self, shape: ColliderShape, transform: mat4, filter: QueryFilter = QueryFilter())-> [u32] {
+        if shape.kind == ColliderKind::MESH { return []; }
+
+        self.overlapConvex(Collider(shape, transform).convex(), filter)
+    }
+
+    /**
+     * Find the bodies sharing a point with a sphere (see overlapShape)
+     * */
+    pub fn overlapSphere(self, centre: vec3, radius: f32, filter: QueryFilter = QueryFilter())-> [u32] {
+        self.overlapConvex(Convex::sphere(centre, radius), filter)
+    }
+
+    /**
+     * Find the bodies sharing a point with a box (see overlapShape)
+     * @params:
+     *    - centre: the centre of the box
+     *    - size: the sides of the box along its axes
+     *    - rotation: the rotation of the box, from its axes to those of the world
+     * */
+    pub fn overlapBox(self, centre: vec3, size: vec3, rotation: Quaternion = Quaternion(),
+                      filter: QueryFilter = QueryFilter())-> [u32] {
+        let h = size / 2.0f;
+        let box = Convex::box(centre, rotation * makeVec3(h.x, 0.0f, 0.0f), rotation * makeVec3(0.0f, h.y, 0.0f),
+                              rotation * makeVec3(0.0f, 0.0f, h.z));
+        self.overlapConvex(box, filter)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CONTACTS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the pairs of bodies touching each other, one of them at least being kinematic or a trigger and one of them
+     * seeing the other through its mask, and compare them with those of the previous update
+     * @returns: the contacts begun, those that stayed and those that ended since the previous update (the removal of a
+     * body ending its contacts at once, see remove)
+     * */
+    pub fn updateContacts(mut self)-> [ContactEvent] {
+        let mut events: [ContactEvent] = [];
+
+        let dmut current: [u64 => bool] = copy [];
+        for i in 0us .. self._bodies.len {
+            let body = self._bodies[i];
+            if !body.used || !utils::isActive(body.settings) { continue; }
+
+            for j in self._bvh.overlapping(body.collider.bounds) if j != i {
+                let other = self._bodies[j];
+
+                // a pair of two active bodies is found from both of them, and tested from the first
+                if utils::isActive(other.settings) && j < i { continue; }
+                if !utils::sees(body.settings, other.settings) { continue; }
+                if !body.collider.touches(other.collider) { continue; }
+
+                current[utils::pairKey(cast!u32(i), cast!u32(j))] = true;
+            }
+        }
+
+        for key, _ in current {
+            let phase = if key in self._contacts { ContactPhase::STAYED } else { ContactPhase::BEGAN };
+            events ~= [ContactEvent(a-> utils::firstOf(key), b-> utils::secondOf(key), phase-> phase)];
+        }
+
+        for key, _ in self._contacts if !(key in current) {
+            events ~= [ContactEvent(a-> utils::firstOf(key), b-> utils::secondOf(key), phase-> ContactPhase::ENDED)];
+        }
+
+        self._contacts = alias current;
+        events
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Place the collider of a body, its box refit in the hierarchy
+     * */
+    fn place(mut self, handle: u32, collider: Collider) {
+        self._bodies[handle].collider = collider;
+        self._bvh:.update(cast!usize(handle), collider.bounds);
+    }
+
+    /**
+     * @returns: true iif a query hits a body through its filter
+     * */
+    fn accepts(self, handle: u32, filter: QueryFilter)-> bool {
+        let settings = self._bodies[handle].settings;
+        if (settings.layer & filter.mask) == 0u32 { return false; }
+        if settings.trigger && !filter.triggers { return false; }
+        for e in filter.exclude if e == handle { return false; }
+
+        true
+    }
+
+    /**
+     * @returns: the body a convex shape moving along a direction hits first
+     * */
+    fn castConvex(self, moving: Convex, direction: vec3, length: f32, filter: QueryFilter)-> (PhysicsHit)? {
+        if direction.dot(direction) <= 0.0f { return none; }
+
+        let unit = direction.normalized();
+        let swept = moving.bounds.merged(moving.translated(unit * length).bounds);
+        let mut best: (PhysicsHit)? = none;
+        for id in self._bvh.overlapping(swept) if self.accepts(cast!u32(id), filter) {
+            if let Ok(h) = self._bodies[id].collider.sweep(moving, unit, length) {
+                let closer = if let Ok(b) = best { h.distance < b.distance } else { true };
+                if closer { best = utils::hitOf(cast!u32(id), h)?; }
+            }
+        }
+
+        best
+    }
+
+    /**
+     * @returns: the handles of the bodies a convex shape overlaps
+     * */
+    fn overlapConvex(self, shape: Convex, filter: QueryFilter)-> [u32] {
+        let mut result: [u32] = [];
+        for id in self._bvh.overlapping(shape.bounds) if self.accepts(cast!u32(id), filter) {
+            if self._bodies[id].collider.overlaps(shape) { result ~= [cast!u32(id)]; }
+        }
+
+        result
+    }
+
+}
