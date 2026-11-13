@@ -1,0 +1,219 @@
+in curve;
+
+use balder::math::vector;
+
+use std::math;
+
+/**
+ * The number of segments sampling each span of a curve between two of its points
+ * */
+pub def CURVE_SUBDIVISIONS = 16us;
+
+/**
+ * How a curve goes from one of its points to the next
+ * */
+pub enum CurveKind : u32
+| CATMULL_ROM = 0u32 // through the points, leaving each toward the next along the line from the one before it
+| BEZIER      = 1u32; // through the points, leaving each along its handle, coming in along its handle reversed
+
+/**
+ * A curve through points, cubic between each point and the next, sampled by the distance along it (a path of a camera
+ * on rails, of a patrol, of a moving platform)
+ * @info:
+ * =====
+ * Each span between two points is a cubic Bézier curve. A Bézier curve leaves a point p of handle h toward p + h, and
+ * comes into it from p - h; a Catmull-Rom curve leaves each point along half the line from the point before it to the
+ * point after it (the line to its only neighbour at the ends of an open curve), its handles a third of that tangent.
+ * An open curve runs from its first point to its last; a closed one goes back to its first point. The curve is sampled
+ * by a polyline of CURVE_SUBDIVISIONS segments per span, the distances along it read on that polyline: a distance past
+ * the ends of an open curve is kept to them, a distance along a closed curve turns around it.
+ * ====
+ * */
+pub record Curve {
+
+    // The points of the polyline sampling the curve, from its start to its end, the first point again for a closed curve
+    let mut _samples: [vec3] = [];
+
+    // The distance along the curve of each sample, from its start
+    let mut _distances: [f32] = [];
+
+    // True iif the curve goes back to its first point
+    let mut _closed: bool = false;
+
+    /**
+     * @params:
+     *    - kind: how the curve goes from a point to the next
+     *    - points: the points the curve goes through, in order
+     *    - handles: the handle of each point of a Bézier curve, in the order of the points, from the point to where the
+     *               curve leaves toward; a point without one leaves straight toward the next, unused by a Catmull-Rom
+     *               curve
+     *    - closed: true for a curve going back from its last point to its first
+     *    - subdivisions: the number of segments sampling each span, 1 at least
+     * */
+    pub self (kind: CurveKind, points: [vec3], handles: [vec3] = [], closed: bool = false, subdivisions: usize = CURVE_SUBDIVISIONS) {
+        self._closed = closed && points.len > 1us;
+        if points.len == 0us { return; }
+
+        self._samples = copy [points[0]];
+        self._distances = copy [0.0f];
+
+        let n = points.len;
+        let spans = if self._closed { n } else { n - 1us };
+        let steps = if subdivisions == 0us { 1us } else { subdivisions };
+        for i in 0us .. spans {
+            let j = (i + 1us) % n;
+            let (a, b) = if kind == CurveKind::BEZIER {
+                (Curve::handleOf(handles, i), Curve::handleOf(handles, j))
+            } else {
+                (Curve::tangentOf(points, i, self._closed) / 3.0f, Curve::tangentOf(points, j, self._closed) / 3.0f)
+            };
+
+            let p0 = points[i], p1 = points[i] + a, p2 = points[j] - b, p3 = points[j];
+            for k in 1us .. steps + 1us {
+                let t = cast!f32(cast!u64(k)) / cast!f32(cast!u64(steps));
+                let p = Curve::bezier(p0, p1, p2, p3, t);
+                let last = self._samples[$ - 1us];
+                self._distances = self._distances ~ [self._distances[$ - 1us] + p.distance(last)];
+                self._samples = self._samples ~ [p];
+            }
+        }
+    }
+
+    /**
+     * @returns: the length of the curve, the length of the polyline sampling it
+     * */
+    @field
+    pub fn length(self)-> f32 {
+        if self._distances.len == 0us { 0.0f } else { self._distances[$ - 1us] }
+    }
+
+    /**
+     * @returns: true iif the curve goes back to its first point
+     * */
+    @field
+    pub fn closed(self)-> bool {
+        self._closed
+    }
+
+    /**
+     * @returns: the points of the polyline sampling the curve, from its start to its end, the first point again for a
+     * closed curve; one point for a curve of one point, none for a curve of none
+     * */
+    @field
+    pub fn samples(self)-> [vec3] {
+        self._samples
+    }
+
+    /**
+     * @returns: the point of the curve at a distance along it from its start, its only point for a curve of one point,
+     * the origin for a curve of none
+     * @params:
+     *    - distance: the distance along the curve, kept to its ends when it is open, turning around it when it is closed
+     * */
+    pub fn pointAt(self, distance: f32)-> vec3 {
+        if self._samples.len == 0us { return vec3(); }
+        if self._samples.len == 1us { return self._samples[0]; }
+
+        let d = self.along(distance);
+        let i = self.segmentAt(d);
+        let start = self._distances[i], end = self._distances[i + 1us];
+        let t = if end > start { (d - start) / (end - start) } else { 0.0f };
+        self._samples[i] + (self._samples[i + 1us] - self._samples[i]) * t
+    }
+
+    /**
+     * @returns: the unit direction the curve goes along at a distance along it from its start, the direction of the
+     * segment of the polyline under that distance, none when the curve has no length
+     * @params:
+     *    - distance: the distance along the curve, kept to its ends when it is open, turning around it when it is closed
+     * */
+    pub fn directionAt(self, distance: f32)-> (vec3)? {
+        if self.length <= 0.0f { return none; }
+
+        // the segments of no length (two points at the same place) left for the next one with a length
+        let first = self.segmentAt(self.along(distance));
+        for i in first .. self._samples.len - 1us {
+            let span = self._samples[i + 1us] - self._samples[i];
+            if span.length() > 0.0f { return span.normalized()?; }
+        }
+
+        for j in 0us .. first {
+            let i = first - 1us - j;
+            let span = self._samples[i + 1us] - self._samples[i];
+            if span.length() > 0.0f { return span.normalized()?; }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: a distance along the curve kept to its ends when it is open, turned around it when it is closed
+     * */
+    fn along(self, distance: f32)-> f32 {
+        let len = self.length;
+        if len <= 0.0f { return 0.0f; }
+        if self._closed {
+            return distance - math::floor(distance / len) * len;
+        }
+
+        if distance < 0.0f { 0.0f } else if distance > len { len } else { distance }
+    }
+
+    /**
+     * @returns: the index of the first sample of the segment of the polyline holding a distance along the curve, the
+     * distance kept to the curve
+     * */
+    fn segmentAt(self, distance: f32)-> usize {
+        // the last segment starting at or before the distance, by halves
+        let mut low = 0us, mut high = self._samples.len - 1us;
+        while high - low > 1us {
+            let mid = (low + high) / 2us;
+            if self._distances[mid] <= distance { low = mid; } else { high = mid; }
+        }
+
+        low
+    }
+
+}
+
+/**
+ * The spans of the curves
+ * */
+@companion
+mod Curve {
+
+    /**
+     * @returns: the point at a share of a cubic Bézier curve
+     * @params:
+     *    - p0, p3: the ends of the curve
+     *    - p1, p2: its control points, where it leaves p0 toward and comes into p3 from
+     *    - t: the share, 0 at p0, 1 at p3
+     * */
+    pub fn bezier(p0: vec3, p1: vec3, p2: vec3, p3: vec3, t: f32)-> vec3 {
+        let u = 1.0f - t;
+        p0 * (u * u * u) + p1 * (3.0f * u * u * t) + p2 * (3.0f * u * t * t) + p3 * (t * t * t)
+    }
+
+    /**
+     * @returns: the tangent of a Catmull-Rom curve at a point, half the line from the point before it to the point after
+     * it, the line to its only neighbour at the ends of an open curve
+     * */
+    pub fn tangentOf(points: [vec3], i: usize, closed: bool)-> vec3 {
+        let n = points.len;
+        if closed {
+            return (points[(i + 1us) % n] - points[(i + n - 1us) % n]) / 2.0f;
+        }
+
+        if i == 0us { return points[1us] - points[0us]; }
+        if i == n - 1us { return points[n - 1us] - points[n - 2us]; }
+        (points[i + 1us] - points[i - 1us]) / 2.0f
+    }
+
+    /**
+     * @returns: the handle of a point of a Bézier curve, none for a point without one
+     * */
+    pub fn handleOf(handles: [vec3], i: usize)-> vec3 {
+        if i < handles.len { handles[i] } else { vec3() }
+    }
+
+}
