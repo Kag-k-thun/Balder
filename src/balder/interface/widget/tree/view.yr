@@ -6,10 +6,12 @@ use balder::interface::style;
 use balder::interface::loader::registry::schema;
 use balder::interface::widget::list::rows_view;
 use balder::interface::widget::text::label;
-use balder::interface::widget::tree::{expansion, model};
+use balder::interface::widget::tree::{dragging, drop, expansion, model};
 use balder::math::vector;
 
-use ::sdl3::keycode;
+use std::time;
+
+use ::sdl3::{keyboard, keycode, mouse};
 
 use ::std::algorithm::comparison;
 
@@ -19,6 +21,12 @@ def PROBE_TEXT = "Mg";
 // The text of the marker of a node collapsed, and of a node expanded
 def COLLAPSED_MARKER = "▸";
 def EXPANDED_MARKER = "▾";
+
+// The distance the cursor goes from where it pressed a row before the rows selected are dragged, in pixels
+def DRAG_DISTANCE = 4.0f;
+
+// The time a node collapsed is hovered by the rows dragged before it expands, in seconds
+def EXPAND_DELAY = 0.6;
 
 /**
  * The marker of a row of a tree view showing a node having children: a label drawing the background and the border of
@@ -34,6 +42,23 @@ class TreeMarker over Label {
         self:.setOwnerPart("marker");
         self:.forceNoWrap(true);
         self:.setText(COLLAPSED_MARKER);
+    }
+}
+
+/**
+ * The line a tree view draws between two rows while rows are dragged, where they would be dropped: a label without
+ * text drawing the background of the part ::drop
+ * */
+class TreeDropLine over Label {
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "")
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("drop");
+        self:.forceNoWrap(true);
+        self:.hide();
     }
 }
 
@@ -168,6 +193,15 @@ class TreeRow over Label {
  * Left collapses it, or moves to its parent when it is collapsed. `on-select` gives the paths of the selected nodes, in
  * the order of the rows, when the user changes them, a node collapsed unselecting the nodes under it, and `on-activate`
  * gives the path of the current node when Enter is pressed on it, or of a leaf double clicked.
+ *
+ * A tree `draggable` drags the rows selected once the cursor pressing one of them moves (a click on a row among several
+ * selected selecting it alone at its release, so that they are dragged together). A row being dragged over shows where
+ * they would go: in its top quarter before its node, in its bottom quarter after it (before its first child when it is
+ * expanded), as the part `::drop`, a line between the rows, indented at the level they would go to, and in between under
+ * its node, the row taking the state `:drop`; below the rows they go after the last node of the first level. A node
+ * collapsed hovered a moment expands, the rows scroll while the cursor is at their top or their bottom edge, and Escape
+ * cancels the drag. Released, `on-drop` gives the nodes dragged and the place they were dropped at (TreeDrop), the model
+ * deciding what to do of them; a place under one of the nodes dragged is none.
  * ====
  * */
 pub class TreeView over RowsView {
@@ -185,9 +219,46 @@ pub class TreeView over RowsView {
     // The width of a level of the tree, that of the marker, in pixels
     let mut _indent: f32 = 0.0f;
 
+    prot { // dragging
+
+        // True iif the user drags the rows selected (see setDraggable)
+        let mut _draggable: bool = false;
+
+        // The row the left button pressed, the rows selected being dragged once the cursor goes far enough from where it
+        // pressed it, in pixels from the top left corner of the inner box, none when it pressed no row
+        let mut _pressed: (usize)? = none;
+        let mut _pressedAt: vec2 = vec2();
+
+        // A row pressed among several rows selected, selected alone when the button is released before they are dragged
+        let mut _selectOnRelease: (usize)? = none;
+
+        // True while rows are dragged
+        let mut _dragging: bool = false;
+
+        // The nodes dragged, those under another one left out
+        let mut _dragged: [[usize]] = [];
+
+        // The position of the cursor dragging them, in pixels from the top left corner of the inner box
+        let mut _cursor: vec2 = vec2();
+
+        // Where they would be dropped, none over no place they can go to
+        let mut _drop: (TreeDrop)? = none;
+
+        // The row whose top edge the line of a drop between rows lies on, the number of rows for the bottom of the last
+        let mut _dropEdge: usize = 0us;
+
+        // The time the node the rows would be dropped on was hovered, in seconds, expanded past EXPAND_DELAY
+        let mut _hoverTime: f64 = 0.0;
+
+        // The line shown between the rows they would be dropped between, and its thickness, in pixels
+        let dmut _dropLine: &TreeDropLine;
+        let mut _dropThickness: f32 = 0.0f;
+    }
+
     prot { // signals
         let dmut _selected: (&Signal!{[[usize]]})? = none;
         let dmut _activated: (&Signal!{[usize]})? = none;
+        let dmut _dropped: (&Signal!{TreeDrop})? = none;
     }
 
     /*!
@@ -202,6 +273,7 @@ pub class TreeView over RowsView {
         with super(alias manager, id, "TreeView")
         , _probe = copy TreeRow(alias manager)
         , _markerProbe = copy TreeMarker(alias manager)
+        , _dropLine = copy TreeDropLine(alias manager)
     {
         self._probe:.setText(PROBE_TEXT);
     }
@@ -343,6 +415,36 @@ pub class TreeView over RowsView {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ===================================          DRAGGING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Let the user drag the rows selected, and drop them under a node or between two rows (see dropped), or not
+     * */
+    pub fn setDraggable(mut self, draggable: bool) {
+        if !draggable { self:.endDrag(); }
+        self._draggable = draggable;
+    }
+
+    /**
+     * @returns: true iif the user can drag the rows selected
+     * */
+    pub fn isDraggable(self)-> bool {
+        self._draggable
+    }
+
+    /**
+     * @returns: true iif rows are dragged
+     * */
+    pub fn isDragging(self)-> bool {
+        self._dragging
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ====================================          SIGNALS          =====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -377,6 +479,21 @@ pub class TreeView over RowsView {
         alias s
     }
 
+    /**
+     * @returns: the signal emitted when the user drops the rows dragged, with the nodes dragged and the place they were
+     * dropped at, the model deciding what to do of them
+     * */
+    pub fn dropped(mut self)-> dmut &Signal!{TreeDrop} {
+        if let Ok(dmut s) = alias self._dropped {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{TreeDrop} ();
+        self._dropped = (alias s)?;
+
+        alias s
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -388,7 +505,19 @@ pub class TreeView over RowsView {
     over onUpdateSize(mut self) {
         self._markerProbe:.setStyle(self._currentStyle.getSubStyle("marker"));
         self._indent = self._markerProbe:.measureIntrinsicWidths()._1;
+        self._dropLine:.setStyle(self._currentStyle.getSubStyle("drop"));
+        self._dropThickness = self._dropLine:.measureIntrinsicHeights(self._absoluteSize.x)._1;
         self.__super__:.onUpdateSize();
+    }
+
+    over onUpdateScissors(mut self) {
+        self.__super__:.onUpdateScissors();
+        let (sciPos, sciSize) = self.getRowsScissors();
+        self._dropLine:.setScissors(sciPos, sciSize);
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        if self._dragging { max(self.__super__.getMaxDepth(), self._dropLine.getMaxDepth()) } else { self.__super__.getMaxDepth() }
     }
 
     prot over createRow(mut self)-> dmut &Widget {
@@ -404,14 +533,24 @@ pub class TreeView over RowsView {
     }
 
     /**
-     * The marker takes the states of its row, and :expanded for a node expanded
+     * The row the rows dragged would be dropped on takes the state :drop; the marker takes the states of its row, and
+     * :expanded for a node expanded
      * */
     prot over styleRow(mut self, dmut row: &Widget, item: usize) {
-        self.__super__:.styleRow(alias row, item);
+        let path = self._expansion.pathOf(item);
+        let target = if let Ok(d) = self._drop && d.onto { d.parent == path } else { false };
+        row:.setStyle(self:.getPartStyle("row", item, extra-> if target { copy ["drop"] } else { [] }));
         if let Ok(dmut r: &TreeRow) = (alias row)? {
-            let expanded = self._expansion.isExpanded(self._expansion.pathOf(item));
+            let expanded = self._expansion.isExpanded(path);
             r:.setMarkerStyle(self:.getPartStyle("marker", item, extra-> if expanded { copy ["expanded"] } else { [] }));
         }
+    }
+
+    /**
+     * The line of a drop between rows follows the rows as they scroll
+     * */
+    prot over onRowsPlaced(mut self) {
+        self:.placeDropLine();
     }
 
     /**
@@ -426,10 +565,9 @@ pub class TreeView over RowsView {
      * A click on the marker of a node having children expands or collapses it
      * */
     prot over clickRow(mut self, row: usize, pos: vec2)-> bool {
-        let path = self._expansion.pathOf(row);
-        let start = cast!f32(cast!u64(path.len - 1us)) * self._indent;
-        if pos.x < start || pos.x >= start + self._indent || self.countChildren(path) == 0us { return false; }
+        if !self.isOnMarker(row, pos) { return false; }
 
+        let path = self._expansion.pathOf(row);
         self:.setExpanded(path, !self._expansion.isExpanded(path), user-> true);
         true
     }
@@ -455,6 +593,111 @@ pub class TreeView over RowsView {
      */
 
     /**
+     * The left button on a row of a tree draggable keeps it to drag the rows selected; on a row among several selected,
+     * without Ctrl nor Shift, it selects it alone once released only, so that they are dragged together
+     * */
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        self._pressed = none;
+        self._selectOnRelease = none;
+        if button == SDL_BUTTON_LEFT && self._draggable {
+            if let Ok(row) = self.rowUnder(pos) {
+                let pixels = self.toPixels(pos);
+                if !self.isOnMarker(row, pixels) {
+                    self._pressed = (row)?;
+                    self._pressedAt = pixels;
+
+                    let mods = SDL_GetModState();
+                    let alone = (mods & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_GUI)) == 0u16;
+                    if alone && self._selection.isSelected(row) && self._selection.getSelected().len > 1us {
+                        self._selectOnRelease = (row)?;
+                        return (alias self)?;
+                    }
+                }
+            }
+        }
+
+        self.__super__:.onClick(pos, button)
+    }
+
+    /**
+     * The cursor pressing a row drags the rows selected once it went far enough, the place they would be dropped at
+     * following it
+     * */
+    pub over onSliding(mut self, pos: vec2, speed: vec2, button: u8) {
+        if button != SDL_BUTTON_LEFT || !self._pressed.hasValue {
+            self.__super__:.onSliding(pos, speed, button);
+            return;
+        }
+
+        self._cursor = self.toPixels(pos);
+        if !self._dragging {
+            if (self._cursor - self._pressedAt).length() < DRAG_DISTANCE { return; }
+            if !self:.startDrag() { return; }
+        }
+
+        self:.updateDrop();
+    }
+
+    /**
+     * The release of the left button drops the rows dragged, on-drop being emitted when they are over a place they can
+     * go to, or selects alone the row it pressed among several selected
+     * */
+    pub over onSlidingEnd(mut self, button: u8) {
+        if button == SDL_BUTTON_LEFT {
+            if self._dragging {
+                let released = self._drop;
+                self:.endDrag();
+                if let Ok(d) = released {
+                    if let Ok(dmut s) = alias self._dropped {
+                        s:.emit(TreeDrop(nodes-> d.nodes, parent-> d.parent, index-> d.index, onto-> d.onto, mods-> SDL_GetModState()));
+                    }
+                }
+            } else if let Ok(row) = self._selectOnRelease {
+                let changed = self._selection:.click(row, 0u16);
+                self:.showCurrent();
+                if changed { self:.emitSelected(); }
+            }
+
+            self._pressed = none;
+            self._selectOnRelease = none;
+        }
+
+        self.__super__:.onSlidingEnd(button);
+    }
+
+    /**
+     * While rows are dragged, the rows scroll with the cursor at their top or their bottom edge, and the node collapsed
+     * they would be dropped on expands once hovered a moment
+     * */
+    pub over onTick(mut self, delta: Duration) {
+        if !self._dragging { return; }
+
+        let seconds = cast!f64(delta.allMicros) / 1_000_000.0;
+        let speed = edgeScroll(self._cursor.y - self._headerHeight, self._rowsHeight, self._rowHeight);
+        if speed != 0.0 && self:.scrollBy(speed * seconds) {
+            self:.updateDrop();
+        }
+
+        if let Ok(d) = self._drop && d.onto {
+            if self._expansion.isExpanded(d.parent) || self.countChildren(d.parent) == 0us { return; }
+
+            self._hoverTime += seconds;
+            if self._hoverTime >= EXPAND_DELAY {
+                self:.setExpanded(d.parent, true, user-> false);
+                self:.updateDrop();
+            }
+        }
+    }
+
+    /**
+     * A drag ends with the focus, the rows dragged going nowhere
+     * */
+    pub over onLoseFocus(mut self) {
+        self:.endDrag();
+        self.__super__:.onLoseFocus();
+    }
+
+    /**
      * A double click on a node having children expands or collapses it, a leaf being activated
      * */
     pub over onDoubleClick(mut self, pos: vec2)-> dmut (&Widget)? {
@@ -474,6 +717,12 @@ pub class TreeView over RowsView {
      * other keys select as in a list view
      * */
     pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
+        if self._dragging {
+            // Escape cancels the drag, the other keys wait for its end
+            if key == SDLK_ESCAPE { self:.endDrag(); }
+            return true;
+        }
+
         if key != SDLK_LEFT && key != SDLK_RIGHT { return self.__super__:.onKeyPressed(key, mods); }
         if (mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI | SDL_KMOD_SHIFT)) != 0u16 { return false; }
 
@@ -505,6 +754,16 @@ pub class TreeView over RowsView {
      * ====================================================================================================
      */
 
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self._dropLine:.onAttach((self)?);
+    }
+
+    over onHide(mut self) {
+        self.__super__:.onHide();
+        self._dropLine:.hide();
+    }
+
     impl Disposable {
         pub over dispose(mut self) {
             if let Ok(dmut m) = alias self._model {
@@ -513,6 +772,7 @@ pub class TreeView over RowsView {
 
             self._probe:.dispose();
             self._markerProbe:.dispose();
+            self._dropLine:.dispose();
             self.__super__:.dispose();
         }
     }
@@ -560,6 +820,115 @@ pub class TreeView over RowsView {
     fn countChildren(self, node: [usize])-> usize {
         if let Ok(m) = self._model { m.len(node) } else { 0us }
     }
+
+    /**
+     * @returns: true iif a position is over the marker of a row whose node has children
+     * @params:
+     *    - pos: the position, in pixels from the top left corner of the inner box
+     * */
+    fn isOnMarker(self, row: usize, pos: vec2)-> bool {
+        let path = self._expansion.pathOf(row);
+        let start = cast!f32(cast!u64(path.len - 1us)) * self._indent;
+        pos.x >= start && pos.x < start + self._indent && self.countChildren(path) != 0us
+    }
+
+    /**
+     * Start dragging the rows selected, the row pressed among them
+     * @returns: true iif the rows are dragged, false when the row pressed is not selected
+     * */
+    fn startDrag(mut self)-> bool {
+        let pressed = if let Ok(p) = self._pressed { p } else { return false; };
+        if !self._selection.isSelected(pressed) {
+            self._pressed = none;
+            return false;
+        }
+
+        self._dragged = draggedOf(self.getSelected());
+        self._dragging = true;
+        self._selectOnRelease = none;
+        self._hoverTime = 0.0;
+        true
+    }
+
+    /**
+     * Stop dragging, the rows dragged going nowhere, the line and the state :drop leaving the rows
+     * */
+    fn endDrag(mut self) {
+        let was = self._dragging;
+        self._dragging = false;
+        self._dragged = [];
+        self._drop = none;
+        self._pressed = none;
+        self._dropLine:.hide();
+        if was { self:.restyleRows(); }
+    }
+
+    /**
+     * Find where the rows dragged would be dropped, under the cursor, restyling the rows and placing the line between
+     * them as it changes
+     * */
+    fn updateDrop(mut self) {
+        let before = self._drop;
+        let count = self.getRowCount();
+        let y = self._cursor.y - self._headerHeight;
+
+        let mut found: (TreeDrop)? = none;
+        if self._cursor.x >= 0.0f && self._cursor.x < self._rowsWidth && y >= 0.0f && y < self._rowsHeight && self._rowHeight > 0.0f {
+            let height = cast!f64(self._rowHeight);
+            let at = cast!f64(y) + self._offset;
+            let item = cast!usize(cast!u64(at / height));
+
+            let mut place = dropBelowRows(self.countChildren([]));
+            self._dropEdge = count;
+            if item < count {
+                let path = self._expansion.pathOf(item);
+                let part = cast!f32((at - cast!f64(cast!u64(item)) * height) / height);
+                place = dropOnRow(path, part, self.countChildren(path), self._expansion.isExpanded(path));
+                self._dropEdge = if part < DROP_EDGE { item } else { item + 1us };
+            }
+
+            let full = TreeDrop(nodes-> self._dragged, parent-> place.parent, index-> place.index, onto-> place.onto);
+            if !isUnderDragged(full) { found = (full)?; }
+        }
+
+        self._drop = found;
+        let samePlace = if let Ok(b) = before {
+            if let Ok(d) = found { b.parent == d.parent && b.index == d.index && b.onto == d.onto } else { false }
+        } else {
+            !found.hasValue
+        };
+
+        if !samePlace {
+            self._hoverTime = 0.0;
+            self:.restyleRows();
+            self:.placeDropLine();
+        }
+    }
+
+    /**
+     * Show the line of a drop between rows on the edge between them, indented at the level the rows dragged go to,
+     * hidden for a drop on a row or for no drop
+     * */
+    fn placeDropLine(mut self) {
+        let level = if let Ok(d) = self._drop && !d.onto { d.parent.len } else {
+            self._dropLine:.hide();
+            return;
+        };
+
+        let indent = cast!f32(cast!u64(level)) * self._indent;
+        let top = cast!f64(cast!u64(self._dropEdge)) * cast!f64(self._rowHeight) - self._offset;
+        let pos = self._absolutePosition + makeVec2(indent - self._offsetX,
+                                                    self._headerHeight + cast!f32(top) - self._dropThickness / 2.0f);
+        let width = max(0.0f, max(self._rowsWidth, self.getContentWidth()) - indent);
+
+        let mut depth = self._depth + 1;
+        for r in self._rows { depth = max(depth, r.getMaxDepth()); }
+
+        self._dropLine:.setSize(pos, makeVec2(width, self._dropThickness), depth + 1, self._absoluteSize);
+        let (sciPos, sciSize) = self.getRowsScissors();
+        self._dropLine:.setScissors(sciPos, sciSize);
+        if self.isDrawn() { self._dropLine:.show(); }
+    }
 }
 
 /**
@@ -573,11 +942,13 @@ pub mod TreeView {
     pub fn schema()-> &WidgetSchema {
         copy WidgetSchema("TreeView",
                           |dmut m, id|-> dmut &Widget => copy TreeView(alias m, id),
-                          attributes-> copy [copy Setter!{&TreeView, bool}("multiple", |dmut t, m| => { t:.setMultiple(m); })],
+                          attributes-> copy [copy Setter!{&TreeView, bool}("multiple", |dmut t, m| => { t:.setMultiple(m); }),
+                                             copy Setter!{&TreeView, bool}("draggable", |dmut t, d| => { t:.setDraggable(d); })],
                           signals-> copy [copy Emitter!{&TreeView, [[usize]]}("on-select", |dmut t|-> dmut &Signal!{[[usize]]} => alias t:.selected()),
-                                          copy Emitter!{&TreeView, [usize]}("on-activate", |dmut t|-> dmut &Signal!{[usize]} => alias t:.activated())],
-                          parts-> copy ["row", "marker", "scrollbar"],
-                          partStates-> copy ["row" => copy ["hover", "selected", "current"],
+                                          copy Emitter!{&TreeView, [usize]}("on-activate", |dmut t|-> dmut &Signal!{[usize]} => alias t:.activated()),
+                                          copy Emitter!{&TreeView, TreeDrop}("on-drop", |dmut t|-> dmut &Signal!{TreeDrop} => alias t:.dropped())],
+                          parts-> copy ["row", "marker", "drop", "scrollbar"],
+                          partStates-> copy ["row" => copy ["hover", "selected", "current", "drop"],
                                              "marker" => copy ["hover", "selected", "current", "expanded"],
                                              "scrollbar" => copy ["hover", "pressed"]])
     }
