@@ -35,8 +35,13 @@ gyllir build editor
   selected icon is orange, and the gizmo moves its node as any other. A selected light shows its shape (arrows along a
   direction light, the sphere of the range of a point light, the cones of a spot light), a selected camera its frustum.
   *View → Hide the icons* hides them all, and shows them again.
-- **Outline**: the nodes of the scene in the order they were created, a click selecting a node, Ctrl and Shift
-  selecting several, Enter or a double click looking at it. It follows the selection of the viewport.
+- **Outline**: the nodes of the scene in their order, a click selecting a node, Ctrl and Shift selecting several,
+  Enter or a double click looking at it. It follows the selection of the viewport. The rows selected are dragged: onto
+  a row, their nodes go under its node, after its children; between two rows, to that place, under the parent of the
+  line, which tells the level; below the rows, to the end of the first level. Each node keeps its place in the world,
+  its transform computed again in the space of its new parent, or keeps its transform with Alt held at the drop. A node
+  goes neither under itself nor under a node under it, nor in or out of a model (its meshes come from its file), and a
+  node named as a child of its new parent takes a free name (`cube_2`).
 - **Inspector**: the name of the node selected last, then the panel of its kind, refreshed as the gizmo moves it. An
   object (a mesh, a model, a group) shows its position, its rotation (in degrees) and its scale; a light its position,
   its direction, its colour, its intensity, its range, the angles of its cone and whether it casts shadows, the fields
@@ -74,8 +79,9 @@ executed after commands undone drops them; an open starts the history again (`st
 
 - **Nodes are kept, not rebuilt.** A removal keeps the nodes it detached and their parents, an addition, a copy and an
   open the nodes they built: undone or redone, they detach the nodes (`dispose`) or attach them again
-  (`Node::attach`, the nodes under them entering the scene after them). The other commands of the history keep naming
-  the same nodes, and a node keeps its uid, so its place among its siblings. The meshes of an `EditableScene` keep
+  (`Node::attach`, the nodes under them entering the scene after them) at the place they had among their siblings. The
+  other commands of the history keep naming the same nodes. A move keeps the nodes in the scene (`Node::moveUnder`),
+  and undone moves them back, the last one first, each to its parent, its place, its name and its transform. The meshes of an `EditableScene` keep
   their vertices once uploaded (`Scene.keepsVertices`), to enter it again.
 - **The selection** a command found is selected again when it is reverted.
 - **Merging.** A command executed right after another one may merge into it (`merge`), the two being undone as one: the
@@ -90,7 +96,8 @@ executed after commands undone drops them; an open starts the history again (`st
 | `LightCommand` | the settings of lights (colour, intensity, direction, range, cone, shadows), typed in the inspector | the settings before, merging the steps of one field |
 | `RenameCommand` | the name of a node, refused when a sibling has it | the name before |
 | `AddCommand` | a node built from its description, selected | detaching the node |
-| `RemoveCommand` | nodes and the nodes under them | attaching them again under their parents |
+| `RemoveCommand` | nodes and the nodes under them | attaching them again under their parents, at their places |
+| `ReparentCommand` | nodes and the nodes under them moved under another parent or among their siblings, dropped in the outline | moving them back to their parents, places, names and transforms |
 | `DuplicateCommand` | copies of nodes beside them, sharing the geometry of their meshes, selected | detaching the copies |
 | `OpenCommand` | the nodes of the scene replaced by those of a scene file | attaching the nodes replaced again |
 
@@ -132,7 +139,7 @@ A node is `node #<id> <kind> "<name>" { … }`, the kind being `group`, `model`,
 Its id (`Node3D.guid`) is a uuid it keeps from one save to the next, and the nodes under another name it as their
 `parent`, so the file stays flat however deep the tree is: moving a node under another parent changes one line, and a
 node is named by its id rather than by its path. The blocks may come in any order; among siblings, the order of the file
-is the order of the nodes. Comments are those of the `.gui` files.
+is the order of the nodes (`Node::getChildrenInOrder`), which the outline shows and changes. Comments are those of the `.gui` files.
 
 | Entry | Nodes | Value |
 |---|---|---|
@@ -144,7 +151,7 @@ is the order of the nodes. Comments are those of the `.gui` files.
 
 An asset is `asset <key> model "<path>";`, the path a `res:/…` or an absolute one. The writer writes the same file for
 the same nodes, so a scene diffs well under version control: the assets in the order of their paths, keyed by the name
-of their file; the nodes parents first, siblings in the order they were created; the entries of a node in the order of
+of their file; the nodes parents first, siblings in their order; the entries of a node in the order of
 the table, those holding their default left out; each number the shortest decimal reading back the same float. A scene
 started from a template (`editor/scenes/new.scene`) gives its nodes ids of their own (`SceneDescription.withoutIds`).
 

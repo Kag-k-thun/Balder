@@ -317,6 +317,17 @@ Image "res:/images/logo.png";
   rows are selected as in a list view, the rows under a node collapsed being unselected. `on-select` gives the paths of
   the selected nodes in the order of the rows, `on-activate` the path of the current node when Enter is pressed on it,
   or of a leaf double clicked (`fn reached (mut self, node: [usize])`).
+- **A tree view `draggable: true` drags its selected rows**, once the cursor pressing one of them moves a few pixels
+  (a click on a row among several selected selects it alone at its release only, so that they can be dragged
+  together). The nodes under another node selected follow it. Over a row, the top quarter drops before its node, the
+  bottom quarter after it (before its first child when it is expanded), shown by the `::drop` line, indented at the
+  level they would go to and as high as its style sets, and the middle drops under its node, the row taking the state
+  `:drop`; below the rows they go after the last node of the first level, and under one of the nodes dragged nowhere.
+  A node collapsed hovered a moment expands, the rows scroll while the cursor is in their top or their bottom row, and
+  Escape cancels the drag. `on-drop` gives a `TreeDrop`: the paths of the nodes dragged, the path of the parent they
+  go under, their place among its children (the paths and the place counted before the drop), whether they were
+  dropped on the row of the parent, and the modifiers held; the model decides what the drop does
+  (`fn dropped (mut self, drop: TreeDrop)`).
 - **A table view shows the rows of a model in columns**, under their headers. `setModel` takes a class over
   `TableModel`, whose `len`, `columns`, `header (column)` and `text (row, column)` the table reads on demand, for the
   rows shown only (`TextTableModel` holds the headers and the texts of the cells). The headers are its `::header`, in
@@ -1071,13 +1082,13 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `TreeView`
 
-- **Attributes:** `tab-index`: an integer; `multiple`: true or false
+- **Attributes:** `tab-index`: an integer; `multiple`: true or false; `draggable`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
-- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([[usize]]), `on-activate` ([usize])
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([[usize]]), `on-activate` ([usize]), `on-drop` (balder::interface::widget::tree::drop::TreeDrop)
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `row` (states `hover`, `selected`, `current`), `marker` (states `hover`, `selected`, `current`, `expanded`), `scrollbar` (states `hover`, `pressed`)
+- **Parts:** `row` (states `hover`, `selected`, `current`, `drop`), `marker` (states `hover`, `selected`, `current`, `expanded`), `drop`, `scrollbar` (states `hover`, `pressed`)
 - **Properties:** none
 
 ## Style properties
