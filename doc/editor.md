@@ -30,11 +30,24 @@ gyllir build editor
   frames, so that a room and a terrain are crossed alike, and each scene opened keeps its own while the editor runs
   (`CameraFlight`, `balder::scene::node::node3D::camera::flight`); the motion eases in and out. Releasing the button
   turns the camera again around the point in front of it, and F frames the selection from where the flight left it.
-- **Icons**: the nodes without geometry, the lights (a sun, a bulb or a lamp, by their type), the cameras and the
-  groups, are drawn as icons over the viewport, a click on an icon selecting its node before the meshes behind it; a
-  selected icon is orange, and the gizmo moves its node as any other. A selected light shows its shape (arrows along a
-  direction light, the sphere of the range of a point light, the cones of a spot light), a selected camera its frustum.
-  *View → Hide the icons* hides them all, and shows them again.
+- **Icons**: the nodes without geometry, the lights (a sun, a bulb or a lamp, by their type), the cameras, the empties,
+  the markers (by their purpose), the paths, their points (smaller) and the volumes, are drawn as icons over the
+  viewport, a click on an icon selecting its node before the meshes behind it; a selected icon is orange, and the gizmo
+  moves its node as any other. A selected light shows its shape (arrows along a direction light, the sphere of the
+  range of a point light, the cones of a spot light), a selected camera its frustum. The wireframe of a volume and the
+  curve of a path are drawn at all times, in blue, in orange once selected. *View → Hide the icons* hides them all, the
+  wireframes and the curves with them, and shows them again.
+- **Nodes without a mesh**: an *empty* (`Empty3D`) only places the nodes under it. A *marker* (`Marker3D`) is an empty
+  with a purpose (a spawn point, a waypoint, a socket, or none given) and tags, the game looking it up by its name
+  (`Marker3D::find`), its tags (`tagged`) or its purpose (`ofPurpose`) under a node. A *path* (`Path3D`) is a curve,
+  Catmull-Rom or Bézier, open or closed, through its points, the `PathPoint3D` under it in their order, sampled by the
+  distance along it (`curve`, `pointAt`, `directionAt`, `Curve` of `balder::math::curve`): its points are nodes, moved by
+  the gizmo, removed, copied and reordered in the outline as any other; *Add → Point of the path* inserts one after the
+  point selected (halfway to the next one) or at the end of the path selected; a point of a Bézier path leaves along its
+  X axis, as far as its scale along X, so the gizmo turns and stretches its handles. A *volume* (`Volume3D`) is a box, a
+  sphere or a capsule standing along Y, the shape of a trigger or of a collider, its behaviour coming with the physics:
+  selected alone, a white square on each face drags the face along its normal, the opposite face staying where it is (a
+  sphere and the sides of a capsule growing about their centre).
 - **Outline**: the nodes of the scene in their order, a click selecting a node, Ctrl and Shift selecting several,
   Enter or a double click looking at it. It follows the selection of the viewport. The rows selected are dragged: onto
   a row, their nodes go under its node, after its children; between two rows, to that place, under the parent of the
@@ -43,14 +56,18 @@ gyllir build editor
   goes neither under itself nor under a node under it, nor in or out of a model (its meshes come from its file), and a
   node named as a child of its new parent takes a free name (`cube_2`).
 - **Inspector**: the name of the node selected last, then the panel of its kind, refreshed as the gizmo moves it. An
-  object (a mesh, a model, a group) shows its position, its rotation (in degrees) and its scale; a light its position,
+  object (a mesh, a model, an empty, a marker, a path, a point, a volume) shows its position, its rotation (in degrees)
+  and its scale, then a marker its purpose and its tags (separated by spaces, applied when Enter is pressed), a path
+  its curve and whether it is closed, a volume its shape and its size (the sides of a box, the radius of a sphere, the
+  radius and the height of a capsule, its caps included); a light its position,
   its direction, its colour, its intensity, its range, the angles of its cone and whether it casts shadows, the fields
   its type does not use left out (no position for a direction light, no direction for a point light, a cone for a spot
   light only). A name is applied when Enter is pressed; a field changed gives its value to every node selected of the
   kind of the panel, each keeping its other values. One direction light casts shadows at a time.
 - **Menus**: *Scene* opens a new scene or a scene file and saves the scene (Ctrl+S) or saves it in another file
   (Ctrl+Shift+S), *Add* adds a cube, a sphere, a plane, a model read from a
-  file, a group or a light where the centre of the viewport meets a surface (or at the point the camera looks at),
+  file, an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume or a light where the
+  centre of the viewport meets a surface (or at the point the camera looks at), or a point to the path selected,
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
   frames the selection, and *View* hides or shows the icons.
 - **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
@@ -94,8 +111,11 @@ executed after commands undone drops them; an open starts the history again (`st
 |---|---|---|
 | `TransformCommand` | the transforms of nodes, typed in the inspector or dragged with the gizmo | the transforms before, merging the steps of one field |
 | `LightCommand` | the settings of lights (colour, intensity, direction, range, cone, shadows), typed in the inspector | the settings before, merging the steps of one field |
+| `MarkerCommand` | the purpose or the tags of markers, chosen in the inspector | the purposes and the tags before |
+| `PathCommand` | the curve of paths or whether they are closed, chosen in the inspector | the curves and the closings before |
+| `VolumeCommand` | the shapes of volumes, typed in the inspector or dragged by a face with the gizmo, the centre following a face moved on its own | the shapes and the transforms before, merging the steps of one field |
 | `RenameCommand` | the name of a node, refused when a sibling has it | the name before |
-| `AddCommand` | a node built from its description, selected | detaching the node |
+| `AddCommand` | a node built from its description, at a place among the children of its parent (a point inserted in a path), selected | detaching the node |
 | `RemoveCommand` | nodes and the nodes under them | attaching them again under their parents, at their places |
 | `ReparentCommand` | nodes and the nodes under them moved under another parent or among their siblings, dropped in the outline | moving them back to their parents, places, names and transforms |
 | `DuplicateCommand` | copies of nodes beside them, sharing the geometry of their meshes, selected | detaching the copies |
@@ -118,7 +138,7 @@ node #87b7e0df-348c-4ee2-b5e4-a54c540e02bf light "sun" {
     direction: -0.3 -1 -0.2;
 }
 
-node #030e69b7-ba92-4e55-bd67-5381a2351926 group "props" {
+node #030e69b7-ba92-4e55-bd67-5381a2351926 empty "props" {
     position: 0 0 -2;
 }
 
@@ -135,7 +155,9 @@ node #0c203f1a-b872-4e76-b3e0-0c7c95e00c74 model "table" {
 }
 ```
 
-A node is `node #<id> <kind> "<name>" { … }`, the kind being `group`, `model`, `cube`, `sphere`, `plane` or `light`.
+A node is `node #<id> <kind> "<name>" { … }`, the kind being `empty`, `model`, `cube`, `sphere`, `plane`, `light`,
+`marker`, `path`, `path-point` or `volume`, the points of a path being the `path-point` nodes under it, in their
+order.
 Its id (`Node3D.guid`) is a uuid it keeps from one save to the next, and the nodes under another name it as their
 `parent`, so the file stays flat however deep the tree is: moving a node under another parent changes one line, and a
 node is named by its id rather than by its path. The blocks may come in any order; among siblings, the order of the file
@@ -148,6 +170,9 @@ is the order of the nodes (`Node::getChildrenInOrder`), which the outline shows 
 | `file`, `lods` | model | the asset of the model file (`@<key>`, required), whether its levels of detail are built (`true`) |
 | `color`, `roughness`, `metallic` | cube, sphere, plane | the base colour and the material |
 | `light`, `color`, `intensity`, `direction`, `range`, `inner-angle`, `outer-angle`, `shadows` | light | `direction`, `point` or `spot`, then as `Light` has them |
+| `purpose`, `tags` | marker | `generic`, `spawn`, `waypoint` or `socket`; strings (`tags: "enemy" "boss";`) |
+| `curve`, `closed` | path | `catmull-rom` or `bezier`; whether the curve goes back to its first point (`false`) |
+| `shape`, `size`, `radius`, `height` | volume | `box`, `sphere` or `capsule`; the sides of a box, the radius of a sphere or a capsule, the height of a capsule, its caps included (only the entries of its shape are written) |
 
 An asset is `asset <key> model "<path>";`, the path a `res:/…` or an absolute one. The writer writes the same file for
 the same nodes, so a scene diffs well under version control: the assets in the order of their paths, keyed by the name
