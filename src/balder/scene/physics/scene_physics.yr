@@ -1,0 +1,262 @@
+in scene_physics;
+
+use balder::math::{bounds, matrix, quaternion, vector};
+use balder::scene::node::node3D::body;
+
+/**
+ * The physics of a scene: the world of the bodies that entered it, the queries giving the nodes they hit, and the
+ * signals of the contacts emitted on the nodes
+ * @info: the scene guards it with its lock (see Scene::raycast); the signals are emitted under the lock, their slots
+ * running later, in the threads emptying the slot emitters they were connected with
+ * */
+@final
+pub class ScenePhysics {
+
+    // The bodies of the scene, their colliders placed in the world
+    let dmut _world: &PhysicsWorld = copy PhysicsWorld();
+
+    // The nodes of the bodies, by handle
+    let dmut _bodies: [u32 => &PhysicsBody3D] = copy [];
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the world of the bodies of the scene
+     * */
+    @field
+    pub fn world(self)-> &PhysicsWorld {
+        self._world
+    }
+
+    /**
+     * @returns: the number of bodies in the scene
+     * */
+    @field
+    pub fn len(self)-> usize {
+        self._world.len
+    }
+
+    /**
+     * @returns: the bodies a body touched at the last update of the contacts
+     * */
+    pub fn contactsOf(mut self, body: &PhysicsBody3D)-> dmut [&PhysicsBody3D] {
+        let dmut result: [&PhysicsBody3D] = [];
+        if let Ok(h) = body.handle {
+            for other in self._world.contactsOf(h) {
+                if let Ok(dmut b) = alias self._bodies[other] { result ~= [alias b]; }
+            }
+        }
+
+        alias result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          BODIES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add the body of a node to the world, the node given its handle
+     * @info: a node whose body is in the world already has it placed again
+     * */
+    pub fn register(mut self, dmut body: &PhysicsBody3D) {
+        if body.handle.hasValue {
+            self:.changed(body);
+            self:.moved(body);
+            return;
+        }
+
+        let handle = self._world:.add(body.shape, body.transformation, settings-> body.settings);
+        body:.setHandle((handle)?);
+        self._bodies[handle] = alias body;
+    }
+
+    /**
+     * Remove the body of a node from the world, its contacts ended at once, contactEnded being emitted on the two bodies
+     * of each of them
+     * @info: does nothing for a node whose body is not in the world
+     * */
+    pub fn remove(mut self, dmut body: &PhysicsBody3D) {
+        if let Ok(h) = body.handle {
+            for e in self._world:.remove(h) {
+                self:.emit(e);
+            }
+
+            self._bodies:.remove(h);
+            body:.setHandle(none);
+        }
+    }
+
+    /**
+     * Place the body of a node at the transformation of the node
+     * */
+    pub fn moved(mut self, body: &PhysicsBody3D) {
+        if let Ok(h) = body.handle {
+            self._world:.setTransform(h, body.transformation);
+        }
+    }
+
+    /**
+     * Change the shape and the settings of the body of a node to those of the node
+     * */
+    pub fn changed(mut self, body: &PhysicsBody3D) {
+        if let Ok(h) = body.handle {
+            self._world:.setShape(h, body.shape);
+            self._world:.setSettings(h, body.settings);
+        }
+    }
+
+    /**
+     * Update the contacts of the bodies, emitting contactBegan, contactStayed and contactEnded on the two bodies of each
+     * of them (see PhysicsWorld::updateContacts)
+     * */
+    pub fn updateContacts(mut self) {
+        for e in self._world:.updateContacts() {
+            self:.emit(e);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          QUERIES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the body a ray hits first, none when it misses every body the filter keeps (see PhysicsWorld::raycast)
+     * */
+    pub fn raycast(mut self, ray: Ray, filter: QueryFilter = QueryFilter())-> dmut (BodyHit)? {
+        if let Ok(h) = self._world.raycast(ray, filter-> filter) {
+            return alias self:.hitOf(h);
+        }
+
+        none
+    }
+
+    /**
+     * @returns: every body a ray hits, the closest first (see PhysicsWorld::raycastAll)
+     * */
+    pub fn raycastAll(mut self, ray: Ray, filter: QueryFilter = QueryFilter())-> dmut [BodyHit] {
+        let dmut result: [BodyHit] = [];
+        for h in self._world.raycastAll(ray, filter-> filter) {
+            if let Ok(dmut hit) = alias self:.hitOf(h) { result ~= [alias hit]; }
+        }
+
+        alias result
+    }
+
+    /**
+     * @returns: the body a convex shape moving along a direction hits first (see PhysicsWorld::shapeCast)
+     * */
+    pub fn shapeCast(mut self, shape: ColliderShape, transform: mat4, direction: vec3, length: f32,
+                     filter: QueryFilter = QueryFilter())-> dmut (BodyHit)? {
+        if let Ok(h) = self._world.shapeCast(shape, transform, direction, length, filter-> filter) {
+            return alias self:.hitOf(h);
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the body a sphere moving along a direction hits first (see PhysicsWorld::sphereCast)
+     * */
+    pub fn sphereCast(mut self, origin: vec3, radius: f32, direction: vec3, length: f32,
+                      filter: QueryFilter = QueryFilter())-> dmut (BodyHit)? {
+        if let Ok(h) = self._world.sphereCast(origin, radius, direction, length, filter-> filter) {
+            return alias self:.hitOf(h);
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the bodies overlapping a convex shape, in no order (see PhysicsWorld::overlapShape)
+     * */
+    pub fn overlapShape(mut self, shape: ColliderShape, transform: mat4, filter: QueryFilter = QueryFilter())-> dmut [&PhysicsBody3D] {
+        alias self:.bodiesOf(self._world.overlapShape(shape, transform, filter-> filter))
+    }
+
+    /**
+     * @returns: the bodies overlapping a sphere, in no order (see PhysicsWorld::overlapSphere)
+     * */
+    pub fn overlapSphere(mut self, centre: vec3, radius: f32, filter: QueryFilter = QueryFilter())-> dmut [&PhysicsBody3D] {
+        alias self:.bodiesOf(self._world.overlapSphere(centre, radius, filter-> filter))
+    }
+
+    /**
+     * @returns: the bodies overlapping a box, in no order (see PhysicsWorld::overlapBox)
+     * */
+    pub fn overlapBox(mut self, centre: vec3, size: vec3, rotation: Quaternion = Quaternion(),
+                      filter: QueryFilter = QueryFilter())-> dmut [&PhysicsBody3D] {
+        alias self:.bodiesOf(self._world.overlapBox(centre, size, rotation-> rotation, filter-> filter))
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the hit of the node of a body
+     * */
+    fn hitOf(mut self, hit: PhysicsHit)-> dmut (BodyHit)? {
+        if let Ok(dmut b) = alias self._bodies[hit.body] {
+            return (BodyHit(alias b, hit))?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the nodes of bodies
+     * */
+    fn bodiesOf(mut self, handles: [u32])-> dmut [&PhysicsBody3D] {
+        let dmut result: [&PhysicsBody3D] = [];
+        for h in handles {
+            if let Ok(dmut b) = alias self._bodies[h] { result ~= [alias b]; }
+        }
+
+        alias result
+    }
+
+    /**
+     * Emit the signal of a contact on its two bodies, each one with the other
+     * */
+    fn emit(mut self, event: ContactEvent) {
+        if let Ok(dmut a) = alias self._bodies[event.a] {
+            if let Ok(dmut b) = alias self._bodies[event.b] {
+                match event.phase {
+                    ContactPhase::BEGAN => {
+                        a:.contactBegan():.emit(b);
+                        b:.contactBegan():.emit(a);
+                    }
+                    ContactPhase::STAYED => {
+                        a:.contactStayed():.emit(b);
+                        b:.contactStayed():.emit(a);
+                    }
+                    _ => {
+                        a:.contactEnded():.emit(b);
+                        b:.contactEnded():.emit(a);
+                    }
+                }
+            }
+        }
+    }
+
+}
