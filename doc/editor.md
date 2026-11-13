@@ -23,6 +23,13 @@ gyllir build editor
   the point it looks at, Shift and the middle button slide it, the wheel brings it closer. Once clicked, the viewport
   takes the keys W, E and R (translate, rotate, scale, the key of the mode in use switching between the world and the
   local axes), Delete, Ctrl+D (duplicate) and F (look at the selection, or at the whole scene).
+- **Flight**: holding the right button flies the camera, the mouse captured turning it where it stands, W, A, S and D
+  moving it forward, to the left, back and to the right, E and Q up and down, Shift four times faster, the wheel
+  changing its speed. The keys are read by their place on the keyboard (Z, Q, S and D on an AZERTY one), and taken by
+  the viewport alone while it flies. The speed is a share of the distance to the point the camera looks at, the one F
+  frames, so that a room and a terrain are crossed alike, and each scene opened keeps its own while the editor runs
+  (`CameraFlight`, `balder::scene::node::node3D::camera::flight`); the motion eases in and out. Releasing the button
+  turns the camera again around the point in front of it, and F frames the selection from where the flight left it.
 - **Icons**: the nodes without geometry, the lights (a sun, a bulb or a lamp, by their type), the cameras and the
   groups, are drawn as icons over the viewport, a click on an icon selecting its node before the meshes behind it; a
   selected icon is orange, and the gizmo moves its node as any other. A selected light shows its shape (arrows along a

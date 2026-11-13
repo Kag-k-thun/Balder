@@ -8,8 +8,12 @@ use balder::math::{_, bounds};
 use balder::scene;
 use balder::scene::node::node3D;
 use balder::scene::node::node3D::camera;
+use balder::scene::node::node3D::camera::flight;
 
-use ::sdl3::{keyboard, keycode, mouse};
+use std::time;
+use std::algorithm::comparison;
+
+use ::sdl3::{keyboard, keycode, mouse, scancode};
 
 /**
  * The name of the camera the viewport looks through, under the root of the scene
@@ -23,11 +27,15 @@ def ORBIT_SPEED = 5.0f;
 // The slide of the eye for a drag across the whole viewport, in distances to the target
 def PAN_SPEED = 1.2f;
 
+// The turn of the eye flying for a move of the mouse across the whole viewport, in radian
+def LOOK_SPEED = 4.0f;
+
 /**
  * The viewport of the editor: a gizmo moving the nodes selected (see SceneGizmo), the icons of the nodes without
  * geometry (see NodeIcons) and the camera of the editor, turning around the point it looks at
  * @info: the middle button turns the eye around that point, Shift and the middle button slide it, the wheel brings it
- * closer; the keys the gizmo does not use are emitted by keyPressed, the viewport having the focus
+ * closer; held, the right button flies the eye (see fly). The keys the gizmo does not use are emitted by keyPressed,
+ * the viewport having the focus
  * */
 pub class EditorViewport over SceneGizmo {
 
@@ -36,6 +44,12 @@ pub class EditorViewport over SceneGizmo {
 
     // The camera of the editor, created with the scene
     let dmut _camera: (&PerspectiveCamera)? = none;
+
+    // The flight of the eye while the right button is held, its pace kept from one flight to the next
+    let mut _flight: CameraFlight = CameraFlight();
+
+    // True while the right button is held, the eye flying
+    let mut _flying: bool = false;
 
     // The signal emitted when a key the gizmo does not use is pressed, the viewport having the focus
     let dmut _keyPressed: (&Signal!{SDL_Keycode, SDL_Keymod})? = none;
@@ -78,6 +92,22 @@ pub class EditorViewport over SceneGizmo {
     }
 
     /**
+     * @returns: the speed of the flights of the eye, in distances to the point it looks at per second
+     * */
+    @field
+    pub fn flightPace(self)-> f32 {
+        self._flight.pace
+    }
+
+    /**
+     * Change the speed of the flights of the eye
+     * */
+    @field
+    pub fn flightPace(mut self, pace: f32) {
+        self._flight.pace = clamp(pace, MIN_PACE, MAX_PACE);
+    }
+
+    /**
      * Look at nodes from a distance they are seen whole at, the nodes without volume (a light...) by their position
      * */
     pub fn frame(mut self, dmut nodes: [&Node3D]) {
@@ -110,11 +140,74 @@ pub class EditorViewport over SceneGizmo {
     }
 
     /**
+     * The eye flies while the right button is held
+     * */
+    pub over onTick(mut self, delta: Duration) {
+        if self._flying {
+            self:.fly(cast!f32(delta.allMicros) / 1000000.0f);
+        }
+
+        self.__super__:.onTick(delta);
+    }
+
+    /**
      * Place the camera at the eye, looking at the point it turns around
      * */
     fn placeCamera(mut self) {
         if let Ok(dmut cam) = alias self._camera {
             self._orbit.applyTo(alias cam);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FLIGHT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start flying: the mouse is captured, its moves turning the eye
+     * */
+    fn takeOff(mut self) {
+        self._flying = true;
+        self._flight:.stop();
+        self:.captureMouse(true);
+    }
+
+    /**
+     * Stop flying, the eye turning again around the point in front of it
+     * */
+    fn land(mut self) {
+        if !self._flying { return; }
+
+        self._flying = false;
+        self._flight:.stop();
+        self:.captureMouse(false);
+    }
+
+    /**
+     * Move the eye by the keys held: W and S forward and back, A and D to the left and the right, E and Q up and down,
+     * Shift faster; read by their place on the keyboard (scancodes), they are Z, Q, S and D on an AZERTY one
+     * @params:
+     *    - seconds: the time since the last move
+     * */
+    fn fly(mut self, seconds: f32) {
+        let keys = SDL_GetKeyboardState(null);
+        let mut direction = vec3();
+        if held(keys, SDL_Scancode::SDL_SCANCODE_W) { direction = direction + self._orbit.forward(); }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_S) { direction = direction - self._orbit.forward(); }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_D) { direction = direction + self._orbit.right(); }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_A) { direction = direction - self._orbit.right(); }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_E) { direction = direction + makeVec3(0.0f, 1.0f, 0.0f); }
+        if held(keys, SDL_Scancode::SDL_SCANCODE_Q) { direction = direction - makeVec3(0.0f, 1.0f, 0.0f); }
+
+        let fast = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0u16;
+        let offset = self._flight:.step(direction, self._orbit.distance, fast, seconds);
+        if self._flight.isMoving() {
+            self._orbit:.fly(offset);
+            self:.placeCamera();
         }
     }
 
@@ -127,10 +220,27 @@ pub class EditorViewport over SceneGizmo {
      */
 
     /**
-     * The middle button turns the eye around the point it looks at, slides it with Shift; the left button drags the
-     * gizmo
+     * The right button takes off, the eye flying while it is held
+     * */
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if button == SDL_BUTTON_RIGHT {
+            self:.takeOff();
+        }
+
+        self.__super__:.onClick(pos, button)
+    }
+
+    /**
+     * The middle button turns the eye around the point it looks at, slides it with Shift; the right button turns the
+     * eye flying; the left button drags the gizmo
      * */
     pub over onSliding(mut self, pos: vec2, speed: vec2, button: u8) {
+        if button == SDL_BUTTON_RIGHT && self._flying {
+            self._orbit:.look(speed.x * LOOK_SPEED, speed.y * LOOK_SPEED);
+            self:.placeCamera();
+            return;
+        }
+
         if button != SDL_BUTTON_MIDDLE {
             self.__super__:.onSliding(pos, speed, button);
             return;
@@ -146,14 +256,54 @@ pub class EditorViewport over SceneGizmo {
     }
 
     /**
-     * The wheel brings the eye closer to the point it looks at, or farther from it
+     * Releasing the right button lands the eye
+     * */
+    pub over onSlidingEnd(mut self, button: u8) {
+        if button == SDL_BUTTON_RIGHT {
+            self:.land();
+        }
+
+        self.__super__:.onSlidingEnd(button);
+    }
+
+    /**
+     * The wheel brings the eye closer to the point it looks at, or farther from it, and changes the speed of the eye
+     * flying
      * */
     pub over onScroll(mut self, _: vec2, _: i32, amountY: i32)-> bool {
         if amountY == 0 { return false; }
 
+        if self._flying {
+            self._flight:.faster(amountY);
+            return true;
+        }
+
         self._orbit:.zoom(amountY);
         self:.placeCamera();
         true
+    }
+
+    /**
+     * @returns: true while the eye flies, the wheel turned with the right button held changing its speed
+     * */
+    pub over captureWheelOnFocus(self)-> bool {
+        self._flying
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          FOCUS EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Losing the focus lands the eye, the right button no longer followed
+     * */
+    pub over onLoseFocus(mut self) {
+        self:.land();
+        self.__super__:.onLoseFocus();
     }
 
     /*!
@@ -165,9 +315,10 @@ pub class EditorViewport over SceneGizmo {
      */
 
     /**
-     * The keys the gizmo does not use are emitted by keyPressed
+     * The keys the gizmo does not use are emitted by keyPressed; flying, the eye takes them all
      * */
     pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
+        if self._flying { return true; }
         if self.__super__:.onKeyPressed(key, mods) { return true; }
         if key == SDLK_ESCAPE || key == SDLK_TAB { return false; }
 
@@ -193,6 +344,14 @@ pub class EditorViewport over SceneGizmo {
         alias s
     }
 
+}
+
+/**
+ * @returns: true iif the key at a place of the keyboard is held
+ * */
+fn held(keys: *bool, code: SDL_Scancode)-> bool {
+    let index: u32 = code;
+    unsafe { keys[index] }
 }
 
 /**
