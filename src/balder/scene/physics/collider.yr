@@ -1,0 +1,155 @@
+in collider;
+
+mod ::utils;
+
+use balder::math::{bounds, matrix, vector};
+
+/**
+ * A shape placed in the world by the transformation of its body
+ * @info:
+ * =====
+ * The transformation may scale the shape: a box is scaled along each of its axes (and sheared under a parent scaled
+ * along other axes), a mesh is transformed as it is drawn; a sphere keeps its roundness, scaled by the largest scale of
+ * the transformation, and a capsule is scaled along its axis by the scale of Y (its cylinder), in radius by the largest
+ * of the scales of X and Z.
+ * ====
+ * */
+pub record Collider {
+
+    // The shape, in the space of its body
+    pub let shape: ColliderShape;
+
+    // The transformation of the body, from its space to the world
+    pub let transform: mat4;
+
+    // The transformation from the world to the space of the body
+    pub let inverse: mat4;
+
+    // The box enclosing the collider in world space
+    pub let bounds: Aabb;
+
+    /**
+     * @params:
+     *    - shape: the shape, in the space of its body
+     *    - transform: the transformation of the body, from its space to the world
+     * */
+    pub self (shape: ColliderShape, transform: mat4)
+        with shape = shape
+        , transform = transform
+        , inverse = transform.inversed()
+        , bounds = utils::worldBox(shape, transform)
+    {}
+
+    /**
+     * @returns: true iif the collider is the surface of a mesh, holding no volume
+     * */
+    @field
+    pub fn isMesh(self)-> bool {
+        self.shape.kind == ColliderKind::MESH
+    }
+
+    /**
+     * @returns: the collider as a convex shape of the world, a point for a mesh
+     * */
+    pub fn convex(self)-> Convex {
+        utils::convexOf(self.shape, self.transform)
+    }
+
+    /**
+     * @returns: the triangles of a mesh whose boxes overlap a box of the world, in world space; none for another kind
+     * */
+    pub fn trianglesIn(self, box: Aabb)-> [Convex] {
+        let mut result: [Convex] = [];
+        if let Ok(hierarchy) = self.shape.hierarchy {
+            if let Ok(triangles) = self.shape.triangles {
+                for i in hierarchy.overlapping(box.transformed(self.inverse)) {
+                    let t = triangles.getTriangle(i);
+                    result ~= [Convex::triangle(utils::pointTo(self.transform, t.a), utils::pointTo(self.transform, t.b),
+                                                utils::pointTo(self.transform, t.c))];
+                }
+            }
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          QUERIES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @info: a ray starting inside a box, a sphere or a capsule hits it at its origin; a mesh is hit by either face of
+     * its triangles
+     * @returns: the point where a ray hits the collider first, none when it misses it or stops before it
+     * */
+    pub fn raycast(self, ray: Ray)-> (SurfaceHit)? {
+        match self.shape.kind {
+            ColliderKind::MESH => { return utils::rayMesh(ray, self.shape, self.transform, self.inverse); }
+            ColliderKind::BOX  => { return utils::rayBox(ray, self.shape.size / 2.0f, self.inverse); }
+            _ => {}
+        }
+
+        let convex = self.convex();
+        if convex.kind == ConvexKind::POINT {
+            return utils::raySphere(ray, convex.a, convex.margin);
+        }
+
+        utils::rayCapsule(ray, convex.a, convex.b, convex.margin)
+    }
+
+    /**
+     * @returns: true iif a convex shape of the world shares a point with the collider, crossing a triangle of a mesh
+     * */
+    pub fn overlaps(self, other: Convex)-> bool {
+        if !self.isMesh {
+            return gjk::separation(self.convex(), other).overlapping;
+        }
+
+        for t in self.trianglesIn(other.bounds) {
+            if gjk::separation(other, t).overlapping { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif two colliders share a point, two meshes never touching
+     * */
+    pub fn touches(self, other: Collider)-> bool {
+        if self.isMesh {
+            if other.isMesh { return false; }
+            return self.overlaps(other.convex());
+        }
+
+        other.overlaps(self.convex())
+    }
+
+    /**
+     * @params:
+     *    - moving: the shape moved, in world space
+     *    - direction: the unit direction it moves along
+     *    - length: the distance it travels at most
+     * @returns: the point where a moving convex shape hits the collider first (see gjk::sweep), none when it never does
+     * */
+    pub fn sweep(self, moving: Convex, direction: vec3, length: f32)-> (SurfaceHit)? {
+        if !self.isMesh {
+            return gjk::sweep(moving, direction, length, self.convex());
+        }
+
+        let swept = moving.bounds.merged(moving.translated(direction * length).bounds);
+        let mut best: (SurfaceHit)? = none;
+        for t in self.trianglesIn(swept) {
+            if let Ok(hit) = gjk::sweep(moving, direction, length, t) {
+                let closer = if let Ok(b) = best { hit.distance < b.distance } else { true };
+                if closer { best = hit?; }
+            }
+        }
+
+        best
+    }
+
+}
