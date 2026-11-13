@@ -1,0 +1,591 @@
+in reader;
+
+use balder::math::{utils, vector};
+use balder::scene::description::{kind, node_description};
+use balder::scene::node;
+use balder::scene::node::node3D::light;
+use balder::utils::syntax;
+
+use std::{conv, syntax, uuid};
+
+/**
+ * The version of the scene files this Balder reads and writes, the number of their 'scene' statement
+ * */
+pub def SCENE_VERSION = 1u32;
+
+/**
+ * Reader of a scene file into the descriptions of its nodes (see SceneDescription for the format)
+ * @info:
+ * =====
+ * ```
+ * file  = "scene" number ";" { asset | node } ;
+ * asset = "asset" key "model" string ";" ;
+ * node  = "node" "#" uuid kind string "{" { entry } "}" ;
+ * entry = name ":" value { value } ";" ;
+ * value = number | name | "#" uuid | "@" key ;
+ * ```
+ * The blocks of the nodes are flat, each naming its parent by its id: they are put under their parents once every block
+ * is read, in the order of the file among their siblings, so a block may come before the block of its parent. The
+ * reader checks that the ids are distinct, that each parent and asset exists, that no node is under itself, and that
+ * each entry belongs to the kind of its node, is given once and has values of its type.
+ * ====
+ * */
+pub record SceneReader {
+
+    // The scanner of the file
+    let dmut _scanner: &Scanner;
+
+    /**
+     * @params:
+     *    - content: the content of the scene file
+     * */
+    pub self (content: [c8])
+        with _scanner = copy Scanner(content)
+    {}
+
+    /**
+     * Read the whole content
+     * @returns: the nodes under the root, in the order of the file, each with the nodes under it
+     * */
+    pub fn read(mut self)-> [NodeDescription]
+        throws SyntaxError
+    {
+        self:.readHeader();
+
+        let mut nodes: [FlatNode] = [];
+        let mut assets: [Asset] = [];
+        loop {
+            let tok = self._scanner:.next();
+            if tok.kind == TokenKind::EOF { break; }
+
+            if tok.kind == TokenKind::IDENT && tok.text == "node" {
+                nodes = nodes ~ [self:.readNode(tok)];
+            } else if tok.kind == TokenKind::IDENT && tok.text == "asset" {
+                let asset = self:.readAsset();
+                for a in assets if a.key == asset.key {
+                    throw copy SyntaxError(f"asset '${a.key}' declared twice", tok.line, tok.col);
+                }
+
+                assets = assets ~ [asset];
+            } else {
+                throw self._scanner.expected(tok, "a node or an asset");
+            }
+        }
+
+        SceneReader::assemble(SceneReader::resolveAssets(nodes, assets))
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          STATEMENTS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the statement opening the file, `scene 1;`, the version of its format
+     * */
+    fn readHeader(mut self)
+        throws SyntaxError
+    {
+        let tok = self._scanner:.next();
+        if tok.kind != TokenKind::IDENT || tok.text != "scene" {
+            throw self._scanner.expected(tok, f"'scene ${SCENE_VERSION};' opening the scene file");
+        }
+
+        let version = self._scanner:.next();
+        if version.kind != TokenKind::NUMBER || version.unit != "" || version.text != f"${SCENE_VERSION}" {
+            throw copy SyntaxError(f"version '${self._scanner.source(version.start, version.end)}' of the scene file, this Balder reading version ${SCENE_VERSION}",
+                                   version.line, version.col);
+        }
+
+        self._scanner:.expect(";");
+    }
+
+    /**
+     * Read the declaration of an asset after its keyword, `asset table model "res:/models/table.glb";`
+     * */
+    fn readAsset(mut self)-> Asset
+        throws SyntaxError
+    {
+        let key = self._scanner:.next();
+        if key.kind != TokenKind::IDENT {
+            throw self._scanner.expected(key, "the key of the asset");
+        }
+
+        let kind = self._scanner:.next();
+        if kind.kind != TokenKind::IDENT || kind.text != "model" {
+            throw self._scanner.expected(kind, "the kind of the asset, model");
+        }
+
+        let path = self._scanner:.next();
+        if path.kind != TokenKind::STRING || path.text.len == 0us {
+            throw self._scanner.expected(path, "the path of the file of the asset");
+        }
+
+        self._scanner:.expect(";");
+        Asset(key.text, path.text)
+    }
+
+    /**
+     * Read the block of a node after its keyword, `node #<id> <kind> "<name>" { <entries> }`
+     * @params:
+     *    - at: the keyword, where the node is
+     * */
+    fn readNode(mut self, at: Token)-> FlatNode
+        throws SyntaxError
+    {
+        let id = self.readId(self._scanner:.next(), "the id of the node, #<uuid>");
+
+        let kindTok = self._scanner:.next();
+        let kind = if let Ok(k) = (if kindTok.kind == TokenKind::IDENT { kindNamed(kindTok.text) } else { none }) { k } else {
+            throw self._scanner.expected(kindTok, "the kind of the node, group, model, cube, sphere, plane or light");
+        };
+
+        let nameTok = self._scanner:.next();
+        if nameTok.kind != TokenKind::STRING {
+            throw self._scanner.expected(nameTok, "the name of the node, between quotes");
+        }
+
+        if !isValidName(nameTok.text) {
+            throw copy SyntaxError(f"node name '${nameTok.text}', empty or holding a '/'", nameTok.line, nameTok.col);
+        }
+
+        let mut d = NodeDescription(nameTok.text, kind);
+        d.id = id;
+
+        let mut node = FlatNode(d, at.line, at.col);
+        let mut given: [[c8]] = [];
+        self._scanner:.expect("{");
+        loop {
+            let tok = self._scanner:.next();
+            if tok.kind == TokenKind::DELIM && tok.text == "}" { break; }
+            if tok.kind != TokenKind::IDENT {
+                throw self._scanner.expected(tok, "an entry of the node or '}'");
+            }
+
+            for g in given if g == tok.text {
+                throw copy SyntaxError(f"entry '${tok.text}' given twice", tok.line, tok.col);
+            }
+
+            given = given ~ [tok.text];
+            self._scanner:.expect(":");
+            let values = self:.readValues();
+            self.readEntry(ref node, tok, values);
+        }
+
+        if kind == NodeKind::MODEL && node.asset.len == 0us {
+            throw copy SyntaxError(f"model '${d.name}' without a file", at.line, at.col);
+        }
+
+        node
+    }
+
+    /**
+     * @returns: the tokens of the value of an entry, up to the ';' closing it, consumed
+     * */
+    fn readValues(mut self)-> [Token]
+        throws SyntaxError
+    {
+        let mut values: [Token] = [];
+        loop {
+            let tok = self._scanner:.next();
+            if tok.kind == TokenKind::DELIM && tok.text == ";" { break; }
+            if tok.kind == TokenKind::EOF || tok.kind == TokenKind::DELIM {
+                throw self._scanner.expected(tok, "a value or ';'");
+            }
+
+            values = values ~ [tok];
+        }
+
+        values
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          ENTRIES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read an entry of a node, an entry of every node or one of its kind
+     * @params:
+     *    - key: the name of the entry
+     *    - values: the tokens of its value
+     * */
+    fn readEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
+        throws SyntaxError
+    {
+        match key.text {
+            "parent"   => {
+                node.parent = (self.readId(self.single(key, values), "the id of the parent, #<uuid>"))?;
+                return;
+            }
+            "position" => { node.description.position = self.vector(key, values); return; }
+            "rotation" => {
+                let r = self.vector(key, values);
+                node.description.rotation = makeVec3(radian(r.x), radian(r.y), radian(r.z));
+                return;
+            }
+            "scale"    => { node.description.scale = self.vector(key, values); return; }
+        }
+
+        match node.description.kind {
+            NodeKind::MODEL  => { self.readModelEntry(ref node, key, values); }
+            NodeKind::CUBE   => { self.readMaterialEntry(ref node, key, values); }
+            NodeKind::SPHERE => { self.readMaterialEntry(ref node, key, values); }
+            NodeKind::PLANE  => { self.readMaterialEntry(ref node, key, values); }
+            NodeKind::LIGHT  => { self.readLightEntry(ref node, key, values); }
+            _ => { throw self.foreign(node, key); }
+        }
+    }
+
+    /**
+     * Read an entry of a model: file (@<asset>) and lods
+     * */
+    fn readModelEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
+        throws SyntaxError
+    {
+        match key.text {
+            "file" => {
+                let tok = self.single(key, values);
+                if tok.kind != TokenKind::DIRECTIVE {
+                    throw copy SyntaxError("file must be an asset, @<key>", tok.line, tok.col);
+                }
+
+                node.asset = tok.text;
+            }
+            "lods" => { node.description.lods = self.boolean(key, values); }
+            _ => { throw self.foreign(node, key); }
+        }
+    }
+
+    /**
+     * Read an entry of a cube, a sphere or a plane: color, roughness and metallic
+     * */
+    fn readMaterialEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
+        throws SyntaxError
+    {
+        match key.text {
+            "color"     => { node.description.material.baseColor = self.vector(key, values); }
+            "roughness" => { node.description.material.roughness = self.number(key, values); }
+            "metallic"  => { node.description.material.metallic = self.number(key, values); }
+            _ => { throw self.foreign(node, key); }
+        }
+    }
+
+    /**
+     * Read an entry of a light: light, color, intensity, direction, range, inner-angle, outer-angle and shadows
+     * */
+    fn readLightEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
+        throws SyntaxError
+    {
+        match key.text {
+            "light"       => { node.description.light = self.lightType(key, values); }
+            "color"       => { node.description.color = self.vector(key, values); }
+            "intensity"   => { node.description.intensity = self.number(key, values); }
+            "direction"   => { node.description.direction = self.vector(key, values); }
+            "range"       => { node.description.range = self.number(key, values); }
+            "inner-angle" => { node.description.innerAngle = self.number(key, values); }
+            "outer-angle" => { node.description.outerAngle = self.number(key, values); }
+            "shadows"     => { node.description.shadows = self.boolean(key, values); }
+            _ => { throw self.foreign(node, key); }
+        }
+    }
+
+    /**
+     * @returns: the error of an entry the kind of a node does not have
+     * */
+    fn foreign(self, node: FlatNode, key: Token)-> &SyntaxError {
+        copy SyntaxError(f"${kindName(node.description.kind)} '${node.description.name}' has no entry '${key.text}'",
+                         key.line, key.col)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          VALUES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the id of a token '#<uuid>'
+     * @params:
+     *    - what: what the id is, with its article, for the error
+     * */
+    fn readId(self, tok: Token, what: [c8])-> Uuid
+        throws SyntaxError
+    {
+        if tok.kind == TokenKind::HASH {
+            {
+                let id = std::uuid::to!{Uuid} (tok.text);
+                if !id.isNil() { return id; }
+            } catch {
+                _ => {}
+            }
+        }
+
+        throw self._scanner.expected(tok, what);
+    }
+
+    /**
+     * @returns: the one token of the value of an entry
+     * */
+    fn single(self, key: Token, values: [Token])-> Token
+        throws SyntaxError
+    {
+        if values.len != 1us {
+            throw copy SyntaxError(f"${key.text} takes one value", key.line, key.col);
+        }
+
+        values[0]
+    }
+
+    /**
+     * @returns: the number of a token
+     * */
+    fn toNumber(self, key: Token, tok: Token)-> f32
+        throws SyntaxError
+    {
+        if tok.kind == TokenKind::NUMBER && tok.unit == "" {
+            {
+                return std::conv::to!{f32} (tok.text);
+            } catch {
+                _ => {}
+            }
+        }
+
+        throw copy SyntaxError(f"${key.text} must be a number, found '${self._scanner.source(tok.start, tok.end)}'", tok.line, tok.col);
+    }
+
+    /**
+     * @returns: the value of an entry of one number
+     * */
+    fn number(self, key: Token, values: [Token])-> f32
+        throws SyntaxError
+    {
+        self.toNumber(key, self.single(key, values))
+    }
+
+    /**
+     * @returns: the value of an entry of three numbers
+     * */
+    fn vector(self, key: Token, values: [Token])-> vec3
+        throws SyntaxError
+    {
+        if values.len != 3us {
+            throw copy SyntaxError(f"${key.text} must be three numbers", key.line, key.col);
+        }
+
+        makeVec3(self.toNumber(key, values[0]), self.toNumber(key, values[1]), self.toNumber(key, values[2]))
+    }
+
+    /**
+     * @returns: the value of an entry of true or false
+     * */
+    fn boolean(self, key: Token, values: [Token])-> bool
+        throws SyntaxError
+    {
+        let tok = self.single(key, values);
+        if tok.kind == TokenKind::IDENT {
+            match tok.text {
+                "true"  => { return true; }
+                "false" => { return false; }
+            }
+        }
+
+        throw copy SyntaxError(f"${key.text} must be true or false", tok.line, tok.col);
+    }
+
+    /**
+     * @returns: the type of light of an entry, direction, point or spot
+     * */
+    fn lightType(self, key: Token, values: [Token])-> LightType
+        throws SyntaxError
+    {
+        let tok = self.single(key, values);
+        if tok.kind == TokenKind::IDENT {
+            match tok.text {
+                "direction" => { return LightType::DIRECTION; }
+                "point"     => { return LightType::POINT; }
+                "spot"      => { return LightType::SPOT; }
+            }
+        }
+
+        throw copy SyntaxError(f"${key.text} must be direction, point or spot", tok.line, tok.col);
+    }
+
+}
+
+/**
+ * A node as its block of a scene file gives it, before the nodes are put under their parents
+ * */
+record FlatNode {
+
+    // The node, without its children
+    pub let mut description: NodeDescription;
+
+    // The id of its parent, none for a node under the root
+    pub let mut parent: (Uuid)?;
+
+    // The key of the asset of a model, empty for the other nodes
+    pub let mut asset: [c8];
+
+    // The place of the block, quoted in the errors
+    pub let mut line: usize;
+    pub let mut col: usize;
+
+    pub self (description: NodeDescription, line: usize, col: usize)
+        with description = description
+        , parent = none
+        , asset = ""
+        , line = line
+        , col = col
+    {}
+
+}
+
+/**
+ * An asset of a scene file, a file its nodes name by its key
+ * */
+record Asset {
+
+    // The key the nodes name it by, after a '@'
+    pub let key: [c8];
+
+    // The project path of the file
+    pub let path: [c8];
+
+    pub self (key: [c8], path: [c8])
+        with key = key
+        , path = path
+    {}
+
+}
+
+/**
+ * The assembly of the nodes a SceneReader read, once every block of the file is read
+ * */
+@companion
+mod SceneReader {
+
+    /**
+     * @returns: the nodes, each model given the path of the asset it names
+     * @throws:
+     *    - &SyntaxError: if a model names an asset not declared
+     * */
+    pub fn resolveAssets(nodes: [FlatNode], assets: [Asset])-> [FlatNode]
+        throws SyntaxError
+    {
+        let mut resolved: [FlatNode] = [];
+        for n in nodes {
+            let mut r = n;
+            if n.asset.len != 0us {
+                let mut found = false;
+                for a in assets if a.key == n.asset {
+                    r.description.file = a.path;
+                    found = true;
+                }
+
+                if !found {
+                    throw copy SyntaxError(f"model '${n.description.name}' names the asset '${n.asset}', not declared", n.line, n.col);
+                }
+            }
+
+            resolved = resolved ~ [r];
+        }
+
+        resolved
+    }
+
+    /**
+     * Put each node under its parent
+     * @returns: the nodes under the root, in the order of the file, each with the nodes under it in that order
+     * @throws:
+     *    - &SyntaxError: if two nodes have the same id, a node names a parent that is not in the file, or a node is under
+     *                    itself
+     * */
+    pub fn assemble(nodes: [FlatNode])-> [NodeDescription]
+        throws SyntaxError
+    {
+        let dmut index: [Uuid => usize] = copy [];
+        for i, n in nodes {
+            if index[n.description.id].hasValue {
+                throw copy SyntaxError(f"id #${n.description.id} given to two nodes", n.line, n.col);
+            }
+
+            index[n.description.id] = i;
+        }
+
+        let dmut children: [usize => [usize]] = copy [];
+        let mut roots: [usize] = [];
+        for i, n in nodes {
+            if let Ok(p) = n.parent {
+                if let Ok(j) = index[p] {
+                    children[j] = SceneReader::under(children, j) ~ [i];
+                } else {
+                    throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' is under #${p}, no node of the file", n.line, n.col);
+                }
+            } else {
+                roots = roots ~ [i];
+            }
+        }
+
+        let mut placed = 0us;
+        let mut tree: [NodeDescription] = [];
+        for r in roots {
+            tree = tree ~ [SceneReader::build(nodes, children, r, ref placed)];
+        }
+
+        if placed != nodes.len {
+            for i, n in nodes if !SceneReader::isPlaced(children, roots, i) {
+                throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' is under itself", n.line, n.col);
+            }
+        }
+
+        tree
+    }
+
+    /**
+     * @returns: the description of a node with the nodes under it
+     * @params:
+     *    - placed: the number of nodes put in the tree, increased by those of this one
+     * */
+    pub fn build(nodes: [FlatNode], children: [usize => [usize]], i: usize, ref mut placed: usize)-> NodeDescription {
+        placed += 1us;
+        let mut d = nodes[i].description;
+        let mut under: [NodeDescription] = [];
+        for c in SceneReader::under(children, i) {
+            under = under ~ [SceneReader::build(nodes, children, c, ref placed)];
+        }
+
+        d.children = under;
+        d
+    }
+
+    /**
+     * @returns: the indices of the nodes under a node, in the order of the file
+     * */
+    pub fn under(children: [usize => [usize]], i: usize)-> [usize] {
+        if let Ok(c) = children[i] { c } else { [] }
+    }
+
+    /**
+     * @returns: true iif a node is a root or under one
+     * */
+    pub fn isPlaced(children: [usize => [usize]], roots: [usize], i: usize)-> bool {
+        let mut stack = roots;
+        while stack.len != 0us {
+            let top = stack[$ - 1us];
+            stack = stack[0us .. $ - 1us];
+            if top == i { return true; }
+            stack = stack ~ SceneReader::under(children, top);
+        }
+
+        false
+    }
+}
