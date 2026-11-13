@@ -1,0 +1,211 @@
+in reparent;
+
+use main::naming;
+use main::command::{remove, utils};
+use balder::core::error;
+use balder::scene::editable;
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{solid, transform};
+
+/**
+ * The move of nodes, with the nodes under them, under another parent or to another place among their siblings, the
+ * nodes dropped on a row of the outline or between two of its rows
+ * @info: each node keeps its transformation in the world, its transform computed again in the space of its new parent
+ * (see NodeTransform::inParent), or keeps its transform in the space of its parent (Alt held at the drop); a node named
+ * as another child of its new parent takes a free name (see freeNameAmong). The command keeps where each node was, its
+ * parent, its place, its name and its transform, undoing it moving the nodes back the other way round
+ * */
+pub class ReparentCommand over EditCommand {
+
+    // The nodes moved, in the order of the outline, those under another one following it
+    let dmut _nodes: [&Node3D];
+
+    // The node they go under, the root of the scene to detach them from their parents
+    let dmut _parent: &Node;
+
+    // The child of the parent they go before, none to go after its children
+    let dmut _before: (&Node)?;
+
+    // True iif the nodes keep their transforms in the space of their parent, false to keep their transformations in the
+    // world
+    let _keepLocal: bool;
+
+    // The nodes moved once the command is applied, then, for each, where it was before its move: its parent, its place
+    // among the children of the parent, its name and its transform
+    let dmut _moved: [&Node3D] = [];
+    let dmut _from: [&Node] = [];
+    let mut _places: [usize] = [];
+    let mut _names: [[c8]] = [];
+    let mut _transforms: [NodeTransform] = [];
+
+    // The nodes selected before the move, selected again when it is undone
+    let dmut _selected: [&Node3D] = [];
+
+    /**
+     * @params:
+     *    - nodes: the nodes moved, in the order of the outline
+     *    - parent: the node they go under, the root of the scene to detach them
+     *    - before: the child of the parent they go before, none to go after its children
+     *    - keepLocal: true for the nodes to keep their transforms in the space of their parent, false to keep their
+     *                 transformations in the world
+     * */
+    pub self (dmut nodes: [&Node3D], dmut parent: &Node, dmut before: (&Node)? = none, keepLocal: bool = false)
+        with _nodes = alias nodes
+        , _parent = alias parent
+        , _before = alias before
+        , _keepLocal = keepLocal
+    {}
+
+    /**
+     * @throws:
+     *    - &BalderError: if a node would go under itself or under a node under it, under a model or out of a model (the
+     *                    nodes under a model come from its file), the scene staying as it was
+     * */
+    pub over apply(mut self, dmut scene: &EditableScene)-> bool
+        throws BalderError
+    {
+        self:.check();
+
+        self._selected = alias selectedNodes(alias scene);
+        self._moved = [];
+        self._from = [];
+        self._places = [];
+        self._names = [];
+        self._transforms = [];
+
+        for dmut n in alias self._nodes if !isUnderOneOf(n, self._nodes) {
+            if let Ok(dmut from) = alias n:.getParent() {
+                self:.moveNode(alias n, alias from);
+            }
+        }
+
+        self._moved.len != 0us
+    }
+
+    pub over revert(mut self, dmut scene: &EditableScene) {
+        // the last node moved goes back first, each finding the children of its parent as it left them
+        for i in 0us .. self._moved.len {
+            let j = self._moved.len - 1us - i;
+            let dmut n = alias self._moved[j];
+            n:.moveUnder(alias self._from[j], at-> self._places[j]);
+            n:.rename(self._names[j]);
+            self._transforms[j].applyTo(alias n);
+        }
+
+        reselect(alias scene, alias self._selected);
+    }
+
+    pub over describe(self)-> [c8] {
+        let what = if self._moved.len == 1us {
+            self._moved[0].name.file()
+        } else {
+            std::conv::to!{[c8]} (self._moved.len) ~ " nodes"
+        };
+
+        let mut among = true;
+        for f in self._from {
+            if f.uid != self._parent.uid { among = false; }
+        }
+
+        if among { return "Reordered " ~ what; }
+        if let p: &Node3D = self._parent {
+            return "Moved " ~ what ~ " under " ~ p.name.file();
+        }
+
+        "Moved " ~ what ~ " to the root"
+    }
+
+    pub over reshapes(self)-> bool {
+        true
+    }
+
+    /**
+     * Refuse a move the scene cannot take, before any node moved
+     * @throws:
+     *    - &BalderError: if a node would go under itself or under a node under it, under a model, or out of a model
+     * */
+    fn check(mut self)
+        throws BalderError
+    {
+        if isModel(self._parent) {
+            throw copy BalderError(f"The nodes under ${self._parent.name.file()} come from the file of the model, no node goes under it");
+        }
+
+        for dmut n in alias self._nodes {
+            if n.uid == self._parent.uid || self._parent.isUnder(n) {
+                throw copy BalderError(f"${n.name.file()} cannot go under itself, nor under a node under it");
+            }
+
+            if let Ok(dmut p) = alias n:.getParent() && isModel(p) {
+                throw copy BalderError(f"${n.name.file()} comes from the file of its model, it stays under it");
+            }
+        }
+    }
+
+    /**
+     * Move a node under the parent, before the child given, renamed when another child of the parent has its name, its
+     * transformation in the world kept unless the command keeps the local transforms
+     * @params:
+     *    - from: the parent the node is under
+     * */
+    fn moveNode(mut self, dmut n: &Node3D, dmut from: &Node) {
+        let among = from.uid == self._parent.uid;
+        let place = n.index;
+        let at = self:.placeOf(n, among);
+
+        // the node at its own place moves nowhere
+        let count = from:.getChildrenInOrder().len;
+        if among && (at == place || (at >= count - 1us && place == count - 1us)) { return; }
+
+        let world = n.transformation;
+        let name = n.name.file();
+        let transform = NodeTransform(n);
+
+        if !among && self._parent:.getChilds()[name].hasValue {
+            let dmut parents = copy [alias self._parent, alias from];
+            n:.rename(freeNameAmong(alias parents, name));
+        }
+
+        if !n:.moveUnder(alias self._parent, at-> at) {
+            n:.rename(name);
+            return;
+        }
+
+        if !among && !self._keepLocal {
+            NodeTransform::inParent(world, n.parentTransformation).applyTo(alias n);
+        }
+
+        self._moved ~= [alias n];
+        self._from ~= [alias from];
+        self._places ~= [place];
+        self._names ~= [name];
+        self._transforms ~= [transform];
+    }
+
+    /**
+     * @returns: the place a node goes to among the children of the parent, the other children counted (see
+     * Node::moveUnder): that of the child given, past the children without one
+     * @params:
+     *    - among: true iif the node is a child of the parent already, its place being left out
+     * */
+    fn placeOf(mut self, n: &Node3D, among: bool)-> usize {
+        if let Ok(dmut b) = alias self._before {
+            if let Ok(dmut bp) = alias b:.getParent() && bp.uid == self._parent.uid {
+                let i = b.index;
+                return if among && n.index < i { i - 1us } else { i };
+            }
+        }
+
+        LAST_PLACE
+    }
+
+}
+
+/**
+ * @returns: true iif a node is a model, the nodes under it coming from its file
+ * */
+fn isModel(node: &Node)-> bool {
+    if let _: &SolidObjectModel = node { return true; }
+    false
+}
