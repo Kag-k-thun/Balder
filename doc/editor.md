@@ -23,6 +23,11 @@ gyllir build editor
   the point it looks at, Shift and the middle button slide it, the wheel brings it closer. Once clicked, the viewport
   takes the keys W, E and R (translate, rotate, scale, the key of the mode in use switching between the world and the
   local axes), Delete, Ctrl+D (duplicate) and F (look at the selection, or at the whole scene).
+- **Icons**: the nodes without geometry, the lights (a sun, a bulb or a lamp, by their type), the cameras and the
+  groups, are drawn as icons over the viewport, a click on an icon selecting its node before the meshes behind it; a
+  selected icon is orange, and the gizmo moves its node as any other. A selected light shows its shape (arrows along a
+  direction light, the sphere of the range of a point light, the cones of a spot light), a selected camera its frustum.
+  *View → Hide the icons* hides them all, and shows them again.
 - **Outline**: the nodes of the scene in the order they were created, a click selecting a node, Ctrl and Shift
   selecting several, Enter or a double click looking at it. It follows the selection of the viewport.
 - **Inspector**: the name of the node selected last, then the panel of its kind, refreshed as the gizmo moves it. An
@@ -33,9 +38,9 @@ gyllir build editor
   kind of the panel, each keeping its other values. One direction light casts shadows at a time.
 - **Menus**: *Scene* opens a new scene or a scene file and saves the scene (Ctrl+S) or saves it in another file
   (Ctrl+Shift+S), *Add* adds a cube, a sphere, a plane, a model read from a
-  file, a group or a light where the centre of the viewport meets a surface (or at the point the camera looks at), and
+  file, a group or a light where the centre of the viewport meets a surface (or at the point the camera looks at),
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
-  frames the selection.
+  frames the selection, and *View* hides or shows the icons.
 - **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
   scene is undone, the nodes selected before it being selected again; the steps of one field of the inspector (its
   arrows clicked, its keys held, its wheel turned) are undone as one change. Opening a scene starts the history again.
@@ -46,7 +51,7 @@ gyllir build editor
   given the extension `.scene` when it has none. New, Open and Quit (from the menu or by closing the window) ask
   whether to save the changes first, to discard them, or to do nothing.
 
-The nodes named `__…__` belong to the editor (its camera, the gizmo): they are neither shown, nor removed with the
+The nodes named `__…__` belong to the editor (its camera, the gizmo, the icons): they are neither shown, nor removed with the
 scene, nor saved.
 
 ## Commands

@@ -4,18 +4,27 @@ use balder::core::application::signal;
 use balder::interface::loader::registry::schema;
 use balder::interface::widget::layout::d3scene::overlay;
 use balder::math::vector;
+use balder::scene;
 use balder::scene::{editable, selection};
+use balder::scene::gizmo::{icons, view};
 use balder::scene::node::node3D;
 use balder::scene::node::node3D::visual;
 
 use ::sdl3::{keyboard, mouse};
 
 /**
+ * The name of the node of the icons, under the root of the scene
+ * */
+def ICONS_NODE = "__icons__";
+
+/**
  * The overlay of a Scene3D picking the instances under the cursor: a click of the left button emits picked, a move of
  * the cursor emits hovered, and a selectable picker selects the instance clicked, or the model it is a mesh of, in the
  * selection of the scene
  * @info: the instances are told apart by their triangles (see Scene.pick); the instance under the cursor is looked
- * for only when a signal asks for it or the picker is selectable
+ * for only when a signal asks for it or the picker is selectable. A picker showing the icons (icons: true) draws the
+ * nodes without geometry (the lights, the cameras, the groups) as icons over the image (see NodeIcons), a click on an
+ * icon selecting its node before the instances behind it
  * */
 pub class ScenePicker over SceneOverlay {
 
@@ -30,6 +39,12 @@ pub class ScenePicker over SceneOverlay {
 
     // True iif a click selects the instance under the cursor in the selection of the scene
     let mut _selectable: bool = false;
+
+    // True iif the nodes without geometry are drawn as icons, picked before the instances
+    let mut _showsIcons: bool = false;
+
+    // The icons of the nodes without geometry, spawned under the root of the scene while they are shown
+    let dmut _icons: (&NodeIcons)? = none;
 
     /*!
      * ====================================================================================================
@@ -74,6 +89,68 @@ pub class ScenePicker over SceneOverlay {
         self._selectable
     }
 
+    /**
+     * @returns: true iif the nodes without geometry are drawn as icons, picked before the instances
+     * */
+    @field
+    pub fn showsIcons(self)-> bool {
+        self._showsIcons
+    }
+
+    /**
+     * Draw the nodes without geometry as icons over the image of the scene, picked before the instances, or hide them
+     * @info: the icons are a node spawned under the root of the scene (named __icons__) while they are shown, once the
+     * scene is created
+     * */
+    @field
+    pub fn showsIcons(mut self, shows: bool) {
+        self._showsIcons = shows;
+        if shows {
+            self:.spawnIcons();
+        } else if let Ok(dmut i) = alias self._icons {
+            i:.dispose();
+            self._icons = none;
+        }
+    }
+
+    /**
+     * @returns: the icons of the nodes without geometry, none while they are not shown or before the scene is created
+     * */
+    @field
+    pub fn icons(self)-> (&NodeIcons)? {
+        self._icons
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SCENE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The icons are spawned once the scene is created, when they are shown
+     * */
+    pub over onSceneCreated(mut self, dmut scene: &Scene) {
+        self.__super__:.onSceneCreated(alias scene);
+        if self._showsIcons {
+            self:.spawnIcons();
+        }
+    }
+
+    /**
+     * Spawn the icons under the root of the scene, once it is created, unless they are
+     * */
+    fn spawnIcons(mut self) {
+        if self._icons.hasValue { return; }
+
+        if let Ok(dmut scene) = alias self:.getScene() {
+            let dmut i = copy NodeIcons(ICONS_NODE, alias scene:.getRootNode());
+            self._icons = (alias i)?;
+        }
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -83,9 +160,19 @@ pub class ScenePicker over SceneOverlay {
      */
 
     /**
-     * The instance under the cursor is looked for only when the hovered signal was asked for
+     * The icon under the cursor is drawn in white; the instance under the cursor is looked for only when the hovered
+     * signal was asked for
      * */
     pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        if let Ok(dmut i) = alias self._icons {
+            let pixel = self.renderPixel(pos);
+            if let Ok(view) = self:.iconsView() && pixel.hasValue {
+                i:.hover(view, pixel ?? vec2());
+            } else {
+                i:.leave();
+            }
+        }
+
         if self._hovered.hasValue {
             let hit = self:.pickUnder(pos);
             self:.emitHovered(hit);
@@ -95,22 +182,28 @@ pub class ScenePicker over SceneOverlay {
     }
 
     pub over onLoseHoverFocus(mut self) {
+        if let Ok(dmut i) = alias self._icons {
+            i:.leave();
+        }
+
         self:.emitHovered(none);
         self.__super__:.onLoseHoverFocus();
     }
 
     /**
-     * A click of the left button picks the instance under the cursor, and selects it when the picker is selectable
+     * A click of the left button picks the icon or the instance under the cursor, and selects its node when the picker
+     * is selectable; an icon covers the instances behind it, picked emitting none
      * */
     pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
         if button == SDL_BUTTON_LEFT && (self._picked.hasValue || self._selectable) {
-            let dmut hit = self:.pickUnder(pos);
+            let dmut icon = self:.iconUnder(pos);
+            let dmut hit: (&VisualInstance3D)? = if icon.hasValue { none } else { alias self:.pickUnder(pos) };
             if let Ok(dmut s) = alias self._picked {
                 s:.emit(hit);
             }
 
             if self._selectable {
-                self:.selectUnder(alias hit);
+                self:.selectUnder(alias icon, alias hit);
             }
         }
 
@@ -118,17 +211,53 @@ pub class ScenePicker over SceneOverlay {
     }
 
     /**
-     * Select the instance under the cursor in the selection of the scene, or the model it is a mesh of (see
-     * selectedOnClick), as a click does with the modifiers held
      * @params:
+     *    - pos: the position of the cursor relative to the overlay, between 0 and 1
+     * @returns: the node whose icon is under the cursor, none when there is none or when the icons are not shown
+     * */
+    pub fn iconUnder(mut self, pos: vec2)-> dmut (&Node3D)? {
+        if let Ok(pixel) = self.renderPixel(pos) {
+            if let Ok(view) = self:.iconsView() {
+                if let Ok(dmut i) = alias self._icons {
+                    return alias i:.iconAt(view, pixel);
+                }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Select the node of the icon under the cursor in the selection of the scene, or else the instance under it or the
+     * model it is a mesh of (see selectedOnClick), as a click does with the modifiers held
+     * @params:
+     *    - icon: the node whose icon is under the cursor, none when the click is on none
      *    - hit: the instance under the cursor, none when the click is on none
      * */
-    fn selectUnder(mut self, dmut hit: (&VisualInstance3D)?) {
+    fn selectUnder(mut self, dmut icon: (&Node3D)?, dmut hit: (&VisualInstance3D)?) {
         if let Ok(dmut scene: &EditableScene) = alias self:.getScene() {
-            let dmut node: (&Node3D)? = if let Ok(dmut h) = alias hit { (alias selectedOnClick(alias h))? } else { none };
+            let dmut node: (&Node3D)? = if let Ok(dmut n) = alias icon {
+                (alias n)?
+            } else if let Ok(dmut h) = alias hit {
+                (alias selectedOnClick(alias h))?
+            } else {
+                none
+            };
+
             let dmut selection = alias scene.selection;
             selection:.click(alias node, SDL_GetModState());
         }
+    }
+
+    /**
+     * @returns: how the camera sees the scene into its image, for the icons, none without a scene or a camera
+     * */
+    fn iconsView(mut self)-> (GizmoView)? {
+        if let Ok(dmut scene) = alias self:.getScene() {
+            return viewOf(alias scene);
+        }
+
+        none
     }
 
     /**
@@ -192,13 +321,16 @@ pub mod ScenePicker {
 
     /**
      * @returns: the schema of the scene pickers, the overlay of a Scene3D, a left click selecting the instance under the
-     * cursor when selectable: true
+     * cursor when selectable: true, the nodes without geometry drawn as icons with icons: true
      * */
     pub fn schema()-> &WidgetSchema {
         copy WidgetSchema("ScenePicker",
                           |dmut m, id|-> dmut &Widget => copy ScenePicker(alias m, id),
                           attributes-> copy [copy Setter!{&ScenePicker, bool}("selectable", |dmut p, b| => {
                                                  p:.setSelectable(b);
+                                             }),
+                                             copy Setter!{&ScenePicker, bool}("icons", |dmut p, b| => {
+                                                 p.showsIcons = b;
                                              })])
     }
 }
