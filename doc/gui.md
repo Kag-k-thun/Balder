@@ -516,18 +516,22 @@ Scene3D #scene { resolution: 1280 720; editable: true;
 picker.showsIcons = false;                       // hides them all, true shows them again
 ```
 
-- **`icons: true` draws the nodes without geometry as icons**: the lights, the cameras and the groups, which have no
+- **`icons: true` draws the nodes without geometry as icons**: the lights, the cameras, the empties, the markers, the
+  paths and their points, and the volumes, which have no
   surface to click, get a glyph on a dark disc at their origin, at the same size on screen wherever they are, drawn
   over the image (never by the rendering of the scene). The picker spawns a `NodeIcons` under the root of the scene
   (named `__icons__`) while they are shown, and disposes it when they are hidden (`showsIcons`); a `SceneGizmo` takes
   the attribute too.
 - **The icon comes from the class of the node**: `Node3D.editorIcon ()` gives a `NodeIcon`, the shapes of a glyph in
-  the square from (-1, -1) to (1, 1), `none` for a node seen by its geometry. `Group3D`, `Light` (a sun, a bulb or a
-  lamp, by its type) and `Camera` override it, and so does any class of nodes without geometry that wants one
-  (`NodeIcon::sun ()`, `bulb ()`, `spot ()`, `camera ()`, `group ()`, or shapes of its own). The nodes of the tools
-  (named `__…__`, and those under them) and the camera the scene is seen through have none.
+  the square from (-1, -1) to (1, 1), `none` for a node seen by its geometry. `Empty3D`, `Light` (a sun, a bulb or a
+  lamp, by its type), `Camera`, `Marker3D` (a cross, a figure, a flag or a ring about a dot, by its purpose), `Path3D`,
+  `PathPoint3D` and `Volume3D` override it, and so does any class of nodes without geometry that wants one
+  (`NodeIcon::sun ()`, `bulb ()`, `spot ()`, `camera ()`, `empty ()`, `marker ()`, `spawnPoint ()`, `waypoint ()`,
+  `socket ()`, `path ()`, `pathPoint ()`, `volume ()`, or shapes of its own). `NodeIcon.size` scales the disc, the glyph
+  and the distance the icon is picked within: the points of a path, many and close, are 0.55 of the others. The nodes
+  of the tools (named `__…__`, and those under them) and the camera the scene is seen through have none.
 - **A click on an icon selects its node before the instances**: an icon covers what is behind it, so a left click within
-  14 texels of its centre selects its node as a click on an instance does (Ctrl toggling it), the icon closest to the eye
+  14 texels of its centre (times its size) selects its node as a click on an instance does (Ctrl toggling it), the icon closest to the eye
   winning, as it is drawn over the others; `picked` emits `none` then. The icon under the cursor is drawn in white, and
   the icons of the nodes selected in orange, ringed. A node selected by its icon is dragged by a gizmo as any other.
 - **A selected node shows its shape**: `Node3D.editorGuides (size)` gives lines in world space (`NodeGuide`), drawn
@@ -535,9 +539,13 @@ picker.showsIcons = false;                       // hides them all, true shows t
   screen), the three circles of the range of a point light, the cones of a spot light up to its range (its light, then
   its full light fainter), the frustum of a camera from its near plane to its far plane. A line crossing the near plane
   of the eye is cut there.
+- **A shape without geometry is drawn at all times**: `Node3D.editorWires ()` gives lines in world space drawn under
+  the guides whether the node is selected or not, light blue, orange once selected: the wireframe of a volume (the
+  edges of a box, three circles of a sphere, the circles, the sides and the caps of a capsule), the curve of a path
+  through its points with, for a Bézier one, the handles of its points fainter.
 - **The icons are drawn as the gizmo is**, by a `GizmoEffect` of their own (`icons`), placed before the gizmo in the
-  chain so the gizmo is drawn over them. It draws 256 shapes at most: past them the guides are left out first, then the
-  icons farthest from the eye.
+  chain so the gizmo is drawn over them. It draws 1024 shapes at most: past them the wires are left out first, then the
+  guides, then the icons farthest from the eye.
 
 ### Moving the selection with a gizmo
 
@@ -574,6 +582,14 @@ if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
   grab is given to every node selected, those under another node selected moving with it: the same translation in the
   world, the same rotation and the same factors of scale about the origin of each. Ctrl (or Command) snaps it to the
   steps of `gizmo.snap`, 0.5 world units along each axis, 15° and a tenth of the scale by default.
+- **A volume selected alone shows the squares of its faces** (`TransformGizmo.faceAt`, `GizmoHandle::FACE`), picked
+  before the handles of the gizmo, within 7 texels of their centre, the one closest to the eye winning. A face dragged
+  follows the ray through the cursor projected on its normal (snapped to the step of the translation): a face of a box
+  or an end of a capsule moves on its own, the centre of the volume moving half as far so the opposite face stays where
+  it is; a face of a sphere or a side of a capsule changes its radius about its centre (`VolumeShape::movedFace`, in the
+  space of the volume, its scale counted). The change is a `VolumeEdit` (the shape and the transform before and after),
+  kept in `gizmo.volumeEdit`, `reshaped` being emitted when the drag ends having changed the volume; Escape gives it
+  back its shape.
 - **The gizmo stands on the node selected last**, at the same size on the image wherever it is: an axis spans `size`
   texels of the render resolution (110 by default), from `Camera::screenSize`. An axis pointing at the eye and a plane
   seen edge on are hidden. In local space it follows the axes of the node; the scale of a `Node3D` acts along its own
@@ -589,7 +605,8 @@ if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
 - **The gizmo is drawn after the post-process chain**: a `GizmoEffect` (`gizmo`), added to the chain the first time a
   gizmo enters the scene and skipped while there is none (`PostChain.enable`), runs last in display space (`PostEffect::runsLast`), after the grading and the
   anti-aliasing, so its colours are its own and its lines stay sharp. Its compute pass copies the image and blends the
-  shapes of the gizmo over it (segments, triangles and rings in texels, `GizmoShape`, 256 at most, their edges smoothed),
+  shapes of the gizmo over it (segments, triangles and rings in texels, `GizmoShape`, 1024 at most, their edges smoothed,
+  48 bytes each in a uniform block of 49184 bytes, within the 64 KiB most devices allow),
   testing no depth; the texels outside the box the shapes cover are only copied. The gizmo writes its shapes in its
   parameters at each tick of the scene when they change, without recording the frames again.
 - **The shapes are measured on screen**: the image is scaled to the aspect of the scene on screen, so its texels are
