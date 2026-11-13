@@ -118,9 +118,22 @@ yet, so there is no contention: when the solver writes the transformation of eve
 results should be double-buffered rather than written under the lock body by body. The interpolation between two steps
 can then read the two buffers.
 
+## Steps
+
+The physics advances by steps of a fixed duration, `physics` steps a second (60 by default, `[timer]` of the
+configuration), whatever the duration of the ticks: a `FixedStep` adds the delta of each tick and runs the steps it
+covers, the time left over carried to the next tick. A tick runs `catchUp` steps at most (4 by default); the time beyond
+them is dropped, so a long stall slows the simulation down instead of piling up steps. `alpha`, the time left over over
+the duration of a step, places the display between the last two steps.
+
+A body turns by its angular velocity through `Quaternion::integrated`, and is placed by a `RigidTransform` (a rotation
+then a translation). A `Node3D` holds its rotation as a quaternion: the Euler angles it is given are kept for the editor
+and the scene files, and read from the quaternion once it is set as one (`orientation`).
+
 ## Not done yet
 
 - dynamic bodies, the narrowphase giving contact points and depths (GJK/EPA), the solver, and the transformations
   written back to the nodes;
 - the bodies in the scene files and in the editor (their panel, their wires);
 - the debug view of the colliders and a character controller.
+
