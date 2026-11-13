@@ -1,0 +1,212 @@
+in colliders;
+
+use balder::math::{bounds, matrix, utils, vector};
+use balder::scene::physics;
+use balder::scene::node::node3D::volume_shape;
+
+use std::math;
+
+/**
+ * @returns: true iif two numbers are equal, give or take the rounding errors
+ * */
+fn near(a: f32, b: f32, tolerance: f32 = 0.001f)-> bool {
+    math::abs(a - b) < tolerance
+}
+
+/**
+ * @returns: true iif two vectors are equal, give or take the rounding errors
+ * */
+fn near(a: vec3, b: vec3, tolerance: f32 = 0.001f)-> bool {
+    (a - b).length() < tolerance
+}
+
+/**
+ * @returns: the distance at which a ray hits a collider, -1 when it misses it
+ * */
+fn distanceOf(collider: Collider, ray: Ray)-> f32 {
+    if let Ok(hit) = collider.raycast(ray) { hit.distance } else { -1.0f }
+}
+
+/**
+ * @returns: a floor of two triangles, the square of side 2 centred on the origin in the plane y = 0
+ * */
+fn floorMesh()-> dmut &TriangleBvh {
+    let positions = copy [makeVec3(-1.0f, 0.0f, -1.0f), makeVec3(1.0f, 0.0f, -1.0f), makeVec3(1.0f, 0.0f, 1.0f),
+                          makeVec3(-1.0f, 0.0f, 1.0f)];
+    copy TriangleBvh(positions, copy [0u32, 1u32, 2u32, 0u32, 2u32, 3u32])
+}
+
+__test the_shapes_keep_their_sizes_above_the_smallest_and_a_capsule_as_high_as_wide {
+    let box = ColliderShape::box(makeVec3(-1.0f, 2.0f, 0.0f));
+    assert (box.kind == ColliderKind::BOX && near(box.size, makeVec3(MIN_VOLUME_SIZE, 2.0f, MIN_VOLUME_SIZE)));
+
+    assert (near(ColliderShape::sphere(0.0f).radius, MIN_VOLUME_SIZE));
+
+    let capsule = ColliderShape::capsule(1.5f, 2.0f);
+    assert (near(capsule.radius, 1.5f) && near(capsule.height, 3.0f));
+}
+
+__test the_shape_of_a_volume_is_a_collider_of_its_kind_and_sizes {
+    let volume = VolumeShape(VolumeKind::CAPSULE, makeVec3(1.0f, 2.0f, 3.0f), 0.5f, 3.0f);
+    let shape = ColliderShape(volume);
+    assert (shape.kind == ColliderKind::CAPSULE && near(shape.radius, 0.5f) && near(shape.height, 3.0f));
+    assert (ColliderShape(volume.withKind(VolumeKind::SPHERE)).kind == ColliderKind::SPHERE);
+
+    let box = ColliderShape(volume.withKind(VolumeKind::BOX));
+    assert (box.kind == ColliderKind::BOX && near(box.size, makeVec3(1.0f, 2.0f, 3.0f)));
+    assert (ColliderShape().kind == ColliderKind::BOX && near(ColliderShape().size, makeVec3(1.0f, 1.0f, 1.0f)));
+}
+
+__test the_local_box_of_a_shape_encloses_it_around_the_origin {
+    let capsule = ColliderShape::capsule(0.5f, 3.0f).localBox();
+    assert (near(capsule.min, makeVec3(-0.5f, -1.5f, -0.5f)) && near(capsule.max, makeVec3(0.5f, 1.5f, 0.5f)));
+
+    let mesh = ColliderShape::mesh(floorMesh()).localBox();
+    assert (near(mesh.min, makeVec3(-1.0f, 0.0f, -1.0f)) && near(mesh.max, makeVec3(1.0f, 0.0f, 1.0f)));
+}
+
+__test the_box_of_a_collider_encloses_its_shape_in_the_world {
+    let moved = translation(makeVec3(10.0f, 0.0f, 0.0f));
+    let sphere = Collider(ColliderShape::sphere(1.0f), moved * scaling(makeVec3(1.0f, 3.0f, 1.0f)));
+
+    // a sphere keeps its roundness, scaled by the largest scale
+    assert (near(sphere.bounds.min, makeVec3(7.0f, -3.0f, -3.0f)) && near(sphere.bounds.max, makeVec3(13.0f, 3.0f, 3.0f)));
+
+    let turned = Collider(ColliderShape::box(makeVec3(2.0f, 2.0f, 2.0f)), rotationY(cast!f32(math::PI) / 4.0f));
+    assert (near(turned.bounds.max, makeVec3(math::sqrt(2.0f), 1.0f, math::sqrt(2.0f))));
+}
+
+__test a_ray_hits_a_sphere_on_its_surface_facing_the_ray {
+    let sphere = Collider(ColliderShape::sphere(2.0f), translation(makeVec3(0.0f, 0.0f, -10.0f)));
+    if let Ok(hit) = sphere.raycast(Ray(vec3(), makeVec3(0.0f, 0.0f, -1.0f))) {
+        assert (near(hit.distance, 8.0f) && near(hit.point, makeVec3(0.0f, 0.0f, -8.0f)));
+        assert (near(hit.normal, makeVec3(0.0f, 0.0f, 1.0f)));
+    } else {
+        assert (false);
+    }
+
+    assert (distanceOf(sphere, Ray(makeVec3(0.0f, 2.5f, 0.0f), makeVec3(0.0f, 0.0f, -1.0f))) < 0.0f);
+    assert (distanceOf(sphere, Ray(vec3(), makeVec3(0.0f, 0.0f, 1.0f))) < 0.0f);
+    assert (distanceOf(sphere, Ray(vec3(), makeVec3(0.0f, 0.0f, -1.0f), length-> 7.0f)) < 0.0f);
+}
+
+__test a_ray_hits_a_turned_and_scaled_box_on_the_face_it_enters {
+    // a box of side 2 turned by 45° about Y, then stretched twice along its X axis
+    let m = translation(makeVec3(0.0f, 0.0f, -10.0f)) * rotationY(cast!f32(math::PI) / 4.0f) * scaling(makeVec3(2.0f, 1.0f, 1.0f));
+    let box = Collider(ColliderShape::box(makeVec3(2.0f, 2.0f, 2.0f)), m);
+
+    let down = makeVec3(0.0f, -1.0f, 0.0f);
+    if let Ok(hit) = box.raycast(Ray(makeVec3(0.5f, 10.0f, -10.0f), down)) {
+        assert (near(hit.distance, 9.0f) && near(hit.normal, makeVec3(0.0f, 1.0f, 0.0f)));
+    } else {
+        assert (false);
+    }
+
+    // along the X axis of the world, the ray enters a corner region of the turned box: its normal is that of the face
+    // entered, turned, and the point hit is on that face
+    let ray = Ray(makeVec3(-20.0f, 0.0f, -10.0f), makeVec3(1.0f, 0.0f, 0.0f));
+    if let Ok(hit) = box.raycast(ray) {
+        let local = (m.inversed() * makeVec4(hit.point, 1.0f)).xyz;
+        assert (near(math::abs(local.x), 1.0f) || near(math::abs(local.z), 1.0f));
+        assert (near(hit.normal.length(), 1.0f) && hit.normal.dot(ray.direction) < 0.0f);
+        assert (near(hit.point, ray.at(hit.distance)));
+    } else {
+        assert (false);
+    }
+
+    assert (distanceOf(box, Ray(makeVec3(5.0f, 10.0f, -10.0f), down)) < 0.0f);
+}
+
+__test a_ray_starting_inside_a_volume_hits_it_at_its_origin {
+    let forward = makeVec3(0.0f, 0.0f, -1.0f);
+    for shape in [ColliderShape::box(makeVec3(2.0f, 2.0f, 2.0f)), ColliderShape::sphere(1.0f), ColliderShape::capsule(1.0f, 4.0f)] {
+        if let Ok(hit) = Collider(shape, mat4()).raycast(Ray(makeVec3(0.0f, 0.2f, 0.0f), forward)) {
+            assert (hit.distance == 0.0f && near(hit.normal, -forward));
+        } else {
+            assert (false);
+        }
+    }
+}
+
+__test a_ray_hits_a_capsule_on_its_side_or_on_its_caps {
+    let capsule = Collider(ColliderShape::capsule(1.0f, 4.0f), translation(makeVec3(0.0f, 0.0f, -10.0f)));
+
+    // the side, the cylinder between y = -1 and y = 1
+    if let Ok(hit) = capsule.raycast(Ray(makeVec3(0.0f, 0.5f, 0.0f), makeVec3(0.0f, 0.0f, -1.0f))) {
+        assert (near(hit.distance, 9.0f) && near(hit.normal, makeVec3(0.0f, 0.0f, 1.0f)));
+    } else {
+        assert (false);
+    }
+
+    // the top cap, from above
+    if let Ok(hit) = capsule.raycast(Ray(makeVec3(0.0f, 10.0f, -10.0f), makeVec3(0.0f, -1.0f, 0.0f))) {
+        assert (near(hit.distance, 8.0f) && near(hit.normal, makeVec3(0.0f, 1.0f, 0.0f)));
+    } else {
+        assert (false);
+    }
+
+    // the bottom cap, off its axis
+    if let Ok(hit) = capsule.raycast(Ray(makeVec3(0.6f, -10.0f, -10.0f), makeVec3(0.0f, 1.0f, 0.0f))) {
+        assert (near(hit.point.y, -1.0f - math::sqrt(1.0f - 0.36f)));
+    } else {
+        assert (false);
+    }
+
+    assert (distanceOf(capsule, Ray(makeVec3(1.5f, 10.0f, -10.0f), makeVec3(0.0f, -1.0f, 0.0f))) < 0.0f);
+}
+
+__test a_ray_hits_a_mesh_by_either_face_of_its_triangles {
+    let floor = Collider(ColliderShape::mesh(floorMesh()), translation(makeVec3(0.0f, -2.0f, 0.0f)) * scaling(makeVec3(5.0f, 1.0f, 5.0f)));
+
+    if let Ok(hit) = floor.raycast(Ray(makeVec3(3.0f, 0.0f, 3.0f), makeVec3(0.0f, -1.0f, 0.0f))) {
+        assert (near(hit.distance, 2.0f) && near(hit.normal, makeVec3(0.0f, 1.0f, 0.0f)));
+    } else {
+        assert (false);
+    }
+
+    if let Ok(hit) = floor.raycast(Ray(makeVec3(-3.0f, -5.0f, 0.0f), makeVec3(0.0f, 1.0f, 0.0f))) {
+        assert (near(hit.distance, 3.0f) && near(hit.normal, makeVec3(0.0f, -1.0f, 0.0f)));
+    } else {
+        assert (false);
+    }
+
+    // past the scaled floor, and along it
+    assert (distanceOf(floor, Ray(makeVec3(6.0f, 0.0f, 0.0f), makeVec3(0.0f, -1.0f, 0.0f))) < 0.0f);
+    assert (distanceOf(floor, Ray(makeVec3(-10.0f, -2.0f, 0.0f), makeVec3(1.0f, 0.0f, 0.0f))) < 0.0f);
+}
+
+__test a_convex_shape_overlaps_a_collider_crossing_it_a_mesh_by_crossing_a_triangle {
+    let box = Collider(ColliderShape::box(makeVec3(2.0f, 2.0f, 2.0f)), mat4());
+    assert (box.overlaps(Convex::sphere(makeVec3(1.5f, 0.0f, 0.0f), 1.0f)));
+    assert (!box.overlaps(Convex::sphere(makeVec3(2.5f, 0.0f, 0.0f), 1.0f)));
+
+    let floor = Collider(ColliderShape::mesh(floorMesh()), mat4());
+    assert (floor.overlaps(Convex::sphere(makeVec3(0.5f, 0.5f, 0.0f), 1.0f)));
+    assert (!floor.overlaps(Convex::sphere(makeVec3(0.5f, 1.5f, 0.0f), 1.0f)));
+
+    // a mesh is only a surface: a shape under it, crossing no triangle, does not overlap it
+    assert (!floor.overlaps(Convex::sphere(makeVec3(0.0f, -2.0f, 0.0f), 1.0f)));
+}
+
+__test two_colliders_touch_when_they_share_a_point_two_meshes_never {
+    let box = Collider(ColliderShape::box(makeVec3(2.0f, 2.0f, 2.0f)), mat4());
+    let floor = Collider(ColliderShape::mesh(floorMesh()), translation(makeVec3(0.0f, -1.5f, 0.0f)));
+    let ball = Collider(ColliderShape::sphere(1.0f), translation(makeVec3(0.0f, 1.5f, 0.0f)));
+
+    assert (box.touches(ball) && ball.touches(box));
+    assert (!floor.touches(ball));
+    assert (!box.touches(floor) && !floor.touches(box));
+    assert (Collider(ColliderShape::box(makeVec3(2.0f, 4.0f, 2.0f)), mat4()).touches(floor));
+    assert (!floor.touches(Collider(ColliderShape::mesh(floorMesh()), translation(makeVec3(0.0f, -1.5f, 0.0f)))));
+}
+
+__test a_shape_swept_onto_a_mesh_stops_on_the_triangle_it_meets_first {
+    let floor = Collider(ColliderShape::mesh(floorMesh()), scaling(makeVec3(5.0f, 1.0f, 5.0f)));
+    if let Ok(hit) = floor.sweep(Convex::sphere(makeVec3(1.0f, 5.0f, 1.0f), 1.0f), makeVec3(0.0f, -1.0f, 0.0f), 10.0f) {
+        assert (near(hit.distance, 4.0f) && near(hit.normal, makeVec3(0.0f, 1.0f, 0.0f)));
+    } else {
+        assert (false);
+    }
+
+    assert (!floor.sweep(Convex::sphere(makeVec3(8.0f, 5.0f, 0.0f), 1.0f), makeVec3(0.0f, -1.0f, 0.0f), 10.0f).hasValue);
+}

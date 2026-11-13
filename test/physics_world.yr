@@ -1,0 +1,239 @@
+in physics_world;
+
+use balder::math::{bounds, matrix, quaternion, utils, vector};
+use balder::scene::physics;
+
+use std::math;
+use std::algorithm::sorting;
+
+/**
+ * @returns: true iif two numbers are equal, give or take the rounding errors
+ * */
+fn near(a: f32, b: f32, tolerance: f32 = 0.001f)-> bool {
+    math::abs(a - b) < tolerance
+}
+
+/**
+ * @returns: the handles, sorted
+ * */
+fn sorted(handles: [u32])-> [u32] {
+    let dmut res = copy handles;
+    (alias res).sort()
+}
+
+/**
+ * @returns: the bodies a ray hits first, -1 when it hits none
+ * */
+fn firstHit(world: &PhysicsWorld, ray: Ray, filter: QueryFilter = QueryFilter())-> i64 {
+    if let Ok(hit) = world.raycast(ray, filter-> filter) { cast!i64(hit.body) } else { -1i64 }
+}
+
+/**
+ * @returns: the contacts of an update, as (a, b, phase), in their order
+ * */
+fn contactsOf(events: [ContactEvent])-> [(u32, u32, u32)] {
+    let mut res: [(u32, u32, u32)] = [];
+    for e in events {
+        let phase: u32 = e.phase;
+        res ~= [(e.a, e.b, phase)];
+    }
+
+    res
+}
+
+/**
+ * @returns: the settings of a kinematic body
+ * */
+fn kinematic(layer: u32 = DEFAULT_LAYER, mask: u32 = ALL_LAYERS)-> BodySettings {
+    BodySettings(motion-> BodyMotion::KINEMATIC, layer-> layer, mask-> mask)
+}
+
+/**
+ * @returns: a box of side 2
+ * */
+fn cube()-> ColliderShape {
+    ColliderShape::box(makeVec3(2.0f, 2.0f, 2.0f))
+}
+
+__test the_handles_of_the_bodies_removed_are_given_to_the_next_ones {
+    let dmut world = copy PhysicsWorld();
+    let a = world:.add(cube(), mat4());
+    let b = world:.add(cube(), translation(makeVec3(5.0f, 0.0f, 0.0f)));
+    assert (a != b && world.len == 2us && world.contains(a) && world.contains(b));
+
+    world:.remove(a);
+    assert (world.len == 1us && !world.contains(a));
+    assert (world:.remove(a).len == 0us);
+
+    let c = world:.add(ColliderShape::sphere(1.0f), mat4());
+    assert (c == a && world.len == 2us && world.getCollider(c).shape.kind == ColliderKind::SPHERE);
+    assert (!world.contains(42u32));
+}
+
+__test a_ray_hits_the_closest_body_and_follows_the_bodies_moved_and_removed {
+    let dmut world = copy PhysicsWorld();
+    let near5 = world:.add(cube(), translation(makeVec3(0.0f, 0.0f, -5.0f)));
+    let far10 = world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(0.0f, 0.0f, -10.0f)));
+    world:.add(cube(), translation(makeVec3(5.0f, 0.0f, -2.0f)));
+
+    let ray = Ray(vec3(), makeVec3(0.0f, 0.0f, -1.0f));
+    if let Ok(hit) = world.raycast(ray) {
+        assert (hit.body == near5 && near(hit.distance, 4.0f) && near(hit.normal.z, 1.0f));
+    } else {
+        assert (false);
+    }
+
+    world:.setTransform(near5, translation(makeVec3(0.0f, 5.0f, -5.0f)));
+    assert (firstHit(world, ray) == cast!i64(far10));
+
+    world:.remove(far10);
+    assert (firstHit(world, ray) == -1i64);
+}
+
+__test a_query_hits_the_bodies_its_filter_keeps {
+    let dmut world = copy PhysicsWorld();
+    let wall = world:.add(cube(), translation(makeVec3(0.0f, 0.0f, -5.0f)), settings-> BodySettings(layer-> 2u32));
+    let trigger = world:.add(cube(), translation(makeVec3(0.0f, 0.0f, -2.5f)), settings-> BodySettings(trigger-> true));
+    let ground = world:.add(cube(), translation(makeVec3(0.0f, 0.0f, -10.0f)));
+
+    let ray = Ray(makeVec3(0.0f, 0.0f, 1.0f), makeVec3(0.0f, 0.0f, -1.0f));
+
+    // the triggers are skipped unless asked for
+    assert (firstHit(world, ray) == cast!i64(wall));
+    assert (firstHit(world, ray, filter-> QueryFilter(triggers-> true)) == cast!i64(trigger));
+
+    // the layers of the mask, the bodies excluded
+    assert (firstHit(world, ray, filter-> QueryFilter(mask-> 1u32)) == cast!i64(ground));
+    assert (firstHit(world, ray, filter-> QueryFilter(exclude-> copy [wall])) == cast!i64(ground));
+    assert (firstHit(world, ray, filter-> QueryFilter(mask-> 4u32)) == -1i64);
+}
+
+__test every_body_on_a_ray_is_hit_the_closest_first {
+    let dmut world = copy PhysicsWorld();
+    let c = world:.add(cube(), translation(makeVec3(0.0f, 0.0f, -15.0f)));
+    let a = world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(0.0f, 0.0f, -5.0f)));
+    let b = world:.add(ColliderShape::capsule(0.5f, 2.0f), translation(makeVec3(0.0f, 0.0f, -10.0f)));
+    world:.add(cube(), translation(makeVec3(0.0f, 4.0f, -10.0f)));
+
+    let hits = world.raycastAll(Ray(vec3(), makeVec3(0.0f, 0.0f, -1.0f)));
+    assert (hits.len == 3us);
+    assert (hits[0].body == a && hits[1].body == b && hits[2].body == c);
+    assert (near(hits[0].distance, 4.0f) && near(hits[1].distance, 9.5f) && near(hits[2].distance, 14.0f));
+}
+
+__test a_sphere_cast_stops_against_the_first_body_on_its_way {
+    let dmut world = copy PhysicsWorld();
+    world:.add(cube(), translation(makeVec3(0.0f, 0.0f, -10.0f)));
+    let post = world:.add(cube(), translation(makeVec3(1.5f, 0.0f, -5.0f)));
+
+    // a ray along the axis passes by the post, a sphere of radius 1 hits it
+    assert (firstHit(world, Ray(vec3(), makeVec3(0.0f, 0.0f, -1.0f))) != cast!i64(post));
+    if let Ok(hit) = world.sphereCast(vec3(), 1.0f, makeVec3(0.0f, 0.0f, -2.0f), 20.0f) {
+        assert (hit.body == post);
+        assert (hit.distance > 3.0f && hit.distance < 4.0f);
+    } else {
+        assert (false);
+    }
+
+    assert (!world.sphereCast(vec3(), 1.0f, makeVec3(0.0f, 0.0f, -1.0f), 2.0f).hasValue);
+    assert (!world.sphereCast(vec3(), 1.0f, vec3(), 20.0f).hasValue);
+}
+
+__test a_box_cast_stops_where_its_face_meets_the_body {
+    let dmut world = copy PhysicsWorld();
+    let ground = world:.add(ColliderShape::box(makeVec3(20.0f, 1.0f, 20.0f)), translation(makeVec3(0.0f, -0.5f, 0.0f)));
+
+    let dropped = ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f));
+    if let Ok(hit) = world.shapeCast(dropped, translation(makeVec3(0.0f, 5.0f, 0.0f)), makeVec3(0.0f, -1.0f, 0.0f), 10.0f) {
+        assert (hit.body == ground && near(hit.distance, 4.5f) && near(hit.normal.y, 1.0f));
+    } else {
+        assert (false);
+    }
+
+    assert (!world.shapeCast(ColliderShape::mesh(copy TriangleBvh(copy [vec3()], copy [0u32])), mat4(),
+                             makeVec3(0.0f, -1.0f, 0.0f), 10.0f).hasValue);
+}
+
+__test the_bodies_overlapping_a_sphere_or_a_box_are_found {
+    let dmut world = copy PhysicsWorld();
+    let a = world:.add(cube(), mat4());
+    let b = world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(3.0f, 0.0f, 0.0f)));
+    let c = world:.add(cube(), translation(makeVec3(0.0f, 0.0f, 6.0f)), settings-> BodySettings(trigger-> true));
+
+    assert (sorted(world.overlapSphere(makeVec3(1.5f, 0.0f, 0.0f), 1.0f)) == [a, b]);
+    assert (world.overlapSphere(makeVec3(0.0f, 0.0f, 3.5f), 1.0f).len == 0us);
+    assert (world.overlapSphere(makeVec3(0.0f, 0.0f, 4.5f), 1.0f, filter-> QueryFilter(triggers-> true)) == [c]);
+
+    // a long box along Z reaches the trigger when turned onto the Z axis only
+    let long = makeVec3(12.0f, 1.0f, 1.0f);
+    let quarter = Quaternion::fromAxisAngle(cast!f32(math::PI) / 2.0f, makeVec3(0.0f, 1.0f, 0.0f));
+    let all = QueryFilter(triggers-> true);
+    assert (sorted(world.overlapBox(vec3(), long, filter-> all)) == [a, b]);
+    assert (sorted(world.overlapBox(vec3(), long, rotation-> quarter, filter-> all)) == [a, c]);
+
+    assert (sorted(world.overlapShape(ColliderShape::capsule(0.5f, 10.0f), mat4(), filter-> all)) == [a]);
+}
+
+__test the_contacts_begin_stay_and_end_as_a_kinematic_body_moves {
+    let dmut world = copy PhysicsWorld();
+    let wall = world:.add(cube(), mat4());
+    let mover = world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(5.0f, 0.0f, 0.0f)), settings-> kinematic());
+
+    assert (world:.updateContacts().len == 0us);
+
+    world:.setTransform(mover, translation(makeVec3(1.5f, 0.0f, 0.0f)));
+    assert (contactsOf(world:.updateContacts()) == [(wall, mover, 0u32)]);
+    assert (world.contactsOf(wall) == [mover] && world.contactsOf(mover) == [wall]);
+
+    assert (contactsOf(world:.updateContacts()) == [(wall, mover, 1u32)]);
+
+    world:.setTransform(mover, translation(makeVec3(5.0f, 0.0f, 0.0f)));
+    assert (contactsOf(world:.updateContacts()) == [(wall, mover, 2u32)]);
+    assert (world:.updateContacts().len == 0us && world.contactsOf(wall).len == 0us);
+}
+
+__test two_static_bodies_never_touch_but_a_trigger_reports_what_it_overlaps {
+    let dmut world = copy PhysicsWorld();
+    let a = world:.add(cube(), mat4());
+    world:.add(cube(), translation(makeVec3(1.0f, 0.0f, 0.0f)));
+    assert (world:.updateContacts().len == 0us);
+
+    let zone = world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(-1.5f, 0.0f, 0.0f)), settings-> BodySettings(trigger-> true));
+    assert (contactsOf(world:.updateContacts()) == [(a, zone, 0u32)]);
+}
+
+__test two_kinematic_bodies_touch_once_when_one_sees_the_other_through_its_mask {
+    let dmut world = copy PhysicsWorld();
+    let a = world:.add(cube(), mat4(), settings-> kinematic(layer-> 1u32, mask-> 0u32));
+    let b = world:.add(cube(), translation(makeVec3(1.0f, 0.0f, 0.0f)), settings-> kinematic(layer-> 2u32, mask-> 0u32));
+
+    // neither sees the other
+    assert (world:.updateContacts().len == 0us);
+
+    world:.setSettings(b, kinematic(layer-> 2u32, mask-> 1u32));
+    assert (contactsOf(world:.updateContacts()) == [(a, b, 0u32)]);
+}
+
+__test a_body_removed_ends_its_contacts_at_once {
+    let dmut world = copy PhysicsWorld();
+    let wall = world:.add(cube(), mat4());
+    let mover = world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(1.5f, 0.0f, 0.0f)), settings-> kinematic());
+    world:.updateContacts();
+
+    assert (contactsOf(world:.remove(mover)) == [(wall, mover, 2u32)]);
+
+    // the handle given to another body touching nothing reports no contact ended
+    world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(10.0f, 0.0f, 0.0f)), settings-> kinematic());
+    assert (world:.updateContacts().len == 0us);
+}
+
+__test a_body_reshaped_touches_what_its_new_shape_reaches {
+    let dmut world = copy PhysicsWorld();
+    let wall = world:.add(cube(), mat4());
+    let mover = world:.add(ColliderShape::sphere(1.0f), translation(makeVec3(4.0f, 0.0f, 0.0f)), settings-> kinematic());
+    assert (world:.updateContacts().len == 0us);
+
+    world:.setShape(mover, ColliderShape::sphere(3.5f));
+    assert (contactsOf(world:.updateContacts()) == [(wall, mover, 0u32)]);
+    assert (firstHit(world, Ray(makeVec3(4.0f, 10.0f, 0.0f), makeVec3(0.0f, -1.0f, 0.0f))) == cast!i64(mover));
+}
