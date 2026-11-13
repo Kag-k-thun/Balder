@@ -1,0 +1,310 @@
+in gjk;
+
+use balder::math::vector;
+
+/**
+ * The number of points the search of the closest points adds to its simplex at most
+ * */
+def MAX_ITERATIONS = 32us;
+
+/**
+ * The number of advances of a shape cast at most, a shape grazing another one advancing by smaller and smaller steps
+ * */
+def MAX_CAST_STEPS = 32us;
+
+/**
+ * The progress toward the origin, relative to its squared distance, under which the search of the closest points stops
+ * */
+def RELATIVE_PROGRESS = 1.0e-5f;
+
+/**
+ * The squared distance under which two cores touch
+ * */
+def TOUCHING = 1.0e-10f;
+
+/**
+ * The squared sine of an angle under which a triangle or a tetrahedron of the simplex is flat
+ * */
+def FLAT = 1.0e-12f;
+
+/**
+ * The distance under which a shape cast stops, touching what it hits
+ * */
+def CAST_TOLERANCE = 1.0e-4f;
+
+/**
+ * A point of the Minkowski difference of two cores, and the points of the cores giving it
+ * */
+@data
+record Vertex {
+
+    // The point of the difference, a - b
+    pub let mut w: vec3 = vec3();
+
+    // The point of the first core
+    pub let mut a: vec3 = vec3();
+
+    // The point of the second core
+    pub let mut b: vec3 = vec3();
+
+}
+
+/**
+ * The point of a simplex closest to the origin, as weights of the vertices of the smallest face holding it
+ * */
+@data
+record Closest {
+
+    // The vertices of the face holding the point
+    pub let mut vertices: [Vertex] = [];
+
+    // The weights of the vertices, summing to 1
+    pub let mut weights: [f32] = [];
+
+    // True when the simplex, a tetrahedron, holds the origin
+    pub let mut inside: bool = false;
+
+}
+
+/**
+ * Find the points of two convex shapes closest to each other, by the search of Gilbert, Johnson and Keerthi: the point
+ * of their Minkowski difference closest to the origin is approached by simplices of the difference, each one replacing
+ * the farthest vertex by the point of the difference the farthest toward the origin
+ * @info: the search runs on the cores of the shapes, their margins being taken off the distance found, so a sphere or
+ * a capsule is exact
+ * @returns: the separation of the shapes, overlapping when their cores are closer than their margins
+ * */
+pub fn separation(a: Convex, b: Convex)-> Separation {
+    let mut start = a.centre - b.centre;
+    if start.dot(start) <= TOUCHING { start = makeVec3(1.0f, 0.0f, 0.0f); }
+
+    let mut simplex: [Vertex] = copy [vertexAlong(a, b, start)];
+    let mut weights: [f32] = copy [1.0f];
+    let mut closest = simplex[0].w;
+    for _ in 0us .. MAX_ITERATIONS {
+        let squared = closest.dot(closest);
+        if squared <= TOUCHING { return Separation(overlapping-> true); }
+
+        let next = vertexAlong(a, b, -closest);
+        if squared - closest.dot(next.w) <= RELATIVE_PROGRESS * squared { break; }
+
+        let reduced = closestToOrigin(simplex ~ [next]);
+        if reduced.inside { return Separation(overlapping-> true); }
+
+        // the rounding errors may stop the progress near the closest point, the last simplex being kept
+        let point = pointOf(reduced);
+        if point.dot(point) >= squared { break; }
+
+        simplex = reduced.vertices;
+        weights = reduced.weights;
+        closest = point;
+    }
+
+    let mut onA = vec3();
+    let mut onB = vec3();
+    for i in 0us .. simplex.len {
+        onA = onA + simplex[i].a * weights[i];
+        onB = onB + simplex[i].b * weights[i];
+    }
+
+    let distance = closest.length();
+    let margins = a.margin + b.margin;
+    if distance <= margins { return Separation(overlapping-> true); }
+
+    let normal = (onB - onA) / distance;
+    Separation(distance-> distance - margins, pointA-> onA + normal * a.margin, pointB-> onB - normal * b.margin,
+               normal-> normal)
+}
+
+/**
+ * Move a convex shape along a direction until it touches another one, by conservative advancement: the distance between
+ * two convex shapes, one moving in a straight line, is a convex function of the distance travelled, so the shape can
+ * advance by the distance between them divided by the speed at which they get closer without passing through; each
+ * advance stops half of CAST_TOLERANCE short, so that a face met flat is not reached exactly, the shapes touching there
+ * without telling where
+ * @params:
+ *    - moving: the shape moved
+ *    - direction: the unit direction it moves along
+ *    - length: the distance it travels at most
+ *    - target: the shape it may hit
+ * @returns: the hit, the moving shape stopping within CAST_TOLERANCE of the target; at a distance 0 when it starts
+ * touching it; none when it never touches it, gets away from it, or travels its length first
+ * */
+pub fn sweep(moving: Convex, direction: vec3, length: f32, target: Convex)-> (SurfaceHit)? {
+    let mut travelled = 0.0f;
+    let mut last: (Separation)? = none;
+    for _ in 0us .. MAX_CAST_STEPS {
+        let s = separation(moving.translated(direction * travelled), target);
+        if s.overlapping {
+            // reached by the rounding errors only, the previous separation telling where the shapes meet
+            if let Ok(previous) = last {
+                return SurfaceHit(distance-> travelled, point-> previous.pointB, normal-> -previous.normal)?;
+            }
+
+            return SurfaceHit(distance-> travelled, point-> moving.centre, normal-> -direction)?;
+        }
+
+        if s.distance <= CAST_TOLERANCE {
+            return SurfaceHit(distance-> travelled, point-> s.pointB, normal-> -s.normal)?;
+        }
+
+        let closing = direction.dot(s.normal);
+        if closing <= 1.0e-6f { return none; }
+
+        travelled += (s.distance - CAST_TOLERANCE / 2.0f) / closing;
+        if travelled > length { return none; }
+        last = s?;
+    }
+
+    none
+}
+
+/**
+ * @returns: the vertex of the Minkowski difference of two cores the farthest along a direction
+ * */
+fn vertexAlong(a: Convex, b: Convex, d: vec3)-> Vertex {
+    let onA = a.support(d);
+    let onB = b.support(-d);
+    Vertex(w-> onA - onB, a-> onA, b-> onB)
+}
+
+/**
+ * @returns: the point a reduced simplex gives
+ * */
+fn pointOf(closest: Closest)-> vec3 {
+    let mut point = vec3();
+    for i in 0us .. closest.vertices.len {
+        point = point + closest.vertices[i].w * closest.weights[i];
+    }
+
+    point
+}
+
+/**
+ * @returns: the point of a simplex of one to four vertices closest to the origin
+ * */
+fn closestToOrigin(simplex: [Vertex])-> Closest {
+    match simplex.len {
+        1us => { single(simplex[0]) }
+        2us => { closestOnSegment(simplex[0], simplex[1]) }
+        3us => { closestOnTriangle(simplex[0], simplex[1], simplex[2]) }
+        _   => { closestInTetrahedron(simplex[0], simplex[1], simplex[2], simplex[3]) }
+    }
+}
+
+/**
+ * @returns: a vertex alone
+ * */
+fn single(p: Vertex)-> Closest {
+    Closest(vertices-> copy [p], weights-> copy [1.0f])
+}
+
+/**
+ * @returns: the point of a segment closest to the origin
+ * */
+fn closestOnSegment(p: Vertex, q: Vertex)-> Closest {
+    let pq = q.w - p.w;
+    let squared = pq.dot(pq);
+    if squared <= TOUCHING { return single(p); }
+
+    let t = (-p.w).dot(pq) / squared;
+    if t <= 0.0f { return single(p); }
+    if t >= 1.0f { return single(q); }
+
+    Closest(vertices-> copy [p, q], weights-> copy [1.0f - t, t])
+}
+
+/**
+ * @info: the regions of Voronoi of the corners, the edges and the face of the triangle (Ericson, Real-Time Collision
+ * Detection, 5.1.5), a flat triangle giving the closest point of its edges
+ * @returns: the point of a triangle closest to the origin
+ * */
+fn closestOnTriangle(a: Vertex, b: Vertex, c: Vertex)-> Closest {
+    let ab = b.w - a.w, ac = c.w - a.w;
+
+    let d1 = ab.dot(-a.w), d2 = ac.dot(-a.w);
+    if d1 <= 0.0f && d2 <= 0.0f { return single(a); }
+
+    let d3 = ab.dot(-b.w), d4 = ac.dot(-b.w);
+    if d3 >= 0.0f && d4 <= d3 { return single(b); }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f {
+        let t = d1 / (d1 - d3);
+        return Closest(vertices-> copy [a, b], weights-> copy [1.0f - t, t]);
+    }
+
+    let d5 = ab.dot(-c.w), d6 = ac.dot(-c.w);
+    if d6 >= 0.0f && d5 <= d6 { return single(c); }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f {
+        let t = d2 / (d2 - d6);
+        return Closest(vertices-> copy [a, c], weights-> copy [1.0f - t, t]);
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f {
+        let t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return Closest(vertices-> copy [b, c], weights-> copy [1.0f - t, t]);
+    }
+
+    // va + vb + vc is the squared area of the parallelogram of the edges, nothing for a flat triangle
+    let sum = va + vb + vc;
+    if sum <= FLAT * ab.dot(ab) * ac.dot(ac) {
+        return nearest(nearest(closestOnSegment(a, b), closestOnSegment(a, c)), closestOnSegment(b, c));
+    }
+
+    let v = vb / sum, w = vc / sum;
+    Closest(vertices-> copy [a, b, c], weights-> copy [1.0f - v - w, v, w])
+}
+
+/**
+ * @info: the faces of the tetrahedron whose plane separates the origin from the tetrahedron (Ericson, 5.1.6)
+ * @returns: the point of a tetrahedron closest to the origin, inside when the origin is in it
+ * */
+fn closestInTetrahedron(a: Vertex, b: Vertex, c: Vertex, d: Vertex)-> Closest {
+    let mut best = Closest(inside-> true);
+    let mut distance = f32::max;
+    closerFace(a, b, c, d, ref best, ref distance);
+    closerFace(a, c, d, b, ref best, ref distance);
+    closerFace(a, d, b, c, ref best, ref distance);
+    closerFace(b, d, c, a, ref best, ref distance);
+
+    best
+}
+
+/**
+ * Keep the point of a face of a tetrahedron closest to the origin, if the origin is on the other side of the face than
+ * the tetrahedron and the point is closer than the best one
+ * @params:
+ *    - p, q, r: the corners of the face
+ *    - opposite: the corner of the tetrahedron off the face
+ *    - best: the closest point so far
+ *    - distance: the squared distance of the closest point so far
+ * */
+fn closerFace(p: Vertex, q: Vertex, r: Vertex, opposite: Vertex, ref mut best: Closest, ref mut distance: f32) {
+    let n = (q.w - p.w).cross(r.w - p.w);
+    let toOpposite = opposite.w - p.w;
+    let sideOrigin = (-p.w).dot(n);
+    let sideOpposite = toOpposite.dot(n);
+
+    // a flat tetrahedron has no inside, each of its faces being looked at
+    let flat = sideOpposite * sideOpposite <= FLAT * n.dot(n) * toOpposite.dot(toOpposite);
+    if !flat && sideOrigin * sideOpposite >= 0.0f { return; }
+
+    let closest = closestOnTriangle(p, q, r);
+    let point = pointOf(closest);
+    if point.dot(point) < distance {
+        distance = point.dot(point);
+        best = closest;
+    }
+}
+
+/**
+ * @returns: the closest to the origin of two points of a simplex
+ * */
+fn nearest(x: Closest, y: Closest)-> Closest {
+    let px = pointOf(x), py = pointOf(y);
+    if px.dot(px) <= py.dot(py) { x } else { y }
+}
