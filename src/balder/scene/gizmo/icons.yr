@@ -1,0 +1,361 @@
+in icons;
+
+mod ::utils;
+
+use balder::math::vector;
+use balder::scene::editable;
+use balder::scene::description::node_description;
+use balder::scene::gizmo::view;
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{guide, icon};
+use balder::scene::utils::post::gizmo;
+use balder::scene::utils::post::gizmo::shape;
+use balder::utils::log;
+
+use std::time;
+use std::algorithm::sorting;
+
+/**
+ * The radius of the disc an icon is drawn on, the texels a unit of its glyph covers, and the distance from the centre of
+ * an icon within which the cursor picks it, in texels of the image
+ * */
+def BADGE_RADIUS = 13.0f;
+def GLYPH_SCALE  = 8.0f;
+def PICK_RADIUS  = 14.0f;
+
+/**
+ * The width of the ring about the disc of an icon selected, in texels
+ * */
+def SELECTED_RING = 2.5f;
+
+/**
+ * The name of the effect drawing the icons in the post-process chain of a scene
+ * */
+def ICONS_EFFECT = "icons";
+
+/**
+ * The icons of the nodes without geometry of a scene (its lights, its cameras, its groups...), drawn over its image by an
+ * editor at a size on the image wherever the nodes are, and picked by the cursor (see Node3D::editorIcon)
+ * @info:
+ * =====
+ * The icons are a node of the scene, spawned under its root by a ScenePicker showing them (icons: true). While they are
+ * in a scene, an effect of its post-process chain (a GizmoEffect named icons, before the gizmo) draws them, the shapes
+ * following the camera and the nodes at each tick; the effect is skipped once they leave. Each node under the root but
+ * those of the tools (named __…__, see isReservedName) and the camera the scene is seen through is drawn as the glyph
+ * its class gives, on a dark disc, the nodes closer to the eye over the farther ones; a selected node (see setSelected)
+ * is drawn in orange, with the lines of its shape (see Node3D::editorGuides) under the icons, and the node under the
+ * cursor in white. The shapes past MAX_GIZMO_SHAPES are not drawn, the guides first, then the icons farthest from the
+ * eye.
+ * ====
+ * */
+pub class NodeIcons over Node {
+
+    // The nodes selected, drawn in orange with their guides
+    let dmut _selected: [&Node3D] = [];
+
+    // The uniq id of the node whose icon is under the cursor, none when there is none
+    let mut _hovered: (usize)? = none;
+
+    // The effect of the post-process chain drawing the icons, while they are in a scene
+    let dmut _effect: (&GizmoEffect)? = none;
+
+    /**
+     * Create the icons of the nodes under a node, put in a tree
+     * @params:
+     *    - name: the name of the node
+     *    - parent: the node whose nodes are drawn as icons, the root of a scene to draw them
+     * */
+    pub self (name: [c8], dmut parent: &Node)
+        with super(name, alias parent)
+    {
+        // the shapes follow the camera and the nodes at each tick
+        self.ticked = true;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SCENE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the icons by the effect of the post-process chain of the scene, added the first time icons enter it, before
+     * the other effects running last (the gizmo drawn over them)
+     * */
+    pub over onEnter(mut self, dmut scene: &Scene) {
+        let dmut chain = scene:.getPostChain();
+        if let Ok(dmut e: &GizmoEffect) = alias chain:.get(ICONS_EFFECT) {
+            chain:.enable(ICONS_EFFECT, true);
+            self._effect = (alias e)?;
+            return;
+        }
+
+        let dmut effect = copy GizmoEffect(name-> ICONS_EFFECT);
+        {
+            chain:.add(alias effect);
+            self._effect = (alias effect)?;
+        } catch {
+            err => {
+                log::error #("NodeIcons", "Failed to draw the icons", err);
+                return;
+            }
+        }
+
+        let effects = chain.effects;
+        for i in 0us .. effects.len {
+            if effects[i].runsLast && effects[i].name != ICONS_EFFECT {
+                chain:.reorder(ICONS_EFFECT, i);
+                break;
+            }
+        }
+    }
+
+    /**
+     * Stop drawing the icons, the effect of the post-process chain skipped
+     * */
+    pub over onExit(mut self, dmut scene: &Scene) {
+        if let Ok(dmut e) = alias self._effect {
+            e:.setShapes([]);
+        }
+
+        self._effect = none;
+        scene:.getPostChain():.enable(ICONS_EFFECT, false);
+    }
+
+    /**
+     * Give the effect the shapes the camera of the scene sees the icons as, the nodes selected in an EditableScene drawn
+     * as selected
+     * */
+    pub over onTick(mut self, delta: Duration) {
+        if let Ok(dmut scene) = alias self:.getScene() {
+            if let dmut editable: &EditableScene = alias scene {
+                let dmut selection = alias editable.selection;
+                self:.setSelected(alias selection.nodes);
+            }
+
+            if let Ok(dmut e) = alias self._effect {
+                if let Ok(view) = viewOf(alias scene) {
+                    e:.setShapes(self:.shapes(view), texelAspect-> view.texelAspect);
+                } else {
+                    e:.setShapes([]);
+                }
+            }
+        }
+
+        self.__super__:.onTick(delta);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the nodes selected, drawn in orange with their guides
+     * */
+    @field
+    pub fn selected(self)-> [&Node3D] {
+        self._selected
+    }
+
+    /**
+     * Draw other nodes as selected, in orange with their guides, the nodes of a selection
+     * @info: in an EditableScene, the icons draw the nodes of its selection as selected at each tick
+     * */
+    pub fn setSelected(mut self, dmut nodes: [&Node3D]) {
+        self._selected = alias nodes;
+    }
+
+    /**
+     * @returns: the uniq id of the node whose icon was under the cursor at its last move, none when there was none
+     * */
+    @field
+    pub fn hovered(self)-> (usize)? {
+        self._hovered
+    }
+
+    /**
+     * @returns: the nodes drawn as icons seen by a view, those under the parent of the icons with an icon, but the nodes
+     * of the tools (named __…__, and those under them) and the camera of the view
+     * */
+    pub fn nodes(mut self, view: GizmoView)-> dmut [&Node3D] {
+        let dmut found: [&Node3D] = [];
+        if let Ok(dmut parent) = alias self:.getParent() {
+            for _, dmut c in alias parent:.getChilds() {
+                self:.gather(alias c, view, ref found);
+            }
+        }
+
+        alias found
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PICKING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - pixel: the point of the image under the cursor, in texels from its top left corner
+     * @returns: the node whose icon is under a point of the image, within PICK_RADIUS texels of its centre, the closest
+     * to the eye among them, as it is drawn over the others; none when there is none
+     * */
+    pub fn iconAt(mut self, view: GizmoView, pixel: vec2)-> dmut (&Node3D)? {
+        let dmut nodes = self:.nodes(view);
+        let mut best: (usize)? = none;
+        let mut bestDepth = f32::max;
+        for i in 0us .. nodes.len {
+            let origin = utils::worldOrigin(nodes[i]);
+            if let Ok(centre) = view.project(origin) {
+                let depth = view.depth(origin);
+                if utils::onScreen(centre - pixel, view).length() <= PICK_RADIUS && depth < bestDepth {
+                    best = i?;
+                    bestDepth = depth;
+                }
+            }
+        }
+
+        if let Ok(i) = best {
+            return (alias nodes[i])?;
+        }
+
+        none
+    }
+
+    /**
+     * Follow the cursor over the icons, the icon under it drawn in white
+     * @params:
+     *    - pixel: the point of the image under the cursor, in texels from its top left corner
+     * @returns: the uniq id of the node whose icon is under the cursor, none when there is none
+     * */
+    pub fn hover(mut self, view: GizmoView, pixel: vec2)-> (usize)? {
+        self._hovered = if let Ok(n) = self:.iconAt(view, pixel) { n.uid? } else { none };
+        self._hovered
+    }
+
+    /**
+     * Forget the icon under the cursor, the cursor leaving the image
+     * */
+    pub fn leave(mut self) {
+        self._hovered = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SHAPES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the shapes drawing the icons seen by a view, in texels of its image: the guides of the nodes selected,
+     * then the icons from the farthest to the closest to the eye, MAX_GIZMO_SHAPES at most
+     * */
+    pub fn shapes(mut self, view: GizmoView)-> [GizmoShape] {
+        let nodes = self:.nodes(view);
+
+        // the icons seen, from the farthest to the closest
+        let dmut seen: [(usize, vec2, f32)] = [];
+        for i in 0us .. nodes.len {
+            let origin = utils::worldOrigin(nodes[i]);
+            if let Ok(centre) = view.project(origin) {
+                if utils::isOnImage(view, centre, BADGE_RADIUS) {
+                    seen ~= [(i, centre, view.depth(origin))];
+                }
+            }
+        }
+
+        sort(alias seen, |a, b| => { a._2 > b._2 });
+
+        let mut icons: [GizmoShape] = [];
+        for j in 0us .. seen.len {
+            // the farthest icons left out when the closest ones fill the shapes
+            let k = seen.len - 1us - j;
+            let node = nodes[seen[k]._0];
+            if let Ok(icon) = node.editorIcon() {
+                let drawn = self.iconShapes(view, icon, seen[k]._1, self.isSelected(node), self._hovered == node.uid?);
+                if icons.len + drawn.len > MAX_GIZMO_SHAPES { break; }
+
+                icons = drawn ~ icons;
+            }
+        }
+
+        let mut guides: [GizmoShape] = [];
+        for n in self._selected {
+            guides ~= utils::guideShapes(view, n);
+        }
+
+        let room = MAX_GIZMO_SHAPES - icons.len;
+        (if guides.len > room { guides[0us .. room] } else { guides }) ~ icons
+    }
+
+    /**
+     * @returns: the shapes of an icon centred on a point of the image: its disc, the ring of a node selected, and its glyph
+     * in the colour of its state, round on screen
+     * */
+    fn iconShapes(self, view: GizmoView, icon: NodeIcon, centre: vec2, selected: bool, hovered: bool)-> [GizmoShape] {
+        let tint = if selected {
+            utils::selectedColor()
+        } else if hovered {
+            utils::hoveredColor()
+        } else {
+            utils::idleColor()
+        };
+
+        // a texel of the image in texels on screen, the shapes keeping their aspect there
+        let texel = makeVec2(1.0f / view.texelAspect, 1.0f);
+        let white = makeVec4(1.0f, 1.0f, 1.0f, 1.0f);
+
+        let badge = GizmoShape::ring(vec2(), 0.0f, 2.0f * BADGE_RADIUS, utils::badgeColor());
+        let mut shapes: [GizmoShape] = copy [badge.placed(centre, texel, white)];
+        if selected {
+            let ring = GizmoShape::ring(vec2(), BADGE_RADIUS, SELECTED_RING, utils::selectedColor());
+            shapes ~= [ring.placed(centre, texel, white)];
+        }
+
+        for s in icon.shapes {
+            shapes ~= [s.placed(centre, texel * GLYPH_SCALE, tint)];
+        }
+
+        shapes
+    }
+
+    /**
+     * @returns: true iif a node is drawn as selected
+     * */
+    fn isSelected(self, node: &Node3D)-> bool {
+        for n in self._selected {
+            if n.uid == node.uid { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * Add to a list a node and the nodes under it with an icon, but the nodes of the tools and the camera of a view
+     * */
+    fn gather(mut self, dmut node: &Node, view: GizmoView, ref dmut found: [&Node3D]) {
+        if isReservedName(node.name.file()) { return; }
+
+        if let dmut n: &Node3D = alias node {
+            if n.uid != view.camera.uid && n.editorIcon().hasValue {
+                found ~= [alias n];
+            }
+        }
+
+        for _, dmut c in alias node:.getChilds() {
+            self:.gather(alias c, view, ref found);
+        }
+    }
+
+}
