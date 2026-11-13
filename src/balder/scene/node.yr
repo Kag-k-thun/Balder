@@ -10,6 +10,9 @@ use std::fs;
 
 use ::std::time;
 
+// The place of a child past the other children of its parent, the last one (see Node::attach and moveUnder)
+pub def LAST_PLACE = usize::max;
+
 lazy dmut __NODE_UID__ = copy [0us];
 fn getUID()-> usize {
     atomic {
@@ -34,8 +37,11 @@ pub class Node {
         // The scene in which the node can be found
         let dmut _parent: (&Node)? = none;
 
-        // The list of childs in the node
+        // The children of the node, by their name
         let dmut _childs: [[c8] => &Node] = copy [];
+
+        // The children of the node, in their order (the order of the nodes in a scene file, the outline of an editor)
+        let dmut _order: [&Node] = [];
     }
 
     prv { // Tick
@@ -84,9 +90,11 @@ pub class Node {
      */
 
     /**
-     * Add a child node in the trees of node
+     * Add a child node in the trees of node, at a place among the children, a child of the same name being disposed
+     * @params:
+     *    - at: the place of the child among the children, past them for the last one
      * */
-    fn addChild(mut self, name: [c8], dmut node: &Node) {
+    fn addChild(mut self, name: [c8], dmut node: &Node, at: usize = LAST_PLACE) {
         if let Ok(dmut old) = alias self._childs[name] {
             old:.dispose();
         }
@@ -95,32 +103,120 @@ pub class Node {
         node._parent = (alias self)?;
 
         self._childs[name] = alias node;
+        self:.insertInOrder(alias node, at);
     }
 
     /**
      * Remove a direct child in the node
      * */
     fn removeChild(mut self, name: [c8]) {
+        if let Ok(c) = self._childs[name] {
+            self:.removeFromOrder(c.uid);
+        }
+
         self._childs:.remove(name);
     }
 
     /**
-     * Attach a node detached from its tree (see dispose) under a parent, under its name, the node and the nodes under it
-     * entering the scene of the parent, parents first
+     * Put a child at a place among the children in their order
+     * @params:
+     *    - at: the place of the child, past the children for the last one
+     * */
+    fn insertInOrder(mut self, dmut node: &Node, at: usize) {
+        let place = if at > self._order.len { self._order.len } else { at };
+        let dmut order: [&Node] = [];
+        for i, dmut c in alias self._order {
+            if i == place { order ~= [alias node]; }
+            order ~= [alias c];
+        }
+
+        if place == self._order.len { order ~= [alias node]; }
+        self._order = alias order;
+    }
+
+    /**
+     * Take a child out of the children in their order
+     * @params:
+     *    - uid: the uniq id of the child
+     * */
+    fn removeFromOrder(mut self, uid: usize) {
+        let dmut order: [&Node] = [];
+        for dmut c in alias self._order if c.uid != uid {
+            order ~= [alias c];
+        }
+
+        self._order = alias order;
+    }
+
+    /**
+     * Attach a node detached from its tree (see dispose) under a parent, under its name, at a place among the children
+     * of the parent, the node and the nodes under it entering the scene of the parent, parents first
+     * @params:
+     *    - at: the place of the node among the children of the parent, LAST_PLACE past them
      * @returns: true iif the node is attached, false when it has a parent already or when a child of the parent has its
      * name
-     * @info: an editor undoing the removal of a node attaches it again under the parent it had
+     * @info: an editor undoing the removal of a node attaches it again under the parent it had, at the place it had
      * */
-    pub fn attach(mut self, dmut parent: &Node)-> bool {
+    pub fn attach(mut self, dmut parent: &Node, at: usize)-> bool {
         if self._parent.hasValue { return false; }
 
         let name = self._name.file();
         if parent._childs[name].hasValue { return false; }
 
-        parent:.addChild(name, alias self);
+        parent:.addChild(name, alias self, at-> at);
         self:.renameChildren();
         self:.enterTree();
         true
+    }
+
+    /**
+     * Move the node under a parent, at a place among its children, or to another place among its siblings, the node and
+     * the nodes under it keeping their places in the scene: they do not leave it, nor enter it again, when the parent is
+     * in the tree of the node, only their transformations following (see onMoved)
+     * @params:
+     *    - parent: the new parent, the parent of the node to change its place among its siblings
+     *    - at: the place of the node among the children of the parent once moved, the other children counted,
+     *          LAST_PLACE past them
+     * @returns: true iif the node is moved, false when it has no parent (see attach), when the parent is the node or one
+     * of the nodes under it, or when another child of the parent has its name
+     * */
+    pub fn moveUnder(mut self, dmut parent: &Node, at: usize)-> bool {
+        let dmut from = if let Ok(dmut p) = alias self._parent { alias p } else { return false; };
+        if parent.uid == self._uid || parent.isUnder(self) { return false; }
+
+        let name = self._name.file();
+        if let Ok(c) = parent._childs[name] && c.uid != self._uid { return false; }
+
+        if from.uid == parent.uid {
+            parent:.removeFromOrder(self._uid);
+            parent:.insertInOrder(alias self, at);
+            return true;
+        }
+
+        if from:.getRoot() !is parent:.getRoot() {
+            // another tree: the node leaves the scene of the one, and enters the scene of the other
+            self:.dispose();
+            return self:.attach(alias parent, at-> at);
+        }
+
+        from:.removeChild(name);
+        parent:.addChild(name, alias self, at-> at);
+        self:.renameChildren();
+        self:.onMoved(alias from);
+        true
+    }
+
+    /**
+     * @returns: true iif the node is under another one, the other being one of its ancestors
+     * */
+    pub fn isUnder(self, node: &Node)-> bool {
+        let mut parent = self._parent;
+        while let Ok(p) = parent {
+            if p.uid == node.uid { return true; }
+            parent = p._parent;
+        }
+
+        false
     }
 
     /**
@@ -185,6 +281,14 @@ pub class Node {
     pub fn onTick(mut self, _: Duration) {}
 
     /**
+     * Method called when the node was moved under another parent of its tree (see moveUnder), the node and the nodes
+     * under it staying in the scene, a 3D node computing its transformation again under the new parent
+     * @params:
+     *    - from: the parent the node was under
+     * */
+    prot fn onMoved(mut self, dmut _: &Node) {}
+
+    /**
      * Propagate the entry of a node to scene
      * */
     fn onTreeEnter(mut self, dmut who: &Node) {
@@ -199,7 +303,7 @@ pub class Node {
      * */
     fn enterTree(mut self) {
         self:.onTreeEnter(alias self);
-        for _, dmut c in alias self._childs {
+        for dmut c in alias self._order {
             c:.enterTree();
         }
     }
@@ -240,16 +344,28 @@ pub class Node {
         none
     }
 
+    /**
+     * @returns: the children of the node, by their name
+     * */
     pub fn getChilds(mut self)-> dmut [[c8] => &Node] {
         alias self._childs
     }
 
     /**
-     * Traverse the tree and return the list of nodes that can be found within it
+     * @returns: the children of the node, in their order: the order they were attached in, or the places they were
+     * given (see attach), the order of the nodes in a scene file
+     * */
+    pub fn getChildrenInOrder(mut self)-> dmut [&Node] {
+        alias self._order
+    }
+
+    /**
+     * Traverse the tree and return the list of nodes that can be found within it, parents first, the children in their
+     * order
      * */
     pub fn getAllNodes(mut self, ref dmut list: [&Node])-> dmut [&Node] {
         list ~= [alias self];
-        for _, dmut c in alias self._childs {
+        for dmut c in alias self._order {
             c:.getAllNodes(ref list);
         }
 
@@ -293,6 +409,20 @@ pub class Node {
     }
 
     /**
+     * @returns: the place of the node among the children of its parent, in their order, 0 for a node without a parent
+     * */
+    @field
+    pub fn index(self)-> usize {
+        if let Ok(p) = self._parent {
+            for i, c in p._order {
+                if c.uid == self._uid { return i; }
+            }
+        }
+
+        0us
+    }
+
+    /**
      * @returns: true iif the scene ticks the node, calling onTick at each of its ticks
      * */
     @field
@@ -312,6 +442,17 @@ pub class Node {
         if let Ok(dmut scene) = alias self:.getScene() {
             scene:.onNodeTicked(alias self);
         }
+    }
+
+    /**
+     * @returns: the top of the tree of the node, the node itself when it has no parent
+     * */
+    pub fn getRoot(mut self)-> dmut &Node {
+        if let Ok(dmut p) = alias self._parent {
+            return alias p:.getRoot();
+        }
+
+        alias self
     }
 
     /**
