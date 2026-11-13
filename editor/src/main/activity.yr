@@ -1,15 +1,16 @@
 in activity;
 
 use main::{command, editor, inspector_panel, naming, outline_panel, project, viewport};
-use main::command::{add, duplicate, open, remove, transform};
+use main::command::{add, duplicate, open, remove, transform, volume};
 use balder::core::{_, application::_};
 use balder::interface::dialog;
 use balder::interface::widget::{button::push, layout::d3scene, text::label, tree::view};
 use balder::math::vector;
 use balder::scene::{description::_, editable};
 use balder::scene::gizmo::mode;
+use balder::scene::node;
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::light;
+use balder::scene::node::node3D::{light, marker, path, path_point, volume_shape};
 use balder::scene::node::node3D::camera::flight;
 use balder::utils::log;
 
@@ -107,7 +108,16 @@ pub class EditorActivity over Activity {
         self:.slot("add::sphere", &self:.onAddSphere);
         self:.slot("add::plane", &self:.onAddPlane);
         self:.slot("add::model", &self:.onAddModel);
-        self:.slot("add::group", &self:.onAddGroup);
+        self:.slot("add::empty", &self:.onAddEmpty);
+        self:.slot("add::marker", &self:.onAddMarker);
+        self:.slot("add::spawn", &self:.onAddSpawnPoint);
+        self:.slot("add::waypoint", &self:.onAddWaypoint);
+        self:.slot("add::socket", &self:.onAddSocket);
+        self:.slot("add::path", &self:.onAddPath);
+        self:.slot("add::path-point", &self:.onAddPathPoint);
+        self:.slot("add::box-volume", &self:.onAddBoxVolume);
+        self:.slot("add::sphere-volume", &self:.onAddSphereVolume);
+        self:.slot("add::capsule-volume", &self:.onAddCapsuleVolume);
         self:.slot("add::direction", &self:.onAddDirectionLight);
         self:.slot("add::point", &self:.onAddPointLight);
         self:.slot("add::spot", &self:.onAddSpotLight);
@@ -149,6 +159,7 @@ pub class EditorActivity over Activity {
         if let Ok(dmut v: &EditorViewport) = self.gui:.find("BODY/MAIN/VIEW/GIZMO") {
             v:.keyPressed():.connect(self.box, &self:.onViewportKey);
             v:.transformed():.connect(self.box, &self:.onGizmoTransformed);
+            v:.reshaped():.connect(self.box, &self:.onGizmoReshaped);
             self._viewport = (alias v)?;
         }
 
@@ -459,10 +470,134 @@ pub class EditorActivity over Activity {
         if b == SDL_BUTTON_LEFT { self:.addPrimitive("plane", NodeKind::PLANE); }
     }
 
-    fn onAddGroup(mut self, b: u8) {
+    fn onAddEmpty(mut self, b: u8) {
         if b == SDL_BUTTON_LEFT {
-            self:.add(NodeDescription("group", NodeKind::GROUP), lift-> 0.0f);
+            self:.add(NodeDescription("empty", NodeKind::EMPTY), lift-> 0.0f);
         }
+    }
+
+    fn onAddMarker(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addMarker("marker", MarkerPurpose::GENERIC); }
+    }
+
+    fn onAddSpawnPoint(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addMarker("spawn", MarkerPurpose::SPAWN); }
+    }
+
+    fn onAddWaypoint(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addMarker("waypoint", MarkerPurpose::WAYPOINT); }
+    }
+
+    fn onAddSocket(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addMarker("socket", MarkerPurpose::SOCKET); }
+    }
+
+    /**
+     * Add a path of three points, a curve from the left to the right bending away from the eye
+     * */
+    fn onAddPath(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let mut path = NodeDescription("path", NodeKind::PATH);
+        let places = [makeVec3(-2.0f, 0.0f, 0.0f), makeVec3(0.0f, 0.0f, -1.5f), makeVec3(2.0f, 0.0f, 0.0f)];
+        for i, at in places {
+            let mut point = NodeDescription(if i == 0us { "point" } else { f"point_${i + 1us}" }, NodeKind::PATH_POINT);
+            point.position = at;
+            path.children ~= [point];
+        }
+
+        self:.add(path, lift-> 0.5f);
+    }
+
+    /**
+     * Insert a point in the path selected after its last point, or in the path of the point selected right after it
+     * (see insertedPoint), the status bar telling when no path is selected
+     * */
+    fn onAddPathPoint(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut nodes = alias self:.selectedNodes();
+        if nodes.len != 0us {
+            let dmut last = alias nodes[$ - 1us];
+            if let dmut p: &Path3D = alias last {
+                self:.insertPoint(alias p, none);
+                return;
+            }
+
+            if let dmut point: &PathPoint3D = alias last {
+                if let Ok(dmut parent) = alias point:.getParent() {
+                    if let dmut p: &Path3D = alias parent {
+                        self:.insertPoint(alias p, point.index?);
+                        return;
+                    }
+                }
+            }
+        }
+
+        self:.setStatus("Select a path, or a point of a path, to insert a point in it");
+    }
+
+    /**
+     * Insert a point in a path after one of its points, halfway to the next one, or a step past the last one
+     * @params:
+     *    - after: the place among the children of the path of the point the new one follows, none for its last point
+     * */
+    fn insertPoint(mut self, dmut path: &Path3D, after: (usize)?) {
+        let points = path.points();
+        let mut i = if points.len == 0us { 0us } else { points.len - 1us };
+        if let Ok(a) = after {
+            for k, p in points if p.index == a { i = k; }
+        }
+
+        let mut d = NodeDescription("point", NodeKind::PATH_POINT);
+        let mut at = LAST_PLACE;
+        if points.len != 0us {
+            let from = points[i];
+            d.position = insertedPoint(points, i, path.closed);
+            d.rotation = from.rotation;
+            d.scale = from.scale;
+            at = from.index + 1us;
+        }
+
+        self:.run(copy AddCommand(d, alias path, at-> at));
+    }
+
+    fn onAddBoxVolume(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.addVolume("box", VolumeShape(), lift-> 0.5f);
+        }
+    }
+
+    fn onAddSphereVolume(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.addVolume("sphere_volume", VolumeShape().withKind(VolumeKind::SPHERE), lift-> 0.5f);
+        }
+    }
+
+    fn onAddCapsuleVolume(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.addVolume("capsule", VolumeShape().withKind(VolumeKind::CAPSULE), lift-> 1.0f);
+        }
+    }
+
+    /**
+     * Add a marker of a purpose, on the surface seen at the centre of the viewport
+     * */
+    fn addMarker(mut self, name: [c8], purpose: MarkerPurpose) {
+        let mut d = NodeDescription(name, NodeKind::MARKER);
+        d.purpose = purpose;
+        self:.add(d, lift-> 0.0f);
+    }
+
+    /**
+     * Add a volume of a shape, standing on the surface seen at the centre of the viewport
+     * @params:
+     *    - lift: the half height of the shape, its centre above that surface
+     * */
+    fn addVolume(mut self, name: [c8], shape: VolumeShape, lift: f32) {
+        let mut d = NodeDescription(name, NodeKind::VOLUME);
+        d.volume = shape;
+        self:.add(d, lift-> lift);
     }
 
     fn onAddModel(mut self, b: u8) {
@@ -704,6 +839,17 @@ pub class EditorActivity over Activity {
     }
 
     /**
+     * A drag of a face of a volume changed its shape: the change is recorded as a command
+     * */
+    fn onGizmoReshaped(mut self) {
+        if let Ok(v) = self._viewport {
+            if let Ok(e) = v.volumeEdit {
+                self:.run(copy VolumeCommand(copy [e], applied-> true));
+            }
+        }
+    }
+
+    /**
      * The keys the viewport takes besides those of the gizmo: Delete removes the nodes selected, Ctrl+D copies them, F
      * looks at them
      * */
@@ -818,6 +964,26 @@ pub class EditorActivity over Activity {
  * */
 fn sceneExtensions()-> [[c8]] {
     copy [SCENE_EXTENSION]
+}
+
+/**
+ * @returns: where a point inserted in a path after one of its points goes, in the space of the path: halfway to the next
+ * point, to the first one past the last point of a closed path; a step past the last point of an open path, the step
+ * from the point before it, one unit along X for a path of one point
+ * @params:
+ *    - points: the points of the path, in their order
+ *    - i: the index among them of the point the new one follows
+ * */
+fn insertedPoint(points: [&PathPoint3D], i: usize, closed: bool)-> vec3 {
+    let p = points[i].position;
+    if i + 1us < points.len {
+        return (p + points[i + 1us].position) / 2.0f;
+    }
+
+    if points.len < 2us { return p + makeVec3(1.0f, 0.0f, 0.0f); }
+    if closed { return (p + points[0].position) / 2.0f; }
+
+    p + (p - points[i - 1us].position)
 }
 
 /**

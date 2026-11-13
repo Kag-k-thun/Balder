@@ -11,12 +11,13 @@ mod ::geometry;
 mod ::parts;
 
 use balder::core::application::signal;
-use balder::math::{bounds, utils, vector};
+use balder::math::{bounds, matrix, utils, vector};
 use balder::scene::edit;
+use balder::scene::edit::volume_edit;
 use balder::scene::gizmo::{frame, handle, mode, snap, space, view};
 use balder::scene::node;
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::transform;
+use balder::scene::node::node3D::{transform, volume, volume_shape};
 use balder::scene::utils::post::gizmo;
 use balder::scene::utils::post::gizmo::shape;
 use balder::utils::log;
@@ -69,6 +70,12 @@ def HEAD_HALF      = 5.5f;
 def CENTRE_DOT     = 6.0f;
 
 /**
+ * The half side of the square on a face of a volume, and of the dark square under it, in texels
+ * */
+def FACE_HALF   = 4.5f;
+def FACE_BORDER = 6.0f;
+
+/**
  * The name of the effect drawing the gizmos in the post-process chain of a scene
  * */
 def GIZMO_EFFECT = "gizmo";
@@ -89,6 +96,11 @@ def GIZMO_EFFECT = "gizmo";
  * In local space the gizmo follows the axes of its node; the scale of a node acts along its own axes, so the gizmo
  * scales along those whatever its space. The snapping (see snap) rounds the translation along each axis, the
  * angle and the factors of scale.
+ * A gizmo moving a volume alone (see Volume3D) draws a square on each of its six faces, picked before the handles of
+ * the gizmo, within PICK_TEXELS texels: dragged, the face moves along its normal by the distance the cursor goes along
+ * it (rounded to the step of the translation while snapping), the shape and the centre of the volume following (see
+ * VolumeShape::movedFace) through a VolumeEdit, kept until the next drag (see volumeEdit), the reshaped signal emitted
+ * once the drag ends.
  * ====
  * */
 pub class TransformGizmo over Node {
@@ -113,6 +125,12 @@ pub class TransformGizmo over Node {
 
     // The signal emitted when a drag ends having changed the nodes
     let dmut _transformed: (&Signal!{()})? = none;
+
+    // The signal emitted when a drag of a face of a volume ends having changed it
+    let dmut _reshaped: (&Signal!{()})? = none;
+
+    // The face of the volume under the cursor or dragged, while the handle hovered or grabbed is FACE
+    let mut _face: usize = 0us;
 
     // The effect of the post-process chain drawing the gizmo, while it is in a scene
     let dmut _effect: (&GizmoEffect)? = none;
@@ -141,6 +159,15 @@ pub class TransformGizmo over Node {
 
         // The edits of the nodes by the drag, or by the last one, in the order of the nodes
         let dmut _edits: [TransformEdit] = [];
+
+        // The unit normal in the world of the face of a volume grabbed, the world units a unit of the space of the volume
+        // covers along it, and the transformation of the volume at the grab
+        let mut _grabNormal: vec3 = vec3();
+        let mut _grabStretch: f32 = 1.0f;
+        let mut _grabMatrix: mat4 = mat4();
+
+        // The edit of the volume by the drag of a face, or by the last one, none before the first
+        let dmut _volumeEdit: (VolumeEdit)? = none;
     }
 
     /**
@@ -329,6 +356,22 @@ pub class TransformGizmo over Node {
     @field
     pub fn edits(self)-> [TransformEdit] {
         self._edits
+    }
+
+    /**
+     * @returns: the edit of the volume by the drag of one of its faces, or by the last one, none before the first
+     * */
+    @field
+    pub fn volumeEdit(self)-> (VolumeEdit)? {
+        self._volumeEdit
+    }
+
+    /**
+     * @returns: the face of the volume under the cursor or dragged, while the handle hovered or grabbed is FACE
+     * */
+    @field
+    pub fn face(self)-> usize {
+        self._face
     }
 
     /**
@@ -534,6 +577,42 @@ pub class TransformGizmo over Node {
     }
 
     /**
+     * @returns: the volume whose faces the gizmo drags, the node it moves when it moves a volume alone, none otherwise
+     * */
+    pub fn volume(self)-> (&Volume3D)? {
+        if self._nodes.len != 1us { return none; }
+        if let v: &Volume3D = self._nodes[0] { return v?; }
+
+        none
+    }
+
+    /**
+     * @params:
+     *    - pixel: the point of the image under the cursor, in texels from its top left corner
+     * @returns: the face of the volume the gizmo moves alone whose square is under a point of the image, within
+     * PICK_TEXELS texels of its centre, the closest to the eye among them; none when there is none or no volume
+     * */
+    pub fn faceAt(self, view: GizmoView, pixel: vec2)-> (usize)? {
+        let v = if let Ok(v) = self.volume() { v } else { return none; };
+        let m = v.transformation, shape = v.shape;
+        let mut best: (usize)? = none;
+        let mut bestDepth = f32::max;
+        for f in 0us .. VOLUME_FACES {
+            let p = (m * makeVec4(shape.face(f), 1.0f)).xyz;
+            if let Ok(at) = view.project(p) {
+                let offset = at - pixel;
+                let depth = view.depth(p);
+                if makeVec2(offset.x * view.texelAspect, offset.y).length() <= PICK_TEXELS && depth < bestDepth {
+                    best = f?;
+                    bestDepth = depth;
+                }
+            }
+        }
+
+        best
+    }
+
+    /**
      * @returns: the closest distance between a ray and a ring, and the distance along the ray of its point closest to it
      * @params:
      *    - frontOnly: true to leave out the segments of the ring on the far side of the centre
@@ -569,7 +648,12 @@ pub class TransformGizmo over Node {
      * */
     pub fn hover(mut self, view: GizmoView, pixel: vec2)-> GizmoHandle {
         if !self.isDragging {
-            self._hovered = self.handleAt(view, pixel);
+            if let Ok(f) = self.faceAt(view, pixel) {
+                self._face = f;
+                self._hovered = GizmoHandle::FACE;
+            } else {
+                self._hovered = self.handleAt(view, pixel);
+            }
         }
 
         self._hovered
@@ -593,6 +677,10 @@ pub class TransformGizmo over Node {
      * */
     pub fn grab(mut self, view: GizmoView, pixel: vec2)-> bool {
         self:.release();
+
+        if let Ok(f) = self.faceAt(view, pixel) {
+            return self:.grabFace(view.ray(pixel), f);
+        }
 
         let handle = self.handleAt(view, pixel);
         if handle == GizmoHandle::NONE { return false; }
@@ -649,6 +737,11 @@ pub class TransformGizmo over Node {
         if !self.isDragging { return; }
 
         let ray = view.ray(pixel);
+        if self._grabbed == GizmoHandle::FACE {
+            self:.dragFace(ray, snapping);
+            return;
+        }
+
         match self._mode {
             GizmoMode::TRANSLATE => {
                 if let Ok(delta) = self.translation(ray, snapping) {
@@ -684,6 +777,19 @@ pub class TransformGizmo over Node {
     pub fn release(mut self)-> bool {
         if !self.isDragging { return false; }
 
+        if self._grabbed == GizmoHandle::FACE {
+            self._grabbed = GizmoHandle::NONE;
+            if let Ok(e) = self._volumeEdit && e.changes() {
+                if let Ok(dmut s) = alias self._reshaped {
+                    s:.emit();
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
         self._grabbed = GizmoHandle::NONE;
         let mut changed = false;
         for e in self._edits {
@@ -705,12 +811,68 @@ pub class TransformGizmo over Node {
     pub fn cancel(mut self) {
         if !self.isDragging { return; }
 
+        if self._grabbed == GizmoHandle::FACE {
+            if let Ok(dmut e) = alias self._volumeEdit {
+                e:.revert();
+            }
+
+            self._volumeEdit = none;
+            self._grabbed = GizmoHandle::NONE;
+            return;
+        }
+
         for i in 0us .. self._edits.len {
             self._edits[i]:.revert();
         }
 
         self._edits = [];
         self._grabbed = GizmoHandle::NONE;
+    }
+
+    /**
+     * Grab a face of the volume the gizmo moves alone, a drag starting from the shape and the transform it has
+     * @returns: true iif the face is grabbed, false when the volume is flattened along its normal
+     * */
+    fn grabFace(mut self, ray: Ray, face: usize)-> bool {
+        let dmut v = if let dmut v: &Volume3D = alias self._nodes[0] { alias v } else { return false; };
+        let m = v.transformation;
+        let along = geometry::direction(m, VolumeShape::faceNormal(face));
+        let stretch = along.length();
+        if stretch < 1.0e-9f { return false; }
+
+        let centre = (m * makeVec4(v.shape.face(face), 1.0f)).xyz;
+        self._grabbed = GizmoHandle::FACE;
+        self._hovered = GizmoHandle::FACE;
+        self._face = face;
+        self._grabPoint = centre;
+        self._grabNormal = along / stretch;
+        self._grabStretch = stretch;
+        self._grabMatrix = m;
+        self._grabAlong = if let Ok(a) = geometry::alongAxis(ray, centre, self._grabNormal) { a } else { 0.0f };
+        self._edits = [];
+        self._volumeEdit = VolumeEdit(alias v, v.shape, NodeTransform(v))?;
+        true
+    }
+
+    /**
+     * Drag the face grabbed to a ray, along its normal, the volume given the shape and the centre the move gives it
+     * */
+    fn dragFace(mut self, ray: Ray, snapping: bool) {
+        let along = if let Ok(a) = geometry::alongAxis(ray, self._grabPoint, self._grabNormal) { a } else { return; };
+        let step = if snapping { self._snap.translation } else { 0.0f };
+        let offset = geometry::snapped(along - self._grabAlong, step);
+
+        if let Ok(dmut e) = alias self._volumeEdit {
+            let (shape, shift) = e.before.movedFace(self._face, offset / self._grabStretch);
+
+            // the move of the centre in the space of the volume, then in the world, then in the space of its parent
+            let world = geometry::direction(self._grabMatrix, shift);
+            let local = geometry::direction(e.node.parentTransformation.inversed(), world);
+            let before = e.placedBefore;
+            let dmut next = e:.extendedTo(shape, NodeTransform(before.position + local, before.rotation, before.scale));
+            next:.apply();
+            self._volumeEdit = (alias next)?;
+        }
     }
 
     /**
@@ -863,17 +1025,41 @@ pub class TransformGizmo over Node {
      * the cursor highlighted; none without nodes or when the gizmo is behind the camera
      * */
     pub fn shapes(self, view: GizmoView)-> [GizmoShape] {
-        let frame = if let Ok(f) = self.frame(view) { f } else { return []; };
-        let centre = if let Ok(p) = view.project(frame.centre) { p } else { return []; };
         let active = if self.isDragging { self._grabbed } else { self._hovered };
+        let faces = self.faceShapes(view, active);
+        let frame = if let Ok(f) = self.frame(view) { f } else { return faces; };
+        let centre = if let Ok(p) = view.project(frame.centre) { p } else { return faces; };
 
-        if self._mode == GizmoMode::TRANSLATE {
+        let handles = if self._mode == GizmoMode::TRANSLATE {
             self.translateShapes(view, frame, centre, active)
         } else if self._mode == GizmoMode::ROTATE {
             self.rotateShapes(view, frame, active)
         } else {
             self.scaleShapes(view, frame, centre, active)
+        };
+
+        // the squares of the faces over the handles, as they are picked first
+        handles ~ faces
+    }
+
+    /**
+     * @returns: the squares on the faces of the volume the gizmo moves alone, the one under the cursor or dragged
+     * highlighted, each over a dark square; none without a volume
+     * */
+    fn faceShapes(self, view: GizmoView, active: GizmoHandle)-> [GizmoShape] {
+        let v = if let Ok(v) = self.volume() { v } else { return []; };
+        let m = v.transformation, shape = v.shape;
+        let dark = makeVec4(0.07f, 0.08f, 0.1f, 0.8f);
+
+        let mut shapes: [GizmoShape] = [];
+        for f in 0us .. VOLUME_FACES {
+            if let Ok(at) = view.project((m * makeVec4(shape.face(f), 1.0f)).xyz) {
+                let lit = active == GizmoHandle::FACE && self._face == f;
+                shapes ~= parts::boxShapes(at, FACE_BORDER, dark) ~ parts::boxShapes(at, FACE_HALF, parts::neutralColor(lit));
+            }
         }
+
+        shapes
     }
 
     /**
@@ -989,6 +1175,21 @@ pub class TransformGizmo over Node {
 
         let dmut s = copy Signal!{()} ();
         self._transformed = (alias s)?;
+
+        alias s
+    }
+
+    /**
+     * @returns: the signal emitted when a drag of a face of a volume ends having changed it, the edit of the drag read
+     * from the gizmo (see volumeEdit)
+     * */
+    pub fn reshaped(mut self)-> dmut &Signal!{()} {
+        if let Ok(dmut s) = alias self._reshaped {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{()} ();
+        self._reshaped = (alias s)?;
 
         alias s
     }
