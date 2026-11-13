@@ -333,8 +333,8 @@ its own. An effect declares the space of the colours it works on, `HDR` (the lig
 `NORMALS`, `VELOCITY`), its compute shaders and the size of its parameters. The tone mapping is the effect the chain always holds: the effects
 in HDR space run before it and those in display space after it, each in the order of the chain, but the effects
 declaring `runsFirst` (the anti-aliasing), which run before the others of their space wherever they are in the chain,
-and those declaring `runsLast` (the gizmo of the scene, `GizmoEffect`, drawn over the image in display space), which run
-after them. An effect is told when its passes start or stop running (`setRunning`), as the chain declares them again.
+and those declaring `runsLast` (the gizmo of the scene and the icons of its nodes, `GizmoEffect`s, drawn over the image
+in display space), which run after them. An effect is told when its passes start or stop running (`setRunning`), as the chain declares them again.
 
 ```
 let dmut chain = scene:.getPostChain ();

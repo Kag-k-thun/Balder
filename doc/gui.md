@@ -493,6 +493,41 @@ if let Ok (dmut scene : &EditableScene) = alias scene3D:.getScene () {
   `Bvh.raycast (ray, hit)`, the leaf whose content the ray hits first, giving a `RayHit`, and `TriangleBvh`, the
   triangles of a mesh.
 
+### Icons of the nodes without geometry
+
+```
+Scene3D #scene { resolution: 1280 720; editable: true;
+    ScenePicker #picker { selectable: true; icons: true; }
+}
+```
+
+```
+picker.showsIcons = false;                       // hides them all, true shows them again
+```
+
+- **`icons: true` draws the nodes without geometry as icons**: the lights, the cameras and the groups, which have no
+  surface to click, get a glyph on a dark disc at their origin, at the same size on screen wherever they are, drawn
+  over the image (never by the rendering of the scene). The picker spawns a `NodeIcons` under the root of the scene
+  (named `__icons__`) while they are shown, and disposes it when they are hidden (`showsIcons`); a `SceneGizmo` takes
+  the attribute too.
+- **The icon comes from the class of the node**: `Node3D.editorIcon ()` gives a `NodeIcon`, the shapes of a glyph in
+  the square from (-1, -1) to (1, 1), `none` for a node seen by its geometry. `Group3D`, `Light` (a sun, a bulb or a
+  lamp, by its type) and `Camera` override it, and so does any class of nodes without geometry that wants one
+  (`NodeIcon::sun ()`, `bulb ()`, `spot ()`, `camera ()`, `group ()`, or shapes of its own). The nodes of the tools
+  (named `__…__`, and those under them) and the camera the scene is seen through have none.
+- **A click on an icon selects its node before the instances**: an icon covers what is behind it, so a left click within
+  14 texels of its centre selects its node as a click on an instance does (Ctrl toggling it), the icon closest to the eye
+  winning, as it is drawn over the others; `picked` emits `none` then. The icon under the cursor is drawn in white, and
+  the icons of the nodes selected in orange, ringed. A node selected by its icon is dragged by a gizmo as any other.
+- **A selected node shows its shape**: `Node3D.editorGuides (size)` gives lines in world space (`NodeGuide`), drawn
+  under the icons while the node is selected: five arrows along a direction light, `size` world units long (90 texels on
+  screen), the three circles of the range of a point light, the cones of a spot light up to its range (its light, then
+  its full light fainter), the frustum of a camera from its near plane to its far plane. A line crossing the near plane
+  of the eye is cut there.
+- **The icons are drawn as the gizmo is**, by a `GizmoEffect` of their own (`icons`), placed before the gizmo in the
+  chain so the gizmo is drawn over them. It draws 256 shapes at most: past them the guides are left out first, then the
+  icons farthest from the eye.
+
 ### Moving the selection with a gizmo
 
 ```
@@ -543,9 +578,14 @@ if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
 - **The gizmo is drawn after the post-process chain**: a `GizmoEffect` (`gizmo`), added to the chain the first time a
   gizmo enters the scene and skipped while there is none (`PostChain.enable`), runs last in display space (`PostEffect::runsLast`), after the grading and the
   anti-aliasing, so its colours are its own and its lines stay sharp. Its compute pass copies the image and blends the
-  shapes of the gizmo over it (segments and triangles in texels, `GizmoShape`, 256 at most, their edges smoothed),
+  shapes of the gizmo over it (segments, triangles and rings in texels, `GizmoShape`, 256 at most, their edges smoothed),
   testing no depth; the texels outside the box the shapes cover are only copied. The gizmo writes its shapes in its
   parameters at each tick of the scene when they change, without recording the frames again.
+- **The shapes are measured on screen**: the image is scaled to the aspect of the scene on screen, so its texels are
+  wider or narrower than high (`GizmoView.texelAspect`, given to `GizmoEffect.setShapes`). The widths of the lines and
+  the radii of the rings (`GizmoShape::ring`) are in heights of a texel and the distances are taken on screen, so a line
+  keeps its width whatever its direction and a ring is round when the square enclosing it is square on screen
+  (`GizmoShape.placed` with a scale divided by the aspect along x).
 
 ## The style file
 
@@ -943,7 +983,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `SceneGizmo`
 
-- **Attributes:** `tab-index`: an integer; `selectable`: true or false; `size`: a number
+- **Attributes:** `tab-index`: an integer; `selectable`: true or false; `icons`: true or false; `size`: a number
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -954,7 +994,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `ScenePicker`
 
-- **Attributes:** `tab-index`: an integer; `selectable`: true or false
+- **Attributes:** `tab-index`: an integer; `selectable`: true or false; `icons`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
