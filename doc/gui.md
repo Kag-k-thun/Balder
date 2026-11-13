@@ -413,9 +413,9 @@ fn onClearClicked (mut self, button: u8) {
 
   | Dialog | Answers |
   |---|---|
-  | `MessageDialog (message)` | a question answered by Yes or No: `MessageDialogStatus::YES`, `NO`, or `CANCEL` when dismissed |
+  | `MessageDialog (message, yes-> "Save", no-> "Discard", cancel-> "Cancel")` | a question answered by its yes and no buttons (Yes and No by default), and by a cancelling button when it is given a text: `MessageDialogStatus::YES`, `NO`, or `CANCEL` when cancelled or dismissed |
   | `ConfirmDialog (question, accept-> "Clear", cancel-> "Cancel")` | an action confirmed by the button named after it, Enter accepting it: `true`, or `false` when cancelled |
-  | `FileDialog (FileDialogMode::OPEN, directory-> "res", filters-> copy ["png"])` | the absolute path of a file to open, of a file to save (`SAVE`) or of a directory (`DIRECTORY`), or `none` when cancelled |
+  | `FileDialog (FileDialogMode::OPEN, directory-> "res", filters-> copy ["png"])` | the absolute path of a file to open, of a file to save (`SAVE`, `name->` proposing one) or of a directory (`DIRECTORY`), or `none` when cancelled |
   | `ColorDialog (color-> c)` | a colour (`vec4`, its channels from 0 to 1) set by the sliders and the spin boxes of its channels and its opacity, or by its code typed as in a sheet (`#3380e6`, `steelblue / 50%`), or `none` when cancelled |
 
 - **A file dialog browses the directories in a table**, the directories first: a double click or Enter on a directory

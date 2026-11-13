@@ -2,20 +2,41 @@ in description;
 
 pub mod ::kind;
 pub mod ::node_description;
+mod ::reader;
+mod ::writer;
 
 use balder::core::error;
-use balder::scene::description::node_description;
+use balder::scene::description::{node_description, reader, writer};
 use balder::scene::node;
 use balder::scene::node::node3D;
 use balder::utils::path;
 
-use std::{config, fs, syntax};
+use std::{fs, syntax, uuid};
 
 /**
  * A scene as a scene file describes it: the nodes under its root, each with the nodes under it
- * @info: a scene file is a toml file whose array of tables 'node' holds the nodes under the root, in order (see
- * NodeDescription for the entries of a node); built under a node, the nodes are created under it, a scene being loaded
- * by building its description under the root of a Scene
+ * @info:
+ * =====
+ * A scene file (.scene) opens with the version of its format, declares the files its nodes use, then holds a flat
+ * block per node, each naming its parent by its id (see NodeDescription for the entries of a node):
+ * ```
+ * scene 1;
+ *
+ * asset table model "res:/models/table.glb";
+ *
+ * node #9c41e2a0-51be-4c2d-9e3f-0a1b2c3d4e5f group "props" {
+ *     position: 0 0 -2;
+ * }
+ *
+ * node #3f2a9c41-1b2c-4d3e-8f00-6a5b4c3d2e1f model "table" {
+ *     parent: #9c41e2a0-51be-4c2d-9e3f-0a1b2c3d4e5f;
+ *     file: @table;
+ * }
+ * ```
+ * A node keeps its id from one save to the next (see Node3D.guid): moving a node under another parent changes one line
+ * of the file, and the other files name a node by its id. The comments are those of the .gui files. Built under a node,
+ * the nodes are created under it, a scene being loaded by building its description under the root of a Scene.
+ * ====
  * */
 pub class SceneDescription {
 
@@ -25,31 +46,22 @@ pub class SceneDescription {
     /**
      * Read the description of a scene from the content of a scene file
      * @params:
-     *    - content: the toml content of the file
+     *    - content: the content of the file
      *    - file: the name of the file, quoted in the errors
      * @throws:
-     *    - &BalderError: if the content is not toml, or does not describe nodes
+     *    - &BalderError: if the content is not a scene file, the message telling where and why
      * */
     pub self (content: [c8], file: [c8] = "")
         with _nodes = []
         throws BalderError
     {
-        let where = if file.len == 0us { "scene" } else { file };
         {
-            let cfg = std::config::toml::parse(content);
-            if let Ok(nodes) = cfg["node"]? {
-                self._nodes = readNodes(nodes, where ~ ": node");
-            }
-
-            for key, _ in cfg[] if key != "node" {
-                throw copy BalderError(where ~ ": unexpected entry " ~ key ~ ", the nodes being in [[node]]");
-            }
+            let dmut r = SceneReader(content);
+            self._nodes = r:.read();
         } catch {
             s: &SyntaxError => {
-                throw copy BalderError(where ~ ": " ~ s.msg ~ " (" ~ std::conv::to!{[c8]} (s.line) ~ "," ~ std::conv::to!{[c8]} (s.col) ~ ")");
-            }
-            b: &BalderError => {
-                throw b;
+                let where = if file.len == 0us { "scene" } else { file };
+                throw copy BalderError(f"${where}:${s.line}:${s.col}: ${s.msg}");
             }
         }
     }
@@ -59,12 +71,45 @@ pub class SceneDescription {
      * @params:
      *    - path: the project path of the file ('res:/...')
      * @throws:
-     *    - &BalderError: if the file cannot be read, is not toml, or does not describe nodes
+     *    - &BalderError: if the file cannot be read, or is not a scene file
      * */
     pub self fromFile(path: [c8])
         with self(readSceneFile(path), file-> path)
         throws BalderError
     {}
+
+    /**
+     * The description of the nodes under a node, the root of a scene, as a scene file saves them
+     * @info: the nodes named __…__ are left out (see isReservedName), the others in the order they were created
+     * @throws:
+     *    - &BalderError: if a node is of a kind no scene file describes (see NodeDescription)
+     * */
+    pub self (dmut root: &Node)
+        with _nodes = []
+        throws BalderError
+    {
+        let dmut under: [&Node3D] = [];
+        for name, dmut c in alias root:.getChilds() if !isReservedName(name) {
+            if let dmut n: &Node3D = alias c {
+                under ~= [alias n];
+            }
+        }
+
+        // the children are held by name: they are sorted by their uniq id, which grows as they are created
+        for i in 1us .. under.len {
+            let mut j = i;
+            while j > 0us && under[j - 1us].uid > under[j].uid {
+                let dmut swapped = alias under[j];
+                under[j] = alias under[j - 1us];
+                under[j - 1us] = alias swapped;
+                j -= 1us;
+            }
+        }
+
+        for dmut n in alias under {
+            self._nodes = self._nodes ~ [NodeDescription(alias n)];
+        }
+    }
 
     /**
      * A description of the nodes given
@@ -81,6 +126,43 @@ pub class SceneDescription {
     @field
     pub fn nodes(self)-> [NodeDescription] {
         self._nodes
+    }
+
+    /**
+     * @returns: the content of the scene file of the description (see SceneWriter), the same for the same nodes
+     * */
+    pub fn content(self)-> [c8] {
+        SceneWriter(self._nodes).write()
+    }
+
+    /**
+     * Write the scene file of the description, replacing the file there
+     * @params:
+     *    - path: the project path of the file ('res:/...'), or an absolute path
+     * @throws:
+     *    - &BalderError: if the file cannot be written
+     * */
+    pub fn save(self, path: [c8])
+        throws BalderError
+    {
+        let file = projectPath(path);
+        {
+            let dmut f = File::create(file, write-> true);
+            f:.write(self.content());
+            f:.close();
+        } catch {
+            _: &FsError => {
+                throw copy BalderError(f"Scene file not written: ${file.toStr()}");
+            }
+        }
+    }
+
+    /**
+     * @returns: the same nodes without their ids, the nodes built taking new ones: a scene started from a template has
+     * ids of its own
+     * */
+    pub fn withoutIds(self)-> &SceneDescription {
+        copy SceneDescription(nodesWithoutIds(self._nodes))
     }
 
     /**
@@ -103,6 +185,21 @@ pub class SceneDescription {
 }
 
 /**
+ * @returns: nodes, and the nodes under them, of nil ids
+ * */
+fn nodesWithoutIds(nodes: [NodeDescription])-> [NodeDescription] {
+    let mut res: [NodeDescription] = [];
+    for n in nodes {
+        let mut d = n;
+        d.id = Uuid::nil();
+        d.children = nodesWithoutIds(n.children);
+        res = res ~ [d];
+    }
+
+    res
+}
+
+/**
  * @returns: the content of a scene file
  * @params:
  *    - path: the project path of the file ('res:/...')
@@ -118,7 +215,7 @@ fn readSceneFile(path: [c8])-> [c8]
         return f:.readAll();
     } catch {
         _: &FsError => {
-            throw copy BalderError("Scene file not found: " ~ file.toStr());
+            throw copy BalderError(f"Scene file not found: ${file.toStr()}");
         }
     }
 }

@@ -1,0 +1,305 @@
+in writer;
+
+use balder::math::{utils, vector};
+use balder::scene::description::{kind, node_description, reader};
+use balder::scene::node::node3D::light;
+
+use std::{conv, stream, uuid};
+use std::algorithm::sorting;
+
+/**
+ * Writer of the descriptions of the nodes of a scene into a scene file (see SceneDescription for the format)
+ * @info:
+ * =====
+ * The file is the same each time the same nodes are written, so it diffs well under version control: the assets in the
+ * order of their paths, each keyed by the name of its file; the nodes parents first, in the order of the descriptions
+ * among their siblings; the entries of a node in a fixed order, those holding the default of the description left out;
+ * each number the shortest decimal that reads back the same float (the angles, in degrees, the same radians).
+ * ====
+ * */
+pub record SceneWriter {
+
+    // The nodes under the root, in order, each with the nodes under it
+    let _nodes: [NodeDescription];
+
+    /**
+     * @params:
+     *    - nodes: the nodes under the root, in order
+     * */
+    pub self (nodes: [NodeDescription])
+        with _nodes = nodes
+    {}
+
+    /**
+     * @returns: the content of the scene file of the nodes
+     * @info: a node of a nil id is given a new one, written in the file
+     * */
+    pub fn write(self)-> [c8] {
+        let assets = SceneWriter::assets(self._nodes);
+        let dmut out = copy StringStream();
+        out:.write(f"scene ${SCENE_VERSION};\n");
+        if assets.len != 0us {
+            out:.write("\n");
+            for a in assets {
+                out:.write(f"asset ${a._1} model ${SceneWriter::quoted(a._0)};\n");
+            }
+        }
+
+        for n in self._nodes {
+            SceneWriter::writeNode(alias out, n, none, assets);
+        }
+
+        out[]
+    }
+
+}
+
+/**
+ * The writing of the nodes and of their values
+ * */
+@companion
+mod SceneWriter {
+
+    /**
+     * Write the block of a node, then the blocks of the nodes under it
+     * @params:
+     *    - parent: the id of its parent, none under the root
+     *    - assets: the keys of the files of the models (see assets)
+     * */
+    pub fn writeNode(dmut out: &StringStream, n: NodeDescription, parent: (Uuid)?, assets: [([c8], [c8])]) {
+        let id = if n.id.isNil() { v4() } else { n.id };
+        let defaults = NodeDescription(n.name, n.kind);
+
+        out:.write(f"\nnode #${id} ${kindName(n.kind)} ${SceneWriter::quoted(n.name)} {\n");
+        if let Ok(p) = parent {
+            SceneWriter::entry(alias out, "parent", f"#${p}");
+        }
+
+        if n.position != defaults.position { SceneWriter::entry(alias out, "position", SceneWriter::vector(n.position)); }
+        if n.rotation != defaults.rotation {
+            let r = n.rotation;
+            SceneWriter::entry(alias out, "rotation", SceneWriter::angle(r.x) ~ " " ~ SceneWriter::angle(r.y) ~ " " ~ SceneWriter::angle(r.z));
+        }
+
+        if n.scale != defaults.scale { SceneWriter::entry(alias out, "scale", SceneWriter::vector(n.scale)); }
+
+        match n.kind {
+            NodeKind::MODEL => {
+                for a in assets if a._0 == n.file {
+                    SceneWriter::entry(alias out, "file", "@" ~ a._1);
+                }
+
+                if n.lods != defaults.lods { SceneWriter::entry(alias out, "lods", SceneWriter::boolean(n.lods)); }
+            }
+            NodeKind::LIGHT => {
+                if n.light != defaults.light            { SceneWriter::entry(alias out, "light", SceneWriter::lightName(n.light)); }
+                if n.color != defaults.color            { SceneWriter::entry(alias out, "color", SceneWriter::vector(n.color)); }
+                if n.intensity != defaults.intensity    { SceneWriter::entry(alias out, "intensity", SceneWriter::number(n.intensity)); }
+                if n.direction != defaults.direction    { SceneWriter::entry(alias out, "direction", SceneWriter::vector(n.direction)); }
+                if n.range != defaults.range            { SceneWriter::entry(alias out, "range", SceneWriter::number(n.range)); }
+                if n.innerAngle != defaults.innerAngle  { SceneWriter::entry(alias out, "inner-angle", SceneWriter::number(n.innerAngle)); }
+                if n.outerAngle != defaults.outerAngle  { SceneWriter::entry(alias out, "outer-angle", SceneWriter::number(n.outerAngle)); }
+                if n.shadows != defaults.shadows        { SceneWriter::entry(alias out, "shadows", SceneWriter::boolean(n.shadows)); }
+            }
+            NodeKind::GROUP => {}
+            _ => {
+                let m = n.material, d = defaults.material;
+                if m.baseColor != d.baseColor { SceneWriter::entry(alias out, "color", SceneWriter::vector(m.baseColor)); }
+                if m.roughness != d.roughness { SceneWriter::entry(alias out, "roughness", SceneWriter::number(m.roughness)); }
+                if m.metallic != d.metallic   { SceneWriter::entry(alias out, "metallic", SceneWriter::number(m.metallic)); }
+            }
+        }
+
+        out:.write("}\n");
+        for c in n.children {
+            SceneWriter::writeNode(alias out, c, (id)?, assets);
+        }
+    }
+
+    /**
+     * Write an entry of a node, `name: value;`
+     * */
+    pub fn entry(dmut out: &StringStream, name: [c8], value: [c8]) {
+        out:.write(f"    ${name}: ${value};\n");
+    }
+
+    /**
+     * @returns: the files of the models of nodes and of the nodes under them, each once, in the order of their paths,
+     * with the key of each: the name of the file, without its directory and its extension, made a valid name, followed
+     * by the first free number when another file before it took it
+     * */
+    pub fn assets(nodes: [NodeDescription])-> [([c8], [c8])] {
+        let mut keyed: [([c8], [c8])] = [];
+        for p in sort(copy SceneWriter::modelFiles(nodes, [])) {
+            let base = SceneWriter::keyOf(p);
+            let mut key = base, mut i = 2us;
+            while SceneWriter::isTaken(keyed, key) {
+                key = f"${base}_${i}";
+                i += 1us;
+            }
+
+            keyed = keyed ~ [(p, key)];
+        }
+
+        keyed
+    }
+
+    /**
+     * @returns: the files of the models of nodes and of the nodes under them, each once, added to those found already
+     * */
+    pub fn modelFiles(nodes: [NodeDescription], found: [[c8]])-> [[c8]] {
+        let mut files = found;
+        for n in nodes {
+            if n.kind == NodeKind::MODEL {
+                let mut known = false;
+                for f in files if f == n.file { known = true; }
+                if !known { files = files ~ [n.file]; }
+            }
+
+            files = SceneWriter::modelFiles(n.children, files);
+        }
+
+        files
+    }
+
+    /**
+     * @returns: true iif a key is the key of an asset already
+     * */
+    pub fn isTaken(keyed: [([c8], [c8])], key: [c8])-> bool {
+        for a in keyed if a._1 == key { return true; }
+        false
+    }
+
+    /**
+     * @returns: the key of the asset of a file, its name without its directory and its extension, each character a name
+     * cannot hold replaced by a '_', starting with a letter or a '_'
+     * */
+    pub fn keyOf(path: [c8])-> [c8] {
+        let mut start = 0us, mut end = path.len;
+        for i, c in path {
+            if c == '/' { start = i + 1us; }
+        }
+
+        for i in start .. path.len {
+            if path[i] == '.' && i > start { end = i; }
+        }
+
+        let dmut key = copy StringStream();
+        for i in start .. end {
+            let c = path[i];
+            let isLetter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+            if isLetter || (c >= '0' && c <= '9') || c == '_' || (c == '-' && i > start) {
+                key:.write(c);
+            } else {
+                key:.write('_');
+            }
+        }
+
+        let k = key[];
+        if k.len == 0us { return "asset"; }
+
+        let first = k[0];
+        if (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_' { k } else { "_" ~ k }
+    }
+
+    /**
+     * @returns: a text between double quotes, its quotes, backslashes, line breaks and tabs escaped
+     * */
+    pub fn quoted(text: [c8])-> [c8] {
+        let dmut s = copy StringStream();
+        s:.write('"');
+        for c in text {
+            match c {
+                '"'  => { s:.write("\\\""); }
+                '\\' => { s:.write("\\\\"); }
+                '\n' => { s:.write("\\n"); }
+                '\t' => { s:.write("\\t"); }
+                _    => { s:.write(c); }
+            }
+        }
+
+        s:.write('"');
+        s[]
+    }
+
+    /**
+     * @returns: true or false
+     * */
+    pub fn boolean(b: bool)-> [c8] {
+        if b { "true" } else { "false" }
+    }
+
+    /**
+     * @returns: the three numbers of a vector
+     * */
+    pub fn vector(v: vec3)-> [c8] {
+        SceneWriter::number(v.x) ~ " " ~ SceneWriter::number(v.y) ~ " " ~ SceneWriter::number(v.z)
+    }
+
+    /**
+     * @returns: the shortest decimal reading back a number, without exponent
+     * */
+    pub fn number(f: f32)-> [c8] {
+        SceneWriter::shortest(f, f, isAngle-> false)
+    }
+
+    /**
+     * @returns: the shortest decimal of an angle in degrees reading back an angle in radian
+     * */
+    pub fn angle(r: f32)-> [c8] {
+        SceneWriter::shortest(degree(r), r, isAngle-> true)
+    }
+
+    /**
+     * @returns: the decimal of the fewest digits of a value that reads back a target, the value in radian of an angle
+     * in degrees, or the decimal of the most digits when none does
+     * @params:
+     *    - value: the value written
+     *    - target: the value it reads back as
+     *    - isAngle: true when the value is in degrees and the target in radian
+     * */
+    pub fn shortest(value: f32, target: f32, isAngle: bool)-> [c8] {
+        if target == 0.0f { return "0"; }
+
+        let mut text = "0";
+        for p in 0u32 .. 48u32 {
+            text = SceneWriter::trimmed(std::conv::to!{[c8]} (value, prec-> p));
+            let read = {
+                std::conv::to!{f32} (text)
+            } catch {
+                _ => { continue; }
+            };
+
+            if (if isAngle { radian(read) } else { read }) == target { return text; }
+        }
+
+        text
+    }
+
+    /**
+     * @returns: a decimal without the zeros ending its fractional part, nor the '.' left alone
+     * */
+    pub fn trimmed(text: [c8])-> [c8] {
+        let mut dot = false;
+        for c in text if c == '.' { dot = true; }
+        if !dot { return text; }
+
+        let mut end = text.len;
+        while end > 0us && text[end - 1us] == '0' { end -= 1us; }
+        if end > 0us && text[end - 1us] == '.' { end -= 1us; }
+
+        let t = text[0us .. end];
+        if t == "-0" { "0" } else { t }
+    }
+
+    /**
+     * @returns: the name of a type of light, as the entry light of a scene file writes it
+     * */
+    pub fn lightName(t: LightType)-> [c8] {
+        match t {
+            LightType::POINT => { "point" }
+            LightType::SPOT  => { "spot" }
+            _                => { "direction" }
+        }
+    }
+}
