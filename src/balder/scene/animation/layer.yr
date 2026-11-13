@@ -1,21 +1,25 @@
 in layer;
 
-use balder::scene::animation::{clip, clip_state, event, joint_mask, joint_pose, skeleton};
+use balder::core::error;
+use balder::scene::animation::{event, joint_mask, joint_pose, motion, motion_state, parameters, skeleton, state, state_machine};
 
 /**
- * A layer of an animation player: the clips it plays, the clip played last (its current clip) fading in as the others
- * fade out, blended into one pose put over the layers below it, on the joints of its mask and by its weight
+ * A layer of an animation player: the motions it plays (clips, blend spaces), the motion played last (its current motion)
+ * fading in as the others fade out, blended into one pose put over the layers below it, on the joints of its mask and by
+ * its weight
  * @info:
  *    - an override layer replaces the pose below it (an upper body playing over the walk of the legs); an additive
  *      layer adds to it the motion of its clips from their first pose (a breath, a flinch)
- *    - only the current clip signals its events and its end, the clips fading out being silent, so that a cross-fade
- *      between two walks does not double the footsteps
+ *    - only the current motion signals its events and its end, the motions fading out being silent, so that a
+ *      cross-fade between two walks does not double the footsteps
+ *    - a layer running a state machine plays the motion of its current state, and cross-fades to the motion of the
+ *      next state when a transition fires (see playMachine)
  * */
 @final
 pub class AnimationLayer {
 
-    // The clips played, the current one last, the others fading out
-    let dmut _states: [ClipState] = [];
+    // The motions played, the current one last, the others fading out
+    let dmut _states: [MotionState] = [];
 
     // The weight of each joint in the layer, none for every joint fully
     let _mask: (JointMask)?;
@@ -26,8 +30,14 @@ pub class AnimationLayer {
     // True when the layer adds the motion of its clips to the pose below it, false when it replaces that pose
     let _additive: bool;
 
-    // True when the current clip fades out too, the layer stopping
+    // True when the current motion fades out too, the layer stopping
     let mut _stopping: bool = false;
+
+    // The state machine the layer runs, none when it plays motions on its own
+    let mut _machine: (&AnimationStateMachine)? = none;
+
+    // The index of the state of the machine the layer is in
+    let mut _state: usize = 0us;
 
     /*!
      * ====================================================================================================
@@ -38,7 +48,7 @@ pub class AnimationLayer {
      */
 
     /**
-     * An empty layer, playing no clip
+     * An empty layer, playing no motion
      * @params:
      *    - mask: the weight of each joint in the layer, none for every joint fully
      *    - weight: the part the layer takes in the pose, in [0, 1]
@@ -91,18 +101,18 @@ pub class AnimationLayer {
     }
 
     /**
-     * @returns: the clips the layer plays, the current one last, with their times and their weights
+     * @returns: the motions the layer plays, the current one last, with their times and their weights
      * */
     @field
-    pub fn states(self)-> [ClipState] {
+    pub fn states(self)-> [MotionState] {
         self._states
     }
 
     /**
-     * @returns: the clip played last, fading in or faded in, none when the layer plays nothing or stops
+     * @returns: the motion played last, fading in or faded in, none when the layer plays nothing or stops
      * */
     @field
-    pub fn current(self)-> (ClipState)? {
+    pub fn current(self)-> (MotionState)? {
         if self._stopping || self._states.len == 0us {
             return none;
         }
@@ -111,7 +121,27 @@ pub class AnimationLayer {
     }
 
     /**
-     * @returns: true iif the layer plays a clip, its current one or one fading out
+     * @returns: the state machine the layer runs, none when it plays motions on its own
+     * */
+    @field
+    pub fn machine(self)-> (&AnimationStateMachine)? {
+        self._machine
+    }
+
+    /**
+     * @returns: the state of the machine the layer is in, none when it runs no machine
+     * */
+    @field
+    pub fn state(self)-> (AnimationState)? {
+        if let Ok(m) = self._machine {
+            return (m.states[self._state])?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif the layer plays a motion, its current one or one fading out
      * */
     @field
     pub fn playing(self)-> bool {
@@ -127,33 +157,72 @@ pub class AnimationLayer {
      */
 
     /**
-     * Play a clip from its start (from its end when played backwards), the clip becoming the current one, fading in
-     * over a time as the clips played before it fade out over the same time, the weights of all summing to the same
+     * Play a motion from its start (from its end when played backwards), the motion becoming the current one, fading in
+     * over a time as the motions played before it fade out over the same time, the weights of all summing to the same;
+     * the layer no longer runs its state machine
      * @params:
-     *    - clip: the clip played
-     *    - looping: true for the clip to start again at its end, false to hold its last pose
-     *    - speed: the speed of the clip, negative to play it backwards
-     *    - fade: the time of the cross-fade, in seconds, 0 to replace the clips played at once
+     *    - motion: the motion played, a clip or a blend space
+     *    - parameters: the parameters of the player
+     *    - looping: true for the motion to start again at its end, false to hold its last pose
+     *    - speed: the speed of the motion, negative to play it backwards
+     *    - fade: the time of the cross-fade, in seconds, 0 to replace the motions played at once
      * */
-    pub fn play(mut self, clip: &AnimationClip, looping: bool = true, speed: f32 = 1.0f, fade: f32 = 0.0f) {
-        let start = if speed < 0.0f { clip.duration } else { 0.0f };
-        if fade <= 0.0f {
-            self._states = copy [ClipState(clip, time-> start, speed-> speed, looping-> looping)];
-        } else {
-            self:.fadeOut(fade);
-            self._states ~= [ClipState(clip, time-> start, speed-> speed, looping-> looping, weight-> 0.0f,
-                                       fade-> 1.0f / fade)];
-        }
-
-        self._stopping = false;
+    pub fn play(mut self, motion: &AnimationMotion, parameters: &AnimationParameters, looping: bool = true,
+                speed: f32 = 1.0f, fade: f32 = 0.0f) {
+        self._machine = none;
+        self:.start(motion, parameters, looping, speed, fade);
     }
 
     /**
-     * Stop the clips of the layer, fading them out over a time, the layer playing nothing once they faded out
+     * Run a state machine, entering its entry state, its motion cross-fading from the motions the layer played; at each
+     * advance, a transition from the current state firing on the parameters of the player cross-fades to the next state
+     * @params:
+     *    - machine: the machine run
+     *    - parameters: the parameters of the player
+     *    - fade: the time of the cross-fade to the entry state, in seconds, 0 to replace the motions played at once
+     * */
+    pub fn playMachine(mut self, machine: &AnimationStateMachine, parameters: &AnimationParameters, fade: f32 = 0.0f) {
+        self._machine = (machine)?;
+        if machine.states.len == 0us {
+            self:.stop(fade-> fade);
+            return;
+        }
+
+        self:.enter(machine.entry, parameters, fade);
+    }
+
+    /**
+     * Move the state machine the layer runs to a state of a name, whatever its transitions, cross-fading to its motion
+     * @params:
+     *    - name: the name of the state
+     *    - parameters: the parameters of the player
+     *    - fade: the time of the cross-fade, in seconds, 0 to enter the state at once
+     * @throws:
+     *    - BalderError: when the layer runs no state machine, or the machine has no state of that name
+     * */
+    pub fn enterState(mut self, name: [c8], parameters: &AnimationParameters, fade: f32 = 0.0f)
+        throws BalderError
+    {
+        if let Ok(m) = self._machine {
+            if let Ok(index) = m.find(name) {
+                self:.enter(index, parameters, fade);
+                return;
+            }
+
+            throw copy BalderError("The state machine has no state " ~ name);
+        }
+
+        throw copy BalderError("The layer runs no state machine, it cannot enter the state " ~ name);
+    }
+
+    /**
+     * Stop the motions of the layer, fading them out over a time, the layer playing nothing once they faded out, and
+     * running its state machine no more
      * @params:
      *    - fade: the time of the fade, in seconds, 0 to stop at once
      * */
     pub fn stop(mut self, fade: f32 = 0.0f) {
+        self._machine = none;
         if fade <= 0.0f {
             self._states = [];
         } else {
@@ -164,10 +233,10 @@ pub class AnimationLayer {
     }
 
     /**
-     * Move the current clip to a time, wrapped in the clip when it loops, held in it otherwise, no event being crossed;
-     * nothing is done when the layer has no current clip
+     * Move the current motion to a time, wrapped in the motion when it loops, held in it otherwise, no event being
+     * crossed; nothing is done when the layer has no current motion
      * @params:
-     *    - time: the time in the clip, in seconds
+     *    - time: the time in the motion, in seconds
      * */
     pub fn seek(mut self, time: f32) {
         if self.current.hasValue {
@@ -178,8 +247,8 @@ pub class AnimationLayer {
     }
 
     /**
-     * Change the speed of the current clip, negative to play it backwards; nothing is done when the layer has no
-     * current clip
+     * Change the speed of the current motion, negative to play it backwards; nothing is done when the layer has no
+     * current motion
      * */
     pub fn speed(mut self, speed: f32) {
         if self.current.hasValue {
@@ -188,25 +257,31 @@ pub class AnimationLayer {
     }
 
     /**
-     * Move the clips of the layer along a time elapsed, at their speeds, their weights along their fades, the clips
-     * faded out leaving the layer; only the current clip signals the events it crosses and its end
+     * Move the motions of the layer along a time elapsed, at their speeds, their weights along their fades, the motions
+     * faded out leaving the layer; only the current motion signals the events it crosses and its end; then, when the
+     * layer runs a state machine, the first transition firing from its state cross-fades to the next state, consuming
+     * its triggers
      * @params:
      *    - seconds: the time elapsed, in seconds
-     *    - crossed: called with each event the current clip crosses
-     *    - ended: called with the current clip when, played once, it reaches its end
+     *    - parameters: the parameters of the player, the lengths of the blend spaces read again from them
+     *    - crossed: called with each event the current motion crosses
+     *    - ended: called with the current motion when, played once, it reaches its end
      * */
-    pub fn advance(mut self, seconds: f32, crossed: dg (AnimationEvent)-> void, ended: dg (&AnimationClip)-> void) {
+    pub fn advance(mut self, seconds: f32, dmut parameters: &AnimationParameters, crossed: dg (AnimationEvent)-> void,
+                   ended: dg (&AnimationMotion)-> void) {
         if self._states.len == 0us { return; }
 
         let hasCurrent = self.current.hasValue;
         let last = self._states.len - 1us;
+        let before = self._states[last].played;
         let mut faded = 0us;
         for i in 0us .. self._states.len {
             // the states are records, written back by index
             let mut state = self._states[i];
+            state:.refresh(parameters);
             if hasCurrent && i == last {
                 if state:.advance(seconds, crossed) {
-                    ended(state.clip);
+                    ended(state.motion);
                 }
             } else {
                 state:.place(state.time + seconds * state.speed);
@@ -219,9 +294,9 @@ pub class AnimationLayer {
             }
         }
 
-        // the clips faded out leave the layer, which allocates only at the end of a fade
+        // the motions faded out leave the layer, which allocates only at the end of a fade
         if faded != 0us {
-            let dmut kept: [ClipState] = [];
+            let dmut kept: [MotionState] = [];
             for state in self._states {
                 if !(state.fadingOut && state.weight <= 0.0f) {
                     kept ~= [state];
@@ -230,32 +305,39 @@ pub class AnimationLayer {
 
             self._states = alias kept;
         }
+
+        if hasCurrent {
+            self:.transit(before, alias parameters);
+        }
     }
 
     /**
-     * Write the pose of the layer in a buffer, the poses of its clips blended by their weights, allocating nothing; the
+     * Write the pose of the layer in a buffer, the poses of its motions blended by their weights, allocating nothing; the
      * pose of an additive layer is the motion of its clips from their first pose (see JointPose.difference)
      * @params:
      *    - skeleton: the skeleton moved
+     *    - parameters: the parameters of the player, placing its blend spaces between their clips
      *    - pose: the buffer of the pose of the layer, a pose for each joint of the skeleton
-     *    - sample: a buffer of the same size, the pose of each clip sampled in it
-     *    - reference: a buffer of the same size, the first pose of each clip of an additive layer sampled in it
-     * @returns: the part the clips take in the pose, the sum of their weights held in [0, 1], 0 when the layer plays
+     *    - sample: a buffer of the same size, the pose of each motion sampled in it
+     *    - scratch: a buffer of the same size, the clips of a blend space sampled in it
+     *    - reference: a buffer of the same size, the first pose of each motion of an additive layer sampled in it
+     * @returns: the part the motions take in the pose, the sum of their weights held in [0, 1], 0 when the layer plays
      * nothing (the buffer left as it was)
      * */
-    pub fn poseInto(self, skeleton: &Skeleton, dmut pose: [JointPose], dmut sample: [JointPose], dmut reference: [JointPose])-> f32 {
+    pub fn poseInto(self, skeleton: &Skeleton, parameters: &AnimationParameters, dmut pose: [JointPose],
+                    dmut sample: [JointPose], dmut scratch: [JointPose], dmut reference: [JointPose])-> f32 {
         let mut total = 0.0f;
         for state in self._states {
             if state.weight > 0.0f {
-                state.clip.sampleInto(skeleton, state.time, alias sample);
+                state.motion.sampleMotionInto(skeleton, state.time, parameters, alias sample, alias scratch);
                 if self._additive {
-                    state.clip.sampleInto(skeleton, 0.0f, alias reference);
+                    state.motion.sampleMotionInto(skeleton, 0.0f, parameters, alias reference, alias scratch);
                     for j in 0us .. sample.len {
                         sample[j] = sample[j].difference(reference[j]);
                     }
                 }
 
-                // each clip blended by its part of the weights so far, so the pose is their weighted mean
+                // each motion blended by its part of the weights so far, so the pose is their weighted mean
                 total += state.weight;
                 if total == state.weight {
                     for j in 0us .. sample.len {
@@ -274,7 +356,58 @@ pub class AnimationLayer {
     }
 
     /**
-     * Fade out every clip of the layer over a time, from their weight to 0, a clip of no weight leaving the layer at
+     * Play a motion, the current one fading in as the others fade out (see play), keeping the state machine of the layer
+     * */
+    fn start(mut self, motion: &AnimationMotion, parameters: &AnimationParameters, looping: bool, speed: f32, fade: f32) {
+        let duration = motion.motionDuration(parameters);
+        let begin = if speed < 0.0f { duration } else { 0.0f };
+        if fade <= 0.0f {
+            self._states = copy [MotionState(motion, parameters, time-> begin, speed-> speed, looping-> looping)];
+        } else {
+            self:.fadeOut(fade);
+            self._states ~= [MotionState(motion, parameters, time-> begin, speed-> speed, looping-> looping,
+                                         weight-> 0.0f, fade-> 1.0f / fade)];
+        }
+
+        self._stopping = false;
+    }
+
+    /**
+     * Enter a state of the machine of the layer, cross-fading to its motion
+     * @params:
+     *    - index: the index of the state in the machine
+     *    - parameters: the parameters of the player
+     *    - fade: the time of the cross-fade, in seconds
+     * */
+    fn enter(mut self, index: usize, parameters: &AnimationParameters, fade: f32) {
+        if let Ok(m) = self._machine {
+            let state = m.states[index];
+            self:.start(state.motion, parameters, state.looping, state.speed, fade);
+            self._state = index;
+        }
+    }
+
+    /**
+     * Fire the first transition of the state machine of the layer from its state, if any, at the end of an advance,
+     * entering the next state and consuming the triggers of the transition
+     * @params:
+     *    - before: how much of the current motion was played before the advance
+     *    - parameters: the parameters of the player
+     * */
+    fn transit(mut self, before: f32, dmut parameters: &AnimationParameters) {
+        if let Ok(m) = self._machine {
+            if let Ok(current) = self.current {
+                if let Ok(t) = m.firing(self._state, current, before, parameters) {
+                    let transition = m.transitions[t];
+                    transition.consumeTriggers(alias parameters);
+                    self:.enter(transition.to, parameters, transition.fade);
+                }
+            }
+        }
+    }
+
+    /**
+     * Fade out every motion of the layer over a time, from their weight to 0, a motion of no weight leaving the layer at
      * the next advance
      * @params:
      *    - fade: the time of the fade, in seconds, positive

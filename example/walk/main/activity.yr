@@ -1,0 +1,458 @@
+in activity;
+
+use main::pack;
+use balder::math::_;
+use balder::core::{_, application::_};
+use balder::interface::_;
+use balder::interface::widget::{layout::_, text::_};
+use balder::scene::animation::_;
+use balder::scene::node::{node3D::_, node3D::camera, node3D::group, node3D::visual::_, node3D::visual::material::_};
+use balder::utils::log;
+
+use sdl3::_;
+
+use std::{math, time};
+
+/**
+ * The directories of the Mixamo packs the character is read from, Tab going from one to the next
+ * */
+pub lazy mut __PACKS__: [mut [[c8]]] = copy [copy ["local_res/models/Locomotion Pack", "local_res/models/Female Locomotion Pack"]];
+
+/**
+ * How fast the velocity of the character reaches the one of the keys, the share of the gap closed in a second
+ * */
+def ACCELERATION = 8.0f;
+
+/**
+ * How fast a moving character turns to face the way the camera looks, the share of the gap closed in a second
+ * */
+def FACING = 10.0f;
+
+/**
+ * The height of the character, in metres
+ * */
+def HEIGHT = 1.8f;
+
+/**
+ * The height under the floor the characters of the packs not shown are put at
+ * */
+def HIDDEN = -1000.0f;
+
+/**
+ * The side of a tile of the floor, in metres, and the number of tiles on a side of the floor, odd, the floor following
+ * the character two tiles at a time for the checker to stay in place
+ * */
+def TILE = 2.0f;
+def TILES = 41;
+
+/**
+ * A character walking, strafing, running, turning and jumping on an endless floor under a blue sky, its clips mixed by
+ * a state machine (see Pack), the clips of a Mixamo pack at a time, Tab going to the next pack; the camera follows it
+ * from behind, the character facing the way the camera looks as it moves, and turning to face it when it stands still
+ * */
+pub class WalkActivity over Activity {
+
+    let dmut _scene: (&Scene)? = none;
+    let dmut _cam: (&PerspectiveCamera)? = none;
+    let dmut _state: (&Label)? = none;
+
+    // The packs, the one shown, and the floor under the character
+    let dmut _packs: [&Pack] = [];
+    let mut _shown: usize = 0us;
+    let dmut _floor: (&Group3D)? = none;
+
+    // The keys held: Z, S, Q, D, Shift
+    let mut _forwardKey: bool = false;
+    let mut _backwardKey: bool = false;
+    let mut _leftKey: bool = false;
+    let mut _rightKey: bool = false;
+    let mut _runKey: bool = false;
+
+    // The position of the character on the floor, the way it faces, in degrees as the yaw of the camera, and its
+    // velocity, along its right and its front, in metres a second
+    let mut _position: vec3 = vec3();
+    let mut _facing: f32 = 0.0f;
+    let mut _velocity: vec2 = vec2();
+
+    // The camera turning about the character: its yaw and its pitch, in degrees, looking toward -z at a yaw of 0, and
+    // its distance to the character; the right button turns it
+    let mut _yaw: f32 = 0.0f;
+    let mut _pitch: f32 = -15.0f;
+    let mut _distance: f32 = 4.0f;
+    let mut _turning: bool = false;
+    let mut _turnStart: (i32, i32) = (0, 0);
+
+    // The text of the label of the state, written again when it changes only
+    let mut _stateText: [c8] = "";
+
+    pub self (uid: usize, dmut app: &Application, dmut window: &Window)
+        with super(uid, alias app, alias window)
+    {}
+
+    over onStart(mut self) {
+        self.input:.quit():.connect(self.box, &self:.onQuit);
+        self.input:.keyboard(KeyInfo(SDLK_Z, KeyEvent::ALL)):.connect(self.box, &self:.onForward);
+        self.input:.keyboard(KeyInfo(SDLK_S, KeyEvent::ALL)):.connect(self.box, &self:.onBackward);
+        self.input:.keyboard(KeyInfo(SDLK_Q, KeyEvent::ALL)):.connect(self.box, &self:.onLeft);
+        self.input:.keyboard(KeyInfo(SDLK_D, KeyEvent::ALL)):.connect(self.box, &self:.onRight);
+        self.input:.keyboard(KeyInfo(SDLK_LSHIFT, KeyEvent::ALL)):.connect(self.box, &self:.onRun);
+        self.input:.keyboard(KeyInfo(SDLK_SPACE, KeyEvent::DOWN)):.connect(self.box, &self:.onJump);
+        self.input:.keyboard(KeyInfo(SDLK_TAB, KeyEvent::DOWN)):.connect(self.box, &self:.onNextPack);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::DOWN)):.connect(self.box, &self:.onTurnStart);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::RELEASE)):.connect(self.box, &self:.onTurnEnd);
+        self.input:.mouseMotion():.connect(self.box, &self:.onMouseMove);
+        self.input:.mouseWheel():.connect(self.box, &self:.onWheel);
+
+        {
+            self.gui:.loadStyleFile("res:/config/walk.style");
+            self.gui:.loadGUIFile("res:/config/walk.gui");
+        } catch {
+            err => {
+                log::error #("Walk", "Failed to load the interface", err);
+                return;
+            }
+        }
+
+        if let Ok(dmut w: &Scene3DLayout) = self.gui:.find("scene") {
+            self._scene = w:.getScene();
+        }
+
+        if let Ok(dmut l: &Label) = self.gui:.find("state") {
+            self._state = (alias l)?;
+        }
+
+        {
+            if let Ok(dmut s: &Scene) = alias self._scene {
+                // a sky blue background
+                s.background = makeVec3(0.25f, 0.55f, 1.0f);
+                s.ambient = makeVec3(0.35f, 0.4f, 0.5f);
+                s.ambientOcclusion = true;
+                self:.createLight(alias s);
+                self:.createFloor(alias s);
+                self:.createCharacters(alias s);
+                self:.createCamera(alias s);
+            }
+        } catch {
+            err => {
+                log::error #("Walk", "Failed to build the scene", err);
+            }
+        }
+    }
+
+    over onUpdate(mut self, delta: Duration) {
+        let seconds = cast!f32(delta.allMicros) / 1000000.0f;
+
+        // the nodes move between two frames, never during the submission of one: a frame drawing the floor halfway
+        // through its shift would show holes where its tiles were
+        self.window:.lockFrame();
+        if self._packs.len != 0us {
+            self:.moveCharacter(seconds);
+            let dmut pack = alias self._packs[self._shown];
+            let dmut player = alias pack:.player();
+            self:.setParameters(alias player);
+            player:.advance(delta);
+            pack:.model():.pose(player.poses);
+        }
+
+        self:.followCharacter();
+        self.window:.unlockFrame();
+
+        self:.showState();
+    }
+
+    pub fn onQuit(mut self) {
+        self.app:.close(alias self);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          INPUTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub fn onForward(mut self, info: KeyInfo) {
+        self._forwardKey = held(info, self._forwardKey);
+    }
+
+    pub fn onBackward(mut self, info: KeyInfo) {
+        self._backwardKey = held(info, self._backwardKey);
+    }
+
+    pub fn onLeft(mut self, info: KeyInfo) {
+        self._leftKey = held(info, self._leftKey);
+    }
+
+    pub fn onRight(mut self, info: KeyInfo) {
+        self._rightKey = held(info, self._rightKey);
+    }
+
+    pub fn onRun(mut self, info: KeyInfo) {
+        self._runKey = held(info, self._runKey);
+    }
+
+    /**
+     * Jump, the state machine leaving any state for a jump at its next advance (see Pack); nothing is done during a
+     * jump, the trigger would stay set and jump again on landing
+     * */
+    pub fn onJump(mut self, _: KeyInfo) {
+        if self._packs.len == 0us { return; }
+
+        let state = self._packs[self._shown].state;
+        if state == "jump" || state == "running jump" { return; }
+
+        self._packs[self._shown]:.player():.parameters():.trigger("jump");
+    }
+
+    /**
+     * Show the character of the next pack in place of the one shown, the others hidden under the floor
+     * */
+    pub fn onNextPack(mut self, _: KeyInfo) {
+        if self._packs.len < 2us { return; }
+
+        self.window:.lockFrame();
+        self._packs[self._shown]:.model().position = makeVec3(self._position.x, HIDDEN, self._position.z);
+        self._shown = (self._shown + 1us) % self._packs.len;
+        self.window:.unlockFrame();
+
+        log::info #("Walk", "Pack", self._packs[self._shown].name);
+    }
+
+    pub fn onTurnStart(mut self, x: i32, y: i32, _: MouseInfo) {
+        self._turning = true;
+        self._turnStart = (x, y);
+    }
+
+    pub fn onTurnEnd(mut self, _: i32, _: i32, _: MouseInfo) {
+        self._turning = false;
+    }
+
+    pub fn onMouseMove(mut self, x: i32, y: i32) {
+        if !self._turning { return; }
+
+        self._yaw = (self._yaw + cast!f32(x - self._turnStart._0) * 0.2f) % 360.0f;
+        self._pitch = std::algorithm::comparison::clamp(self._pitch + cast!f32(self._turnStart._1 - y) * 0.2f, -80.0f, 10.0f);
+        self._turnStart = (x, y);
+    }
+
+    pub fn onWheel(mut self, _: i32, _: i32, _: i32, w: i32) {
+        self._distance = std::algorithm::comparison::clamp(self._distance - cast!f32(w) * 0.5f, 1.5f, 20.0f);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          MOVEMENT          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Move the velocity of the character toward the one of the keys held, at the speeds of the clips of its pack, and
+     * the character along it; turn it to face the camera, as it moves, or by the turn it plays standing still; the floor
+     * follows it
+     * */
+    fn moveCharacter(mut self, seconds: f32) {
+        let pack = self._packs[self._shown];
+        let mut side = 0.0f;
+        let mut front = 0.0f;
+        if self._forwardKey { front += 1.0f; }
+        if self._backwardKey { front -= 1.0f; }
+        if self._rightKey { side += 1.0f; }
+        if self._leftKey { side -= 1.0f; }
+
+        let target = pack.velocityOf(side, front, self._runKey);
+        let share = if seconds * ACCELERATION > 1.0f { 1.0f } else { seconds * ACCELERATION };
+        self._velocity = self._velocity + (target - self._velocity) * share;
+
+        // the character stops at once and stands still through a standing jump, its feet on the ground as it crouches
+        // and lands
+        let state = pack.state;
+        if state == "jump" {
+            self._velocity = vec2();
+        }
+
+        // a turn standing still turns the character at its own rate; moving, the character faces the camera
+        let rate = pack.turnRate;
+        if rate != 0.0f {
+            self._facing += rate * seconds;
+        } else if self._velocity.length() > IDLE_SPEED {
+            let turn = if seconds * FACING > 1.0f { 1.0f } else { seconds * FACING };
+            self._facing += self.gap() * turn;
+        }
+
+        // the facing kept in [-180, 180) as it turns round and round
+        self._facing = self._yaw - self.gap();
+
+        let facing = math::utils::radian(self._facing);
+        let forward = makeVec3(-sin(facing), 0.0f, -cos(facing));
+        let right = makeVec3(-cos(facing), 0.0f, sin(facing));
+        self._position = self._position + (right * self._velocity.x + forward * self._velocity.y) * seconds;
+
+        let dmut model = alias self._packs[self._shown]:.model();
+        model.position = self._position;
+        model.rotation = makeVec3(0.0f, facing, 0.0f);
+
+        // the floor moves two tiles at a time, the checker staying in place under the character
+        if let Ok(dmut f) = alias self._floor {
+            let step = 2.0f * TILE;
+            let at = makeVec3(floor(self._position.x / step) * step, 0.0f, floor(self._position.z / step) * step);
+            if at.x != f.position.x || at.z != f.position.z {
+                f.position = at;
+            }
+        }
+    }
+
+    /**
+     * @returns: the angle from the facing of the character to the yaw of the camera, in degrees, in [-180, 180),
+     * positive to the right
+     * */
+    fn gap(self)-> f32 {
+        let d = (self._yaw - self._facing) % 360.0f;
+        let wrapped = if d < 0.0f { d + 360.0f } else { d };
+        if wrapped >= 180.0f { wrapped - 360.0f } else { wrapped }
+    }
+
+    /**
+     * Give the animation the velocity of the character: its speed for the state machine to choose between idle and
+     * moving, the velocity for the blend space of the motion, mirrored when it goes backward, the backward state playing
+     * the motion backwards, and the gap between its facing and the camera, for its turns
+     * */
+    fn setParameters(mut self, dmut player: &AnimationPlayer) {
+        let backward = self._velocity.y < -IDLE_SPEED;
+        let dmut parameters = alias player:.parameters();
+        parameters:.value("speed", self._velocity.length());
+        parameters:.flag("backward", backward);
+        parameters:.value("side", if backward { -self._velocity.x } else { self._velocity.x });
+        parameters:.value("forward", if backward { -self._velocity.y } else { self._velocity.y });
+        parameters:.value("gap", self.gap());
+    }
+
+    /**
+     * Place the camera behind the character, looking at its chest along the yaw and the pitch
+     * */
+    fn followCharacter(mut self) {
+        if let Ok(dmut cam) = alias self._cam {
+            let pitch = math::utils::radian(self._pitch);
+            let yaw = math::utils::radian(self._yaw);
+            let look = makeVec3(-cos(pitch) * sin(yaw), sin(pitch), -cos(pitch) * cos(yaw));
+            let target = self._position + makeVec3(0.0f, HEIGHT * 0.6f, 0.0f);
+
+            cam.position = target - look * self._distance;
+            cam.target = target;
+        }
+    }
+
+    /**
+     * Write the pack, the state of the character and its velocity in their label
+     * */
+    fn showState(mut self) {
+        if self._packs.len == 0us { return; }
+
+        let pack = self._packs[self._shown];
+        let text = std::format::format("pack: {} (Tab) | state: {} | velocity: {:.1} m/s sideways, {:.1} m/s forward",
+                                       pack.name, pack.state, self._velocity.x, self._velocity.y);
+        if text == self._stateText { return; }
+
+        self._stateText = text;
+        if let Ok(dmut lbl) = alias self._state {
+            lbl:.setText(text);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCENE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The characters of the packs of '--packs', HEIGHT metres tall, the first one at the origin, the others hidden under
+     * the floor; a pack that cannot be read is skipped
+     * */
+    fn createCharacters(mut self, dmut scene: &Scene) {
+        for dir in __PACKS__[0] {
+            {
+                let dmut pack = copy Pack(dir, alias scene:.getRootNode(), HEIGHT);
+                if self._packs.len != 0us {
+                    pack:.model().position = makeVec3(0.0f, HIDDEN, 0.0f);
+                }
+
+                self._packs ~= [alias pack];
+            } catch {
+                err => {
+                    log::error #("Walk", "Failed to load the pack", dir, err);
+                }
+            }
+        }
+    }
+
+    /**
+     * The floor, a checker of TILES x TILES tiles of two greys around the character
+     * */
+    fn createFloor(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        let mut light = MaterialConfig();
+        light.baseColor = makeVec3(0.8f, 0.8f, 0.78f);
+        light.roughness = 0.9f;
+
+        let mut dark = MaterialConfig();
+        dark.baseColor = makeVec3(0.45f, 0.47f, 0.45f);
+        dark.roughness = 0.9f;
+
+        let dmut floor = copy Group3D("floor", scene:.getRootNode());
+        let (array, indices) = planeMesh();
+        let dmut first = copy IndexedMesh3D("tile", alias floor, LodChain(indices), array, copy ConstantMaterial(light));
+
+        let half = TILES / 2;
+        for i in 0 .. TILES {
+            for j in 0 .. TILES {
+                let at = makeVec3(cast!f32(i - half) * TILE, 0.0f, cast!f32(j - half) * TILE);
+                if i == half && j == half {
+                    first.position = at;
+                    first.scale = makeVec3(TILE, 1.0f, TILE);
+                } else {
+                    let config = if (i + j) % 2 == 0 { light } else { dark };
+                    let dmut tile = copy IndexedMesh3D::sharing(std::format::format("tile_{}_{}", i, j), alias floor,
+                                                                alias first.mesh, copy ConstantMaterial(config));
+                    tile.position = at;
+                    tile.scale = makeVec3(TILE, 1.0f, TILE);
+                }
+            }
+        }
+
+        self._floor = (alias floor)?;
+    }
+
+    /**
+     * A sun casting shadows, low enough for the shadow of the character to show its steps
+     * */
+    fn createLight(mut self, dmut scene: &Scene) {
+        let dmut sun = copy Light("sun", scene:.getRootNode(), castShadow-> true);
+        sun.direction = makeVec3(-0.4f, -1.0f, -0.6f);
+        sun.intensity = 2.5f;
+        sun.color = makeVec3(1.0f, 0.95f, 0.85f);
+    }
+
+    fn createCamera(mut self, dmut scene: &Scene) {
+        let dmut cam = copy PerspectiveCamera("cam", scene:.getRootNode());
+        cam.fov = 70.0f;
+        cam.far = 200.0f;
+        self._cam = (alias cam)?;
+        self:.followCharacter();
+    }
+
+}
+
+/**
+ * @returns: true while a key is held, from its press to its release, its repeats changing nothing
+ * */
+fn held(info: KeyInfo, was: bool)-> bool {
+    if info.type == KeyEvent::DOWN { true }
+    else if info.type == KeyEvent::RELEASE { false }
+    else { was }
+}

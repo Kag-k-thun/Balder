@@ -2,18 +2,19 @@ in player;
 
 use balder::core::error;
 use balder::core::application::signal;
-use balder::scene::animation::{clip, event, joint_mask, joint_pose, layer, skeleton};
+use balder::scene::animation::{event, joint_mask, joint_pose, layer, motion, parameters, skeleton, state_machine};
 
 use std::conv;
 
 use ::std::time;
 
 /**
- * Plays the clips of a skeleton in layers: each layer plays a clip at a time, in a loop or once, at a speed, cross-fading
- * from one clip to the next, the layers put one over the other on the joints of their masks (an upper body over the
- * walk of the legs, a breath added to both); the pose of the skeleton is sampled again at each advance for a model to
- * be moved to it (see SolidObjectModel.pose), and the events the current clips cross are signalled (see events), and
- * the end of those played once (see finished)
+ * Plays the motions of a skeleton in layers: each layer plays a motion at a time (a clip, or a blend space mixing clips
+ * by the parameters of the player), in a loop or once, at a speed, cross-fading from one motion to the next, or runs a
+ * state machine moving between motions on those parameters; the layers are put one over the other on the joints of
+ * their masks (an upper body over the walk of the legs, a breath added to both); the pose of the skeleton is sampled
+ * again at each advance for a model to be moved to it (see SolidObjectModel.pose), and the events the current motions
+ * cross are signalled (see events), and the end of those played once (see finished)
  * @info: the layer 0 replaces the rest pose of the skeleton, on every joint, and cannot be removed; the methods taking
  * a layer act on it by default
  * @example:
@@ -26,7 +27,11 @@ use ::std::time;
  * let upper = player:.addLayer(mask-> (JointMask::fromJoint(skeleton, "b_Spine01_02"))?);
  * player:.play(library:.find("res:/models/fox/Fox.gltf", "Survey"), fade-> 0.3f, layer-> upper);
  *
+ * // or a state machine, walking and running by the speed the actor sets
+ * player:.playMachine(locomotion);
+ *
  * // at each tick
+ * player:.parameters():.value("speed", speed);
  * player:.advance(delta);
  * fox:.pose(player.poses);
  * ```
@@ -43,20 +48,24 @@ pub class AnimationPlayer {
     // The pose of each joint of the skeleton relative to its parent, sampled again in place at each advance
     let dmut _poses: [JointPose];
 
-    // The buffers of the pose of a layer, of a clip of a layer, and of the first pose of a clip of an additive layer,
-    // the size of the skeleton, sampled in place
+    // The buffers of the pose of a layer, of a motion of a layer, of a clip of a blend space, and of the first pose of a
+    // motion of an additive layer, the size of the skeleton, sampled in place
     let dmut _layerPose: [JointPose];
     let dmut _sample: [JointPose];
+    let dmut _scratch: [JointPose];
     let dmut _reference: [JointPose];
 
-    // True when the player holds its clips at their times
+    // The values the actor sets, read by the blend spaces and the transitions of the state machines
+    let dmut _parameters: &AnimationParameters = copy AnimationParameters();
+
+    // True when the player holds its motions at their times
     let mut _paused: bool = false;
 
-    // The events of the clips crossed by the time of the player (see AnimationClip.addEvent)
+    // The events of the motions crossed by the time of the player (see AnimationClip.addEvent)
     let dmut _events: &Signal!{AnimationEvent} = copy Signal!{AnimationEvent} ();
 
-    // The clips played once that reached their end
-    let dmut _finished: &Signal!{&AnimationClip} = copy Signal!{&AnimationClip} ();
+    // The motions played once that reached their end
+    let dmut _finished: &Signal!{&AnimationMotion} = copy Signal!{&AnimationMotion} ();
 
     /*!
      * ====================================================================================================
@@ -77,6 +86,7 @@ pub class AnimationPlayer {
         , _poses = copy skeleton.rest
         , _layerPose = copy skeleton.rest
         , _sample = copy skeleton.rest
+        , _scratch = copy skeleton.rest
         , _reference = copy skeleton.rest
     {}
 
@@ -97,24 +107,31 @@ pub class AnimationPlayer {
     }
 
     /**
-     * @returns: the signal of the events crossed by the current clips of the layers, in the order they cross them (see
-     * ClipState.advance), the listeners called on the thread of their slot emitter
+     * @returns: the values the actor sets for the blend spaces and the state machines of the layers, read at each advance
+     * */
+    pub fn parameters(mut self)-> dmut &AnimationParameters {
+        alias self._parameters
+    }
+
+    /**
+     * @returns: the signal of the events crossed by the current motions of the layers, in the order they cross them (see
+     * MotionState.advance), the listeners called on the thread of their slot emitter
      * */
     pub fn events(mut self)-> dmut &Signal!{AnimationEvent} {
         alias self._events
     }
 
     /**
-     * @returns: the signal of the current clips played once reaching their end (their start when played backwards),
-     * once each time they reach it, the clip holding its last pose
+     * @returns: the signal of the current motions played once reaching their end (their start when played backwards),
+     * once each time they reach it, the motion holding its last pose
      * */
-    pub fn finished(mut self)-> dmut &Signal!{&AnimationClip} {
+    pub fn finished(mut self)-> dmut &Signal!{&AnimationMotion} {
         alias self._finished
     }
 
     /**
      * @returns: the pose of each joint of the skeleton relative to its parent, the layers put one over the other at the
-     * times of their clips, the rest pose when nothing plays
+     * times of their motions, the rest pose when nothing plays
      * */
     @field
     pub fn poses(self)-> [JointPose] {
@@ -122,7 +139,7 @@ pub class AnimationPlayer {
     }
 
     /**
-     * @returns: the layers, the layer 0 at the bottom, with their clips (see AnimationLayer.current)
+     * @returns: the layers, the layer 0 at the bottom, with their motions (see AnimationLayer.current)
      * */
     @field
     pub fn layers(self)-> [&AnimationLayer] {
@@ -130,7 +147,7 @@ pub class AnimationPlayer {
     }
 
     /**
-     * @returns: true iif a layer plays a clip, paused or not
+     * @returns: true iif a layer plays a motion, paused or not
      * */
     @field
     pub fn playing(self)-> bool {
@@ -142,7 +159,7 @@ pub class AnimationPlayer {
     }
 
     /**
-     * @returns: true iif the player holds its clips at their times
+     * @returns: true iif the player holds its motions at their times
      * */
     @field
     pub fn paused(self)-> bool {
@@ -150,7 +167,7 @@ pub class AnimationPlayer {
     }
 
     /**
-     * Hold the clips at their times, or move them along again
+     * Hold the motions at their times, or move them along again
      * */
     @field
     pub fn paused(mut self, paused: bool) {
@@ -210,24 +227,55 @@ pub class AnimationPlayer {
      */
 
     /**
-     * Play a clip on a layer from its start (from its end when played backwards), cross-fading from the clips the layer
-     * played; the player is no longer paused
+     * Play a motion on a layer from its start (from its end when played backwards), cross-fading from the motions the
+     * layer played, the layer no longer running its state machine; the player is no longer paused
      * @params:
-     *    - clip: the clip played, its joints found in the skeleton by their names
-     *    - looping: true for the clip to start again at its end, false to hold its last pose
-     *    - speed: the speed of the clip, negative to play it backwards
-     *    - fade: the time of the cross-fade, in seconds, 0 to replace the clips of the layer at once
+     *    - motion: the motion played, a clip or a blend space, its joints found in the skeleton by their names
+     *    - looping: true for the motion to start again at its end, false to hold its last pose
+     *    - speed: the speed of the motion, negative to play it backwards
+     *    - fade: the time of the cross-fade, in seconds, 0 to replace the motions of the layer at once
      *    - layer: the index of the layer
      * */
-    pub fn play(mut self, clip: &AnimationClip, looping: bool = true, speed: f32 = 1.0f, fade: f32 = 0.0f, layer: usize = 0us) {
-        self._layers[layer]:.play(clip, looping-> looping, speed-> speed, fade-> fade);
+    pub fn play(mut self, motion: &AnimationMotion, looping: bool = true, speed: f32 = 1.0f, fade: f32 = 0.0f,
+                layer: usize = 0us) {
+        self._layers[layer]:.play(motion, self._parameters, looping-> looping, speed-> speed, fade-> fade);
         self._paused = false;
         self:.sample();
     }
 
     /**
-     * Stop the clips of a layer, fading them out, the pose below the layer coming back as they fade (the rest pose for
-     * the layer 0)
+     * Run a state machine on a layer from its entry state, cross-fading from the motions the layer played; the
+     * transitions fire at the advances, on the parameters of the player; the player is no longer paused
+     * @params:
+     *    - machine: the machine run, the layer holding its own state in it
+     *    - fade: the time of the cross-fade to the entry state, in seconds, 0 to replace the motions of the layer at once
+     *    - layer: the index of the layer
+     * */
+    pub fn playMachine(mut self, machine: &AnimationStateMachine, fade: f32 = 0.0f, layer: usize = 0us) {
+        self._layers[layer]:.playMachine(machine, self._parameters, fade-> fade);
+        self._paused = false;
+        self:.sample();
+    }
+
+    /**
+     * Move the state machine a layer runs to a state, whatever its transitions, cross-fading to its motion
+     * @params:
+     *    - name: the name of the state
+     *    - fade: the time of the cross-fade, in seconds, 0 to enter the state at once
+     *    - layer: the index of the layer
+     * @throws:
+     *    - BalderError: when the layer runs no state machine, or the machine has no state of that name
+     * */
+    pub fn enterState(mut self, name: [c8], fade: f32 = 0.0f, layer: usize = 0us)
+        throws BalderError
+    {
+        self._layers[layer]:.enterState(name, self._parameters, fade-> fade);
+        self:.sample();
+    }
+
+    /**
+     * Stop the motions of a layer, fading them out, the pose below the layer coming back as they fade (the rest pose for
+     * the layer 0), the layer no longer running its state machine
      * @params:
      *    - fade: the time of the fade, in seconds, 0 to stop at once
      *    - layer: the index of the layer
@@ -238,10 +286,10 @@ pub class AnimationPlayer {
     }
 
     /**
-     * Move the current clip of a layer to a time, wrapped in the clip when it loops, held in it otherwise, no event
-     * being crossed; nothing is done when the layer has no current clip
+     * Move the current motion of a layer to a time, wrapped in the motion when it loops, held in it otherwise, no event
+     * being crossed; nothing is done when the layer has no current motion
      * @params:
-     *    - time: the time in the clip, in seconds
+     *    - time: the time in the motion, in seconds
      *    - layer: the index of the layer
      * */
     pub fn seek(mut self, time: f32, layer: usize = 0us) {
@@ -250,10 +298,10 @@ pub class AnimationPlayer {
     }
 
     /**
-     * Change the speed of the current clip of a layer, negative to play it backwards; nothing is done when the layer has
-     * no current clip (play takes the speed of the next clip)
+     * Change the speed of the current motion of a layer, negative to play it backwards; nothing is done when the layer
+     * has no current motion (play takes the speed of the next motion)
      * @params:
-     *    - speed: the speed of the clip
+     *    - speed: the speed of the motion
      *    - layer: the index of the layer
      * */
     pub fn speed(mut self, speed: f32, layer: usize = 0us) {
@@ -261,9 +309,10 @@ pub class AnimationPlayer {
     }
 
     /**
-     * Move the clips of the layers along a time elapsed, at their speeds, along their fades, signal the events the
-     * current clips cross and the end of those played once, and sample the pose of the skeleton at their new times,
-     * allocating nothing but the signals emitted and at the end of a fade; nothing is done when the player is paused
+     * Move the motions of the layers along a time elapsed, at their speeds, along their fades, signal the events the
+     * current motions cross and the end of those played once, fire the transitions of the state machines the layers
+     * run, and sample the pose of the skeleton at the new times, allocating nothing but the signals emitted and at the
+     * end of a fade; nothing is done when the player is paused
      * @params:
      *    - delta: the time elapsed since the last advance
      * */
@@ -272,7 +321,7 @@ pub class AnimationPlayer {
 
         let seconds = cast!f32(delta.allMicros) / 1000000.0f;
         for dmut l in alias self._layers {
-            l:.advance(seconds, &self:.onEvent, &self:.onFinished);
+            l:.advance(seconds, alias self._parameters, &self:.onEvent, &self:.onFinished);
         }
 
         self:.sample();
@@ -280,7 +329,7 @@ pub class AnimationPlayer {
 
     /**
      * Sample the pose of the skeleton, in place: the rest pose, then each layer over it, on the joints of its mask, by
-     * its weight and the weights of its clips
+     * its weight and the weights of its motions
      * */
     fn sample(mut self) {
         let rest = self._skeleton.rest;
@@ -289,7 +338,8 @@ pub class AnimationPlayer {
         }
 
         for l in self._layers {
-            let part = l.weight * l.poseInto(self._skeleton, alias self._layerPose, alias self._sample, alias self._reference);
+            let part = l.weight * l.poseInto(self._skeleton, self._parameters, alias self._layerPose, alias self._sample,
+                                             alias self._scratch, alias self._reference);
             if part > 0.0f {
                 let mut weights: [f32] = [];
                 if let Ok(mask) = l.mask {
@@ -311,17 +361,17 @@ pub class AnimationPlayer {
     }
 
     /**
-     * Signal an event crossed by the current clip of a layer
+     * Signal an event crossed by the current motion of a layer
      * */
     fn onEvent(mut self, event: AnimationEvent) {
         self._events:.emit(event);
     }
 
     /**
-     * Signal the end of the current clip of a layer, played once
+     * Signal the end of the current motion of a layer, played once
      * */
-    fn onFinished(mut self, clip: &AnimationClip) {
-        self._finished:.emit(clip);
+    fn onFinished(mut self, motion: &AnimationMotion) {
+        self._finished:.emit(motion);
     }
 
 }

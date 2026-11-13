@@ -1,0 +1,259 @@
+in animation_states;
+
+use balder::core::error;
+use balder::math::vector;
+use balder::scene::animation::_;
+
+use std::{math, time};
+
+
+/**
+ * @returns: true iif two numbers are equal, give or take the rounding errors
+ * */
+fn near(a: f32, b: f32)-> bool {
+    abs(a - b) < 0.0001f
+}
+
+/**
+ * @returns: a skeleton of a single joint, at the origin at rest
+ * */
+fn single()-> &Skeleton
+    throws BalderError
+{
+    copy Skeleton(copy ["root"], copy [none], copy [JointPose()])
+}
+
+/**
+ * @returns: a clip of a length moving the joint along x from 0 to a distance, linearly
+ * */
+fn slide(name: [c8], duration: f32, distance: f32)-> &AnimationClip {
+    let channel = JointChannel("root", translation-> Track!{vec3}(times-> copy [0.0f, duration],
+                                                                  values-> copy [vec3(), makeVec3(distance, 0.0f, 0.0f)]));
+    copy AnimationClip(name, duration, copy [channel])
+}
+
+/**
+ * @returns: the parameters of a player with one number set
+ * */
+fn valued(name: [c8], value: f32)-> &AnimationParameters {
+    let dmut parameters = copy AnimationParameters();
+    parameters:.value(name, value);
+    parameters
+}
+
+/**
+ * @returns: the name of the state the layer 0 of a player is in, empty when it runs no state machine
+ * */
+fn stateOf(player: &AnimationPlayer)-> [c8] {
+    if let Ok(s) = player.layers[0us].state { s.name } else { "" }
+}
+
+__test the_parameters_hold_numbers_flags_and_triggers_until_consumed {
+    let dmut parameters = copy AnimationParameters();
+    assert (parameters.value("speed") == 0.0f && !parameters.flag("grounded") && !parameters.triggered("jump"));
+
+    parameters:.value("speed", 2.0f);
+    parameters:.flag("grounded", true);
+    parameters:.trigger("jump");
+    assert (parameters.value("speed") == 2.0f && parameters.flag("grounded") && parameters.triggered("jump"));
+
+    parameters:.consume("jump");
+    assert (!parameters.triggered("jump"));
+}
+
+/**
+ * Between two clips both weigh by how near the parameter is to each, beyond the ends the nearest plays alone, and the
+ * motion lasts as long as the mean of their lengths by their weights
+ * */
+__test a_blend_space_1d_weighs_the_two_clips_around_its_parameter {
+    let dmut space = copy BlendSpace1D("speed");
+    space:.addClip(slide("run", 2.0f, 4.0f), 2.0f);
+    space:.addClip(slide("walk", 1.0f, 1.0f), 0.0f);
+    assert (space.clips[0us].name == "walk" && space.positions[1us] == 2.0f);
+
+    for k in [(-1.0f, 1.0f), (0.0f, 1.0f), (0.5f, 0.75f), (2.0f, 0.0f), (5.0f, 0.0f)] {
+        let value = k._0, walk = k._1;
+        assert (near(space.weight(0us, value), walk) && near(space.weight(1us, value), 1.0f - walk));
+    }
+
+    assert (near(space.motionDuration(valued("speed", 1.0f)), 1.5f));
+    assert (space.leadingClip(valued("speed", 1.5f)).name == "run");
+
+    let thrown = {
+        space:.addClip(slide("other", 1.0f, 1.0f), 2.0f);
+        false
+    } catch {
+        _: &BalderError => { true }
+    };
+
+    assert (thrown);
+}
+
+/**
+ * The clips of a blend space are sampled at the same place in their lengths, the pose the mean of theirs by their
+ * weights
+ * */
+__test a_blend_space_plays_its_clips_in_step {
+    let skeleton = single();
+    let dmut space = copy BlendSpace1D("speed");
+    space:.addClip(slide("walk", 1.0f, 1.0f), 0.0f);
+    space:.addClip(slide("run", 2.0f, 4.0f), 2.0f);
+
+    // halfway through a motion of 1.5 seconds, the walk at 0.5 and the run at 2, half of each
+    let parameters = valued("speed", 1.0f);
+    let dmut poses = copy skeleton.rest;
+    let dmut scratch = copy skeleton.rest;
+    space.sampleMotionInto(skeleton, 0.75f, parameters, alias poses, alias scratch);
+    assert (near(poses[0us].translation.x, 1.25f));
+
+    // at a clip, the clip alone
+    space.sampleMotionInto(skeleton, 1.0f, valued("speed", 2.0f), alias poses, alias scratch);
+    assert (near(poses[0us].translation.x, 2.0f));
+}
+
+/**
+ * Each clip weighs 1 at its position and 0 at the others, the weights summing to 1 everywhere, beyond the clips too
+ * */
+__test a_blend_space_2d_weighs_its_clips_by_gradient_bands {
+    let dmut space = copy BlendSpace2D("side", "forward");
+    let positions = [makeVec2(0.0f, 0.0f), makeVec2(1.5f, 0.0f), makeVec2(-1.5f, 0.0f), makeVec2(0.0f, 1.5f)];
+    for i, p in positions {
+        space:.addClip(slide("clip", 1.0f + cast!f32(cast!u64(i)), 1.0f), p);
+    }
+
+    for i, p in positions {
+        for j in 0us .. positions.len {
+            assert (near(space.weight(j, p), if i == j { 1.0f } else { 0.0f }));
+        }
+    }
+
+    for v in [makeVec2(0.4f, 0.7f), makeVec2(-1.0f, 0.2f), makeVec2(3.0f, 3.0f), makeVec2(0.0f, -2.0f)] {
+        let mut total = 0.0f;
+        for j in 0us .. positions.len {
+            let w = space.weight(j, v);
+            assert (w >= 0.0f);
+            total += w;
+        }
+
+        assert (near(total, 1.0f));
+    }
+
+    // halfway between the idle and the walk forward, both weigh half
+    let half = makeVec2(0.0f, 0.75f);
+    assert (near(space.weight(0us, half), 0.5f) && near(space.weight(3us, half), 0.5f));
+}
+
+/**
+ * A blend space changing length as its parameter changes keeps its place in the motion, its time scaled
+ * */
+__test a_motion_state_keeps_its_place_as_its_length_changes {
+    let dmut space = copy BlendSpace1D("speed");
+    space:.addClip(slide("walk", 1.0f, 1.0f), 0.0f);
+    space:.addClip(slide("run", 2.0f, 4.0f), 2.0f);
+
+    let dmut parameters = copy AnimationParameters();
+    let mut state = MotionState(space, parameters, time-> 0.25f);
+    assert (near(state.duration, 1.0f));
+
+    parameters:.value("speed", 2.0f);
+    state:.refresh(parameters);
+    assert (near(state.duration, 2.0f) && near(state.time, 0.5f) && near(state.normalizedTime, 0.25f));
+    assert (state.leading.name == "run");
+}
+
+/**
+ * The transitions of a state machine are refused without a condition nor an exit time, or between unknown states
+ * */
+__test a_state_machine_refuses_the_transitions_it_cannot_fire {
+    let dmut machine = copy AnimationStateMachine();
+    machine:.addState("idle", slide("idle", 1.0f, 0.0f));
+    machine:.addState("walk", slide("walk", 1.0f, 1.0f));
+
+    let mut refused = 0;
+    for i in 0 .. 3 {
+        {
+            match i {
+                0 => { machine:.addTransition("idle", "walk"); }
+                1 => { machine:.addTransition("idle", "swim", exitTime-> (1.0f)?); }
+                _ => { machine:.addState("idle", slide("other", 1.0f, 0.0f)); }
+            }
+        } catch {
+            _: &BalderError => { refused += 1; }
+        }
+    }
+
+    assert (refused == 3 && machine.transitions.len == 0us && machine.states.len == 2us);
+    assert (!machine.find("swim").hasValue);
+    if let Ok(walk) = machine.find("walk") {
+        assert (walk == 1us);
+    } else {
+        assert (false);
+    }
+}
+
+/**
+ * A player running a state machine moves between its states on the parameters it is given: on numbers, on a trigger
+ * consumed by the transition it fires from any state, and at the end of a motion played once
+ * */
+__test a_player_runs_its_state_machine_on_its_parameters {
+    let skeleton = single();
+    let dmut machine = copy AnimationStateMachine();
+    machine:.addState("idle", slide("idle", 1.0f, 0.0f));
+    machine:.addState("walk", slide("walk", 1.0f, 1.0f));
+    machine:.addState("hit", slide("hit", 1.0f, -1.0f), looping-> false);
+    machine:.addTransition("idle", "walk", conditions-> copy [AnimationCondition::above("speed", 0.5f)], fade-> 0.0f);
+    machine:.addTransition("walk", "idle", conditions-> copy [AnimationCondition::below("speed", 0.5f)], fade-> 0.0f);
+    machine:.addTransitionFromAny("hit", copy [AnimationCondition::triggered("hit")], fade-> 0.0f);
+    machine:.addTransition("hit", "idle", fade-> 0.0f, exitTime-> (1.0f)?);
+
+    let dmut player = copy AnimationPlayer(skeleton);
+    player:.playMachine(machine);
+    assert (stateOf(player) == "idle");
+    player:.advance(millis(100u64));
+    assert (stateOf(player) == "idle");
+
+    player:.parameters():.value("speed", 1.0f);
+    player:.advance(millis(100u64));
+    assert (stateOf(player) == "walk");
+
+    // the walk entered at once, its pose is the one of its start, moved along by the next advance
+    player:.advance(millis(500u64));
+    assert (near(player.poses[0us].translation.x, 0.5f));
+
+    player:.parameters():.trigger("hit");
+    player:.advance(millis(100u64));
+    assert (stateOf(player) == "hit" && !player:.parameters().triggered("hit"));
+
+    // the hit played once is left for idle at its end only
+    player:.advance(millis(500u64));
+    assert (stateOf(player) == "hit");
+    player:.advance(millis(600u64));
+    assert (stateOf(player) == "idle");
+}
+
+/**
+ * The exit time of a transition from a loop is crossed once a loop, the transition firing at a crossing only, when its
+ * conditions are met then
+ * */
+__test a_transition_from_a_loop_fires_when_its_exit_time_is_crossed {
+    let skeleton = single();
+    let dmut machine = copy AnimationStateMachine();
+    machine:.addState("loop", slide("loop", 1.0f, 1.0f));
+    machine:.addState("next", slide("next", 1.0f, 0.0f));
+    machine:.addTransition("loop", "next", conditions-> copy [AnimationCondition::isTrue("go")], fade-> 0.0f,
+                           exitTime-> (0.5f)?);
+
+    let dmut player = copy AnimationPlayer(skeleton);
+    player:.playMachine(machine);
+    // the half of the first loop crossed without the flag, and the flag set after it, the loop goes on
+    player:.advance(millis(600u64));
+    player:.parameters():.flag("go", true);
+    player:.advance(millis(300u64));
+    assert (stateOf(player) == "loop");
+    player:.advance(millis(400u64));
+    assert (stateOf(player) == "loop");
+
+    // the half of the second loop crossed with the flag set
+    player:.advance(millis(300u64));
+    assert (stateOf(player) == "next");
+}

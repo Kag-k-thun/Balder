@@ -1,0 +1,183 @@
+in blend_space_1d;
+
+use balder::core::error;
+use balder::scene::animation::{clip, joint_pose, motion, parameters, skeleton};
+
+use std::conv;
+
+/**
+ * A motion mixing clips placed along a line by a parameter of the player: an idle at a speed of 0, a walk at 1.5 and a
+ * run at 4, the speed of the actor choosing between them; between two clips both play, by how near the parameter is to
+ * each, beyond the ends the clip of the nearest end plays alone
+ * @info: the clips play in step: the motion lasts as long as the mean of their lengths by their weights, each clip at the
+ * same place in its own length, so the feet of a walk and of a run land together as they are mixed
+ * @example:
+ * ```
+ * let dmut locomotion = copy BlendSpace1D("speed");
+ * locomotion:.addClip(library:.find("res:/models/fox/Fox.gltf", "Survey"), 0.0f);
+ * locomotion:.addClip(library:.find("res:/models/fox/Fox.gltf", "Walk"), 1.5f);
+ * locomotion:.addClip(library:.find("res:/models/fox/Fox.gltf", "Run"), 4.0f);
+ *
+ * player:.play(locomotion);
+ * player:.parameters():.value("speed", 2.0f); // a walk turning into a run
+ * ```
+ * */
+@final
+pub class BlendSpace1D over AnimationMotion {
+
+    // The parameter of the player placing the motion between its clips
+    let _parameter: [c8];
+
+    // The clips, sorted by their positions
+    let mut _clips: [&AnimationClip] = [];
+
+    // The position of each clip along the parameter, growing
+    let mut _positions: [f32] = [];
+
+    /**
+     * An empty blend space, to which clips are added (see addClip)
+     * @params:
+     *    - parameter: the name of the parameter of the player placing the motion between its clips (see
+     *      AnimationParameters.value)
+     * */
+    pub self (parameter: [c8])
+        with super()
+        , _parameter = parameter
+    {}
+
+    /**
+     * @returns: the name of the parameter placing the motion between its clips
+     * */
+    @field
+    pub fn parameter(self)-> [c8] {
+        self._parameter
+    }
+
+    /**
+     * @returns: the clips, sorted by their positions
+     * */
+    @field
+    pub fn clips(self)-> [&AnimationClip] {
+        self._clips
+    }
+
+    /**
+     * @returns: the position of each clip along the parameter, growing
+     * */
+    @field
+    pub fn positions(self)-> [f32] {
+        self._positions
+    }
+
+    /**
+     * Place a clip at a value of the parameter, the clips kept sorted by their positions
+     * @params:
+     *    - clip: the clip, played alone when the parameter is at its position
+     *    - position: the value of the parameter at which the clip plays alone
+     * @throws:
+     *    - BalderError: when a clip is already at that position
+     * */
+    pub fn addClip(mut self, clip: &AnimationClip, position: f32)
+        throws BalderError
+    {
+        for i, p in self._positions {
+            if p == position {
+                throw copy BalderError("The blend space of " ~ self._parameter ~ " has already a clip at "
+                                       ~ position.to![c8]());
+            }
+
+            if p > position {
+                self._clips = self._clips[0us .. i] ~ [clip] ~ self._clips[i .. $];
+                self._positions = self._positions[0us .. i] ~ [position] ~ self._positions[i .. $];
+                return;
+            }
+        }
+
+        self._clips ~= [clip];
+        self._positions ~= [position];
+    }
+
+    /**
+     * @returns: the weight of a clip at a value of the parameter, in [0, 1], the weights of the clips summing to 1 (to 0
+     * when the blend space has no clip)
+     * @params:
+     *    - index: the index of the clip, in the order of their positions
+     *    - value: the value of the parameter
+     * */
+    pub fn weight(self, index: usize, value: f32)-> f32 {
+        let (low, high, t) = self.segment(value);
+        if index == low && index == high { 1.0f }
+        else if index == low { 1.0f - t }
+        else if index == high { t }
+        else { 0.0f }
+    }
+
+    /**
+     * @returns: the mean of the lengths of the clips by their weights at the value of the parameter
+     * */
+    pub over motionDuration(self, parameters: &AnimationParameters)-> f32 {
+        if self._clips.len == 0us { return 0.0f; }
+
+        let (low, high, t) = self.segment(parameters.value(self._parameter));
+        self._clips[low].duration * (1.0f - t) + self._clips[high].duration * t
+    }
+
+    /**
+     * @returns: the clip weighing the most at the value of the parameter, the lower one of two weighing as much
+     * @throws: an out of array panic when the blend space has no clip (a motion needs one)
+     * */
+    pub over leadingClip(self, parameters: &AnimationParameters)-> &AnimationClip {
+        let (low, high, t) = self.segment(parameters.value(self._parameter));
+        if t > 0.5f { self._clips[high] } else { self._clips[low] }
+    }
+
+    /**
+     * Write the pose of the skeleton at a time of the motion, the two clips around the value of the parameter sampled at
+     * the same place in their lengths and blended by their weights; the rest pose when the blend space has no clip
+     * */
+    pub over sampleMotionInto(self, skeleton: &Skeleton, time: f32, parameters: &AnimationParameters,
+                              dmut poses: [JointPose], dmut scratch: [JointPose]) {
+        if self._clips.len == 0us {
+            let rest = skeleton.rest;
+            for j in 0us .. poses.len { poses[j] = rest[j]; }
+            return;
+        }
+
+        let duration = self.motionDuration(parameters);
+        let phase = if duration <= 0.0f { 0.0f } else { time / duration };
+        let (low, high, t) = self.segment(parameters.value(self._parameter));
+
+        let first = self._clips[low];
+        first.sampleInto(skeleton, phase * first.duration, alias poses);
+        if high != low && t > 0.0f {
+            let second = self._clips[high];
+            second.sampleInto(skeleton, phase * second.duration, alias scratch);
+            for j in 0us .. poses.len {
+                poses[j] = poses[j].blended(scratch[j], t);
+            }
+        }
+    }
+
+    /**
+     * @returns:
+     *    - 0: the index of the clip at or below the value, the first one below them all
+     *    - 1: the index of the clip above it, the same as 0 beyond the ends or when the value is at a clip
+     *    - 2: the weight of the clip above, in [0, 1)
+     * */
+    fn segment(self, value: f32)-> (usize, usize, f32) {
+        let n = self._positions.len;
+        if n == 0us || value <= self._positions[0us] { return (0us, 0us, 0.0f); }
+        if value >= self._positions[n - 1us] { return (n - 1us, n - 1us, 0.0f); }
+
+        for i in 1us .. n {
+            let p = self._positions[i];
+            if value < p {
+                let q = self._positions[i - 1us];
+                return (i - 1us, i, (value - q) / (p - q));
+            }
+        }
+
+        (n - 1us, n - 1us, 0.0f)
+    }
+
+}
