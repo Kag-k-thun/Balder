@@ -1,24 +1,28 @@
 in inspector_panel;
 
 use main::{command, editor, lighting, outline};
-use main::command::{light, rename, transform};
+use main::command::{light, marker, path, rename, transform, volume};
 use balder::core::application::signal;
 use balder::core::error;
 use balder::interface;
 use balder::interface::widget;
 use balder::interface::loader::registry::behavior;
-use balder::interface::widget::button::check;
+use balder::interface::widget::button::{check, dropdown};
 use balder::interface::widget::text::_;
 use balder::math::{_, utils};
 use balder::scene::edit;
+use balder::scene::edit::volume_edit;
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::light;
-use balder::scene::node::node3D::transform;
+use balder::scene::node::node3D::{light, marker, path, path_point, transform, volume, volume_shape};
 
-// The path of the inspector in the interface of the editor, then of its panels, of an object and of a light
+// The path of the inspector in the interface of the editor, then of its panels, of an object, a light, a marker, a path
+// and a volume
 def INSPECTOR = "BODY/MAIN/INSPECTOR";
 def OBJECT = "BODY/MAIN/INSPECTOR/OBJECT";
 def LIGHT = "BODY/MAIN/INSPECTOR/LIGHT";
+def MARKER = "BODY/MAIN/INSPECTOR/MARKER";
+def PATH = "BODY/MAIN/INSPECTOR/PATH";
+def VOLUME = "BODY/MAIN/INSPECTOR/VOLUME";
 
 // The rows of the transform in the panel of an object, then the fields of the axes in each row
 def ROWS = ["POSITION", "ROTATION", "SCALE"];
@@ -36,11 +40,39 @@ def SET_INNER = 4u32;
 def SET_OUTER = 5u32;
 def SET_SHADOWS = 6u32;
 
+// The settings of a volume a field of its panel changes (see withVolumeSetting)
+def SET_SHAPE = 0u32;
+def SET_SIZE = 1u32;
+def SET_RADIUS = 2u32;
+def SET_HEIGHT = 3u32;
+
+/**
+ * The items of the dropdowns of the inspector, in their order in inspector.gui: the purposes of a marker, the curves of
+ * a path, the shapes of a volume
+ * */
+enum Purposes
+| GENERIC  = (0us, MarkerPurpose::GENERIC)
+| SPAWN    = (1us, MarkerPurpose::SPAWN)
+| WAYPOINT = (2us, MarkerPurpose::WAYPOINT)
+| SOCKET   = (3us, MarkerPurpose::SOCKET);
+
+enum Curves
+| CATMULL_ROM = (0us, CurveKind::CATMULL_ROM)
+| BEZIER      = (1us, CurveKind::BEZIER);
+
+enum Shapes
+| BOX     = (0us, VolumeKind::BOX)
+| SPHERE  = (1us, VolumeKind::SPHERE)
+| CAPSULE = (2us, VolumeKind::CAPSULE);
+
 /**
  * The inspector of the node selected last, on the right of the editor, mounted under the behavior 'inspector': its name,
  * then the panel of its kind, in fields refreshed when the node moves. The panel of an object (a mesh, a model,
- * an empty) holds its position, its rotation (in degrees) and its scale; the panel of a light its position, its direction,
- * its colour, its intensity, its range, its cone and its shadows, the fields its type does not use being absent
+ * an empty, a marker, a path, a point of a path, a volume) holds its position, its rotation (in degrees) and its scale;
+ * the panel of a light its position, its direction, its colour, its intensity, its range, its cone and its shadows, the
+ * fields its type does not use being absent. Under the panel of an object, a marker has the panel of its purpose and
+ * its tags, a path the panel of its curve and of whether it is closed, a volume the panel of its shape, the fields its
+ * shape does not use being absent
  * @info: a name validated renames the node inspected; a field changed gives its value to every node selected of the
  * kind of the panel, each keeping its other settings; every change goes through the commands of the editor, the steps
  * of one field merging into one command
@@ -84,6 +116,14 @@ pub class InspectorPanel over Behavior {
         self:.slot("narrowed", &self:.onNarrowed);
         self:.slot("widened", &self:.onWidened);
         self:.slot("shadowed", &self:.onShadowed);
+        self:.slot("purposed", &self:.onPurposed);
+        self:.slot("tagged", &self:.onTagged);
+        self:.slot("curved", &self:.onCurved);
+        self:.slot("closed", &self:.onClosed);
+        self:.slot("shaped", &self:.onShaped);
+        self:.slot("sized", &self:.onSized);
+        self:.slot("rounded", &self:.onRounded);
+        self:.slot("heightened", &self:.onHeightened);
     }
 
     /**
@@ -164,11 +204,80 @@ pub class InspectorPanel over Behavior {
         let isLight = if let Ok(_: &Light) = self._node { true } else { false };
         self:.setPresent(OBJECT, self._node.hasValue && !isLight);
         self:.setPresent(LIGHT, isLight);
+        self:.setPresent(MARKER, if let Ok(_: &Marker3D) = self._node { true } else { false });
+        self:.setPresent(PATH, if let Ok(_: &Path3D) = self._node { true } else { false });
+        self:.setPresent(VOLUME, if let Ok(_: &Volume3D) = self._node { true } else { false });
 
         if let Ok(l: &Light) = self._node {
             self:.refreshLight(l);
         } else if let Ok(n) = self._node {
             self:.refreshObject(n);
+        }
+
+        if let Ok(m: &Marker3D) = self._node {
+            self:.refreshMarker(m);
+        } else if let Ok(p: &Path3D) = self._node {
+            self:.refreshPath(p);
+        } else if let Ok(v: &Volume3D) = self._node {
+            self:.refreshVolume(v);
+        }
+    }
+
+    /**
+     * Write the purpose and the tags of a marker in its panel, the tags separated by spaces
+     * */
+    fn refreshMarker(mut self, marker: &Marker3D) {
+        cte for p in Purposes::__members__ {
+            if p._1 == marker.purpose { self:.setChoice(MARKER ~ "/PURPOSE", p._0); }
+        }
+
+        let mut text = "";
+        for i, t in marker.tags {
+            text = if i == 0us { t } else { text ~ " " ~ t };
+        }
+
+        if let Ok(dmut input: &InputText) = self._gui:.find(MARKER ~ "/TAGS") {
+            input:.setText(text);
+        }
+    }
+
+    /**
+     * Write the curve of a path and whether it is closed in its panel
+     * */
+    fn refreshPath(mut self, path: &Path3D) {
+        cte for c in Curves::__members__ {
+            if c._1 == path.curveKind { self:.setChoice(PATH ~ "/CURVE", c._0); }
+        }
+
+        if let Ok(dmut c: &CheckBox) = self._gui:.find(PATH ~ "/CLOSED") {
+            c:.setChecked(path.closed);
+        }
+    }
+
+    /**
+     * Write the shape of a volume in its panel, the rows its shape does not use absent
+     * */
+    fn refreshVolume(mut self, volume: &Volume3D) {
+        let shape = volume.shape;
+        cte for k in Shapes::__members__ {
+            if k._1 == shape.kind { self:.setChoice(VOLUME ~ "/SHAPE", k._0); }
+        }
+
+        self:.setPresent(VOLUME ~ "/SIDES", shape.kind == VolumeKind::BOX);
+        self:.setPresent(VOLUME ~ "/RADIUS", shape.kind != VolumeKind::BOX);
+        self:.setPresent(VOLUME ~ "/HEIGHT", shape.kind == VolumeKind::CAPSULE);
+
+        self:.setAxes(VOLUME ~ "/SIDES/SIZE", shape.size);
+        self:.setNumber(VOLUME ~ "/RADIUS", shape.radius);
+        self:.setNumber(VOLUME ~ "/HEIGHT", shape.height);
+    }
+
+    /**
+     * Select an item of a dropdown, without emitting its signal
+     * */
+    fn setChoice(mut self, path: [c8], index: usize) {
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(path) {
+            d:.setSelected(index);
         }
     }
 
@@ -319,6 +428,139 @@ pub class InspectorPanel over Behavior {
     }
 
     /**
+     * An item of the purpose of a marker was chosen: every marker selected marks it
+     * */
+    fn onPurposed(mut self, index: usize) {
+        cte for p in Purposes::__members__ {
+            if p._0 == index {
+                let dmut markers = alias self:.selectedMarkers();
+                if markers.len != 0us { self:.run(copy MarkerCommand(alias markers, purpose-> (p._1)?)); }
+            }
+        }
+
+        self:.refresh();
+    }
+
+    /**
+     * The tags of a marker were validated: every marker selected takes them, the words of the text
+     * */
+    fn onTagged(mut self, text: [c8]) {
+        let dmut markers = alias self:.selectedMarkers();
+        if markers.len != 0us { self:.run(copy MarkerCommand(alias markers, tags-> (wordsOf(text))?)); }
+
+        self:.refresh();
+    }
+
+    /**
+     * An item of the curve of a path was chosen: every path selected goes through its points that way
+     * */
+    fn onCurved(mut self, index: usize) {
+        cte for c in Curves::__members__ {
+            if c._0 == index {
+                let dmut paths = alias self:.selectedPaths();
+                if paths.len != 0us { self:.run(copy PathCommand(alias paths, curveKind-> (c._1)?)); }
+            }
+        }
+
+        self:.refresh();
+    }
+
+    /**
+     * The box of a closed path was toggled: every path selected is closed, or opened
+     * */
+    fn onClosed(mut self, closed: bool) {
+        let dmut paths = alias self:.selectedPaths();
+        if paths.len != 0us { self:.run(copy PathCommand(alias paths, closed-> closed?)); }
+
+        self:.refresh();
+    }
+
+    /**
+     * An item of the shape of a volume was chosen: every volume selected takes that shape, its sizes kept
+     * */
+    fn onShaped(mut self, index: usize) {
+        cte for k in Shapes::__members__ {
+            if k._0 == index { self:.editVolumes(SET_SHAPE, 0u32, 0.0f, k._1); }
+        }
+    }
+
+    /**
+     * A field of the size of a box changed: every volume selected takes the side along its axis
+     * */
+    fn onSized(mut self, axis: u32, value: f32) {
+        self:.editVolumes(SET_SIZE, axis, value, VolumeKind::BOX);
+    }
+
+    fn onRounded(mut self, value: f32) {
+        self:.editVolumes(SET_RADIUS, 0u32, value, VolumeKind::BOX);
+    }
+
+    fn onHeightened(mut self, value: f32) {
+        self:.editVolumes(SET_HEIGHT, 0u32, value, VolumeKind::BOX);
+    }
+
+    /**
+     * Give each volume selected a value of a setting of its shape, through a command, the other settings of each one
+     * kept
+     * @params:
+     *    - setting: the setting changed, SET_SHAPE to SET_HEIGHT
+     *    - axis: the component of the size of a box changed
+     *    - value: the value of a size, a radius or a height
+     *    - kind: the kind of shape a volume takes
+     * */
+    fn editVolumes(mut self, setting: u32, axis: u32, value: f32, kind: VolumeKind) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let dmut scene = alias e.scene;
+        let dmut selection = alias scene.selection;
+
+        let mut edits: [VolumeEdit] = [];
+        for dmut n in alias selection.nodes {
+            if let dmut v: &Volume3D = alias n {
+                edits ~= [VolumeEdit(alias v, withVolumeSetting(v.shape, setting, axis, value, kind), NodeTransform(v))];
+            }
+        }
+
+        if edits.len != 0us {
+            self:.run(copy VolumeCommand(edits, field-> f"volume ${setting} ${axis}"));
+        }
+
+        // a value refused (a height under the diameter...) is written back
+        self:.refresh();
+    }
+
+    /**
+     * @returns: the markers selected, in a list of their own
+     * */
+    fn selectedMarkers(mut self)-> dmut [&Marker3D] {
+        let dmut markers: [&Marker3D] = [];
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            for dmut n in alias selection.nodes if let dmut m: &Marker3D = alias n {
+                markers ~= [alias m];
+            }
+        }
+
+        alias markers
+    }
+
+    /**
+     * @returns: the paths selected, in a list of their own
+     * */
+    fn selectedPaths(mut self)-> dmut [&Path3D] {
+        let dmut paths: [&Path3D] = [];
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            for dmut n in alias selection.nodes if let dmut p: &Path3D = alias n {
+                paths ~= [alias p];
+            }
+        }
+
+        alias paths
+    }
+
+    /**
      * Give each light selected a value of a setting, through a command, the other settings of each one kept
      * @params:
      *    - setting: the setting changed, SET_DIRECTION to SET_SHADOWS
@@ -431,4 +673,37 @@ fn withSetting(s: LightSettings, setting: u32, axis: u32, value: f32)-> LightSet
                   if setting == SET_INNER { value } else { s.innerAngle },
                   if setting == SET_OUTER { value } else { s.outerAngle },
                   if setting == SET_SHADOWS { value != 0.0f } else { s.castShadow })
+}
+
+/**
+ * @returns: the shape of a volume, one of its settings changed
+ * @params:
+ *    - setting: the setting changed, SET_SHAPE to SET_HEIGHT
+ *    - axis: the component of the size of a box changed
+ *    - value: the value of a size, a radius or a height
+ *    - kind: the kind of shape, for SET_SHAPE
+ * */
+fn withVolumeSetting(s: VolumeShape, setting: u32, axis: u32, value: f32, kind: VolumeKind)-> VolumeShape {
+    if setting == SET_SHAPE { return s.withKind(kind); }
+    if setting == SET_SIZE { return VolumeShape(s.kind, withComponent(s.size, axis, value), s.radius, s.height); }
+    if setting == SET_RADIUS { return VolumeShape(s.kind, s.size, value, s.height); }
+
+    VolumeShape(s.kind, s.size, s.radius, value)
+}
+
+/**
+ * @returns: the words of a text, separated by spaces, tabs or commas, the tags of a marker
+ * */
+fn wordsOf(text: [c8])-> [[c8]] {
+    let mut words: [[c8]] = [];
+    let mut start = 0us;
+    for i in 0us .. text.len + 1us {
+        let end = i == text.len || text[i] == ' ' || text[i] == '\t' || text[i] == ',';
+        if end {
+            if i > start { words ~= [text[start .. i]]; }
+            start = i + 1us;
+        }
+    }
+
+    words
 }
