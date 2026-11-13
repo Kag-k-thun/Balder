@@ -4,7 +4,7 @@ use main::{command, editor, inspector_panel, naming, outline_panel, project, vie
 use main::command::{add, duplicate, open, remove, transform};
 use balder::core::{_, application::_};
 use balder::interface::dialog;
-use balder::interface::widget::{layout::d3scene, text::label, tree::view};
+use balder::interface::widget::{button::push, layout::d3scene, text::label, tree::view};
 use balder::math::vector;
 use balder::scene::{description::_, editable};
 use balder::scene::gizmo::mode;
@@ -23,6 +23,13 @@ def NEW_SCENE = "scenes/new.scene";
 // The extension of the scene files
 def SCENE_EXTENSION = "scene";
 
+// The paths of the items of the Edit menu undoing and redoing the changes
+def UNDO_ITEM = "BAR/EDIT/UNDO";
+def REDO_ITEM = "BAR/EDIT/REDO";
+
+// The class of an item of a menu with nothing to do, greyed (see editor.style)
+def IDLE = "idle";
+
 /**
  * What the editor does once the unsaved changes of the scene are saved or discarded
  * */
@@ -38,10 +45,12 @@ enum Pending : u8
  * selected on the right, under a menu bar opening, saving, adding, copying and removing nodes, above a status bar
  * @info:
  * =====
- * Every change of the scene is a command run through the SceneEditor; the viewport, focused by a click, takes the keys
- * W, E and R (the gizmo), Delete, Ctrl+D and F, the window Ctrl+S (save) and Ctrl+Shift+S (save as).
- * A change marks the scene as having unsaved changes, in the title of the window and on the right of the status bar,
- * until it is saved. A new scene, started from scenes/new.scene, has no file yet: its first save asks for one. New, Open
+ * Every change of the scene is a command run through the SceneEditor, which keeps their history; the viewport, focused
+ * by a click, takes the keys W, E and R (the gizmo), Delete, Ctrl+D and F, the window Ctrl+Z (undo), Ctrl+Shift+Z and
+ * Ctrl+Y (redo), Ctrl+S (save) and Ctrl+Shift+S (save as). The items Undo and Redo of the Edit menu name the change they
+ * undo or redo.
+ * The scene has unsaved changes while its history is not where it was at the last save (a change made, or undone),
+ * shown in the title of the window and on the right of the status bar. A new scene, started from scenes/new.scene, has no file yet: its first save asks for one. New, Open
  * and Quit ask whether to save the changes first, or discard them, or do nothing.
  * ====
  * */
@@ -64,9 +73,6 @@ pub class EditorActivity over Activity {
 
     // The file of the scene, where it is saved, empty for a new scene
     let mut _path: [c8] = "";
-
-    // True when the scene changed since it was opened or saved
-    let mut _unsaved: bool = false;
 
     // What to do once the unsaved changes are saved or discarded
     let mut _pending: Pending = Pending::NOTHING;
@@ -98,6 +104,8 @@ pub class EditorActivity over Activity {
         self:.slot("add::direction", &self:.onAddDirectionLight);
         self:.slot("add::point", &self:.onAddPointLight);
         self:.slot("add::spot", &self:.onAddSpotLight);
+        self:.slot("edit::undo", &self:.onUndoClicked);
+        self:.slot("edit::redo", &self:.onRedoClicked);
         self:.slot("edit::duplicate", &self:.onDuplicateClicked);
         self:.slot("edit::delete", &self:.onDeleteClicked);
         self:.slot("edit::frame", &self:.onFrameClicked);
@@ -193,15 +201,21 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * The keys of the window: Ctrl+S saves the scene, Ctrl+Shift+S saves it in another file
+     * The keys of the window: Ctrl+Z undoes the last change, Ctrl+Shift+Z and Ctrl+Y redo it, Ctrl+S saves the scene,
+     * Ctrl+Shift+S saves it in another file
      * */
     fn onKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
         let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
-        if key != SDLK_S || !ctrl || self._asking { return; }
+        if !ctrl || self._asking { return; }
 
-        if (mods & SDL_KMOD_SHIFT) != 0u16 {
+        let shift = (mods & SDL_KMOD_SHIFT) != 0u16;
+        if (key == SDLK_Z && shift) || key == SDLK_Y {
+            self:.redo();
+        } else if key == SDLK_Z {
+            self:.undo();
+        } else if key == SDLK_S && shift {
             self:.saveAs();
-        } else {
+        } else if key == SDLK_S {
             self:.save();
         }
     }
@@ -240,7 +254,7 @@ pub class EditorActivity over Activity {
      * unsaved changes, discard them or do nothing
      * */
     fn ask(mut self, then: Pending) {
-        if !self._unsaved {
+        if !self.unsaved() {
             self:.proceed(then);
             return;
         }
@@ -363,17 +377,18 @@ pub class EditorActivity over Activity {
         }
 
         self._path = path;
-        self:.setUnsaved(false);
+        e:.markSaved();
+        self:.showDocument();
         self:.setStatus("Saved " ~ Path(path).file());
         true
     }
 
     /**
-     * Mark the scene as having unsaved changes or not, in the title of the window and on the right of the status bar
+     * Show the file of the scene and whether it has unsaved changes, in the title of the window and on the right of the
+     * status bar
      * */
-    fn setUnsaved(mut self, unsaved: bool) {
-        self._unsaved = unsaved;
-
+    fn showDocument(mut self) {
+        let unsaved = self.unsaved();
         let name = self.documentName();
         let mark = if unsaved { "*" } else { "" };
         self.window:.setName(f"${name}${mark} - Balder editor");
@@ -382,6 +397,13 @@ pub class EditorActivity over Activity {
             let file = if self._path.len == 0us { "New scene, not saved yet" } else { self._path };
             l:.setText(if unsaved { file ~ " — unsaved changes" } else { file });
         }
+    }
+
+    /**
+     * @returns: true iif the scene has changes not saved, its history not being where it was at the last save
+     * */
+    fn unsaved(self)-> bool {
+        if let Ok(e) = self._editor { e.unsaved } else { false }
     }
 
     /**
@@ -498,6 +520,39 @@ pub class EditorActivity over Activity {
      * ====================================================================================================
      * ====================================================================================================
      */
+
+    fn onUndoClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.undo(); }
+    }
+
+    fn onRedoClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.redo(); }
+    }
+
+    /**
+     * Undo the last change of the scene
+     * */
+    fn undo(mut self) {
+        if let Ok(dmut e) = alias self._editor {
+            if !e:.undo() { self:.setStatus("Nothing to undo"); }
+        }
+    }
+
+    /**
+     * Redo the last change undone, telling in the status bar why it failed
+     * */
+    fn redo(mut self) {
+        if let Ok(dmut e) = alias self._editor {
+            {
+                if !e:.redo() { self:.setStatus("Nothing to redo"); }
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "The change could not be redone", err);
+                    self:.setStatus(err.msg);
+                }
+            }
+        }
+    }
 
     fn onDuplicateClicked(mut self, b: u8) {
         if b == SDL_BUTTON_LEFT { self:.duplicateSelection(); }
@@ -638,14 +693,48 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Tell in the status bar what a command changed, the scene having unsaved changes, but the scene just opened
+     * Tell in the status bar the last change of the scene, executed, undone or redone, whether the scene has unsaved
+     * changes, and in the Edit menu the changes to undo and to redo
      * */
-    fn onEdited(mut self, command: &EditCommand) {
-        self:.setStatus(command.describe());
-        if let _: &OpenCommand = command {
-            self:.setUnsaved(false);
+    fn onEdited(mut self, _: &EditCommand) {
+        if let Ok(e) = self._editor {
+            self:.setStatus(e.change);
+        }
+
+        self:.showDocument();
+        self:.showHistory();
+    }
+
+    /**
+     * Name in the items Undo and Redo of the Edit menu the changes they undo and redo, greying an item with nothing to do
+     * */
+    fn showHistory(mut self) {
+        let (undo, redo) = if let Ok(e) = self._editor {
+            (if let Ok(c) = e.toUndo { c.describe() } else { "" }, if let Ok(c) = e.toRedo { c.describe() } else { "" })
         } else {
-            self:.setUnsaved(true);
+            ("", "")
+        };
+
+        self:.showHistoryItem(UNDO_ITEM, "Undo", undo, "Ctrl+Z");
+        self:.showHistoryItem(REDO_ITEM, "Redo", redo, "Ctrl+Shift+Z");
+    }
+
+    /**
+     * Name in an item of the Edit menu the change it undoes or redoes, the item being greyed when there is none
+     * @params:
+     *    - action: Undo or Redo
+     *    - change: the change, empty when there is none
+     *    - keys: the shortcut of the item
+     * */
+    fn showHistoryItem(mut self, path: [c8], action: [c8], change: [c8], keys: [c8]) {
+        if let Ok(dmut item: &PushButton) = self.gui:.find(path) {
+            if change.len == 0us {
+                item:.setText(f"${action} (${keys})");
+                item:.setClasses(copy ["item", IDLE]);
+            } else {
+                item:.setText(f"${action}: ${change} (${keys})");
+                item:.setClasses(copy ["item"]);
+            }
         }
     }
 
