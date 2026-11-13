@@ -1,0 +1,234 @@
+in volume_shape;
+
+mod ::utils;
+
+use balder::math::{bounds, vector};
+
+use std::math;
+
+/**
+ * The smallest side of a box, radius of a sphere or of a capsule
+ * */
+pub def MIN_VOLUME_SIZE = 0.01f;
+
+/**
+ * The number of faces of a volume an editor drags (see VolumeShape::face): +X, -X, +Y, -Y, +Z, -Z
+ * */
+pub def VOLUME_FACES = 6us;
+
+/**
+ * The number of segments drawing a full circle of the wireframe of a volume
+ * */
+def CIRCLE_SEGMENTS = 24us;
+
+/**
+ * The kinds of the shapes of a volume
+ * */
+pub enum VolumeKind : u32
+| BOX     = 0u32 // a box, of a side along each axis
+| SPHERE  = 1u32 // a sphere, of a radius
+| CAPSULE = 2u32; // a cylinder along the Y axis capped by two half spheres, of a radius and a height
+
+/**
+ * The shape of a volume, in the space of its node, centred on its origin: a box, a sphere, or a capsule standing along
+ * the Y axis (see Volume3D)
+ * @info:
+ * =====
+ * The sides of a box, the radius of a sphere and of a capsule are MIN_VOLUME_SIZE at least, the height of a capsule
+ * (its caps included) twice its radius at least. An editor drags the six faces of a shape (see face and movedFace): a
+ * face of a box, or an end of a capsule, moves on its own, the opposite one staying where it is; a face of a sphere, or
+ * a side of a capsule, changes its radius about its centre.
+ * ====
+ * */
+pub record VolumeShape {
+
+    // What the shape is
+    pub let kind: VolumeKind;
+
+    // The sides of a box along the X, the Y and the Z axes of its node
+    pub let size: vec3;
+
+    // The radius of a sphere, of a capsule
+    pub let radius: f32;
+
+    // The height of a capsule along the Y axis of its node, its caps included
+    pub let height: f32;
+
+    /**
+     * A box of a unit side, its radius 0.5 and its height 2 kept for a sphere or a capsule
+     * */
+    pub self ()
+        with self(VolumeKind::BOX, makeVec3(1.0f, 1.0f, 1.0f), 0.5f, 2.0f)
+    {}
+
+    /**
+     * @params:
+     *    - kind: what the shape is
+     *    - size: the sides of a box, MIN_VOLUME_SIZE at least
+     *    - radius: the radius of a sphere or a capsule, MIN_VOLUME_SIZE at least
+     *    - height: the height of a capsule, its caps included, twice its radius at least
+     * */
+    pub self (kind: VolumeKind, size: vec3, radius: f32, height: f32)
+        with kind = kind
+        , size = makeVec3(utils::atLeast(size.x, MIN_VOLUME_SIZE), utils::atLeast(size.y, MIN_VOLUME_SIZE),
+                          utils::atLeast(size.z, MIN_VOLUME_SIZE))
+        , radius = utils::atLeast(radius, MIN_VOLUME_SIZE)
+        , height = utils::atLeast(height, 2.0f * utils::atLeast(radius, MIN_VOLUME_SIZE))
+    {}
+
+    /**
+     * @returns: the shape of another kind, of the sizes of this one
+     * */
+    pub fn withKind(self, kind: VolumeKind)-> VolumeShape {
+        VolumeShape(kind, self.size, self.radius, self.height)
+    }
+
+    /**
+     * @returns: the box enclosing the shape, in the space of its node
+     * */
+    pub fn localBox(self)-> Aabb {
+        let half = match self.kind {
+            VolumeKind::SPHERE  => { makeVec3(self.radius, self.radius, self.radius) }
+            VolumeKind::CAPSULE => { makeVec3(self.radius, self.height / 2.0f, self.radius) }
+            _                   => { self.size / 2.0f }
+        };
+
+        Aabb(-half, half)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FACES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the centre of a face of the shape, in the space of its node, where an editor draws its handle
+     * @params:
+     *    - face: the face, 0 to VOLUME_FACES - 1: +X, -X, +Y, -Y, +Z, -Z
+     * */
+    pub fn face(self, face: usize)-> vec3 {
+        let normal = VolumeShape::faceNormal(face);
+        let axis = face / 2us;
+        let reach = match self.kind {
+            VolumeKind::SPHERE  => { self.radius }
+            VolumeKind::CAPSULE => { if axis == 1us { self.height / 2.0f } else { self.radius } }
+            _                   => { utils::component(self.size, axis) / 2.0f }
+        };
+
+        normal * reach
+    }
+
+    /**
+     * @returns: the shape a face moved along its normal gives, and the move of the centre of the shape in the space of
+     * its node: half the move of the face of a box or of an end of a capsule, the opposite face staying where it is;
+     * none for a face of a sphere or a side of a capsule, its radius changing about its centre
+     * @params:
+     *    - face: the face, 0 to VOLUME_FACES - 1: +X, -X, +Y, -Y, +Z, -Z
+     *    - offset: the move of the face along its normal, outward, in units of the space of the node
+     * */
+    pub fn movedFace(self, face: usize, offset: f32)-> (VolumeShape, vec3) {
+        let normal = VolumeShape::faceNormal(face);
+        let axis = face / 2us;
+        match self.kind {
+            VolumeKind::SPHERE => {
+                return (VolumeShape(self.kind, self.size, self.radius + offset, self.height), vec3());
+            }
+            VolumeKind::CAPSULE => {
+                if axis != 1us {
+                    return (VolumeShape(self.kind, self.size, self.radius + offset, self.height), vec3());
+                }
+
+                let height = utils::atLeast(self.height + offset, 2.0f * self.radius);
+                return (VolumeShape(self.kind, self.size, self.radius, height), normal * ((height - self.height) / 2.0f));
+            }
+            _ => {}
+        }
+
+        let before = utils::component(self.size, axis);
+        let side = utils::atLeast(before + offset, MIN_VOLUME_SIZE);
+        let size = makeVec3(if axis == 0us { side } else { self.size.x },
+                            if axis == 1us { side } else { self.size.y },
+                            if axis == 2us { side } else { self.size.z });
+        (VolumeShape(self.kind, size, self.radius, self.height), normal * ((side - before) / 2.0f))
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          WIRES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the segments of the wireframe of the shape, in the space of its node: the edges of a box; three circles
+     * about the axes of a sphere; the circles where the caps of a capsule meet its cylinder, the four lines of its sides
+     * and the half circles of its caps
+     * */
+    pub fn wires(self)-> [(vec3, vec3)] {
+        let x = makeVec3(1.0f, 0.0f, 0.0f), y = makeVec3(0.0f, 1.0f, 0.0f), z = makeVec3(0.0f, 0.0f, 1.0f);
+        let pi = cast!f32(math::PI);
+        match self.kind {
+            VolumeKind::SPHERE => {
+                let r = self.radius;
+                return utils::arc(vec3(), x, y, r, 0.0f, 2.0f * pi, CIRCLE_SEGMENTS)
+                    ~ utils::arc(vec3(), y, z, r, 0.0f, 2.0f * pi, CIRCLE_SEGMENTS)
+                    ~ utils::arc(vec3(), z, x, r, 0.0f, 2.0f * pi, CIRCLE_SEGMENTS);
+            }
+            VolumeKind::CAPSULE => {
+                let r = self.radius, top = y * (self.height / 2.0f - self.radius);
+                let mut lines = utils::arc(top, z, x, r, 0.0f, 2.0f * pi, CIRCLE_SEGMENTS)
+                    ~ utils::arc(-top, z, x, r, 0.0f, 2.0f * pi, CIRCLE_SEGMENTS);
+                for side in [x, -x, z, -z] {
+                    lines ~= [(top + side * r, -top + side * r)];
+                }
+
+                // the caps, over the top circle and under the bottom one, in the planes of X and of Z
+                let halfCircle = CIRCLE_SEGMENTS / 2us;
+                return lines ~ utils::arc(top, x, y, r, 0.0f, pi, halfCircle)
+                    ~ utils::arc(top, z, y, r, 0.0f, pi, halfCircle)
+                    ~ utils::arc(-top, x, y, r, pi, 2.0f * pi, halfCircle)
+                    ~ utils::arc(-top, z, y, r, pi, 2.0f * pi, halfCircle);
+            }
+            _ => {}
+        }
+
+        let h = self.size / 2.0f;
+        let mut lines: [(vec3, vec3)] = [];
+        for i in 0us .. 4us {
+            // the corners of the face across Z, turning about it; the edges of the two faces, then those joining them
+            let a = utils::corner(h, i), b = utils::corner(h, (i + 1us) % 4us);
+            lines ~= [(makeVec3(a.x, a.y, -h.z), makeVec3(b.x, b.y, -h.z)),
+                      (makeVec3(a.x, a.y, h.z), makeVec3(b.x, b.y, h.z)),
+                      (makeVec3(a.x, a.y, -h.z), makeVec3(a.x, a.y, h.z))];
+        }
+
+        lines
+    }
+
+    pub fn opEquals(self, other: VolumeShape)-> bool {
+        self.kind == other.kind && self.size == other.size && self.radius == other.radius && self.height == other.height
+    }
+
+}
+
+/**
+ * The faces of the shapes
+ * */
+pub mod VolumeShape {
+
+    /**
+     * @returns: the unit normal of a face of a shape, in the space of its node
+     * @params:
+     *    - face: the face, 0 to VOLUME_FACES - 1: +X, -X, +Y, -Y, +Z, -Z
+     * */
+    pub fn faceNormal(face: usize)-> vec3 {
+        let sign = if face % 2us == 0us { 1.0f } else { -1.0f };
+        let axis = face / 2us;
+        makeVec3(if axis == 0us { sign } else { 0.0f }, if axis == 1us { sign } else { 0.0f }, if axis == 2us { sign } else { 0.0f })
+    }
+
+}
