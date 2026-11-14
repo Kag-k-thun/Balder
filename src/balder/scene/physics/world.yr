@@ -65,6 +65,9 @@ pub class PhysicsWorld {
     // The pairs of bodies touching at the last update of the contacts (see utils::pairKey)
     let dmut _contacts: [u64 => bool] = copy [];
 
+    // The handles of the bodies whose collider is a plane, kept out of the hierarchy, holding no box
+    let mut _planes: [usize] = [];
+
     pub self () {}
 
     /*!
@@ -147,7 +150,13 @@ pub class PhysicsWorld {
 
         let collider = Collider(shape, transform);
         self._bodies[handle] = WorldBody(collider-> collider, settings-> settings, used-> true);
-        self._bvh:.insert(cast!usize(handle), collider.bounds);
+
+        if collider.isPlane {
+            self._planes ~= [cast!usize(handle)];
+        } else {
+            self._bvh:.insert(cast!usize(handle), collider.bounds);
+        }
+
         self._len += 1us;
 
         handle
@@ -169,7 +178,8 @@ pub class PhysicsWorld {
             ended ~= [ContactEvent(a-> utils::firstOf(key), b-> utils::secondOf(key), phase-> ContactPhase::ENDED)];
         }
 
-        self._bvh:.remove(cast!usize(handle));
+        self:.unindex(handle, self._bodies[handle].collider.isPlane);
+
         self._bodies[handle] = WorldBody(next-> self._free);
         self._free = handle;
         self._len -= 1us;
@@ -230,13 +240,28 @@ pub class PhysicsWorld {
             }
         });
 
+        let mut best: (PhysicsHit)? = none;
         if let Ok(f) = first {
             if let Ok(h) = self._bodies[f.id].collider.raycast(ray) {
-                return utils::hitOf(cast!u32(f.id), h)?;
+                best = utils::hitOf(cast!u32(f.id), h)?;
             }
         }
 
-        none
+        for id in self._planes if self.accepts(cast!u32(id), filter) {
+            if let Ok(h) = self._bodies[id].collider.raycast(ray) {
+                let closer = if let Ok(b) = best {
+                    h.distance < b.distance
+                } else {
+                    true
+                };
+
+                if closer {
+                    best = utils::hitOf(cast!u32(id), h)?;
+                }
+            }
+        }
+
+        best
     }
 
     /**
@@ -245,7 +270,7 @@ pub class PhysicsWorld {
      * */
     pub fn raycastAll(self, ray: Ray, filter: QueryFilter = QueryFilter())-> [PhysicsHit] {
         let mut hits: [PhysicsHit] = [];
-        for id in self._bvh.alongRay(ray) if self.accepts(cast!u32(id), filter) {
+        for id in self.alongRay(ray) if self.accepts(cast!u32(id), filter) {
             if let Ok(h) = self._bodies[id].collider.raycast(ray) {
                 hits ~= [utils::hitOf(cast!u32(id), h)];
             }
@@ -340,7 +365,7 @@ pub class PhysicsWorld {
             let body = self._bodies[i];
             if !body.used || !utils::isActive(body.settings) { continue; }
 
-            for j in self._bvh.overlapping(body.collider.bounds) if j != i {
+            for j in self.near(body.collider) if j != i {
                 let other = self._bodies[j];
 
                 // a pair of two active bodies is found from both of them, and tested from the first
@@ -377,8 +402,18 @@ pub class PhysicsWorld {
      * Place the collider of a body, its box refit in the hierarchy
      * */
     fn place(mut self, handle: u32, collider: Collider) {
+        let wasPlane = self._bodies[handle].collider.isPlane;
         self._bodies[handle].collider = collider;
-        self._bvh:.update(cast!usize(handle), collider.bounds);
+        if wasPlane != collider.isPlane {
+            self:.unindex(handle, wasPlane);
+            if collider.isPlane {
+                self._planes ~= [cast!usize(handle)];
+            } else {
+                self._bvh:.insert(cast!usize(handle), collider.bounds);
+            }
+        } else if !collider.isPlane {
+            self._bvh:.update(cast!usize(handle), collider.bounds);
+        }
     }
 
     /**
@@ -402,7 +437,7 @@ pub class PhysicsWorld {
         let unit = direction.normalized();
         let swept = moving.bounds.merged(moving.translated(unit * length).bounds);
         let mut best: (PhysicsHit)? = none;
-        for id in self._bvh.overlapping(swept) if self.accepts(cast!u32(id), filter) {
+        for id in self.candidates(swept) if self.accepts(cast!u32(id), filter) {
             if let Ok(h) = self._bodies[id].collider.sweep(moving, unit, length) {
                 let closer = if let Ok(b) = best { h.distance < b.distance } else { true };
                 if closer { best = utils::hitOf(cast!u32(id), h)?; }
@@ -417,11 +452,68 @@ pub class PhysicsWorld {
      * */
     fn overlapConvex(self, shape: Convex, filter: QueryFilter)-> [u32] {
         let mut result: [u32] = [];
-        for id in self._bvh.overlapping(shape.bounds) if self.accepts(cast!u32(id), filter) {
+        for id in self.candidates(shape.bounds) if self.accepts(cast!u32(id), filter) {
             if self._bodies[id].collider.overlaps(shape) { result ~= [cast!u32(id)]; }
         }
 
         result
     }
 
+    /**
+     * @returns: the bodies whose box overlaps a box of the world, and the planes
+     *
+     * */
+    yield candidates(self, box: Aabb)-> usize {
+        for i in self._bvh.overlapping(box) {
+            yield i;
+        }
+
+        for i in self._planes {
+            yield i;
+        }
+    }
+
+    /**
+     * @returns: the bodies whose box a ray enters, and the planes
+     *
+     * */
+    yield alongRay(self, ray: Ray)-> usize {
+        for i in self._bvh.alongRay(ray) {
+            yield i;
+        }
+
+        for i in self._planes {
+            yield i;
+        }
+    }
+
+    /**
+     * @returns: the bodies a collider may touch: every body for a plane, the
+     * candidates of its box otherwise
+     *
+     * */
+    yield near(self, collider: Collider)-> usize {
+        if !collider.isPlane {
+            yield in self.candidates(collider.bounds);
+            return;
+        }
+
+        for i in 0us .. self._bodies.len if self._bodies[i].used {
+            yield i;
+        }
+    }
+
+    /**
+     * Take a body out of the hierarchy, or out of the planes
+     *
+     * */
+    fn unindex(mut self, handle: u32, plane: bool) {
+        if !plane {
+            self._bvh:.remove(cast!usize(handle));
+            return;
+        }
+
+        let kept = copy [id for id in self._planes if id != cast!usize(handle)];
+        self._planes = kept;
+    }
 }
