@@ -1,0 +1,253 @@
+in utils;
+
+use balder::core::error;
+use balder::math::{bounds, inertia, matrix, vector};
+
+use std::math;
+use std::algorithm::comparison;
+
+
+/**
+ * The distance under which a point its on a face, relative to a the size of the points
+ * */
+def RELATIVE_TOLERANCE = 1.0e-5f;
+
+/**
+ * The index of no vertex, in the remapping of the points to the vertices
+ * */
+def NO_VERTEX = u32::max;
+
+
+/**
+ * A tetrahedron of four points far apart, then each point outside the faces
+ * replaces the faces it sees by the triangles joining their horizon to it, the
+ * edges of the faces it sees whose other side it does not see
+ *
+ * @returns: the vertices of the hull of points and the triangles of its
+ * surface, turning counterclockwise from outside
+ *
+ * @throws: BalderError when the points span no volume
+ *
+ * */
+pub fn surfaceOf(points: [vec3])-> ([vec3], [HullFace])
+    throws BalderError
+{
+    if points.len < 4 {
+        throw copy BalderError("A convex hull needs four points at least");
+    }
+
+    let mut box = Aabb();
+    for p in points {
+        box = box.merged(Aabb(p, p));
+    }
+
+    let tolerance = RELATIVE_TOLERANCE * comparison::max((box.max - box.min).length(), 1.0e-6f);
+    let (i0, i1, i2, i3) = simplexOf(points, tolerance);
+    let inner = (points[i0] + points[i1] + points[i2] + points[i3]) / 4.0f;
+
+    let mut faces = copy [outward(points, i0, i1, i2, inner),
+                          outward(points, i0, i3, i1, inner),
+                          outward(points, i0, i2, i3, inner),
+                          outward(points, i1, i3, i2, inner)];
+
+    for i in 0 .. points.len {
+        let p = points[i];
+        let mut seen = false;
+        for f in faces if f.normal.dot(p) - f.offset > tolerance {
+            seen = true;
+            break;
+        }
+
+        if !seen {
+            continue;
+        }
+
+        let dmut edges: [u64 => bool] = copy [];
+        let mut kept: [HullFace] = [];
+        for f in faces {
+            if f.normal.dot(p) - f.offset > tolerance {
+                edges[edgeKey(f.a, f.b)] = true;
+                edges[edgeKey(f.b, f.c)] = true;
+                edges[edgeKey(f.c, f.a)] = true;
+            } else {
+                kept ~= [f];
+            }
+        }
+
+        for key, _ in edges if !(edgeKey(endOf(key), startOf(key)) in edges) {
+            kept ~= [faceOf(points, startOf(key), endOf(key), cast!u32(i))];
+        }
+
+        faces = kept;
+    }
+
+    compacted(points, faces)
+}
+
+
+/**
+ * The hull split in tetrahedra joining its first vertex to its triangles,
+ * their covariances summed (Blow and Binstock, "How to find the inertia tensor
+ * (or other mass properties) of a 3D solid body represented by a triangle
+ * mesh")
+ *
+ * @returns: the volume of a closed convex surface, the centre of its volume,
+ * and its inertia tensor about that centre at a density of 1
+ *
+ * */
+pub fn massOf(vertices: [vec3], faces: [HullFace])-> (f32, vec3, mat3) {
+    let origin = vertices[0];
+
+    let canonical = makeMat3(2.0f, 1.0f, 1.0f,
+                             1.0f, 2.0f, 1.0f,
+                             1.0f, 1.0f, 2.0f) * (1.0f / 120.0f);
+
+    let mut volume = 0.0f;
+    let mut moment = vec3();
+    let mut covariance = diagonalTensor(vec3());
+    for f in faces {
+        let a = vertices[f.a] - origin;
+        let b = vertices[f.b] - origin;
+        let c = vertices[f.c] - origin;
+
+        let det = a.dot(b.cross(c));
+        let corners = makeMat3(a.x, a.y, a.z,
+                               b.x, b.y, b.z,
+                               c.x, c.y, c.z);
+
+        covariance = covariance + corners * canonical * corners.transposed() * det;
+        volume += det / 6.0f;
+        moment = moment + (a + b + c) * (det / 24.0f);
+    }
+
+    let center = moment / volume;
+    let trace = (covariance.a1 + covariance.b2 + covariance.c3);
+    let aboutOrigin = diagonalTensor(makeVec3(trace, trace, trace)) - covariance;
+
+    (volume, origin + center, shiftedTensor(aboutOrigin, -volume, center))
+}
+
+
+/**
+ * @returns: four points spanning a tetrahedron: the extreme along X, the
+ * farthest from it, the farthest from their line, the farthest from their plane
+ *
+ * @throws: BalderError when the points are all on a line or a plane
+ *
+ * */
+pub fn simplexOf(points: [vec3], tolerance: f32)-> (u32, u32, u32, u32)
+    throws BalderError
+{
+    let mut i0 = 0us;
+    for i in 0 .. points.len if points[i].x < points[i0].x {
+        i0 = i;
+    }
+
+    let mut i1 = i0;
+    for i in 0 .. points.len if (points[i] - points[i0]).length() > (points[i1] - points[i0]).length()  {
+        i1 = i;
+    }
+
+
+    let axis = points[i1] - points[i0];
+    let mut i2 = i0;
+    let mut far = 0.0f;
+    for i in 0 .. points.len {
+        let d = axis.cross(points[i] - points[i0]).length();
+        if d > far {
+            far = d;
+            i2 = i;
+        }
+    }
+
+    let normal = axis.cross(points[i2] - points[i0]);
+    let mut i3 = i0;
+    let mut height = 0.0f;
+    for i in 0us .. points.len {
+        let h = abs(normal.dot(points[i] - points[i0]));
+        if h > height {
+            height = h;
+            i3 = i;
+        }
+    }
+
+    if axis.length() <= tolerance || far <= tolerance * axis.length() || height <= tolerance * normal.length() {
+        throw copy BalderError("The points of a convex hull span no volume");
+    }
+
+    (cast!u32(i0), cast!u32(i1), cast!u32(i2), cast!u32(i3))
+}
+
+
+/**
+ * @returns: the face of three points, counterclockwise around its normal
+ *
+ * */
+fn faceOf(points: [vec3], a: u32, b: u32, c: u32)-> HullFace {
+    let normal = (points[b] - points[a]).cross(points[c] - points[a]).normalized();
+    HullFace(a-> a,
+             b-> b,
+             c-> c,
+             normal-> normal,
+             offset-> normal.dot(points[a]))
+}
+
+/**
+ * @returns: the face of three points, its normal points away from a point inside
+ *
+ * */
+fn outward(points: [vec3], a: u32, b: u32, c: u32, inner: vec3)-> HullFace {
+    let f = faceOf(points, a, b, c);
+    if f.normal.dot(inner) > f.offset {
+        faceOf(points, a, c, b)
+    } else {
+        f
+    }
+}
+
+
+/**
+ * @returns: the vertices of the faces only, the points inside the hull dropped,
+ * and the faces indexing them
+ *
+ * */
+fn compacted(points: [vec3], faces: [HullFace])-> ([vec3], [HullFace]) {
+    let dmut remap = copy [NO_VERTEX; points.len];
+    let mut vertices: [vec3] = [];
+    for f in faces {
+        for v in (f.a, f.b, f.c) if remap[v] == NO_VERTEX {
+            remap[v] = cast!u32(vertices.len);
+            vertices ~= [points[v]];
+        }
+    }
+
+    let result: [HullFace] = copy [
+        HullFace(a-> remap[f.a],
+                 b-> remap[f.b],
+                 c-> remap[f.c],
+                 normal-> f.normal,
+                 offset-> f.offset)
+
+            for f in faces
+        ];
+
+    (vertices, result)
+}
+
+/**
+ * @returns: the key of an edge going from a vertex to another
+ *
+ * */
+fn edgeKey(from: u32, to: u32)-> u64 {
+    (cast!u64(from) << 32u64) | cast!u64(to)
+}
+
+
+fn startOf(key: u64)-> u32 {
+    cast!u32(key >> 32u64)
+}
+
+
+fn endOf(key: u64)-> u32 {
+    cast!u32(key & 0xFFFF_FFFFu64)
+}
