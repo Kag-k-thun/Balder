@@ -7,17 +7,22 @@ use std::math;
 /**
  * The kinds of the cores of a convex shape
  * */
-pub enum ConvexKind : u32
+pub enum ConvexKind: u32
 | POINT    = 0u32 // a point, the core of a sphere
 | SEGMENT  = 1u32 // a segment, the core of a capsule
 | TRIANGLE = 2u32 // a triangle, of a mesh
-| BOX      = 3u32; // a box, turned, scaled and maybe sheared by the transformation of its body
+| BOX      = 3u32 // a box, turned, scaled and maybe sheared by the transformation of its body
+| CYLINDER = 4u32 // a cylinder along v, its radii along u and w
+| HULL     = 5u32; // the vertices of a hull, mapped by the axes of their body
 
 /**
- * A convex shape in world space: a core (a point, a segment, a triangle or a box) grown by a margin in every direction,
- * a sphere being a point grown by its radius and a capsule a segment grown by its radius
- * @info: the distance between two shapes is the distance between their cores, their margins taken off (see
- * gjk::separation)
+ * A convex shape in world space: a core (a point, a segment, a triangle, a box,
+ * a cylinder or a hull) grown by a margin in every direction, a sphere being a
+ * point grown by its radius and a capsule a segment grown by its radius
+ *
+ * @info: the distance between two shapes is the distance between their cores,
+ * their margins taken off (see gjk::separation)
+ *
  * */
 pub record Convex {
 
@@ -29,13 +34,16 @@ pub record Convex {
     pub let b: vec3;
     pub let c: vec3;
 
-    // The half sides of the box along its three edges, in world space
+    // The half sides of the box, the radii and the half height of the cylinder, the axes of the body of the hull
     pub let u: vec3;
     pub let v: vec3;
     pub let w: vec3;
 
     // The distance the core is grown by in every direction
     pub let margin: f32;
+
+    // The vertices of the hull in the space of its body, none for the other kinds
+    pub let points: [vec3];
 
     /**
      * @params:
@@ -44,11 +52,12 @@ pub record Convex {
      *    - u, v, w: the half sides of the box along its edges
      *    - margin: the distance the core is grown by
      * */
-    pub self (kind: ConvexKind, a: vec3, b: vec3, c: vec3, u: vec3, v: vec3, w: vec3, margin: f32)
+    pub self (kind: ConvexKind, a: vec3, b: vec3, c: vec3, u: vec3, v: vec3, w: vec3, margin: f32, points: [vec3] = [])
         with kind = kind
         , a = a, b = b, c = c
         , u = u, v = v, w = w
         , margin = margin
+        , points = points
     {}
 
     /**
@@ -83,7 +92,32 @@ pub record Convex {
     {}
 
     /**
+     * A cylinder, of no margin
+     * @params:
+     *    - centre: the centre of the cylinder
+     *    - u, v: its radii, along X, and the Z axes of its body
+     *    - w: its half height, from its center to thte center of a cap
+     */
+    pub self cylinder(center: vec3, u: vec3, v: vec3, w: vec3)
+        with self(ConvexKind::CYLINDER, center, center, center, u, v, w, 0.0f)
+    {}
+
+    /**
+     * A convex hull, of no margin
+     * @params:
+     *    - origin: the origin of its body in the world
+     *    - centroid: the centre of its volume in the world
+     *    - u, v, w: the X, the Y and the Z axes of its body in the world
+     *    - points: its vertices, in the space of its body
+     * */
+    pub self hull(origin: vec3, centroid: vec3, u: vec3, v: vec3, w: vec3, points: [vec3])
+        with self(ConvexKind::HULL, origin, centroid, origin, u, v, w, 0.0f,
+                  points-> points)
+    {}
+
+    /**
      * @returns: the point of the core the farthest along a direction, not normalized
+     *
      * */
     pub fn support(self, d: vec3)-> vec3 {
         match self.kind {
@@ -95,7 +129,38 @@ pub record Convex {
                 let da = d.dot(self.a), db = d.dot(self.b), dc = d.dot(self.c);
                 if da >= db && da >= dc { self.a } else if db >= dc { self.b } else { self.c }
             }
-            _ => {
+            ConvexKind::CYLINDER => {
+                let du = d.dot(self.u);
+                let dw = d.dot(self.w);
+                let radial = math::sqrt(du * du + dw * dw);
+                let rim = if radial > 0.0f {
+                    self.u * (du / radial) + self.w * (dw / radial)
+                } else {
+                    vec3()
+                };
+                let cap = if d.dot(self.v) >= 0.0f {
+                    self.v
+                } else {
+                    -self.v
+                };
+
+                self.a + rim + cap
+            }
+            ConvexKind::HULL => {
+                let local = makeVec3(d.dot(self.u), d.dot(self.v), d.dot(self.w));
+                let mut best = self.points[0];
+                let mut far = best.dot(local);
+                for p in self.points {
+                    let x = p.dot(local);
+                    if x > far {
+                        far = x;
+                        best = p;
+                    }
+                }
+
+                self.a + self.u * best.x + self.v * best.y + self.w * best.z
+            }
+            ConvexKind::BOX => {
                 let su = if d.dot(self.u) >= 0.0f { 1.0f } else { -1.0f };
                 let sv = if d.dot(self.v) >= 0.0f { 1.0f } else { -1.0f };
                 let sw = if d.dot(self.w) >= 0.0f { 1.0f } else { -1.0f };
@@ -110,9 +175,10 @@ pub record Convex {
     @field
     pub fn centre(self)-> vec3 {
         match self.kind {
-            ConvexKind::SEGMENT  => { (self.a + self.b) / 2.0f }
+            ConvexKind::SEGMENT => { (self.a + self.b) / 2.0f }
             ConvexKind::TRIANGLE => { (self.a + self.b + self.c) / 3.0f }
-            _                    => { self.a }
+            ConvexKind::HULL => { self.b }
+            _ => { self.a }
         }
     }
 
@@ -120,7 +186,15 @@ pub record Convex {
      * @returns: the shape moved by an offset
      * */
     pub fn translated(self, offset: vec3)-> Convex {
-        Convex(self.kind, self.a + offset, self.b + offset, self.c + offset, self.u, self.v, self.w, self.margin)
+        Convex(self.kind,
+               self.a + offset,
+               self.b + offset,
+               self.c + offset,
+               self.u,
+               self.v,
+               self.w,
+               self.margin,
+               points-> self.points)
     }
 
     /**
@@ -129,6 +203,18 @@ pub record Convex {
     @field
     pub fn bounds(self)-> Aabb {
         let grow = makeVec3(self.margin, self.margin, self.margin);
+
+        if self.kind == ConvexKind::CYLINDER || self.kind == ConvexKind::HULL {
+            let x = makeVec3(1.0f, 0.0f, 0.0f);
+            let y = makeVec3(0.0f, 1.0f, 0.0f);
+            let z = makeVec3(0.0f, 0.0f, 1.0f);
+
+            let low = makeVec3(self.support(-x).x, self.support(-y).y, self.support(-z).z);
+            let high = makeVec3(self.support(x).x, self.support(y).y, self.support(z).z);
+
+            return Aabb(low - grow, high + grow);
+        }
+
         if self.kind == ConvexKind::BOX {
             let reach = makeVec3(math::abs(self.u.x) + math::abs(self.v.x) + math::abs(self.w.x),
                                  math::abs(self.u.y) + math::abs(self.v.y) + math::abs(self.w.y),
