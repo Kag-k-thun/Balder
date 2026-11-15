@@ -1,10 +1,13 @@
 in world;
 
+mod ::islands;
 mod ::utils;
 
-use balder::math::{bounds, matrix, quaternion, vector};
+use balder::core::config::physics;
+use balder::math::{bounds, matrix, quaternion, rigid_transform, vector};
 
-use std::algorithm::sorting;
+use std::math;
+use std::algorithm::{comparison, sorting};
 
 /**
  * The handle of no body
@@ -33,11 +36,26 @@ def PREDICTION = 2.0f;
 def SPECULATIVE_FLOOR = 0.02f;
 
 /**
- * The duration of a step of the solver, in seconds, the speculative distances
- * covering what the bodies travel in a step
+ * The duration of a step of the solver until a step is run, in seconds, the
+ * speculative distances covering what the bodies travel in a step
  *
  * */
 def STEP = 1.0f / 60.0f;
+
+/**
+ * The distance under which a kinematic body is not moved between two ticks, in metres
+ * */
+def STILL_MOVE = 1.0e-6f;
+
+/**
+ * The difference from 1 of the cosine of half the angle under which a kinematic body is not turned between two ticks
+ * */
+def STILL_TURN = 1.0e-6f;
+
+/**
+ * The index of no island
+ * */
+def NO_ISLAND = usize::max;
 
 /**
  * A slot of the bodies of a world, holding a body or free
@@ -72,11 +90,13 @@ record WorldBody {
  *
  * The queries (raycast, shapeCast, overlapShape...) need no solver: they test
  * the colliders whose boxes the query reaches, a ray exactly, the shapes by the
- * distance between their cores (see gjk). The contacts are updated on request
- * (updateContacts, at each tick of a scene): the pairs of touching bodies one
- * of which is kinematic or a trigger, as seen by the layers and the masks of
- * the two, compared with those of the previous update. Two meshes never touch,
- * nor two static bodies that are not triggers.
+ * distance between their cores (see gjk). A step (step) moves the dynamic
+ * bodies, their contacts solved by island; the contacts are reported on request
+ * (contactEvents, once a tick of a scene, or updateContacts without a step):
+ * the pairs of touching bodies one of which is not static or is a trigger, as
+ * seen by the layers and the masks of the two, compared with those the last
+ * report gave. Two meshes never touch, nor two static bodies that are not
+ * triggers.
  * ====
  * */
 @final
@@ -109,6 +129,30 @@ pub class PhysicsWorld {
 
     // The pairs of bodies whose enlarged boxes overlap and that may touch
     let dmut _pairs: &PairCache = copy PairCache();
+
+    // The acceleration of the dynamic bodies falling, in metres a second squared
+    let mut _gravity: vec3 = makeVec3(0.0f, -9.81f, 0.0f);
+
+    // How the solver iterates over the contacts and corrects their penetrations
+    let mut _solver: SolverSettings = SolverSettings();
+
+    // The duration of the last step, the speculative distances covering what the bodies travel in a step
+    let mut _step: f32 = STEP;
+
+    // The poses of the bodies before the last step, by handle, the display interpolating from them
+    let dmut _previous: [RigidTransform] = [];
+
+    // The dynamic bodies put to sleep since the last call of takeSlept, their poses still to show
+    let dmut _slept: [u32 => bool] = copy [];
+
+    // The pairs dropped since the last contact events while their contact was reported, their end to report
+    let mut _endedUnreported: [BroadPair] = [];
+
+    // The poses of the kinematic bodies at the last derivation of their velocities, by handle
+    let dmut _kinematicFrom: [u32 => RigidTransform] = copy [];
+
+    // The kinematic bodies whose velocities were set rather than derived from their moves, until they move again
+    let dmut _kinematicSet: [u32 => bool] = copy [];
 
     pub self () {}
 
@@ -145,6 +189,54 @@ pub class PhysicsWorld {
     }
 
     /**
+     * @returns: the acceleration of the dynamic bodies falling, in metres a second squared
+     * */
+    @field
+    pub fn gravity(self)-> vec3 {
+        self._gravity
+    }
+
+    /**
+     * Change the acceleration of the dynamic bodies falling, in metres a second squared
+     * */
+    @field
+    pub fn gravity(mut self, gravity: vec3) {
+        self._gravity = gravity;
+    }
+
+    /**
+     * @returns: how the solver iterates over the contacts and corrects their penetrations
+     * */
+    @field
+    pub fn solverSettings(self)-> SolverSettings {
+        self._solver
+    }
+
+    /**
+     * Change how the solver iterates over the contacts and corrects their penetrations
+     * */
+    @field
+    pub fn solverSettings(mut self, settings: SolverSettings) {
+        self._solver = settings;
+    }
+
+    /**
+     * Set the gravity, the solver and the sleep of the world from the configuration of the physics
+     * */
+    pub fn configure(mut self, config: PhysicsConfig) {
+        self._gravity = config.gravity;
+        self._solver = SolverSettings(substeps-> config.substeps,
+                                      iterations-> config.iterations,
+                                      contactHertz-> config.contactHertz,
+                                      contactDamping-> config.contactDamping,
+                                      maxCorrection-> config.maxCorrection,
+                                      bounceThreshold-> config.bounceThreshold);
+        self._sleep = SleepThresholds(linear-> config.sleepLinear,
+                                      angular-> config.sleepAngular,
+                                      time-> config.sleepTime);
+    }
+
+    /**
      * @returns: the pairs of bodies whose enlarged boxes overlap and that may
      * touch, at the last update the pairs
      *
@@ -159,6 +251,13 @@ pub class PhysicsWorld {
      * */
     pub fn contains(self, handle: u32)-> bool {
         cast!usize(handle) < self._bodies.len && self._bodies[handle].used
+    }
+
+    /**
+     * @returns: true iif a body of the world has a handle and is dynamic, moved by the solver
+     * */
+    pub fn isDynamic(self, handle: u32)-> bool {
+        self.contains(handle) && self._bodies[handle].settings.motion == BodyMotion::DYNAMIC
     }
 
     /**
@@ -188,6 +287,17 @@ pub class PhysicsWorld {
         self._states[handle]
     }
 
+    /**
+     * @returns: the pose of a body before the last step, the display placing it between that pose and the one of its
+     * state (see RigidTransform::interpolated)
+     *
+     * @warning: the body is in the world (see contains)
+     *
+     * */
+    pub fn getPrevious(self, handle: u32)-> RigidTransform {
+        self._previous[handle]
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -212,6 +322,7 @@ pub class PhysicsWorld {
         } else {
             self._bodies = self._bodies ~ copy [WorldBody()];
             self._states = self._states ~ copy [BodyState()];
+            self._previous = self._previous ~ copy [RigidTransform()];
             cast!u32(self._bodies.len - 1us)
         };
 
@@ -221,6 +332,7 @@ pub class PhysicsWorld {
 
         self._bodies[handle] = WorldBody(collider-> collider, settings-> taken, used-> true);
         self._states[handle] = state;
+        self._previous[handle] = state.pose;
 
         if collider.isPlane {
             self._planes ~= [cast!usize(handle)];
@@ -237,11 +349,10 @@ pub class PhysicsWorld {
     /**
      * Remove a body from the world, its handle free for another body
      *
-     * @info: the contacts of the body end at once, the next update of the
-     * contacts not reporting them, as its handle may be given to another body
-     * by then
+     * @info: the contacts of the body end at once, the next contact events not
+     * reporting them, as its handle may be given to another body by then
      *
-     * @returns: the contacts the body had at the last update of the contacts,
+     * @returns: the contacts of the body the last contact events reported,
      * ended; none when the world has no such body
      *
      * */
@@ -249,20 +360,34 @@ pub class PhysicsWorld {
         if !self.contains(handle) { return []; }
 
         let mut ended: [ContactEvent] = [];
+        let mut unreported: [BroadPair] = [];
+        for p in self._endedUnreported {
+            if p.a == handle || p.b == handle {
+                ended ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
+            } else {
+                unreported ~= [p];
+            }
+        }
+
+        self._endedUnreported = unreported;
         let mut slot = 0us;
         while slot < self._pairs.len {
             let p = self._pairs.get(slot);
             if p.a != handle && p.b != handle { slot += 1us; continue; }
 
-            // the last pair is moved into the slot, looked at next
+            // the last pair is moved into the slot, looked at next, what the body held up woken
             self._pairs:.remove(pairKey(p.a, p.b));
-            if p.touching {
+            self:.wakeIfAsleep(if p.a == handle { p.b } else { p.a });
+            if p.reported {
                 ended ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
             }
         }
 
         self:.unindex(handle, self._bodies[handle].collider.isPlane);
         self._moved:.remove(handle);
+        self._kinematicFrom:.remove(handle);
+        self._kinematicSet:.remove(handle);
+        self._slept:.remove(handle);
         self._bodies[handle] = WorldBody(next-> self._free);
         self._states[handle] = BodyState();
         self._free = handle;
@@ -281,9 +406,11 @@ pub class PhysicsWorld {
         let body = self._bodies[handle];
         let state = utils::movedState(self._states[handle], body.collider.shape, transform, body.settings);
         self._states[handle] = state;
+        self._previous[handle] = state.pose;
 
         let placement = utils::placementOf(state, transform, body.settings);
         self:.place(handle, Collider(self._bodies[handle].collider.shape, placement));
+        self:.wakeContactsOf(handle);
     }
 
     /**
@@ -341,7 +468,90 @@ pub class PhysicsWorld {
 
         self._states[handle].linearVelocity = linear;
         self._states[handle].angularVelocity = angular;
+        if self._bodies[handle].settings.motion == BodyMotion::KINEMATIC {
+            self._kinematicSet[handle] = true;
+        }
+
         self:.wake(handle);
+    }
+
+    /**
+     * Give the kinematic bodies the velocities of their moves since the last call, the solver pushing and carrying
+     * what they touch with them: the displacement over the duration, the rotation from the orientation before to the
+     * one now
+     *
+     * @params:
+     *    - seconds: the time since the last call, a tick of a scene
+     *
+     * @info: a kinematic body not moved has no velocity, unless its velocity was set (see setVelocity), kept until it
+     * moves again; the steps do not move a kinematic body, the game placing it
+     *
+     * */
+    pub fn deriveKinematics(mut self, seconds: f32) {
+        if seconds <= 0.0f { return; }
+
+        for i in 0us .. self._bodies.len {
+            let h = cast!u32(i);
+            if !self.contains(h) || self._bodies[i].settings.motion != BodyMotion::KINEMATIC { continue; }
+
+            let now = self._states[i].pose;
+            if let Ok(before) = self._kinematicFrom[h] {
+                let moved = (now.position - before.position).length() > STILL_MOVE
+                         || math::abs(now.rotation.dot(before.rotation)) < 1.0f - STILL_TURN;
+                if moved || !(h in self._kinematicSet) {
+                    let (angle, axis) = (now.rotation * before.rotation.inversed()).normalized().axisAngle();
+                    self._states[i].linearVelocity = (now.position - before.position) / seconds;
+                    self._states[i].angularVelocity = axis * (angle / seconds);
+                    self._kinematicSet:.remove(h);
+                }
+            }
+
+            self._kinematicFrom[h] = now;
+        }
+    }
+
+    /**
+     * Push a dynamic body by an impulse at a point of the world, its velocities changed at once, waking it
+     * @params:
+     *    - impulse: the impulse, in newton seconds
+     *    - at: the point of the world it pushes at
+     *
+     * @info: does nothing for another body, or when the world has no such body
+     *
+     * */
+    pub fn applyImpulse(mut self, handle: u32, impulse: vec3, at: vec3) {
+        if !self.isDynamic(handle) { return; }
+
+        let mut state = self._states[handle];
+        state:.applyImpulse(impulse, at);
+        self._states[handle] = state;
+    }
+
+    /**
+     * Push a dynamic body by a force at a point of the world until the forces are cleared (see clearForces), waking it
+     * @params:
+     *    - force: the force, in newtons
+     *    - at: the point of the world it pushes at
+     *
+     * @info: does nothing for another body, or when the world has no such body
+     *
+     * */
+    pub fn applyForce(mut self, handle: u32, force: vec3, at: vec3) {
+        if !self.isDynamic(handle) { return; }
+
+        let mut state = self._states[handle];
+        state:.applyForce(force, at);
+        self._states[handle] = state;
+    }
+
+    /**
+     * Drop the forces and the torques of the bodies, at the end of a tick
+     * */
+    pub fn clearForces(mut self) {
+        for i in 0us .. self._states.len {
+            self._states[i].force = vec3();
+            self._states[i].torque = vec3();
+        }
     }
 
     /*!
@@ -474,6 +684,46 @@ pub class PhysicsWorld {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ======================================          STEP          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Advance the dynamic bodies by a step: the pairs and their manifolds updated, the bodies grouped in islands, each
+     * awake island solved and moved in sub steps (see solveIsland), the islands still for long enough put to sleep
+     *
+     * @params:
+     *    - dt: the duration of the step, in seconds
+     *
+     * */
+    pub fn step(mut self, dt: f32) {
+        if dt <= 0.0f { return; }
+
+        self._step = dt;
+        for i in 0us .. self._states.len { self._previous[i] = self._states[i].pose; }
+
+        self:.updatePairs();
+        self:.updateAllManifolds();
+
+        let islands = self.islands();
+        self:.wakeTouched(islands);
+
+        let slots = self.slotsOf(islands);
+        for k in 0us .. islands.len if self._states[islands[k][0]].awake {
+            if let Ok(s) = slots[k] {
+                self:.solveIsland(islands[k], s, dt);
+            } else {
+                self:.solveIsland(islands[k], [], dt);
+            }
+        }
+
+        self:.sleepIslands(islands, dt);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * =====================================          PAIRS          ======================================
      * ====================================================================================================
      * ====================================================================================================
@@ -510,6 +760,7 @@ pub class PhysicsWorld {
             } else {
                 self._pairs:.remove(pairKey(p.a, p.b));
                 dropped ~= [p];
+                if p.reported { self._endedUnreported ~= [p]; }
             }
         }
 
@@ -614,6 +865,17 @@ pub class PhysicsWorld {
     }
 
     /**
+     * Wake the dynamic bodies a body is in contact with, a body moved by the game not leaving them asleep in the air
+     * */
+    pub fn wakeContactsOf(mut self, handle: u32) {
+        for slot in 0us .. self._pairs.len {
+            let p = self._pairs.get(slot);
+            if p.a == handle { self:.wakeIfAsleep(p.b); }
+            else if p.b == handle { self:.wakeIfAsleep(p.a); }
+        }
+    }
+
+    /**
      * Put a dynamic body to sleep, its velocities dropped, until something
      * wakes it (see wake)
      *
@@ -628,6 +890,21 @@ pub class PhysicsWorld {
         let mut state = self._states[handle];
         state:.sleep();
         self._states[handle] = state;
+        self._slept[handle] = true;
+    }
+
+    /**
+     * @returns: the dynamic bodies put to sleep since the last call, forgotten, the display placing them one last time
+     * where they stopped
+     * */
+    pub fn takeSlept(mut self)-> [u32] {
+        let mut result: [u32] = [];
+        for h, _ in self._slept if self.isDynamic(h) && !self._states[h].awake {
+            result ~= [h];
+        }
+
+        self._slept = copy [];
+        result
     }
 
     /*!
@@ -639,30 +916,43 @@ pub class PhysicsWorld {
      */
 
     /**
-     * Find the pairs of bodies touching each other, one of them at least being kinematic or a trigger and one of them
-     * seeing the other through its mask, and compare them with those of the previous update
-     * @returns: the contacts begun, those that stayed and those that ended since the previous update (the removal of a
-     * body ending its contacts at once, see remove)
+     * Find the pairs of bodies touching each other without a step, one of them at least being kinematic, dynamic or a
+     * trigger and one of them seeing the other through its mask, then report their contacts (see contactEvents)
+     * @returns: the contacts begun, those that stayed and those that ended since the last contact events (the removal
+     * of a body ending its contacts at once, see remove)
      * */
     pub fn updateContacts(mut self)-> [ContactEvent] {
+        self:.updatePairs();
+        self:.updateAllManifolds();
+        self:.contactEvents()
+    }
+
+    /**
+     * @returns: the contacts begun, those that stayed and those that ended since the last call, from the touching of
+     * each pair against what the last call reported: once a tick of a scene, whatever the steps it runs
+     *
+     * @info: a contact begun and ended between two calls is not reported
+     *
+     * */
+    pub fn contactEvents(mut self)-> [ContactEvent] {
         let mut events: [ContactEvent] = [];
-        for p in self:.updatePairs() if p.touching {
+        for p in self._endedUnreported {
             events ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
         }
 
+        self._endedUnreported = [];
         for slot in 0us .. self._pairs.len {
-            let before = self._pairs.get(slot).touching;
-            let p = self:.updateManifolds(slot);
-            let touching = p.touching;
-            if touching {
-                let phase = if before { ContactPhase::STAYED } else { ContactPhase::BEGAN };
-                events ~= [ContactEvent(a-> p.a,
-                                        b-> p.b,
-                                        phase-> phase)];
-            } else if before {
-                events ~= [ContactEvent(a-> p.a,
-                                        b-> p.b,
-                                        phase-> ContactPhase::ENDED)];
+            let mut p = self._pairs.get(slot);
+            if p.touching {
+                let phase = if p.reported { ContactPhase::STAYED } else { ContactPhase::BEGAN };
+                events ~= [ContactEvent(a-> p.a, b-> p.b, phase-> phase)];
+            } else if p.reported {
+                events ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
+            }
+
+            if p.reported != p.touching {
+                p.reported = p.touching;
+                self._pairs:.set(slot, p);
             }
         }
 
@@ -686,6 +976,274 @@ pub class PhysicsWorld {
      * ====================================================================================================
      * ====================================================================================================
      */
+
+    /**
+     * Find the manifolds of the pairs, a pair whose bodies are both asleep or static keeping its own (a trigger
+     * always looking again)
+     * */
+    fn updateAllManifolds(mut self) {
+        for slot in 0us .. self._pairs.len {
+            let p = self._pairs.get(slot);
+            let a = self._bodies[p.a], b = self._bodies[p.b];
+            let still = !self._states[p.a].awake && !self._states[p.b].awake;
+            if still && !a.settings.trigger && !b.settings.trigger { continue; }
+
+            self:.updateManifolds(slot);
+        }
+    }
+
+    /**
+     * Count the time the bodies of each awake island stayed still during a step, the island sleeping when all its
+     * bodies stayed still for long enough and may sleep
+     * */
+    fn sleepIslands(mut self, islands: [[u32]], dt: f32) {
+        for island in islands if self._states[island[0]].awake {
+            let mut ready = true;
+            for b in island {
+                let mut s = self._states[b];
+                let still = s:.updateSleep(dt, self._sleep);
+                self._states[b] = s;
+                if !still || !self._bodies[b].settings.canSleep { ready = false; }
+            }
+
+            if ready {
+                for b in island { self:.sleep(b); }
+            }
+        }
+    }
+
+    /**
+     * @returns: the slots of the pairs in contact of each island, by the index of the island, a pair being in the
+     * island of its dynamic bodies
+     * */
+    fn slotsOf(self, islands: [[u32]])-> [usize => [usize]] {
+        let dmut islandOf = copy [NO_ISLAND ; self._bodies.len];
+        for k in 0us .. islands.len {
+            for b in islands[k] { islandOf[b] = k; }
+        }
+
+        let dmut result: [usize => [usize]] = copy [];
+        for slot in 0us .. self._pairs.len {
+            let p = self._pairs.get(slot);
+            if !utils::inContact(p) { continue; }
+
+            let k = if islandOf[p.a] != NO_ISLAND { islandOf[p.a] } else { islandOf[p.b] };
+            if k == NO_ISLAND { continue; }
+
+            if let Ok(s) = result[k] {
+                result[k] = s ~ [slot];
+            } else {
+                result[k] = copy [slot];
+            }
+        }
+
+        result
+    }
+
+    /**
+     * Solve and move an island during a step: its dynamic bodies, and the static and kinematic bodies they touch,
+     * copied as solver bodies, the constraints of their points prepared, then, at each sub step, the velocities
+     * changed by gravity and the forces, the constraints warm started and solved, the bodies moved, the velocities the
+     * correction of the penetrations left relaxed; the impulses written back to the points for the next step, the
+     * velocities and the poses to the states
+     *
+     * @params:
+     *    - island: the dynamic bodies of the island
+     *    - slots: the slots of the pairs in contact of the island
+     *
+     * @info: the contacts are found once a step, the sub steps moving the separation of each point by the motion of
+     * its bodies (Box2D v3, solver2d); a stack holds still at a shorter step where more passes over the contacts of a
+     * longer one leave it swaying
+     *
+     * */
+    fn solveIsland(mut self, island: [u32], slots: [usize], dt: f32) {
+        let dmut index: [u32 => usize] = copy [];
+        let dmut bodies: [SolverBody] = [];
+        for b in island {
+            index[b] = bodies.len;
+            bodies = bodies ~ copy [self.solverBodyOf(b)];
+        }
+
+        let dmut constraints: [ContactConstraint] = [];
+        for slot in slots {
+            let p = self._pairs.get(slot);
+            for h in [p.a, p.b] if !(h in index) {
+                index[h] = bodies.len;
+                bodies = bodies ~ copy [self.solverBodyOf(h)];
+            }
+
+            let ia = self.indexOf(index, p.a), ib = self.indexOf(index, p.b);
+            let (friction, restitution) = solver::materialOf(self._bodies[p.a].settings, self._bodies[p.b].settings);
+            for m in 0us .. p.manifolds.len {
+                let manifold = p.manifolds[m];
+                for k in 0us .. manifold.points.len {
+                    let mut c = solver::prepare(bodies, ia, ib, manifold.normal, manifold.points[k], friction,
+                                                restitution, self._solver);
+                    c.slot = slot;
+                    c.manifold = m;
+                    c.point = k;
+                    constraints = constraints ~ copy [c];
+                }
+            }
+        }
+
+        let substeps = comparison::max(self._solver.substeps, 1u32);
+        let h = dt / cast!f32(substeps);
+        for _ in 0u32 .. substeps {
+            solver::integrateVelocities(alias bodies, h);
+            solver::warmStart(alias bodies, constraints);
+            for _ in 0u32 .. self._solver.iterations {
+                solver::solve(alias bodies, alias constraints, h, self._solver, true);
+            }
+
+            solver::integratePositions(alias bodies, h);
+            solver::solve(alias bodies, alias constraints, h, self._solver, false);
+        }
+
+        solver::applyRestitution(alias bodies, alias constraints);
+        self:.storeImpulses(constraints);
+
+        for sb in bodies if self.isDynamic(sb.handle) {
+            let mut s = self._states[sb.handle];
+            s.linearVelocity = sb.linearVelocity;
+            s.angularVelocity = sb.angularVelocity;
+            s.pose.rotation = (sb.deltaRotation * s.pose.rotation).normalized();
+            s.pose.position = sb.centre + sb.deltaPosition - s.pose.rotation * s.centre;
+            s:.refresh();
+            self._states[sb.handle] = s;
+
+            self:.place(sb.handle, Collider(self._bodies[sb.handle].collider.shape, s.placement));
+        }
+    }
+
+    /**
+     * Write the impulses the constraints gathered back to their points, the constraints of a pair following each other
+     * */
+    fn storeImpulses(mut self, constraints: [ContactConstraint]) {
+        let mut k = 0us;
+        while k < constraints.len {
+            let slot = constraints[k].slot;
+            let mut p = self._pairs.get(slot);
+            let dmut manifolds = copy p.manifolds;
+            while k < constraints.len && constraints[k].slot == slot {
+                let c = constraints[k];
+                let m = manifolds[c.manifold];
+                let dmut points = copy m.points;
+                points[c.point].normalImpulse = c.normalImpulse;
+                points[c.point].frictionImpulse = c.tangent1 * c.tangentImpulse1 + c.tangent2 * c.tangentImpulse2;
+                manifolds[c.manifold] = ContactManifold(m.key, m.normal, points);
+                k += 1us;
+            }
+
+            p.manifolds = manifolds;
+            self._pairs:.set(slot, p);
+        }
+    }
+
+    /**
+     * @returns: a body as the solver pushes and moves it, gravity and its forces accelerating a dynamic body, nothing
+     * pushing nor moving a static or a kinematic body
+     * */
+    fn solverBodyOf(self, handle: u32)-> SolverBody {
+        let s = self._states[handle];
+        let mut b = SolverBody(handle-> handle,
+                               linearVelocity-> s.linearVelocity,
+                               angularVelocity-> s.angularVelocity,
+                               centre-> s.worldCentre);
+        if self.isDynamic(handle) {
+            let settings = self._bodies[handle].settings;
+            b.inverseMass = s.inverseMass;
+            b.inverseInertia = s.inverseInertia;
+            b.linearAcceleration = self._gravity + s.force * s.inverseMass;
+            b.angularAcceleration = s.inverseInertia * s.torque;
+            b.linearDamping = settings.linearDamping;
+            b.angularDamping = settings.angularDamping;
+        }
+
+        b
+    }
+
+    /**
+     * @returns: the index of a body in the solver bodies of an island
+     * @warning: the body is in the island
+     * */
+    fn indexOf(self, index: [u32 => usize], handle: u32)-> usize {
+        if let Ok(i) = index[handle] { return i; }
+        panic;
+    }
+
+    /**
+     * @returns: the islands of the dynamic bodies, those in contact through their pairs (a point of a manifold, even
+     * speculative) put in one island, a static or a kinematic body joining none; a dynamic body in contact with no
+     * other an island of its own; the sleeping bodies in their islands too
+     *
+     * */
+    fn islands(self)-> [[u32]] {
+        let dmut parent = copy [0u32 ; self._bodies.len];
+        for i in 0us .. parent.len { parent[i] = cast!u32(i); }
+
+        for p in self._pairs.pairs if utils::inContact(p) && self.isDynamic(p.a) && self.isDynamic(p.b) {
+            islands::join(alias parent, p.a, p.b);
+        }
+
+        let dmut byRoot: [u32 => [u32]] = copy [];
+        for i in 0us .. self._bodies.len if self.isDynamic(cast!u32(i)) {
+            let r = islands::rootOf(alias parent, cast!u32(i));
+            if let Ok(members) = byRoot[r] {
+                byRoot[r] = members ~ [cast!u32(i)];
+            } else {
+                byRoot[r] = copy [cast!u32(i)];
+            }
+        }
+
+        let mut result: [[u32]] = [];
+        for _, members in byRoot { result ~= [members]; }
+        result
+    }
+
+    /**
+     * Wake the sleeping dynamic bodies in contact with an awake dynamic body or a moving kinematic body, their whole
+     * island with them: a stack woken at once, not a body a step
+     *
+     * */
+    fn wakeTouched(mut self, islands: [[u32]]) {
+        for p in self._pairs.pairs if utils::inContact(p) {
+            if self.pushes(p.a) { self:.wakeIfAsleep(p.b); }
+            if self.pushes(p.b) { self:.wakeIfAsleep(p.a); }
+        }
+
+        for island in islands {
+            let mut awake = false;
+            for b in island if self._states[b].awake { awake = true; }
+
+            if awake {
+                for b in island { self:.wakeIfAsleep(b); }
+            }
+        }
+    }
+
+    /**
+     * Wake a dynamic body if it sleeps, an awake body counting its time still on
+     * */
+    fn wakeIfAsleep(mut self, handle: u32) {
+        if self.isDynamic(handle) && !self._states[handle].awake {
+            self:.wake(handle);
+        }
+    }
+
+    /**
+     * @returns: true iif a body wakes those it is in contact with: a dynamic body awake, a kinematic body moving
+     * */
+    fn pushes(self, handle: u32)-> bool {
+        let s = self._states[handle];
+        match self._bodies[handle].settings.motion {
+            BodyMotion::DYNAMIC => { s.awake }
+            BodyMotion::KINEMATIC => {
+                s.linearVelocity.dot(s.linearVelocity) > 0.0f || s.angularVelocity.dot(s.angularVelocity) > 0.0f
+            }
+            _ => { false }
+        }
+    }
 
     /**
      * Find the manifolds of a pair that is not a trigger from those of the step
@@ -724,7 +1282,7 @@ pub class PhysicsWorld {
         let sa = self._states[p.a], sb = self._states[p.b];
         let reachA = sa.angularVelocity.length() * self.reachOf(p.a);
         let reachB = sb.angularVelocity.length() * self.reachOf(p.b);
-        SPECULATIVE_FLOOR + ((sa.linearVelocity - sb.linearVelocity).length() + reachA + reachB) * STEP
+        SPECULATIVE_FLOOR + ((sa.linearVelocity - sb.linearVelocity).length() + reachA + reachB) * self._step
     }
 
     /**

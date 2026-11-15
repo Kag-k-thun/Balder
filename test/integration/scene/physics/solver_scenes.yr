@@ -1,0 +1,265 @@
+in solver_scenes;
+
+use balder::math::{matrix, quaternion, utils, vector};
+use balder::scene::physics;
+
+use integration::utils::compare;
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The duration of a step, at 60 steps a second
+ * */
+def DT = 1.0f / 60.0f;
+
+/**
+ * @returns: the settings of a dynamic body
+ * */
+fn dynamic(mass: f32 = 1.0f, friction: f32 = 0.5f, restitution: f32 = 0.0f, damping: f32 = 0.05f)-> BodySettings {
+    BodySettings(motion-> BodyMotion::DYNAMIC, mass-> mass, friction-> friction, restitution-> restitution,
+                 linearDamping-> damping, angularDamping-> damping)
+}
+
+/**
+ * @returns: a box of side 1
+ * */
+fn crate()-> ColliderShape {
+    ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f))
+}
+
+/**
+ * Step a world for a duration
+ * */
+fn run(dmut world: &PhysicsWorld, seconds: f32) {
+    for _ in 0 .. cast!i32(seconds / DT + 0.5f) { world:.step(DT); }
+}
+
+__test a_box_dropped_on_a_plane_settles_without_jitter_and_sleeps {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let box = world:.add(crate(), translation(makeVec3(0.0f, 2.0f, 0.0f)), settings-> dynamic());
+
+    run(alias world, 2.0f);
+    let s = world.getState(box);
+    assert (s.linearVelocity.length() < 0.01f && s.angularVelocity.length() < 0.01f);
+    assert (s.pose.position.y > 0.5f - 2.0f * 0.005f && s.pose.position.y < 0.501f);
+
+    run(alias world, 1.0f);
+    assert (!world.getState(box).awake);
+}
+
+__test ten_boxes_stacked_hold_still {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let mut crates: [u32] = [];
+    for i in 0 .. 10 {
+        crates ~= [world:.add(crate(), translation(makeVec3(0.0f, 0.5f + cast!f32(i), 0.0f)), settings-> dynamic())];
+    }
+
+    let top = world.getState(crates[9]).pose.position;
+    run(alias world, 5.0f);
+    assert ((world.getState(crates[9]).pose.position - top).length() < 0.01f);
+}
+
+__test a_box_on_a_slope_sticks_above_its_friction_and_slides_below_it {
+    // tan (0.3) = 0.309
+    let angle = 0.3f;
+    let slope = Quaternion::fromAxisAngle(angle, makeVec3(0.0f, 0.0f, 1.0f));
+    let up = slope * makeVec3(0.0f, 1.0f, 0.0f);
+    for friction in [0.5f, 0.1f] {
+        let dmut world = copy PhysicsWorld();
+        world:.add(ColliderShape::plane(), slope.matrix(), settings-> BodySettings(friction-> friction));
+        let box = world:.add(crate(), translation(up * 0.5f) * slope.matrix(),
+                             settings-> dynamic(friction-> friction, damping-> 0.0f));
+
+        run(alias world, 0.5f);
+        let v0 = world.getState(box).linearVelocity.length();
+        run(alias world, 1.0f);
+        let v1 = world.getState(box).linearVelocity.length();
+
+        if friction > math::tan(angle) {
+            assert (v1 < 0.01f);
+        } else {
+            let expected = 9.81f * (math::sin(angle) - friction * math::cos(angle));
+            assert (math::abs((v1 - v0) - expected) < 0.05f * expected);
+        }
+    }
+}
+
+__test a_fast_sphere_does_not_pass_through_a_thin_wall {
+    let dmut world = copy PhysicsWorld();
+    world.gravity = vec3();
+    world:.add(ColliderShape::box(makeVec3(0.02f, 4.0f, 4.0f)), translation(makeVec3(5.0f, 0.0f, 0.0f)));
+    let ball = world:.add(ColliderShape::sphere(0.1f), mat4(), settings-> dynamic());
+    world:.setVelocity(ball, makeVec3(50.0f, 0.0f, 0.0f), vec3());
+
+    run(alias world, 0.5f);
+    assert (world.getState(ball).pose.position.x < 5.0f - 0.01f - 0.1f + 0.01f);
+}
+
+__test a_bouncing_ball_comes_back_up_by_its_restitution_and_rests_below_the_threshold {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4(), settings-> BodySettings(restitution-> 0.8f));
+    let ball = world:.add(ColliderShape::sphere(0.5f), translation(makeVec3(0.0f, 5.5f, 0.0f)),
+                          settings-> dynamic(restitution-> 0.8f, damping-> 0.0f));
+
+    // falling 5 m, it hits the plane at 9.9 m/s and leaves it at 0.8 of that, up to 0.64 of the height
+    let mut highest = 0.0f;
+    let mut bounced = false;
+    for _ in 0 .. 150 {
+        world:.step(DT);
+        let s = world.getState(ball);
+        if s.linearVelocity.y > 0.0f { bounced = true; }
+        if bounced { highest = comparison::max(highest, s.pose.position.y - 0.5f); }
+    }
+
+    assert (math::abs(highest - 3.2f) < 0.3f);
+
+    run(alias world, 12.0f);
+    assert (!world.getState(ball).awake);
+}
+
+__test two_stacks_apart_are_two_islands_and_one_wakes_alone {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let a0 = world:.add(crate(), translation(makeVec3(0.0f, 0.5f, 0.0f)), settings-> dynamic());
+    let a1 = world:.add(crate(), translation(makeVec3(0.0f, 1.5f, 0.0f)), settings-> dynamic());
+    let b0 = world:.add(crate(), translation(makeVec3(10.0f, 0.5f, 0.0f)), settings-> dynamic());
+    let b1 = world:.add(crate(), translation(makeVec3(10.0f, 1.5f, 0.0f)), settings-> dynamic());
+
+    run(alias world, 2.0f);
+    for h in [a0, a1, b0, b1] { assert (!world.getState(h).awake); }
+
+    // the impulse wakes its crate, the step its island, the other stack sleeping on
+    world:.applyImpulse(a1, makeVec3(0.1f, 0.0f, 0.0f), world.getState(a1).worldCentre);
+    world:.step(DT);
+    assert (world.getState(a0).awake && world.getState(a1).awake);
+    assert (!world.getState(b0).awake && !world.getState(b1).awake);
+}
+
+__test a_platform_moved_by_the_game_carries_the_box_on_it {
+    let dmut world = copy PhysicsWorld();
+    let platform = world:.add(ColliderShape::box(makeVec3(4.0f, 0.2f, 4.0f)), translation(makeVec3(0.0f, -0.1f, 0.0f)),
+                              settings-> BodySettings(motion-> BodyMotion::KINEMATIC));
+    let box = world:.add(crate(), translation(makeVec3(0.0f, 0.5f, 0.0f)), settings-> dynamic());
+
+    // 1 cm a step along X, a second long
+    for i in 1 .. 61 {
+        world:.setTransform(platform, translation(makeVec3(cast!f32(i) * 0.01f, -0.1f, 0.0f)));
+        world:.deriveKinematics(DT);
+        world:.step(DT);
+    }
+
+    let x = world.getState(box).pose.position.x;
+    assert (x > 0.5f && x < 0.7f);
+}
+
+__test a_body_falling_is_drawn_between_its_last_two_steps {
+    let dmut world = copy PhysicsWorld();
+    let box = world:.add(crate(), translation(makeVec3(0.0f, 5.0f, 0.0f)), settings-> dynamic());
+
+    run(alias world, 0.5f);
+    let before = world.getState(box).pose;
+    world:.step(DT);
+    let after = world.getState(box).pose;
+    assert (near(world.getPrevious(box).position, before.position));
+    assert (after.position.y < before.position.y);
+
+    let half = world.getPrevious(box).interpolated(after, 0.5f);
+    assert (near(half.position.y, (before.position.y + after.position.y) / 2.0f));
+
+    // a body moved by the game is drawn where it is, not swept from where it was
+    world:.setTransform(box, translation(makeVec3(3.0f, 5.0f, 0.0f)));
+    assert (near(world.getPrevious(box).position, makeVec3(3.0f, 5.0f, 0.0f)));
+}
+
+__test the_contacts_are_reported_once_whatever_the_steps_between_two_reports {
+    let dmut world = copy PhysicsWorld();
+    let ground = world:.add(ColliderShape::plane(), mat4());
+    let box = world:.add(crate(), translation(makeVec3(0.0f, 0.6f, 0.0f)), settings-> dynamic());
+
+    run(alias world, 0.5f);
+    let began = world:.contactEvents();
+    assert (began.len == 1us && began[0].a == ground && began[0].b == box && began[0].phase == ContactPhase::BEGAN);
+
+    run(alias world, 0.1f);
+    let stayed = world:.contactEvents();
+    assert (stayed.len == 1us && stayed[0].phase == ContactPhase::STAYED);
+
+    // carried away by the game, its pair dropped during the steps, the contact ends at the next report
+    world:.setTransform(box, translation(makeVec3(0.0f, 50.0f, 0.0f)));
+    run(alias world, 0.1f);
+    let ended = world:.contactEvents();
+    assert (ended.len == 1us && ended[0].phase == ContactPhase::ENDED);
+    assert (world:.contactEvents().len == 0us);
+}
+
+__test a_kinematic_body_moved_gets_the_velocities_of_its_move {
+    let dmut world = copy PhysicsWorld();
+    let platform = world:.add(crate(), mat4(), settings-> BodySettings(motion-> BodyMotion::KINEMATIC));
+    world:.deriveKinematics(0.5f);
+
+    let turn = Quaternion::fromAxisAngle(0.25f, makeVec3(0.0f, 1.0f, 0.0f));
+    world:.setTransform(platform, translation(makeVec3(1.0f, 0.0f, 0.0f)) * turn.matrix());
+    world:.deriveKinematics(0.5f);
+    let moved = world.getState(platform);
+    assert (near(moved.linearVelocity, makeVec3(2.0f, 0.0f, 0.0f)));
+    assert (near(moved.angularVelocity, makeVec3(0.0f, 0.5f, 0.0f)));
+
+    // still, it stops; given a velocity, it keeps it until it moves again
+    world:.deriveKinematics(0.5f);
+    assert (near(world.getState(platform).linearVelocity, vec3()));
+
+    world:.setVelocity(platform, makeVec3(0.0f, 0.0f, 3.0f), vec3());
+    world:.deriveKinematics(0.5f);
+    assert (near(world.getState(platform).linearVelocity, makeVec3(0.0f, 0.0f, 3.0f)));
+}
+
+__test an_impulse_changes_the_velocities_at_once_and_a_force_until_it_is_cleared {
+    let dmut world = copy PhysicsWorld();
+    world.gravity = vec3();
+    let box = world:.add(crate(), mat4(), settings-> dynamic(mass-> 2.0f, damping-> 0.0f));
+
+    // off its centre, the impulse turns the body as well
+    world:.applyImpulse(box, makeVec3(0.0f, 0.0f, 1.0f), makeVec3(0.5f, 0.0f, 0.0f));
+    let s = world.getState(box);
+    assert (near(s.linearVelocity, makeVec3(0.0f, 0.0f, 0.5f)));
+    assert (s.angularVelocity.y < 0.0f);
+
+    world:.setVelocity(box, vec3(), vec3());
+    world:.applyForce(box, makeVec3(4.0f, 0.0f, 0.0f), world.getState(box).worldCentre);
+    run(alias world, 0.5f);
+    assert (near(world.getState(box).linearVelocity, makeVec3(1.0f, 0.0f, 0.0f), tolerance-> 0.001f));
+
+    world:.clearForces();
+    run(alias world, 0.5f);
+    assert (near(world.getState(box).linearVelocity, makeVec3(1.0f, 0.0f, 0.0f), tolerance-> 0.001f));
+}
+
+__test a_box_asleep_on_a_box_removed_from_under_it_wakes_and_falls {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let low = world:.add(crate(), translation(makeVec3(0.0f, 0.5f, 0.0f)), settings-> dynamic());
+    let high = world:.add(crate(), translation(makeVec3(0.0f, 1.5f, 0.0f)), settings-> dynamic());
+
+    run(alias world, 2.0f);
+    assert (!world.getState(high).awake);
+
+    world:.remove(low);
+    assert (world.getState(high).awake);
+    run(alias world, 1.0f);
+    assert (world.getState(high).pose.position.y < 0.6f);
+}
+
+__test a_body_that_cannot_sleep_keeps_its_island_awake {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let low = world:.add(crate(), translation(makeVec3(0.0f, 0.5f, 0.0f)), settings-> dynamic());
+    let mut restless = dynamic();
+    restless.canSleep = false;
+    let high = world:.add(crate(), translation(makeVec3(0.0f, 1.5f, 0.0f)), settings-> restless);
+
+    run(alias world, 3.0f);
+    assert (world.getState(low).awake && world.getState(high).awake);
+}

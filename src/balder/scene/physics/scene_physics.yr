@@ -1,11 +1,16 @@
 in scene_physics;
 
-use balder::math::{bounds, matrix, quaternion, vector};
+use balder::core::application::fixed_step;
+use balder::core::config::physics;
+use balder::math::{bounds, matrix, quaternion, rigid_transform, vector};
 use balder::scene::node::node3D::body;
 
+use std::time;
+
 /**
- * The physics of a scene: the world of the bodies that entered it, the queries giving the nodes they hit, and the
- * signals of the contacts emitted on the nodes
+ * The physics of a scene: the world of the bodies that entered it, stepped in the ticks of the scene, the poses of the
+ * dynamic bodies written back to their nodes, the queries giving the nodes they hit, and the signals of the contacts
+ * emitted on the nodes
  * @info: the scene guards it with its lock (see Scene::raycast); the signals are emitted under the lock, their slots
  * running later, in the threads emptying the slot emitters they were connected with
  * */
@@ -17,6 +22,12 @@ pub class ScenePhysics {
 
     // The nodes of the bodies, by handle
     let dmut _bodies: [u32 => &PhysicsBody3D] = copy [];
+
+    // The steps of the simulation, at the rate of the configuration (see configure)
+    let mut _steps: FixedStep = FixedStep(60u32);
+
+    // The handle of the body whose node the simulation is placing, its move not going back to the world
+    let mut _writing: (u32)? = none;
 
     pub self () {}
 
@@ -100,9 +111,14 @@ pub class ScenePhysics {
 
     /**
      * Place the body of a node at the transformation of the node
+     * @info: does nothing for the node the simulation is placing (see advance)
      * */
     pub fn moved(mut self, body: &PhysicsBody3D) {
         if let Ok(h) = body.handle {
+            if let Ok(w) = self._writing {
+                if w == h { return; }
+            }
+
             self._world:.setTransform(h, body.transformation);
         }
     }
@@ -123,6 +139,104 @@ pub class ScenePhysics {
      * */
     pub fn updateContacts(mut self) {
         for e in self._world:.updateContacts() {
+            self:.emit(e);
+        }
+    }
+
+    /**
+     * @returns: the velocities of the body of a node, zero for a node whose body is not in the world
+     *    - 0: the velocity of its centre of mass, in metres a second
+     *    - 1: its angular velocity in the world, in radians a second about its direction
+     * */
+    pub fn velocityOf(self, body: &PhysicsBody3D)-> (vec3, vec3) {
+        if let Ok(h) = body.handle {
+            let s = self._world.getState(h);
+            return (s.linearVelocity, s.angularVelocity);
+        }
+
+        (vec3(), vec3())
+    }
+
+    /**
+     * Change the velocities of the body of a node, dynamic or kinematic, waking it (see PhysicsWorld::setVelocity)
+     * */
+    pub fn setVelocity(mut self, body: &PhysicsBody3D, linear: vec3, angular: vec3) {
+        if let Ok(h) = body.handle {
+            self._world:.setVelocity(h, linear, angular);
+        }
+    }
+
+    /**
+     * Push the dynamic body of a node by an impulse at a point of the world, its centre of mass when none
+     * */
+    pub fn applyImpulse(mut self, body: &PhysicsBody3D, impulse: vec3, at: (vec3)? = none) {
+        if let Ok(h) = body.handle {
+            self._world:.applyImpulse(h, impulse, self.pointOf(h, at));
+        }
+    }
+
+    /**
+     * Push the dynamic body of a node by a force at a point of the world until the end of the tick, its centre of mass
+     * when none
+     * */
+    pub fn applyForce(mut self, body: &PhysicsBody3D, force: vec3, at: (vec3)? = none) {
+        if let Ok(h) = body.handle {
+            self._world:.applyForce(h, force, self.pointOf(h, at));
+        }
+    }
+
+    /**
+     * @returns: true iif the body of a node sleeps, the simulation skipping it until something wakes it
+     * */
+    pub fn isSleeping(self, body: &PhysicsBody3D)-> bool {
+        if let Ok(h) = body.handle {
+            return self._world.isDynamic(h) && !self._world.getState(h).awake;
+        }
+
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          STEPS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the rate of the steps and the gravity, the solver and the sleep of the world
+     * @params:
+     *    - config: the configuration of the physics
+     *    - rate: the steps a second
+     *    - catchUp: the steps a tick runs at most, the time beyond them dropped
+     * */
+    pub fn configure(mut self, config: PhysicsConfig, rate: u32, catchUp: u32) {
+        self._steps = FixedStep(rate, maxSteps-> catchUp);
+        self._world:.configure(config);
+    }
+
+    /**
+     * Advance the simulation by the steps a tick covers: the kinematic bodies given the velocities of their moves, the
+     * steps run, the forces dropped, the poses of the dynamic bodies written to their nodes between the last two steps,
+     * the contacts of the tick emitted (see updateContacts)
+     * @params:
+     *    - delta: the duration of the tick
+     * @info: a tick running no step updates the contacts where the bodies were moved, the dynamic bodies staying
+     * */
+    pub fn advance(mut self, delta: Duration) {
+        self._world:.deriveKinematics(cast!f32(delta.allMicros) / 1_000_000.0f);
+
+        let steps = self._steps:.advance(delta);
+        for _ in 0u32 .. steps {
+            self._world:.step(self._steps.seconds);
+        }
+
+        self._world:.clearForces();
+        self:.writeBack(self._steps.alpha);
+
+        let events = if steps == 0u32 { self._world:.updateContacts() } else { self._world:.contactEvents() };
+        for e in events {
             self:.emit(e);
         }
     }
@@ -211,6 +325,44 @@ pub class ScenePhysics {
      * ====================================================================================================
      * ====================================================================================================
      */
+
+    /**
+     * Place the nodes of the awake dynamic bodies where the simulation is between their last two steps, and those put to
+     * sleep since the last tick where they stopped, their moves not going back to the world
+     * */
+    fn writeBack(mut self, alpha: f32) {
+        for h in self._world:.takeSlept() {
+            self:.place(h, self._world.getState(h).pose);
+        }
+
+        let mut awake: [u32] = [];
+        for h, _ in self._bodies if self._world.isDynamic(h) && self._world.getState(h).awake {
+            awake ~= [h];
+        }
+
+        for h in awake {
+            self:.place(h, self._world.getPrevious(h).interpolated(self._world.getState(h).pose, alpha));
+        }
+    }
+
+    /**
+     * @returns: a point of the world a push is applied at, the centre of the mass of the body when none
+     * */
+    fn pointOf(self, handle: u32, at: (vec3)?)-> vec3 {
+        if let Ok(p) = at { return p; }
+        self._world.getState(handle).worldCentre
+    }
+
+    /**
+     * Place the node of a body at a pose of the simulation
+     * */
+    fn place(mut self, handle: u32, pose: RigidTransform) {
+        if let Ok(dmut b) = alias self._bodies[handle] {
+            self._writing = (handle)?;
+            b:.placeFromPhysics(pose);
+            self._writing = none;
+        }
+    }
 
     /**
      * @returns: the hit of the node of a body

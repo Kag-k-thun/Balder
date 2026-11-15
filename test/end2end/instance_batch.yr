@@ -1,0 +1,150 @@
+in instance_batch;
+
+use balder::core::{_, application::_, memory::buffer};
+use balder::core::shader::buffers::{instance_batch, instance_draw};
+use balder::utils::log;
+
+use ::etc::c::memory;
+
+use ::vulkan::core;
+
+/**
+ * The frame the batch lays out, and the objects it lays out the second time, more than its arrays first held
+ * */
+def FRAME = 0u32;
+def OBJECTS = 20us;
+
+/**
+ * The objects drawing something the second time, the others being culled (their draw empty)
+ * */
+def DRAWN = 2us;
+
+/**
+ * The byte the buffers are filled with before their first write, as the memory of a buffer disposed before would be
+ * */
+def GARBAGE = 0xab;
+
+/**
+ * @returns: a draw of 'count' indices from 'first', for the object word 'word'
+ * */
+fn draw(first: u32, count: u32, word: u32)-> InstanceDraw {
+    let mut d = InstanceDraw();
+    d.indexCount = count;
+    d.firstIndex = first;
+    d.word = word;
+    d
+}
+
+/**
+ * Fill a buffer with GARBAGE
+ * */
+fn spoil(dmut buffer: (&Buffer)?) {
+    if let Ok(dmut b) = alias buffer {
+        let ptr = b:.map();
+        if ptr != null {
+            memset(ptr, GARBAGE, b.getSize());
+        }
+    }
+}
+
+/**
+ * Lays out an instance batch on the device of its window, its arrays growing without its buffers being replaced, and
+ * reads the commands and the words its buffers hold for the GPU, then closes
+ * */
+class BatchActivity over Activity {
+
+    // The commands the batch built, and those its buffer holds, as many as laid out
+    pub let mut built: [VkDrawIndexedIndirectCommand] = [];
+    pub let mut commands: [VkDrawIndexedIndirectCommand] = [];
+
+    // The words its buffer holds, as many as laid out
+    pub let mut words: [u32] = [];
+
+    pub self (uid: usize, dmut app: &Application, dmut window: &Window)
+        with super(uid, alias app, alias window)
+    {}
+
+    over onStart(mut self) {
+        // no frame flushes the batch meanwhile
+        self.window:.lockFrame();
+        {
+            self:.layOut();
+        } catch {
+            err => {
+                log::error #("Test", "Failed to lay out the batch", err);
+            }
+        }
+
+        self.window:.unlockFrame();
+        self.app:.close(alias self);
+    }
+
+    /**
+     * One object laid out, its buffers allocated larger than its arrays and spoiled before their first write, then
+     * OBJECTS objects laid out, DRAWN of them drawing the same range: the commands and the words past the first ones
+     * built are empty, the arrays grown to hold them
+     * */
+    fn layOut(mut self)
+        throws BalderError
+    {
+        let dmut batch = copy InstanceBatch(alias self.window:.getVulkanDevice());
+
+        batch:.begin(FRAME);
+        batch:.add(FRAME, 0us, copy [draw(0u32, 36u32, 4u32)]);
+        batch:.end(FRAME);
+        spoil(alias batch:.getCommandBuffer(FRAME));
+        spoil(alias batch:.getWordBuffer(FRAME));
+        batch:.flush(FRAME);
+
+        batch:.begin(FRAME);
+        for i in 0us .. OBJECTS {
+            let d = if i < DRAWN { draw(0u32, 36u32, cast!u32(i + 1us) * 4u32) } else { InstanceDraw() };
+            batch:.add(FRAME, i, copy [d]);
+        }
+
+        let count = batch:.end(FRAME);
+        batch:.flush(FRAME);
+
+        self.built = copy [batch.getCommand(FRAME, i) for i in 0u32 .. count];
+        if let Ok(dmut b) = alias batch:.getCommandBuffer(FRAME) {
+            let ptr = cast!{*VkDrawIndexedIndirectCommand} (b:.map());
+            self.commands = copy [unsafe { ptr[i] } for i in 0u32 .. count];
+        }
+
+        if let Ok(dmut b) = alias batch:.getWordBuffer(FRAME) {
+            let ptr = cast!{*u32} (b:.map());
+            self.words = copy [unsafe { ptr[i] } for i in 0u32 .. count];
+        }
+
+        batch:.dispose();
+    }
+}
+
+/**
+ * @returns: true iif two commands draw the same
+ * */
+fn same(a: VkDrawIndexedIndirectCommand, b: VkDrawIndexedIndirectCommand)-> bool {
+    a.indexCount == b.indexCount
+        && a.instanceCount == b.instanceCount
+        && a.firstIndex == b.firstIndex
+        && a.vertexOffset == b.vertexOffset
+        && a.firstInstance == b.firstInstance
+}
+
+__test the_commands_and_words_past_those_built_draw_nothing_on_the_gpu {
+    let dmut app = copy Application();
+    let act = app:.open!{&BatchActivity} (copy BalderConfig::default());
+    app:.run();
+
+    // the DRAWN objects are one instanced command, the commands after it drawing nothing
+    assert (act.built.len == OBJECTS && act.commands.len == OBJECTS);
+    assert (act.built[0].instanceCount == cast!u32(DRAWN));
+    for i in 0us .. OBJECTS {
+        assert (same(act.commands[i], act.built[i]));
+    }
+
+    assert (act.words.len == OBJECTS);
+    for i in DRAWN .. OBJECTS {
+        assert (act.words[i] == 0u32);
+    }
+}
