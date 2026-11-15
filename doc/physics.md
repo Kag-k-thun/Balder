@@ -33,12 +33,16 @@ so that it enters the world where it is.
 
 A `ColliderShape` is centred on the origin of its body:
 
-| Kind      | Built with                           | Notes                                                    |
-|-----------|--------------------------------------|----------------------------------------------------------|
-| `BOX`     | `ColliderShape::box (size)`          | a side along each axis of the body                       |
-| `SPHERE`  | `ColliderShape::sphere (radius)`     |                                                          |
-| `CAPSULE` | `ColliderShape::capsule (r, height)` | along the Y axis, its caps included in its height        |
-| `MESH`    | `ColliderShape::mesh (triangles)`    | a `TriangleBvh`, its hierarchy built at once             |
+| Kind       | Built with                            | Notes                                                        |
+|------------|---------------------------------------|--------------------------------------------------------------|
+| `BOX`      | `ColliderShape::box (size)`           | a side along each axis of the body                           |
+| `SPHERE`   | `ColliderShape::sphere (radius)`      |                                                              |
+| `CAPSULE`  | `ColliderShape::capsule (r, height)`  | along the Y axis, its caps included in its height            |
+| `MESH`     | `ColliderShape::mesh (triangles)`     | a `TriangleBvh`, its hierarchy built at once                 |
+| `CYLINDER` | `ColliderShape::cylinder (r, height)` | along the Y axis, scaled along each axis of its body         |
+| `PLANE`    | `ColliderShape::plane ()`             | the half space under the XZ plane of its body; static        |
+| `HULL`     | `ColliderShape::hull (hull)`          | a shared `ConvexHull` of points (`copy ConvexHull (points)`) |
+| `COMPOUND` | `ColliderShape::compound (parts)`     | convex parts placed by rigid transforms (`CompoundShape`)    |
 
 `ColliderShape (volume)` gives the shape of a `VolumeShape`, the shape of a `Volume3D`. A mesh is only a surface: a
 ray hits its triangles from either side, a shape overlaps it only when it crosses a triangle, and two meshes never
@@ -48,6 +52,24 @@ The transformation of the body may scale its shape. A box is scaled along each o
 scaled along other axes. A mesh is transformed as it is drawn. A sphere stays round, scaled by the largest scale of the
 transformation. A capsule is scaled along its axis by the scale of Y (its cylinder), and its radius by the larger of the
 scales of X and Z.
+
+`SolidObjectModel::hulls` gives the compound of the hulls of the meshes of a model, one by material, before the model
+enters a scene that does not keep its triangles. A concave model is authored by hand as a compound: there is no convex
+decomposition. A plane has no box: the world keeps its planes apart from its hierarchy and tests them in every query.
+
+## Body state
+
+Next to the slot of each body, the world keeps its `BodyState`, in an array by handle the solver runs over without
+reaching the colliders nor the nodes: its pose (a `RigidTransform`, its scale apart), the centre of its mass, its linear
+and angular velocities, the inverse of its mass and of its inertia tensor, in the space of the body and in the world.
+
+A dynamic body has the mass of its settings, spread uniformly in its shape scaled as its node is (`MassProperties`): a
+compound splits it between its parts by volume. It is placed rigidly, its pose then its scale, the shear of a parent
+dropped. A mesh or a plane is never dynamic, the world keeping it static with an error.
+
+A dynamic body still (under `SleepThresholds::linear` and `angular`) for `time` seconds is ready to sleep
+(`updateSleep`); the solver puts an island to sleep when all its bodies are, their velocities dropped. Moving a body or
+changing its velocity wakes it.
 
 ## The world
 
