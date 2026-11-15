@@ -1,0 +1,223 @@
+in island_set;
+
+/**
+ * The index of no island
+ * */
+pub def NO_ISLAND = usize::max;
+
+/**
+ * The islands of the dynamic bodies of a world: the bodies in contact grouped by a union-find, then the bodies and the
+ * pairs of each island laid out island after island
+ *
+ * @info: a step fills the set in order: reset, join for each contact between two dynamic bodies, addBody for each
+ * dynamic body by increasing handle, sealBodies, addSlot for each pair in contact, sealSlots. The buffers are kept
+ * from step to step and only grow, a step allocating nothing once they are as large as the world needs
+ *
+ * */
+@final
+pub class IslandSet {
+
+    // The parent of each body in the union-find, a root being its own parent, by handle
+    let dmut _parent: [u32] = [];
+
+    // The island of each body, NO_ISLAND for a body in none, by handle
+    let dmut _islandOf: [usize] = [];
+
+    // The island given to the root of each island, NO_ISLAND until it is given one, by handle
+    let dmut _ofRoot: [usize] = [];
+
+    // The bodies of the islands, island after island, by increasing handle in each
+    let dmut _bodies: [u32] = [];
+
+    // The start of the bodies of each island in _bodies, followed by their end
+    let dmut _bodyStarts: [usize] = [];
+
+    // The slots of the pairs of the islands, island after island
+    let dmut _slots: [usize] = [];
+
+    // The start of the slots of each island in _slots, followed by their end
+    let dmut _slotStarts: [usize] = [];
+
+    // The bodies or the slots added and not dealt yet, in their order, and their islands
+    let dmut _pending: [usize] = [];
+    let dmut _pendingIslands: [usize] = [];
+    let mut _pendingLen: usize = 0us;
+
+    // Where the next body or slot of each island goes while they are dealt
+    let dmut _cursors: [usize] = [];
+
+    // The number of islands
+    let mut _len: usize = 0us;
+
+    pub self () {}
+
+    /**
+     * @returns: the number of islands
+     * */
+    @field
+    pub fn len(self)-> usize {
+        self._len
+    }
+
+    /**
+     * @returns: the bodies of an island, by increasing handle
+     * */
+    pub fn bodiesOf(self, island: usize)-> [u32] {
+        self._bodies[self._bodyStarts[island] .. self._bodyStarts[island + 1us]]
+    }
+
+    /**
+     * @returns: the slots of the pairs in contact of an island, in the order they were added
+     * */
+    pub fn slotsOf(self, island: usize)-> [usize] {
+        self._slots[self._slotStarts[island] .. self._slotStarts[island + 1us]]
+    }
+
+    /**
+     * @returns: the island of a body, NO_ISLAND for a body in none
+     * */
+    pub fn islandOf(self, handle: u32)-> usize {
+        self._islandOf[handle]
+    }
+
+    /**
+     * Forget the islands of the step before, each of the bodies of a world its own root
+     * @params:
+     *    - bodies: the number of slots of the bodies of the world
+     * */
+    pub fn reset(mut self, bodies: usize) {
+        while self._parent.len < bodies {
+            self._parent ~= [0u32];
+            self._islandOf ~= [NO_ISLAND];
+            self._ofRoot ~= [NO_ISLAND];
+        }
+
+        for i in 0us .. bodies {
+            self._parent[i] = cast!u32(i);
+            self._islandOf[i] = NO_ISLAND;
+            self._ofRoot[i] = NO_ISLAND;
+        }
+
+        self._len = 0us;
+        self._pendingLen = 0us;
+    }
+
+    /**
+     * Put two bodies in contact in one island
+     * */
+    pub fn join(mut self, a: u32, b: u32) {
+        let ra = self:.rootOf(a), rb = self:.rootOf(b);
+        if ra != rb { self._parent[ra] = rb; }
+    }
+
+    /**
+     * Add a dynamic body to the island of its root, the bodies added by increasing handle
+     * */
+    pub fn addBody(mut self, handle: u32) {
+        let r = self:.rootOf(handle);
+        if self._ofRoot[r] == NO_ISLAND {
+            self._ofRoot[r] = self._len;
+            self._len += 1us;
+        }
+
+        self._islandOf[handle] = self._ofRoot[r];
+        self:.addPending(cast!usize(handle), self._ofRoot[r]);
+    }
+
+    /**
+     * Lay out the bodies added, island after island
+     * */
+    pub fn sealBodies(mut self) {
+        while self._bodyStarts.len < self._len + 1us { self._bodyStarts ~= [0us]; }
+        self:.deal(alias self._bodyStarts);
+        while self._bodies.len < self._pendingLen { self._bodies ~= [0u32]; }
+
+        for i in 0us .. self._pendingLen {
+            let k = self._pendingIslands[i];
+            self._bodies[self._cursors[k]] = cast!u32(self._pending[i]);
+            self._cursors[k] += 1us;
+        }
+
+        self._pendingLen = 0us;
+    }
+
+    /**
+     * Add a pair in contact to the island of its dynamic bodies, a pair of no island (two bodies that are not dynamic)
+     * left out
+     * @params:
+     *    - slot: the slot of the pair
+     *    - a, b: its two bodies
+     * */
+    pub fn addSlot(mut self, slot: usize, a: u32, b: u32) {
+        let k = if self._islandOf[a] != NO_ISLAND { self._islandOf[a] } else { self._islandOf[b] };
+        if k != NO_ISLAND {
+            self:.addPending(slot, k);
+        }
+    }
+
+    /**
+     * Lay out the slots added, island after island
+     * */
+    pub fn sealSlots(mut self) {
+        while self._slotStarts.len < self._len + 1us { self._slotStarts ~= [0us]; }
+        self:.deal(alias self._slotStarts);
+        while self._slots.len < self._pendingLen { self._slots ~= [0us]; }
+
+        for i in 0us .. self._pendingLen {
+            let k = self._pendingIslands[i];
+            self._slots[self._cursors[k]] = self._pending[i];
+            self._cursors[k] += 1us;
+        }
+
+        self._pendingLen = 0us;
+    }
+
+    /**
+     * Keep a body or a slot and its island until they are dealt
+     * */
+    fn addPending(mut self, value: usize, island: usize) {
+        if self._pendingLen < self._pending.len {
+            self._pending[self._pendingLen] = value;
+            self._pendingIslands[self._pendingLen] = island;
+        } else {
+            self._pending ~= [value];
+            self._pendingIslands ~= [island];
+        }
+
+        self._pendingLen += 1us;
+    }
+
+    /**
+     * Count the values pending in each island, the start of each island written to starts, followed by the end of the
+     * last, the cursors of the islands at their starts
+     * @params:
+     *    - starts: the starts of the islands, as long as their number and one more
+     * */
+    fn deal(mut self, dmut starts: [usize]) {
+        while self._cursors.len < self._len { self._cursors ~= [0us]; }
+
+        for k in 0us .. self._len + 1us { starts[k] = 0us; }
+        for i in 0us .. self._pendingLen { starts[self._pendingIslands[i] + 1us] += 1us; }
+        for k in 0us .. self._len {
+            starts[k + 1us] += starts[k];
+            self._cursors[k] = starts[k];
+        }
+    }
+
+    /**
+     * @returns: the root of the island of a body, the path to it shortened on the way
+     * */
+    fn rootOf(mut self, body: u32)-> u32 {
+        let mut r = body;
+        while self._parent[r] != r { r = self._parent[r]; }
+
+        let mut b = body;
+        while self._parent[b] != r {
+            let next = self._parent[b];
+            self._parent[b] = r;
+            b = next;
+        }
+
+        r
+    }
+}

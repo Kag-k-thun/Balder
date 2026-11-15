@@ -1,6 +1,5 @@
 in world;
 
-mod ::islands;
 mod ::utils;
 
 use balder::core::config::physics;
@@ -53,9 +52,9 @@ def STILL_MOVE = 1.0e-6f;
 def STILL_TURN = 1.0e-6f;
 
 /**
- * The index of no island
+ * The index of a body in no island being solved, by handle
  * */
-def NO_ISLAND = usize::max;
+def NOT_SOLVED = usize::max;
 
 /**
  * A slot of the bodies of a world, holding a body or free
@@ -156,6 +155,18 @@ pub class PhysicsWorld {
 
     // What the last step cost, phase by phase
     let mut _timings: StepTimings = StepTimings();
+
+    // The islands of the last step
+    let dmut _islands: &IslandSet = copy IslandSet();
+
+    // The bodies, the manifolds and the points of the island being solved, kept from island to island and from step
+    // to step, the first of each in use
+    let dmut _solverBodies: [SolverBody] = [];
+    let dmut _constraints: [ContactConstraint] = [];
+    let dmut _points: [ConstraintPoint] = [];
+
+    // The index of each body in the solver bodies of the island being solved, NOT_SOLVED for a body in none, by handle
+    let dmut _solverIndex: [usize] = [];
 
     pub self () {}
 
@@ -722,23 +733,20 @@ pub class PhysicsWorld {
         self:.updateAllManifolds();
 
         let beforeIslands = Instant::now();
-        let islands = self.islands();
-        self:.wakeTouched(islands);
-        let slots = self.slotsOf(islands);
+        self:.groupIslands();
+        self:.wakeTouched();
 
         let beforeSolve = Instant::now();
-        for k in 0us .. islands.len if self._states[islands[k][0]].awake {
-            if let Ok(s) = slots[k] {
-                timings.constraintCount += self:.solveIsland(islands[k], s, dt);
-            } else {
-                timings.constraintCount += self:.solveIsland(islands[k], [], dt);
-            }
+        for k in 0us .. self._islands.len {
+            let island = self._islands.bodiesOf(k);
+            if !self._states[island[0]].awake { continue; }
 
-            timings.awakeCount += islands[k].len;
+            timings.constraintCount += self:.solveIsland(island, self._islands.slotsOf(k), dt);
+            timings.awakeCount += island.len;
         }
 
         let beforeSleep = Instant::now();
-        self:.sleepIslands(islands, dt);
+        self:.sleepIslands(dt);
         let end = Instant::now();
 
         timings.pairs = utils::microsBetween(beforePairs, beforeManifolds);
@@ -748,7 +756,7 @@ pub class PhysicsWorld {
         timings.sleep = utils::microsBetween(beforeSleep, end);
         timings.total = utils::microsBetween(start, end);
         timings.pairCount = self._pairs.len;
-        timings.islandCount = islands.len;
+        timings.islandCount = self._islands.len;
         self._timings = timings;
     }
 
@@ -1027,8 +1035,11 @@ pub class PhysicsWorld {
      * Count the time the bodies of each awake island stayed still during a step, the island sleeping when all its
      * bodies stayed still for long enough and may sleep
      * */
-    fn sleepIslands(mut self, islands: [[u32]], dt: f32) {
-        for island in islands if self._states[island[0]].awake {
+    fn sleepIslands(mut self, dt: f32) {
+        for k in 0us .. self._islands.len {
+            let island = self._islands.bodiesOf(k);
+            if !self._states[island[0]].awake { continue; }
+
             let mut ready = true;
             for b in island {
                 let mut s = self._states[b];
@@ -1041,34 +1052,6 @@ pub class PhysicsWorld {
                 for b in island { self:.sleep(b); }
             }
         }
-    }
-
-    /**
-     * @returns: the slots of the pairs in contact of each island, by the index of the island, a pair being in the
-     * island of its dynamic bodies
-     * */
-    fn slotsOf(self, islands: [[u32]])-> [usize => [usize]] {
-        let dmut islandOf = copy [NO_ISLAND ; self._bodies.len];
-        for k in 0us .. islands.len {
-            for b in islands[k] { islandOf[b] = k; }
-        }
-
-        let dmut result: [usize => [usize]] = copy [];
-        for slot in 0us .. self._pairs.len {
-            let p = self._pairs.get(slot);
-            if !utils::inContact(p) { continue; }
-
-            let k = if islandOf[p.a] != NO_ISLAND { islandOf[p.a] } else { islandOf[p.b] };
-            if k == NO_ISLAND { continue; }
-
-            if let Ok(s) = result[k] {
-                result[k] = s ~ [slot];
-            } else {
-                result[k] = copy [slot];
-            }
-        }
-
-        result
     }
 
     /**
@@ -1090,39 +1073,48 @@ pub class PhysicsWorld {
      *
      * */
     fn solveIsland(mut self, island: [u32], slots: [usize], dt: f32)-> usize {
-        let dmut index: [u32 => usize] = copy [];
-        let dmut bodies: [SolverBody] = [];
+        while self._solverIndex.len < self._bodies.len { self._solverIndex ~= [NOT_SOLVED]; }
+
+        let mut nbodies = 0us;
         for b in island {
-            index[b] = bodies.len;
-            bodies = bodies ~ copy [self.solverBodyOf(b)];
+            nbodies = self:.addSolverBody(b, nbodies);
         }
 
-        let mut constraints: [ContactConstraint] = [];
-        let dmut points: [ConstraintPoint] = [];
+        let mut nconstraints = 0us;
+        let mut npoints = 0us;
         for slot in slots {
             let p = self._pairs.get(slot);
-            for h in [p.a, p.b] if !(h in index) {
-                index[h] = bodies.len;
-                bodies = bodies ~ copy [self.solverBodyOf(h)];
-            }
+            nbodies = self:.addSolverBody(p.a, nbodies);
+            nbodies = self:.addSolverBody(p.b, nbodies);
 
-            let ia = self.indexOf(index, p.a), ib = self.indexOf(index, p.b);
+            let ia = self._solverIndex[p.a], ib = self._solverIndex[p.b];
             let (friction, restitution) = solver::materialOf(self._bodies[p.a].settings, self._bodies[p.b].settings);
             for m in 0us .. p.manifolds.len {
                 let manifold = p.manifolds[m];
-                let mut c = solver::prepare(ia, ib, manifold.normal, friction, points.len);
+                let mut c = solver::prepare(ia, ib, manifold.normal, friction, npoints);
                 c.slot = slot;
                 c.manifold = m;
                 c.count = manifold.points.len;
                 for k in 0us .. manifold.points.len {
-                    let mut cp = solver::preparePoint(bodies, c, manifold.points[k], restitution, self._solver);
+                    let mut cp = solver::preparePoint(self._solverBodies[0us .. nbodies], c, manifold.points[k],
+                                                      restitution, self._solver);
                     cp.point = k;
-                    points ~= [cp];
+                    if npoints < self._points.len { self._points[npoints] = cp; } else { self._points ~= [cp]; }
+                    npoints += 1us;
                 }
 
-                constraints ~= [c];
+                if nconstraints < self._constraints.len {
+                    self._constraints[nconstraints] = c;
+                } else {
+                    self._constraints ~= [c];
+                }
+                nconstraints += 1us;
             }
         }
+
+        let dmut bodies = alias self._solverBodies[0us .. nbodies];
+        let constraints = self._constraints[0us .. nconstraints];
+        let dmut points = alias self._points[0us .. npoints];
 
         let substeps = comparison::max(self._solver.substeps, 1u32);
         let h = dt / cast!f32(substeps);
@@ -1152,7 +1144,24 @@ pub class PhysicsWorld {
             self:.place(sb.handle, Collider(self._bodies[sb.handle].collider.shape, s.placement));
         }
 
-        points.len
+        for sb in bodies { self._solverIndex[sb.handle] = NOT_SOLVED; }
+        npoints
+    }
+
+    /**
+     * Copy a body into the solver bodies of the island being solved, unless it is there already
+     * @params:
+     *    - handle: the body
+     *    - len: the number of solver bodies of the island
+     * @returns: the number of solver bodies of the island with the body
+     * */
+    fn addSolverBody(mut self, handle: u32, len: usize)-> usize {
+        if self._solverIndex[handle] != NOT_SOLVED { return len; }
+
+        let b = self.solverBodyOf(handle);
+        if len < self._solverBodies.len { self._solverBodies[len] = b; } else { self._solverBodies ~= [b]; }
+        self._solverIndex[handle] = len;
+        len + 1us
     }
 
     /**
@@ -1208,41 +1217,28 @@ pub class PhysicsWorld {
     }
 
     /**
-     * @returns: the index of a body in the solver bodies of an island
-     * @warning: the body is in the island
-     * */
-    fn indexOf(self, index: [u32 => usize], handle: u32)-> usize {
-        if let Ok(i) = index[handle] { return i; }
-        panic;
-    }
-
-    /**
-     * @returns: the islands of the dynamic bodies, those in contact through their pairs (a point of a manifold, even
+     * Group the dynamic bodies in islands, those in contact through their pairs (a point of a manifold, even
      * speculative) put in one island, a static or a kinematic body joining none; a dynamic body in contact with no
-     * other an island of its own; the sleeping bodies in their islands too
+     * other an island of its own; the sleeping bodies in their islands too; the pairs in contact dealt to the islands
+     * of their dynamic bodies
      *
      * */
-    fn islands(self)-> [[u32]] {
-        let dmut parent = copy [0u32 ; self._bodies.len];
-        for i in 0us .. parent.len { parent[i] = cast!u32(i); }
-
+    fn groupIslands(mut self) {
+        self._islands:.reset(self._bodies.len);
         for p in self._pairs.pairs if utils::inContact(p) && self.isDynamic(p.a) && self.isDynamic(p.b) {
-            islands::join(alias parent, p.a, p.b);
+            self._islands:.join(p.a, p.b);
         }
 
-        let dmut byRoot: [u32 => [u32]] = copy [];
         for i in 0us .. self._bodies.len if self.isDynamic(cast!u32(i)) {
-            let r = islands::rootOf(alias parent, cast!u32(i));
-            if let Ok(members) = byRoot[r] {
-                byRoot[r] = members ~ [cast!u32(i)];
-            } else {
-                byRoot[r] = copy [cast!u32(i)];
-            }
+            self._islands:.addBody(cast!u32(i));
         }
+        self._islands:.sealBodies();
 
-        let mut result: [[u32]] = [];
-        for _, members in byRoot { result ~= [members]; }
-        result
+        for slot in 0us .. self._pairs.len {
+            let p = self._pairs.get(slot);
+            if utils::inContact(p) { self._islands:.addSlot(slot, p.a, p.b); }
+        }
+        self._islands:.sealSlots();
     }
 
     /**
@@ -1250,13 +1246,14 @@ pub class PhysicsWorld {
      * island with them: a stack woken at once, not a body a step
      *
      * */
-    fn wakeTouched(mut self, islands: [[u32]]) {
+    fn wakeTouched(mut self) {
         for p in self._pairs.pairs if utils::inContact(p) {
             if self.pushes(p.a) { self:.wakeIfAsleep(p.b); }
             if self.pushes(p.b) { self:.wakeIfAsleep(p.a); }
         }
 
-        for island in islands {
+        for k in 0us .. self._islands.len {
+            let island = self._islands.bodiesOf(k);
             let mut awake = false;
             for b in island if self._states[b].awake { awake = true; }
 
