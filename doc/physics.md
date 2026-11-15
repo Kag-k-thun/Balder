@@ -132,6 +132,34 @@ The signals go through the slot emitters they are connected with, like the other
 crate:.contactBegan ():.connect (alias box, &self:.onCrateTouched);
 ```
 
+### The narrowphase
+
+`narrow::collide` gives the manifolds of two colliders: a normal from the first to the second, four points at most, each
+as deep as the shapes overlap there, negative for a speculative point (the shapes apart). Two spheres, two capsules, a
+sphere and a capsule, a sphere and a box, a sphere or a capsule on a plane have closed forms (Ericson, *Real-Time
+Collision Detection*, 5.1.9 for the closest points of two segments). The other shapes take the normal of their
+penetration (`gjk::penetration`: the closest points of their cores when the cores are apart, the expansion of a
+polytope of their difference otherwise, van den Bergen), then the face of one clipped by the sides of the face of the
+other (Sutherland-Hodgman), reduced to four spread points. A face is a face of a box, a flat face of a hull (its
+triangles of one plane merged, `ConvexHull::polygons`), a cap of a cylinder as an octagon or a segment of its side, the
+segment of a capsule lying across the normal. An edge against an edge, two faces facing neither the normal, keeps the
+single point of the penetration.
+
+A compound is opened into its parts, a mesh into its triangles near the other shape: a manifold by pair of convex sub
+shapes, told apart by its key. A contact on an inactive edge of a mesh (between two triangles in nearly one plane, their
+vertices welded by position) takes the normal of its triangle, so a box sliding over a floor does not catch on the
+diagonal of its quads.
+
+The manifolds live on the pairs of the broadphase (`BroadPair::manifolds`), and their points carry the impulses of the
+step before when they are found again: by the features making them, or within 2 cm on both shapes. A pair touches when
+a point of its manifolds is not speculative; a trigger only tells whether it overlaps.
+
+The speculative points cover what two bodies may travel toward each other in a step (2 cm at least, plus their relative
+speed and their spins at the reach of their boxes): the solver will let them close in by that much and no more, so a
+fast body does not pass through a thin one. That is the continuous collision of Balder; a body spinning faster than its
+box accounts for, or slowed by a speculative point at a corner it only brushes past, would need conservative
+advancement (`gjk::sweep`) for the few bodies flagged as bullets.
+
 ## Threads
 
 The game moves its bodies from the activity thread (its ticks), and the editor from the main thread. The queries run
@@ -154,8 +182,8 @@ and the scene files, and read from the quaternion once it is set as one (`orient
 
 ## Not done yet
 
-- dynamic bodies, the narrowphase giving contact points and depths (GJK/EPA), the solver, and the transformations
-  written back to the nodes;
+- dynamic bodies, the solver pushing on the manifolds of the narrowphase, and the transformations written back to the
+  nodes;
 - the bodies in the scene files and in the editor (their panel, their wires);
 - the debug view of the colliders and a character controller.
 
