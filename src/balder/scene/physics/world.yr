@@ -83,9 +83,6 @@ pub class PhysicsWorld {
     // The world boxes of the colliders, by handle
     let dmut _bvh: &Bvh = copy Bvh();
 
-    // The pairs of bodies touching at the last update of the contacts (see pairKey)
-    let dmut _contacts: [u64 => bool] = copy [];
-
     // The handles of the bodies whose collider is a plane, kept out of the hierarchy, holding no box
     let mut _planes: [usize] = [];
 
@@ -177,19 +174,6 @@ pub class PhysicsWorld {
         self._states[handle]
     }
 
-    /**
-     * @returns: the handles of the bodies a body touched at the last update of the contacts
-     * */
-    pub fn contactsOf(self, handle: u32)-> [u32] {
-        let mut result: [u32] = [];
-        for key, _ in self._contacts {
-            if firstOf(key) == handle { result ~= [secondOf(key)]; }
-            else if secondOf(key) == handle { result ~= [firstOf(key)]; }
-        }
-
-        result
-    }
-
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -230,6 +214,7 @@ pub class PhysicsWorld {
             self._bvh:.moveBox(cast!usize(handle), collider.bounds, BROAD_MARGIN);
         }
 
+        self._moved[handle] = true;
         self._len += 1us;
 
         handle
@@ -237,18 +222,29 @@ pub class PhysicsWorld {
 
     /**
      * Remove a body from the world, its handle free for another body
-     * @info: the contacts of the body end at once, the next update of the contacts not reporting them, as its handle may
-     * be given to another body by then
-     * @returns: the contacts the body had at the last update of the contacts, ended; none when the world has no such body
+     *
+     * @info: the contacts of the body end at once, the next update of the
+     * contacts not reporting them, as its handle may be given to another body
+     * by then
+     *
+     * @returns: the contacts the body had at the last update of the contacts,
+     * ended; none when the world has no such body
+     *
      * */
     pub fn remove(mut self, handle: u32)-> [ContactEvent] {
         if !self.contains(handle) { return []; }
 
         let mut ended: [ContactEvent] = [];
-        for other in self.contactsOf(handle) {
-            let key = pairKey(handle, other);
-            self._contacts:.remove(key);
-            ended ~= [ContactEvent(a-> firstOf(key), b-> secondOf(key), phase-> ContactPhase::ENDED)];
+        let mut slot = 0us;
+        while slot < self._pairs.len {
+            let p = self._pairs.get(slot);
+            if p.a != handle && p.b != handle { slot += 1us; continue; }
+
+            // the last pair is moved into the slot, looked at next
+            self._pairs:.remove(pairKey(p.a, p.b));
+            if p.touching {
+                ended ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
+            }
         }
 
         self:.unindex(handle, self._bodies[handle].collider.isPlane);
@@ -496,10 +492,10 @@ pub class PhysicsWorld {
         while slot < self._pairs.len {
             let p = self._pairs.get(slot);
             if self.keeps(p) {
-                slot += 1;
+                slot += 1us;
             } else {
                 self._pairs:.remove(pairKey(p.a, p.b));
-                dropped ~= [p]
+                dropped ~= [p];
             }
         }
 
@@ -636,35 +632,40 @@ pub class PhysicsWorld {
      * */
     pub fn updateContacts(mut self)-> [ContactEvent] {
         let mut events: [ContactEvent] = [];
+        for p in self:.updatePairs() if p.touching {
+            events ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
+        }
 
-        let dmut current: [u64 => bool] = copy [];
-        for i in 0us .. self._bodies.len {
-            let body = self._bodies[i];
-            if !body.used || !utils::isActive(body.settings) { continue; }
-
-            for j in self.near(body.collider) if j != i {
-                let other = self._bodies[j];
-
-                // a pair of two active bodies is found from both of them, and tested from the first
-                if utils::isActive(other.settings) && j < i { continue; }
-                if !utils::sees(body.settings, other.settings) { continue; }
-                if !body.collider.touches(other.collider) { continue; }
-
-                current[pairKey(cast!u32(i), cast!u32(j))] = true;
+        for slot in 0us .. self._pairs.len {
+            let mut p = self._pairs.get(slot);
+            let touching = self._bodies[p.a].collider.touches(self._bodies[p.b].collider);
+            if touching {
+                let phase = if p.touching { ContactPhase::STAYED } else { ContactPhase::BEGAN };
+                events ~= [ContactEvent(a-> p.a,
+                                        b-> p.b,
+                                        phase-> phase)];
+            } else if p.touching {
+                events ~= [ContactEvent(a-> p.a,
+                                        b-> p.b,
+                                        phase-> ContactPhase::ENDED)];
             }
+
+            p.touching = touching;
+            self._pairs:.set(slot, p);
         }
 
-        for key, _ in current {
-            let phase = if key in self._contacts { ContactPhase::STAYED } else { ContactPhase::BEGAN };
-            events ~= [ContactEvent(a-> firstOf(key), b-> secondOf(key), phase-> phase)];
-        }
-
-        for key, _ in self._contacts if !(key in current) {
-            events ~= [ContactEvent(a-> firstOf(key), b-> secondOf(key), phase-> ContactPhase::ENDED)];
-        }
-
-        self._contacts = alias current;
         events
+    }
+
+
+    /**
+     * @returns: the handles of the bodies a body touched at the last update of the contacts
+     * */
+    pub yield contactsOf(self, handle: u32)-> u32 {
+        for p in self._pairs.pairs if p.touching {
+            if p.a == handle { yield p.b; }
+            else if p.b == handle { yield p.a; }
+        }
     }
 
     /*!
