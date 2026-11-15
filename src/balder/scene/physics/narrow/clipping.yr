@@ -1,0 +1,253 @@
+in clipping;
+
+use balder::math::vector;
+
+use std::algorithm::comparison;
+use std::math;
+
+/**
+ * The cosine between the normal of a contact and a face over which the face
+ * makes the points of the contact: a face of the shapes along an edge on edge
+ * normal makes none, the single point of the contact staying
+ *
+ * */
+def FACING = 0.95f;
+
+/**
+ * The bit of the id of a point cut on an edge of the incident face by a side of
+ * the reference face, the id of the other points being their corner
+ *
+ * */
+def CUT = 0x1000u32;
+
+/**
+ * A corner of a polygon being clipped, and the feature it comes from
+ * */
+@data
+record ClipVertex {
+
+    // The corner, in the world
+    let mut p: vec3 = vec3();
+
+    // The corner of the incident face it is, or the side and the edge cutting it
+    let mut id: u32 = 0u32;
+}
+
+/**
+ * Clip the face of b against the face of a along a normal, or the other way
+ * when the face of b is the most facing the other shape
+ *
+ * @params:
+ *    - normal: the unit normal from a to b
+ *    - speculative: the distance apart down to which the points are kept, of a negative depth
+ *
+ * @returns: the points of the incident face under the reference face, none when
+ * neither face is a polygon facing the other shape along the normal
+ *
+ * */
+pub fn clipped(a: Collider, b: Collider, normal: vec3, speculative: f32)-> [ContactPoint] {
+    let fa = faces::supportFace(a, normal), fb = faces::supportFace(b, -normal);
+    let alignA = if fa.corners.len >= 3us { fa.normal.dot(normal) } else { -1.0f };
+    let alignB = if fb.corners.len >= 3us { -fb.normal.dot(normal) } else { -1.0f };
+    if comparison::max(alignA, alignB) < FACING {
+        return [];
+    }
+
+    // the reference face is the polygon the most facing the other shape
+    if alignB > alignA + 1.0e-3f {
+        return clipFaces(fb, fa, true, speculative);
+    }
+
+    clipFaces(fa, fb, false, speculative)
+}
+
+/**
+ * Clip an incident face (a polygon, a segment or a point) by the side planes of
+ * a reference face, its corners under the reference plane kept
+ *
+ * @params:
+ *    - reference: the polygon clipping, of the first shape unless flipped
+ *    - incident: the face clipped, of the other shape
+ *    - flipped: true when the reference face is of the second shape
+ *    - speculative: the distance apart down to which the points are kept, of a negative depth
+ *
+ * @returns: the points of the incident face under the reference face, its
+ * corners on the first shape then on the second, their feature telling the two
+ * faces and the corner or the cut
+ *
+ * */
+pub fn clipFaces(reference: faces::Face, incident: faces::Face, flipped: bool, speculative: f32)-> [ContactPoint] {
+    let mut polygon = copy [ClipVertex(p-> incident.corners[i], id-> cast!u32(i))
+                            for i in 0us .. incident.corners.len];
+
+    let count = reference.corners.len;
+    let mut centre = vec3();
+    for c in reference.corners {
+        centre = centre + c;
+    }
+
+    centre = centre / cast!f32(cast!u64(count));
+
+    let n = reference.normal;
+    for i in 0us .. count {
+        let p = reference.corners[i], q = reference.corners[(i + 1us) % count];
+        let mut side = (q - p).cross(n);
+        if side.dot(side) <= 1.0e-12f {
+            continue;
+        }
+
+        side = side.normalized();
+        if side.dot(centre - p) > 0.0f {
+            side = -side;
+        }
+
+        polygon = clipBy(polygon, side, side.dot(p), cast!u32(i));
+    }
+
+    let offset = n.dot(reference.corners[0]);
+    let faces = ((reference.index & 0xFFu32) << 24u32) | ((incident.index & 0xFFu32) << 16u32)
+              | (if flipped { 0x8000u32 } else { 0u32 });
+
+    let mut points: [ContactPoint] = [];
+    for v in polygon {
+        let depth = offset - n.dot(v.p);
+        if depth < -speculative {
+            continue;
+        }
+
+        let onReference = v.p + n * depth;
+        let (onA, onB) = if flipped { (v.p, onReference) } else { (onReference, v.p) };
+        points ~= [ContactPoint(point-> (onA + onB) / 2.0f,
+                                localA-> onA,
+                                localB-> onB,
+                                depth-> depth,
+                                feature-> faces | (v.id & 0x7FFFu32))];
+    }
+
+    points
+}
+
+/**
+ * @returns: four points at most, spread: the deepest, the farthest from it, the
+ * one making the largest triangle with them, the one adding the most area on
+ * the other side of that triangle
+ *
+ * */
+pub fn reduced(points: [ContactPoint], normal: vec3)-> [ContactPoint] {
+    if points.len <= 4us {
+        return points;
+    }
+
+    let mut i0 = 0us;
+    for i in 0us .. points.len if points[i].depth > points[i0].depth {
+        i0 = i;
+    }
+
+    let p0 = points[i0].point;
+    let mut i1 = i0;
+    for i in 0us .. points.len if (points[i].point - p0).length() > (points[i1].point - p0).length() {
+        i1 = i;
+    }
+
+    let p1 = points[i1].point;
+    let mut i2 = i0;
+    let mut area = 0.0f;
+    for i in 0us .. points.len {
+        let a = (p1 - p0).cross(points[i].point - p0).dot(normal);
+        if math::abs(a) > math::abs(area) {
+            area = a;
+            i2 = i;
+        }
+    }
+
+    // the most area added outside one of the edges of the triangle
+    let p2 = points[i2].point;
+    let s = if area >= 0.0f { -1.0f } else { 1.0f };
+    let mut i3 = i0;
+    let mut added = 0.0f;
+    for i in 0us .. points.len {
+        let q = points[i].point;
+        let a = comparison::max(s * (p1 - p0).cross(q - p0).dot(normal),
+                                comparison::max(s * (p2 - p1).cross(q - p1).dot(normal),
+                                                s * (p0 - p2).cross(q - p2).dot(normal)));
+        if a > added {
+            added = a;
+            i3 = i;
+        }
+    }
+
+    if added > 0.0f {
+        return copy [points[i0], points[i1], points[i2], points[i3]];
+    }
+
+    copy [points[i0], points[i1], points[i2]]
+}
+
+/**
+ * @returns: the part of a polygon (or a segment, or a point) behind a plane,
+ * n.dot(p) <= offset, a point cut on an edge taking the id of the side and of
+ * the edge
+ *
+ * */
+fn clipBy(polygon: [ClipVertex], n: vec3, offset: f32, side: u32)-> [ClipVertex] {
+    if polygon.len == 0us {
+        return polygon;
+    }
+
+    if polygon.len == 1us {
+        if n.dot(polygon[0].p) <= offset {
+            return polygon;
+        }
+
+        return [];
+    }
+
+    if polygon.len == 2us {
+        return clipSegment(polygon[0], polygon[1], n, offset, side);
+    }
+
+    let mut out: [ClipVertex] = [];
+    for i in 0us .. polygon.len {
+        let p = polygon[i], q = polygon[(i + 1us) % polygon.len];
+        let dp = n.dot(p.p) - offset, dq = n.dot(q.p) - offset;
+        if dp <= 0.0f {
+            out ~= [p];
+        }
+
+        if (dp < 0.0f && dq > 0.0f) || (dp > 0.0f && dq < 0.0f) {
+            out ~= [cut(p, q, dp, dq, side)];
+        }
+    }
+
+    out
+}
+
+/**
+ * @returns: the part of a segment behind a plane, its ends in their order
+ * */
+fn clipSegment(p: ClipVertex, q: ClipVertex, n: vec3, offset: f32, side: u32)-> [ClipVertex] {
+    let dp = n.dot(p.p) - offset, dq = n.dot(q.p) - offset;
+    if dp > 0.0f && dq > 0.0f {
+        return [];
+    }
+
+    if dp <= 0.0f && dq <= 0.0f {
+        return copy [p, q];
+    }
+
+    if dp <= 0.0f {
+        return copy [p, cut(p, q, dp, dq, side)];
+    }
+
+    copy [cut(p, q, dp, dq, side), q]
+}
+
+/**
+ * @returns: the point where an edge crosses a plane, of the id of the side
+ * cutting it and of the corner the edge starts from
+ *
+ * */
+fn cut(p: ClipVertex, q: ClipVertex, dp: f32, dq: f32, side: u32)-> ClipVertex {
+    ClipVertex(p-> p.p + (q.p - p.p) * (dp / (dp - dq)),
+               id-> CUT | ((side & 0x3Fu32) << 6u32) | (p.id & 0x3Fu32))
+}

@@ -2,6 +2,8 @@ in gjk;
 
 use balder::math::vector;
 
+use std::algorithm::comparison;
+
 /**
  * The number of points the search of the closest points adds to its simplex at most
  * */
@@ -31,6 +33,16 @@ def FLAT = 1.0e-12f;
  * The distance under which a shape cast stops, touching what it hits
  * */
 def CAST_TOLERANCE = 1.0e-4f;
+
+/**
+ * The number of points the expansion of the polytope adds at most
+ * */
+def MAX_EXPANSION = 64us;
+
+/**
+ * The progress of the support along the closest face, relative to its distance, under which the expansion stops
+ * */
+def EXPANSION_TOLERANCE = 1.0e-4f;
 
 /**
  * A point of the Minkowski difference of two cores, and the points of the cores giving it
@@ -67,14 +79,43 @@ record Closest {
 }
 
 /**
- * Find the points of two convex shapes closest to each other, by the search of Gilbert, Johnson and Keerthi: the point
- * of their Minkowski difference closest to the origin is approached by simplices of the difference, each one replacing
- * the farthest vertex by the point of the difference the farthest toward the origin
- * @info: the search runs on the cores of the shapes, their margins being taken off the distance found, so a sphere or
- * a capsule is exact
- * @returns: the separation of the shapes, overlapping when their cores are closer than their margins
+ * The closest points of two cores, their margins left out, and the simplex the
+ * search ended on
+ *
  * */
-pub fn separation(a: Convex, b: Convex)-> Separation {
+@data
+record CoreSearch {
+
+    // True when the cores share a point, the simplex then holding the origin or touching it
+    let mut overlapping: bool = false;
+
+    // The distance between the cores, their closest points and the unit direction from the first to the second
+    let mut distance: f32 = 0.0f;
+    let mut pointA: vec3 = vec3();
+    let mut pointB: vec3 = vec3();
+    let mut normal: vec3 = vec3();
+
+    // The vertices of the last simplex
+    let mut simplex: [Vertex] = [];
+}
+
+
+/**
+ * A triangle of the polytope of the expansion, its corners in the vertices,
+ * counterclockwise from outside
+ *
+ * */
+@data
+record PolytopeFace {
+    let mut i: u32 = 0u32;
+    let mut j: u32 = 0u32;
+    let mut k: u32 = 0u32;
+    let mut normal: vec3 = vec3();
+    let mut distance: f32 = 0.0f;
+}
+
+
+fn closestCores(a: Convex, b: Convex)-> CoreSearch {
     let mut start = a.centre - b.centre;
     if start.dot(start) <= TOUCHING { start = makeVec3(1.0f, 0.0f, 0.0f); }
 
@@ -83,17 +124,25 @@ pub fn separation(a: Convex, b: Convex)-> Separation {
     let mut closest = simplex[0].w;
     for _ in 0us .. MAX_ITERATIONS {
         let squared = closest.dot(closest);
-        if squared <= TOUCHING { return Separation(overlapping-> true); }
+        if squared <= TOUCHING {
+            return CoreSearch(overlapping-> true, simplex-> simplex);
+        }
 
         let next = vertexAlong(a, b, -closest);
-        if squared - closest.dot(next.w) <= RELATIVE_PROGRESS * squared { break; }
+        if squared - closest.dot(next.w) <= RELATIVE_PROGRESS * squared {
+            break;
+        }
 
-        let reduced = closestToOrigin(simplex ~ [next]);
-        if reduced.inside { return Separation(overlapping-> true); }
+        let candidate = simplex ~ [next];
+        let reduced = closestToOrigin(candidate);
+        if reduced.inside {
+            return CoreSearch(overlapping-> true, simplex-> candidate);
+        }
 
-        // the rounding errors may stop the progress near the closest point, the last simplex being kept
         let point = pointOf(reduced);
-        if point.dot(point) >= squared { break; }
+        if point.dot(point) >= squared {
+            break;
+        }
 
         simplex = reduced.vertices;
         weights = reduced.weights;
@@ -107,13 +156,44 @@ pub fn separation(a: Convex, b: Convex)-> Separation {
         onB = onB + simplex[i].b * weights[i];
     }
 
-    let distance = closest.length();
-    let margins = a.margin + b.margin;
-    if distance <= margins { return Separation(overlapping-> true); }
+    // the search may run out of iterations on a simplex touching the origin, no direction joining the cores
+    if closest.dot(closest) <= TOUCHING {
+        return CoreSearch(overlapping-> true, simplex-> simplex);
+    }
 
-    let normal = (onB - onA) / distance;
-    Separation(distance-> distance - margins, pointA-> onA + normal * a.margin, pointB-> onB - normal * b.margin,
-               normal-> normal)
+    let distance = closest.length();
+    CoreSearch(distance-> distance,
+               pointA-> onA,
+               pointB-> onB,
+               normal-> (onB - onA) / distance,
+               simplex-> simplex)
+}
+
+/**
+ * Find the points of two convex shapes closest to each other, by the search of
+ * Gilbert, Johnson and Keerthi: the point of their Minkowski difference closest
+ * to the origin is approached by simplices of the difference, each one
+ * replacing the farthest vertex by the point of the difference the farthest
+ * toward the origin
+ *
+ * @info: the search runs on the cores of the shapes, their margins being taken
+ * off the distance found, so a sphere or a capsule is exact
+ *
+ * @returns: the separation of the shapes, overlapping when their cores are
+ * closer than their margins
+ *
+ * */
+pub fn separation(a: Convex, b: Convex)-> Separation {
+    let s = closestCores(a, b);
+    let margins = a.margin + b.margin;
+    if s.overlapping || s.distance <= margins {
+        return Separation(overlapping-> true);
+    }
+
+    Separation(distance-> s.distance - margins,
+               pointA-> s.pointA + s.normal * a.margin,
+               pointB-> s.pointB - s.normal * b.margin,
+               normal-> s.normal)
 }
 
 /**
@@ -188,7 +268,7 @@ fn closestToOrigin(simplex: [Vertex])-> Closest {
         1us => { single(simplex[0]) }
         2us => { closestOnSegment(simplex[0], simplex[1]) }
         3us => { closestOnTriangle(simplex[0], simplex[1], simplex[2]) }
-        _   => { closestInTetrahedron(simplex[0], simplex[1], simplex[2], simplex[3]) }
+        _ => { closestInTetrahedron(simplex[0], simplex[1], simplex[2], simplex[3]) }
     }
 }
 
@@ -307,4 +387,177 @@ fn closerFace(p: Vertex, q: Vertex, r: Vertex, opposite: Vertex, ref mut best: C
 fn nearest(x: Closest, y: Closest)-> Closest {
     let px = pointOf(x), py = pointOf(y);
     if px.dot(px) <= py.dot(py) { x } else { y }
+}
+
+
+/**
+ * Find how deep two convex shapes overlap: the closest points of their cores
+ * when the cores are apart, the expansion of a polytope of the difference of
+ * the cores holding the origin otherwise (van den Bergen)
+ *
+ * @returns: the depth (margins included), the normal from a to b and the
+ * deepest points; none when the shapes do not overlap
+ *
+ * */
+pub fn penetration(a: Convex, b: Convex)-> (Penetration)? {
+    let s = closestCores(a, b);
+    let margins = a.margin + b.margin;
+    if !s.overlapping {
+        if s.distance > margins { return none; }
+        return Penetration(depth-> margins - s.distance,
+                           normal-> s.normal,
+                           pointA-> s.pointA + s.normal * a.margin,
+                           pointB-> s.pointB - s.normal * b.margin)?;
+    }
+
+    let mut vertices = tetrahedronOf(a, b, s.simplex);
+    if vertices.len < 4us {
+        return Penetration(depth-> margins,
+                           normal-> makeVec3(0.0f, 1.0f, 0.0f),
+                           pointA-> a.centre,
+                           pointB-> b.centre)?;
+    }
+
+    let mut faces = copy [polytopeFace(vertices, 0u32, 1u32, 2u32),
+                          polytopeFace(vertices, 0u32, 3u32, 1u32),
+                          polytopeFace(vertices, 0u32, 2u32, 3u32),
+                          polytopeFace(vertices, 1u32, 3u32, 2u32)];
+
+    let mut closest = faces[0];
+    for _ in 0us .. MAX_EXPANSION {
+        closest = faces[0];
+        for f in faces if f.distance < closest.distance { closest = f; }
+
+        let next = vertexAlong(a, b, closest.normal);
+        if next.w.dot(closest.normal) - closest.distance <= EXPANSION_TOLERANCE * comparison::max(closest.distance, 1.0f) {
+            break;
+        }
+
+        let index = cast!u32(vertices.len);
+        vertices = vertices ~ [next];
+
+        let dmut edges: [u64 => bool] = copy [];
+        let mut kept: [PolytopeFace] = [];
+        for f in faces {
+            if f.normal.dot(next.w - vertices[f.i].w) > 0.0f {
+                edges[edgeKey(f.i, f.j)] = true;
+                edges[edgeKey(f.j, f.k)] = true;
+                edges[edgeKey(f.k, f.i)] = true;
+            } else {
+                kept ~= [f];
+            }
+        }
+
+        for key, _ in edges if !(edgeKey(endOf(key), startOf(key)) in edges) {
+            kept ~= [polytopeFace(vertices, startOf(key), endOf(key), index)];
+        }
+
+        faces = kept;
+    }
+
+    let (u, v, w) = barycentric(closest.normal * closest.distance,
+                                vertices[closest.i].w,
+                                vertices[closest.j].w,
+                                vertices[closest.k].w);
+
+    let onA = vertices[closest.i].a * u + vertices[closest.j].a * v + vertices[closest.k].a * w;
+    let onB = vertices[closest.i].b * u + vertices[closest.j].b * v + vertices[closest.k].b * w;
+
+    let n = closest.normal;
+    Penetration(depth-> closest.distance + margins,
+                normal-> n,
+                pointA-> onA + n * a.margin,
+                pointB-> onB - n * b.margin)?
+}
+
+/**
+ * @returns: the simplex grown to a tetrahedron by the supports along the axes,
+ * then along the normal of a flat triangle; fewer vertices when the difference
+ * spans no volume
+ *
+ * */
+fn tetrahedronOf(a: Convex, b: Convex, simplex: [Vertex])-> [Vertex] {
+    let mut s = simplex;
+    let x = makeVec3(1.0f, 0.0f, 0.0f);
+    let y = makeVec3(0.0f, 1.0f, 0.0f);
+    let z = makeVec3(0.0f, 0.0f, 1.0f);
+    for d in (x, -x, y, -y, z, -z) if s.len < 3us {
+        let v = vertexAlong(a, b, d);
+        if grows(s, v) {
+            s ~= [v];
+        }
+    }
+
+    if s.len == 3us {
+        let n = (s[1].w - s[0].w).cross(s[2].w - s[0].w);
+        for d in (n, -n) if s.len < 4us {
+            let v = vertexAlong(a, b, d);
+            if grows(s, v) {
+                s ~= [v];
+            }
+        }
+    }
+
+    s
+}
+
+/**
+ * @info: the segment and the triangle formed are compared by the squared sine of their angle to FLAT, whatever the size
+ * of the shapes
+ * @returns: true iif a vertex adds a dimension to a simplex
+ * */
+fn grows(s: [Vertex], v: Vertex)-> bool {
+    if s.len == 0us { return true; }
+
+    let toV = v.w - s[0].w;
+    match s.len {
+        1us => { toV.dot(toV) > TOUCHING }
+        2us => {
+            let edge = s[1].w - s[0].w;
+            let n = edge.cross(toV);
+            n.dot(n) > FLAT * edge.dot(edge) * toV.dot(toV)
+        }
+        _ => {
+            let n = (s[1].w - s[0].w).cross(s[2].w - s[0].w);
+            let side = n.dot(toV);
+            side * side > FLAT * n.dot(n) * toV.dot(toV)
+        }
+    }
+}
+
+/**
+ * @returns: the face of three vertices of the polytope, its normal turned away from the origin
+ * */
+fn polytopeFace(vertices: [Vertex], i: u32, j: u32, k: u32)-> PolytopeFace {
+    let n = (vertices[j].w - vertices[i].w).cross(vertices[k].w - vertices[i].w).normalized();
+    let d = n.dot(vertices[i].w);
+    if d < 0.0f {
+        return PolytopeFace(i-> i,
+                            j-> k,
+                            k-> j,
+                            normal-> -n,
+                            distance-> -d);
+    }
+
+    PolytopeFace(i-> i, j-> j, k-> k, normal-> n, distance-> d)
+}
+
+/**
+ * @returns: the barycentric weights (u, v, w) of a point in the plane of a triangle, p = a * u + b * v + c * w
+ * (Ericson, 3.4); the weights of the centroid when the triangle is flat
+ * */
+fn barycentric(p: vec3, a: vec3, b: vec3, c: vec3)-> (f32, f32, f32) {
+    let v0 = b - a, v1 = c - a, v2 = p - a;
+    let d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1);
+    let d20 = v2.dot(v0), d21 = v2.dot(v1);
+
+    // the squared norm of v0 x v1, compared like the flat triangles of grows
+    let denom = d00 * d11 - d01 * d01;
+    if denom <= FLAT * d00 * d11 {
+        return (1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f);
+    }
+
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    (1.0f - v - w, v, w)
 }

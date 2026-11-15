@@ -1,0 +1,275 @@
+in narrow;
+
+pub mod ::primitives;
+mod ::clipping;
+mod ::faces;
+mod ::mesh;
+
+use balder::math::{bounds, vector};
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The cosine between two axes of a box under which they are orthogonal, the
+ * closed form of a sphere and a box needing them so
+ *
+ * */
+def ORTHOGONAL = 1.0e-4f;
+
+/**
+ * Find where two colliders touch, or are within a speculative distance of each
+ * other
+ *
+ * @params:
+ *    - a, b: the colliders, a the first of the pair (the normals going from a to b)
+ *    - speculative: the distance apart down to which points are made, of a negative depth
+ *    - previous: the manifolds of the pair at the step before, their impulses carried to the points found again
+ *
+ * @returns: a manifold by pair of convex sub shapes in contact (parts of
+ * compounds, triangles of a mesh, told apart by their key), their points in the
+ * spaces of the colliders, four at most; none when the colliders are farther
+ * apart than the speculative distance
+ *
+ * */
+pub fn collide(a: Collider, b: Collider, speculative: f32, previous: [ContactManifold] = [])-> [ContactManifold] {
+    let mut result: [ContactManifold] = [];
+    for m in subManifolds(a, b, speculative) {
+        let points = clipping::reduced(m.points, m.normal);
+        let local = copy [ContactPoint(point-> p.point,
+                                       localA-> (a.inverse * makeVec4(p.localA, 1.0f)).xyz,
+                                       localB-> (b.inverse * makeVec4(p.localB, 1.0f)).xyz,
+                                       depth-> p.depth,
+                                       feature-> p.feature)
+                          for p in points];
+
+        let mut placed = ContactManifold(m.key, m.normal, local);
+        for old in previous if old.key == placed.key {
+            placed = placed.persisted(old);
+            break;
+        }
+
+        result ~= [placed];
+    }
+
+    result
+}
+
+/**
+ * @returns: the manifolds of the convex sub shapes of two colliders, their
+ * points in the world: the parts of a compound against the other collider (the
+ * key the part in its high bits), the triangles of a mesh (the key the
+ * triangle in its low bits), or the two convex shapes
+ *
+ * */
+fn subManifolds(a: Collider, b: Collider, speculative: f32)-> [ContactManifold] {
+    if a.isCompound || b.isCompound {
+        let partsA = if a.isCompound { a.parts } else { copy [a] };
+        let partsB = if b.isCompound { b.parts } else { copy [b] };
+
+        let mut result: [ContactManifold] = [];
+        for i in 0us .. partsA.len {
+            for j in 0us .. partsB.len {
+                let pa = partsA[i], pb = partsB[j];
+                let near = pa.isPlane || pb.isPlane || grownBy(pa.bounds, speculative).overlaps(pb.bounds);
+                if !near {
+                    continue;
+                }
+
+                // the part of the compound (of a when both are), then the part of b or the triangle of a mesh
+                let high = if a.isCompound { i } else { j };
+                for m in subManifolds(pa, pb, speculative) {
+                    let low = if pa.isMesh || pb.isMesh {
+                        m.key
+                    } else if a.isCompound && b.isCompound {
+                        cast!u64(j)
+                    } else {
+                        0u64
+                    };
+
+                    result ~= [ContactManifold((cast!u64(high) << 32u64) | low, m.normal, m.points)];
+                }
+            }
+        }
+
+        return result;
+    }
+
+    if a.isMesh {
+        return mesh::meshManifolds(a, b, speculative);
+    }
+
+    if b.isMesh {
+        return copy [flipped(m) for m in mesh::meshManifolds(b, a, speculative)];
+    }
+
+    if let Ok(m) = convexManifold(a, b, speculative) {
+        return copy [m];
+    }
+
+    []
+}
+
+/**
+ * @returns: the manifold of two convex colliders, or of a convex collider and a
+ * plane: a closed form for the round shapes, otherwise the normal of their
+ * penetration and the points of their faces clipped
+ *
+ * */
+fn convexManifold(a: Collider, b: Collider, speculative: f32)-> (ContactManifold)? {
+    if a.isPlane && b.isPlane {
+        return none;
+    }
+
+    if a.isPlane {
+        return planeManifold(a.plane, b, speculative);
+    }
+
+    if b.isPlane {
+        if let Ok(m) = planeManifold(b.plane, a, speculative) {
+            return flipped(m)?;
+        }
+
+        return none;
+    }
+
+    // in the order of their kinds, so that a closed form is written for one order, the result flipped back
+    if cast!u32(a.shape.kind) > cast!u32(b.shape.kind) {
+        if let Ok(m) = convexManifold(b, a, speculative) {
+            return flipped(m)?;
+        }
+
+        return none;
+    }
+
+    let ca = a.convex(), cb = b.convex();
+    let ka = a.shape.kind, kb = b.shape.kind;
+    if ka == ColliderKind::SPHERE && kb == ColliderKind::SPHERE {
+        return primitives::spheres(ca.a, ca.margin, cb.a, cb.margin, speculative);
+    }
+
+    if ka == ColliderKind::SPHERE && kb == ColliderKind::CAPSULE {
+        return primitives::sphereCapsule(ca.a, ca.margin, cb.a, cb.b, cb.margin, speculative);
+    }
+
+    if ka == ColliderKind::CAPSULE && kb == ColliderKind::CAPSULE {
+        return primitives::capsules(ca.a, ca.b, ca.margin, cb.a, cb.b, cb.margin, speculative);
+    }
+
+    if ka == ColliderKind::BOX && kb == ColliderKind::SPHERE && orthogonal(ca) {
+        return primitives::sphereBox(cb.a, cb.margin, ca.a, ca.u, ca.v, ca.w, speculative);
+    }
+
+    let mut normal = vec3();
+    if let Ok(p) = gjk::penetration(ca, cb) {
+        normal = p.normal;
+    } else {
+        let s = gjk::separation(ca, cb);
+        if s.overlapping || s.distance > speculative {
+            return none;
+        }
+
+        normal = s.normal;
+    }
+
+    let points = clipping::clipped(a, b, normal, speculative);
+    if points.len > 0us {
+        return ContactManifold(0u64, normal, points)?;
+    }
+
+    // no two faces to clip: the single point of the penetration, or of the separation
+    singlePoint(ca, cb, speculative)
+}
+
+/**
+ * @returns: the contact of the half space under a plane and a convex collider,
+ * the plane first: the closed form of a sphere or a capsule, otherwise the
+ * corners under the plane of the face of the shape facing it, or its lowest
+ * point
+ *
+ * */
+fn planeManifold(plane: Plane, other: Collider, speculative: f32)-> (ContactManifold)? {
+    let convex = other.convex();
+    if convex.kind == ConvexKind::POINT || convex.kind == ConvexKind::SEGMENT {
+        return primitives::capsulePlane(plane, convex.a, convex.b, convex.margin, speculative);
+    }
+
+    let n = plane.normal;
+    let face = faces::supportFace(other, -n);
+    let mut points: [ContactPoint] = [];
+    for i in 0us .. face.corners.len {
+        let corner = face.corners[i];
+        let depth = -plane.signedDistance(corner);
+        if depth >= -speculative {
+            points ~= [ContactPoint(point-> corner + n * (depth / 2.0f),
+                                    localA-> corner + n * depth,
+                                    localB-> corner,
+                                    depth-> depth,
+                                    feature-> ((face.index & 0xFFu32) << 16u32) | cast!u32(i))];
+        }
+    }
+
+    if points.len > 0us {
+        return ContactManifold(0u64, n, points)?;
+    }
+
+    let lowest = convex.support(-n) - n * convex.margin;
+    let depth = -plane.signedDistance(lowest);
+    if depth < -speculative {
+        return none;
+    }
+
+    ContactManifold(0u64, n, copy [primitives::pointOf(lowest + n * depth, lowest, depth)])?
+}
+
+/**
+ * @returns: the single point of two convex shapes: the deepest points of their
+ * penetration, or their closest points within the speculative distance
+ *
+ * */
+fn singlePoint(a: Convex, b: Convex, speculative: f32)-> (ContactManifold)? {
+    if let Ok(p) = gjk::penetration(a, b) {
+        return ContactManifold(0u64, p.normal, copy [primitives::pointOf(p.pointA, p.pointB, p.depth)])?;
+    }
+
+    let s = gjk::separation(a, b);
+    if s.overlapping || s.distance > speculative {
+        return none;
+    }
+
+    ContactManifold(0u64, s.normal, copy [primitives::pointOf(s.pointA, s.pointB, -s.distance)])?
+}
+
+/**
+ * @returns: a manifold seen from its second shape: its normal negated, the two
+ * sides of each point swapped
+ *
+ * */
+fn flipped(m: ContactManifold)-> ContactManifold {
+    let points = copy [ContactPoint(point-> p.point,
+                                    localA-> p.localB,
+                                    localB-> p.localA,
+                                    depth-> p.depth,
+                                    feature-> p.feature)
+                       for p in m.points];
+
+    ContactManifold(m.key, -m.normal, points)
+}
+
+/**
+ * @returns: true iif the half sides of a box are orthogonal, the box turned and
+ * scaled along its axes but not sheared
+ *
+ * */
+fn orthogonal(box: Convex)-> bool {
+    let u = box.u.normalized(), v = box.v.normalized(), w = box.w.normalized();
+    comparison::max(math::abs(u.dot(v)), comparison::max(math::abs(v.dot(w)), math::abs(w.dot(u)))) <= ORTHOGONAL
+}
+
+/**
+ * @returns: a box grown by a distance on each side
+ * */
+fn grownBy(box: Aabb, distance: f32)-> Aabb {
+    let reach = makeVec3(distance, distance, distance);
+    Aabb(box.min - reach, box.max + reach)
+}

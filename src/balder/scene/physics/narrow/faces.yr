@@ -1,0 +1,178 @@
+in faces;
+
+use balder::math::{matrix, vector};
+
+use std::math;
+
+/**
+ * The corners of the polygon a cap of a cylinder is clipped as
+ * */
+def CAP_SIDES = 8us;
+
+/**
+ * The cosine between the axis of a cylinder and a direction over which its cap
+ * faces the direction, its side otherwise
+ *
+ * */
+def CAP_FACING = 0.7f;
+
+/**
+ * The cosine between the axis of a capsule and a direction under which its
+ * segment lies across the direction, clipped as a face
+ *
+ * */
+def ACROSS = 0.02f;
+
+/**
+ * A face of a shape in the world, its corners counterclockwise around its
+ * normal; one corner for a point, two for a segment
+ *
+ * */
+@data
+pub record Face {
+
+    // The corners of the face, in the world
+    let mut corners: [vec3] = [];
+
+    // The unit normal, pointing out of the shape
+    let mut normal: vec3 = vec3();
+
+    // The index of the face in its shape, for the features of the points it makes
+    let mut index: u32 = 0u32;
+}
+
+/**
+ * @returns: the face of a convex collider the most along a direction: a face of
+ * a box or of a hull, a cap of a cylinder or a segment of its side, the segment
+ * of a capsule lying across the direction; the point of its surface the farthest
+ * along the direction otherwise
+ *
+ * */
+pub fn supportFace(c: Collider, d: vec3)-> Face {
+    let convex = c.convex();
+    let n = d.normalized();
+    match c.shape.kind {
+        ColliderKind::BOX => {
+            return boxFace(convex, n);
+        }
+        ColliderKind::HULL => {
+            if let Ok(h) = c.shape.convexHull {
+                return hullFace(h, c.transform, c.inverse, n);
+            }
+        }
+        ColliderKind::CYLINDER => {
+            return cylinderFace(convex, n);
+        }
+        ColliderKind::CAPSULE => {
+            let axis = convex.b - convex.a;
+            if axis.dot(axis) > 0.0f && math::abs(axis.normalized().dot(n)) < ACROSS {
+                return Face(corners-> copy [convex.a + n * convex.margin, convex.b + n * convex.margin],
+                            normal-> n);
+            }
+        }
+        _ => {}
+    }
+
+    Face(corners-> copy [convex.support(n) + n * convex.margin], normal-> n)
+}
+
+/**
+ * @returns: the face of a box (its centre a, its half sides u, v, w) the most
+ * along a unit direction, its normal that of its plane when the box is sheared
+ *
+ * */
+fn boxFace(b: Convex, d: vec3)-> Face {
+    let axes = [b.u, b.v, b.w];
+    let mut best = 0us;
+    let mut normal = vec3();
+    let mut far = -f32::max;
+    for i in 0us .. 3us {
+        let s = axes[(i + 1us) % 3us], t = axes[(i + 2us) % 3us];
+        let mut n = s.cross(t).normalized();
+        if n.dot(axes[i]) < 0.0f {
+            n = -n;
+        }
+
+        let x = n.dot(d);
+        if math::abs(x) > far {
+            far = math::abs(x);
+            best = i;
+            normal = if x >= 0.0f { n } else { -n };
+        }
+    }
+
+    let outward = if normal.dot(axes[best]) >= 0.0f { 1.0f } else { -1.0f };
+    let c = b.a + axes[best] * outward;
+    let s = axes[(best + 1us) % 3us], t = axes[(best + 2us) % 3us];
+    let corners = if outward > 0.0f {
+        copy [c - s - t, c + s - t, c + s + t, c - s + t]
+    } else {
+        copy [c - s - t, c - s + t, c + s + t, c + s - t]
+    };
+
+    Face(corners-> corners,
+         normal-> normal,
+         index-> cast!u32(best * 2us) + (if outward > 0.0f { 0u32 } else { 1u32 }))
+}
+
+/**
+ * @returns: the flat face of a hull the most along a unit direction, its
+ * corners and its normal in the world
+ *
+ * */
+fn hullFace(h: &ConvexHull, m: mat4, inverse: mat4, d: vec3)-> Face {
+    let normals = inverse.mat3().transposed();
+    let polygons = h.polygons;
+    let mut best = 0us;
+    let mut far = -f32::max;
+    for i in 0us .. polygons.len {
+        let x = (normals * polygons[i].normal).normalized().dot(d);
+        if x > far {
+            far = x;
+            best = i;
+        }
+    }
+
+    let p = polygons[best];
+    let vertices = h.vertices;
+    let corners = copy [(m * makeVec4(vertices[c], 1.0f)).xyz for c in p.corners];
+    Face(corners-> corners,
+         normal-> (normals * p.normal).normalized(),
+         index-> cast!u32(best))
+}
+
+/**
+ * @returns: the face of a cylinder (its centre a, its radii u and w, its half
+ * height v) the most along a unit direction: a cap of CAP_SIDES corners when
+ * the direction runs along its axis, the segment of its side from cap to cap at
+ * the rim the farthest along the direction otherwise
+ *
+ * */
+fn cylinderFace(c: Convex, d: vec3)-> Face {
+    let mut axis = c.u.cross(c.w).normalized();
+    if axis.dot(c.v) < 0.0f {
+        axis = -axis;
+    }
+
+    let along = axis.dot(d);
+    if math::abs(along) > CAP_FACING {
+        let sign = if along >= 0.0f { 1.0f } else { -1.0f };
+        let centre = c.a + c.v * sign;
+        let mut corners: [vec3] = [];
+        for k in 0us .. CAP_SIDES {
+            let angle = 2.0f * cast!f32(math::PI) * cast!f32(cast!u64(k)) / cast!f32(cast!u64(CAP_SIDES)) * sign;
+            corners ~= [centre + c.u * math::cos(angle) + c.w * math::sin(angle)];
+        }
+
+        return Face(corners-> corners,
+                    normal-> axis * sign,
+                    index-> if sign > 0.0f { 0u32 } else { 1u32 });
+    }
+
+    let du = d.dot(c.u), dw = d.dot(c.w);
+    let radial = math::sqrt(du * du + dw * dw);
+    let rim = if radial > 0.0f { c.u * (du / radial) + c.w * (dw / radial) } else { c.u };
+    Face(corners-> copy [c.a + rim - c.v, c.a + rim + c.v],
+         normal-> d,
+         index-> 2u32)
+}

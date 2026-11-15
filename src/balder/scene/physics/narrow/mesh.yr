@@ -1,0 +1,129 @@
+in mesh;
+
+use balder::math::{bounds, vector};
+
+/**
+ * The barycentric weight under which a point of a triangle is on the edge
+ * facing the corner of the weight
+ *
+ * */
+def ON_EDGE = 1.0e-4f;
+
+/**
+ * @returns: the manifolds of the triangles of a mesh within the speculative
+ * distance of a convex collider, the mesh first, the key of each its triangle;
+ * none for a mesh, a plane or a compound
+ *
+ * */
+pub fn meshManifolds(mesh: Collider, other: Collider, speculative: f32)-> [ContactManifold] {
+    if other.isMesh || other.isPlane || other.isCompound {
+        return [];
+    }
+
+    let mut result: [ContactManifold] = [];
+    if let Ok(hierarchy) = mesh.shape.hierarchy {
+        if let Ok(triangles) = mesh.shape.triangles {
+            let convex = other.convex();
+            let reach = makeVec3(speculative, speculative, speculative);
+            let box = Aabb(other.bounds.min - reach, other.bounds.max + reach).transformed(mesh.inverse);
+            let active = mesh.shape.activeEdges;
+            for i in hierarchy.overlapping(box) {
+                let local = triangles.getTriangle(i);
+                let t = Convex::triangle((mesh.transform * makeVec4(local.a, 1.0f)).xyz,
+                                         (mesh.transform * makeVec4(local.b, 1.0f)).xyz,
+                                         (mesh.transform * makeVec4(local.c, 1.0f)).xyz);
+
+                let edges = if i < active.len { active[i] } else { 7u8 };
+                if let Ok(m) = triangleContact(t, edges, other, convex, speculative) {
+                    result ~= [ContactManifold(cast!u64(i), m.normal, m.points)];
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the contact of a triangle of a mesh and a convex shape, the
+ * triangle first: of the normal of the triangle, the face of the shape clipped
+ * against it, when the point on the triangle is inside it or only on inactive
+ * edges; of the normal of their penetration or separation otherwise
+ *
+ * @params:
+ *    - active: the active edges of the triangle (see TriangleBvh::activeEdges)
+ *
+ * */
+fn triangleContact(t: Convex, active: u8, other: Collider, convex: Convex, speculative: f32)-> (ContactManifold)? {
+    let mut normal = vec3();
+    let mut onTriangle = vec3();
+    let mut onOther = vec3();
+    let mut depth = 0.0f;
+    if let Ok(p) = gjk::penetration(t, convex) {
+        normal = p.normal;
+        onTriangle = p.pointA;
+        onOther = p.pointB;
+        depth = p.depth;
+    } else {
+        let s = gjk::separation(t, convex);
+        if s.overlapping || s.distance > speculative {
+            return none;
+        }
+
+        normal = s.normal;
+        onTriangle = s.pointA;
+        onOther = s.pointB;
+        depth = -s.distance;
+    }
+
+    let face = (t.b - t.a).cross(t.c - t.a);
+    if face.dot(face) <= 1.0e-12f {
+        return none;
+    }
+
+    let up = if face.dot(convex.centre - t.a) >= 0.0f { face.normalized() } else { -face.normalized() };
+    let (u, v, w) = weightsOf(onTriangle, t.a, t.b, t.c);
+    let onAB = w < ON_EDGE, onBC = u < ON_EDGE, onCA = v < ON_EDGE;
+    let alongTriangle = (!onAB || (active & 1u8) == 0u8) && (!onBC || (active & 2u8) == 0u8)
+                     && (!onCA || (active & 4u8) == 0u8);
+
+    if !alongTriangle {
+        // on an active edge or corner: the normal of the shapes stays
+        return ContactManifold(0u64, normal, copy [primitives::pointOf(onTriangle, onOther, depth)])?;
+    }
+
+    let reference = faces::Face(corners-> copy [t.a, t.b, t.c], normal-> up);
+    let points = clipping::clipFaces(reference, faces::supportFace(other, -up), false, speculative);
+    if points.len > 0us {
+        return ContactManifold(0u64, up, points)?;
+    }
+
+    // no face to clip: the lowest point of the shape along the normal of the triangle
+    let lowest = convex.support(-up) - up * convex.margin;
+    let deep = up.dot(t.a) - up.dot(lowest);
+    if deep < -speculative {
+        return none;
+    }
+
+    ContactManifold(0u64, up, copy [primitives::pointOf(lowest + up * deep, lowest, deep)])?
+}
+
+/**
+ * @returns: the barycentric weights (u, v, w) of a point in the plane of a
+ * triangle, p = a * u + b * v + c * w (Ericson, 3.4); the weights of the
+ * centroid for a flat triangle
+ *
+ * */
+fn weightsOf(p: vec3, a: vec3, b: vec3, c: vec3)-> (f32, f32, f32) {
+    let v0 = b - a, v1 = c - a, v2 = p - a;
+    let d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1);
+    let d20 = v2.dot(v0), d21 = v2.dot(v1);
+    let denom = d00 * d11 - d01 * d01;
+    if denom <= 1.0e-12f * d00 * d11 {
+        return (1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f);
+    }
+
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    (1.0f - v - w, v, w)
+}
