@@ -32,19 +32,23 @@ record WorldBody {
 }
 
 /**
- * The bodies of a scene, their colliders placed in the world, the queries running on them, and the contacts between
- * them
+ * The bodies of a scene, their colliders placed in the world, the queries
+ * running on them, and the contacts between them
+ *
  * @info:
  * =====
- * A body is known by its handle, the index of its slot, given back when it is added and free again once it is removed
- * (a later body may get it). The world boxes of the colliders are kept in a bounding volume hierarchy, the broadphase of
- * the queries and of the contacts, refit when a body moves.
+ * A body is known by its handle, the index of its slot, given back when it is
+ * added and free again once it is removed (a later body may get it). The world
+ * boxes of the colliders are kept in a bounding volume hierarchy, the
+ * broadphase of the queries and of the contacts, refit when a body moves.
  *
- * The queries (raycast, shapeCast, overlapShape...) need no solver: they test the colliders whose boxes the query
- * reaches, a ray exactly, the shapes by the distance between their cores (see gjk). The contacts are updated on
- * request (updateContacts, at each tick of a scene): the pairs of touching bodies one of which is kinematic or a
- * trigger, as seen by the layers and the masks of the two, compared with those of the previous update. Two meshes
- * never touch, nor two static bodies that are not triggers.
+ * The queries (raycast, shapeCast, overlapShape...) need no solver: they test
+ * the colliders whose boxes the query reaches, a ray exactly, the shapes by the
+ * distance between their cores (see gjk). The contacts are updated on request
+ * (updateContacts, at each tick of a scene): the pairs of touching bodies one
+ * of which is kinematic or a trigger, as seen by the layers and the masks of
+ * the two, compared with those of the previous update. Two meshes never touch,
+ * nor two static bodies that are not triggers.
  * ====
  * */
 @final
@@ -67,6 +71,9 @@ pub class PhysicsWorld {
 
     // The handles of the bodies whose collider is a plane, kept out of the hierarchy, holding no box
     let mut _planes: [usize] = [];
+
+    // What the solver moves of the bodies, by handle, next to their solts, the free ones at rest
+    let dmut _states: [BodyState] = [];
 
     pub self () {}
 
@@ -110,6 +117,17 @@ pub class PhysicsWorld {
     }
 
     /**
+     * @returns: what the solver moves of a body: its pose, its velocities, its
+     * inverse mass and inertia
+     *
+     * @warning: the body is in the world (see contains)
+     *
+     * */
+    pub fn getState(self, handle: u32)-> BodyState {
+        self._states[handle]
+    }
+
+    /**
      * @returns: the handles of the bodies a body touched at the last update of the contacts
      * */
     pub fn contactsOf(self, handle: u32)-> [u32] {
@@ -145,11 +163,16 @@ pub class PhysicsWorld {
             h
         } else {
             self._bodies = self._bodies ~ copy [WorldBody()];
+            self._states = self._states ~ copy [BodyState()];
             cast!u32(self._bodies.len - 1us)
         };
 
-        let collider = Collider(shape, transform);
-        self._bodies[handle] = WorldBody(collider-> collider, settings-> settings, used-> true);
+        let taken = utils::checked(shape, settings);
+        let state = utils::stateOf(shape, transform, taken);
+        let collider = Collider(shape, utils::placementOf(state, transform, taken));
+
+        self._bodies[handle] = WorldBody(collider-> collider, settings-> taken, used-> true);
+        self._states[handle] = state;
 
         if collider.isPlane {
             self._planes ~= [cast!usize(handle)];
@@ -181,6 +204,7 @@ pub class PhysicsWorld {
         self:.unindex(handle, self._bodies[handle].collider.isPlane);
 
         self._bodies[handle] = WorldBody(next-> self._free);
+        self._states[handle] = BodyState();
         self._free = handle;
         self._len -= 1us;
 
@@ -194,7 +218,12 @@ pub class PhysicsWorld {
     pub fn setTransform(mut self, handle: u32, transform: mat4) {
         if !self.contains(handle) { return; }
 
-        self:.place(handle, Collider(self._bodies[handle].collider.shape, transform));
+        let body = self._bodies[handle];
+        let state = utils::movedState(self._states[handle], body.collider.shape, transform, body.settings);
+        self._states[handle] = state;
+
+        let placement = utils::placementOf(state, transform, body.settings);
+        self:.place(handle, Collider(self._bodies[handle].collider.shape, placement));
     }
 
     /**
@@ -204,7 +233,19 @@ pub class PhysicsWorld {
     pub fn setShape(mut self, handle: u32, shape: ColliderShape) {
         if !self.contains(handle) { return; }
 
-        self:.place(handle, Collider(shape, self._bodies[handle].collider.transform));
+        let body = self._bodies[handle];
+        let taken = utils::checked(shape, body.settings);
+        let transform = body.collider.transform;
+
+        let mut state = utils::stateOf(shape, transform, taken);
+        state.linearVelocity = self._states[handle].linearVelocity;
+        state.angularVelocity = self._states[handle].angularVelocity;
+
+        self._bodies[handle].settings = taken;
+        self._states[handle] = state;
+
+        let placement = utils::placementOf(state, transform, taken);
+        self:.place(handle, Collider(shape, placement));
     }
 
     /**
@@ -214,7 +255,32 @@ pub class PhysicsWorld {
     pub fn setSettings(mut self, handle: u32, settings: BodySettings) {
         if !self.contains(handle) { return; }
 
-        self._bodies[handle].settings = settings;
+        let body = self._bodies[handle];
+        let taken = utils::checked(body.collider.shape, settings);
+        if taken.motion != body.settings.motion || taken.mass != body.settings.mass {
+            self._states[handle] = utils::stateOf(body.collider.shape, body.collider.transform, taken);
+        }
+
+        self._bodies[handle].settings = taken;
+    }
+
+    /**
+     * Change the velocities of a dynamic or a kinematic body, waking it
+     * @params:
+     *    - linear: the velocity of its centre of mass, in metres a second
+     *    - angular: its angular velocity in the world, in radians a second about its direction
+     *
+     * @info: does nothing for a static body, or when the world has no such body
+     *
+     * */
+    pub fn setVelocity(mut self, handle: u32, linear: vec3, angular: vec3) {
+        if !self.contains(handle) || self._bodies[handle].settings.motion == BodyMotion::STATIC {
+            return;
+        }
+
+        self._states[handle].linearVelocity = linear;
+        self._states[handle].angularVelocity = angular;
+        self:.wake(handle);
     }
 
     /*!
@@ -341,6 +407,22 @@ pub class PhysicsWorld {
         let box = Convex::box(centre, rotation * makeVec3(h.x, 0.0f, 0.0f), rotation * makeVec3(0.0f, h.y, 0.0f),
                               rotation * makeVec3(0.0f, 0.0f, h.z));
         self.overlapConvex(box, filter)
+    }
+
+    /**
+     * Wake a dynamic body asleep
+     *
+     * @info: does nothing for another body, or when the world has no such body
+     *
+     * */
+    pub fn wake(mut self, handle: u32) {
+        if !self.contains(handle) || self._bodies[handle].settings.motion != BodyMotion::DYNAMIC {
+            return;
+        }
+
+        let mut state = self._states[handle];
+        state:.wake();
+        self._states[handle] = state;
     }
 
     /*!
