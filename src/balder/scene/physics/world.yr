@@ -90,11 +90,13 @@ record WorldBody {
  *
  * The queries (raycast, shapeCast, overlapShape...) need no solver: they test
  * the colliders whose boxes the query reaches, a ray exactly, the shapes by the
- * distance between their cores (see gjk). The contacts are updated on request
- * (updateContacts, at each tick of a scene): the pairs of touching bodies one
- * of which is kinematic or a trigger, as seen by the layers and the masks of
- * the two, compared with those of the previous update. Two meshes never touch,
- * nor two static bodies that are not triggers.
+ * distance between their cores (see gjk). A step (step) moves the dynamic
+ * bodies, their contacts solved by island; the contacts are reported on request
+ * (contactEvents, once a tick of a scene, or updateContacts without a step):
+ * the pairs of touching bodies one of which is not static or is a trigger, as
+ * seen by the layers and the masks of the two, compared with those the last
+ * report gave. Two meshes never touch, nor two static bodies that are not
+ * triggers.
  * ====
  * */
 @final
@@ -139,6 +141,9 @@ pub class PhysicsWorld {
 
     // The poses of the bodies before the last step, by handle, the display interpolating from them
     let dmut _previous: [RigidTransform] = [];
+
+    // The pairs dropped since the last contact events while their contact was reported, their end to report
+    let mut _endedUnreported: [BroadPair] = [];
 
     // The poses of the kinematic bodies at the last derivation of their velocities, by handle
     let dmut _kinematicFrom: [u32 => RigidTransform] = copy [];
@@ -341,11 +346,10 @@ pub class PhysicsWorld {
     /**
      * Remove a body from the world, its handle free for another body
      *
-     * @info: the contacts of the body end at once, the next update of the
-     * contacts not reporting them, as its handle may be given to another body
-     * by then
+     * @info: the contacts of the body end at once, the next contact events not
+     * reporting them, as its handle may be given to another body by then
      *
-     * @returns: the contacts the body had at the last update of the contacts,
+     * @returns: the contacts of the body the last contact events reported,
      * ended; none when the world has no such body
      *
      * */
@@ -353,6 +357,16 @@ pub class PhysicsWorld {
         if !self.contains(handle) { return []; }
 
         let mut ended: [ContactEvent] = [];
+        let mut unreported: [BroadPair] = [];
+        for p in self._endedUnreported {
+            if p.a == handle || p.b == handle {
+                ended ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
+            } else {
+                unreported ~= [p];
+            }
+        }
+
+        self._endedUnreported = unreported;
         let mut slot = 0us;
         while slot < self._pairs.len {
             let p = self._pairs.get(slot);
@@ -361,7 +375,7 @@ pub class PhysicsWorld {
             // the last pair is moved into the slot, looked at next, what the body held up woken
             self._pairs:.remove(pairKey(p.a, p.b));
             self:.wakeIfAsleep(if p.a == handle { p.b } else { p.a });
-            if p.touching {
+            if p.reported {
                 ended ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
             }
         }
@@ -742,6 +756,7 @@ pub class PhysicsWorld {
             } else {
                 self._pairs:.remove(pairKey(p.a, p.b));
                 dropped ~= [p];
+                if p.reported { self._endedUnreported ~= [p]; }
             }
         }
 
@@ -882,30 +897,43 @@ pub class PhysicsWorld {
      */
 
     /**
-     * Find the pairs of bodies touching each other, one of them at least being kinematic or a trigger and one of them
-     * seeing the other through its mask, and compare them with those of the previous update
-     * @returns: the contacts begun, those that stayed and those that ended since the previous update (the removal of a
-     * body ending its contacts at once, see remove)
+     * Find the pairs of bodies touching each other without a step, one of them at least being kinematic, dynamic or a
+     * trigger and one of them seeing the other through its mask, then report their contacts (see contactEvents)
+     * @returns: the contacts begun, those that stayed and those that ended since the last contact events (the removal
+     * of a body ending its contacts at once, see remove)
      * */
     pub fn updateContacts(mut self)-> [ContactEvent] {
+        self:.updatePairs();
+        self:.updateAllManifolds();
+        self:.contactEvents()
+    }
+
+    /**
+     * @returns: the contacts begun, those that stayed and those that ended since the last call, from the touching of
+     * each pair against what the last call reported: once a tick of a scene, whatever the steps it runs
+     *
+     * @info: a contact begun and ended between two calls is not reported
+     *
+     * */
+    pub fn contactEvents(mut self)-> [ContactEvent] {
         let mut events: [ContactEvent] = [];
-        for p in self:.updatePairs() if p.touching {
+        for p in self._endedUnreported {
             events ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
         }
 
+        self._endedUnreported = [];
         for slot in 0us .. self._pairs.len {
-            let before = self._pairs.get(slot).touching;
-            let p = self:.updateManifolds(slot);
-            let touching = p.touching;
-            if touching {
-                let phase = if before { ContactPhase::STAYED } else { ContactPhase::BEGAN };
-                events ~= [ContactEvent(a-> p.a,
-                                        b-> p.b,
-                                        phase-> phase)];
-            } else if before {
-                events ~= [ContactEvent(a-> p.a,
-                                        b-> p.b,
-                                        phase-> ContactPhase::ENDED)];
+            let mut p = self._pairs.get(slot);
+            if p.touching {
+                let phase = if p.reported { ContactPhase::STAYED } else { ContactPhase::BEGAN };
+                events ~= [ContactEvent(a-> p.a, b-> p.b, phase-> phase)];
+            } else if p.reported {
+                events ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
+            }
+
+            if p.reported != p.touching {
+                p.reported = p.touching;
+                self._pairs:.set(slot, p);
             }
         }
 
