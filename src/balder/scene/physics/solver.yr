@@ -28,7 +28,8 @@ def TANGENT_FROM_X = 0.57735f;
  *    - friction, restitution: the material of the contact (see materialOf)
  *    - settings: when the point bounces
  *
- * @info: a point closing faster than the bounce threshold before the step bounces back by its restitution
+ * @info: a point closing faster than the bounce threshold before the step bounces back by its restitution (see
+ * applyRestitution)
  *
  * */
 pub fn prepare(bodies: [SolverBody], a: usize, b: usize, normal: vec3, p: ContactPoint, friction: f32,
@@ -57,6 +58,112 @@ pub fn prepare(bodies: [SolverBody], a: usize, b: usize, normal: vec3, p: Contac
 }
 
 /**
+ * Change the velocities of the bodies that move by their accelerations during a sub step, then slow them down by
+ * their damping (v / (1 + c h), stable whatever c)
+ * */
+pub fn integrateVelocities(dmut bodies: [SolverBody], h: f32) {
+    for i in 0us .. bodies.len if bodies[i].inverseMass > 0.0f {
+        let b = bodies[i];
+        bodies[i].linearVelocity = (b.linearVelocity + b.linearAcceleration * h) / (1.0f + b.linearDamping * h);
+        bodies[i].angularVelocity = (b.angularVelocity + b.angularAcceleration * h) / (1.0f + b.angularDamping * h);
+    }
+}
+
+/**
+ * Move the bodies that move by their velocities during a sub step, their centres along their linear velocities, their
+ * rotations by their angular velocities
+ * */
+pub fn integratePositions(dmut bodies: [SolverBody], h: f32) {
+    for i in 0us .. bodies.len if bodies[i].inverseMass > 0.0f {
+        let b = bodies[i];
+        bodies[i].deltaPosition = b.deltaPosition + b.linearVelocity * h;
+        bodies[i].deltaRotation = b.deltaRotation.integrated(b.angularVelocity, h);
+    }
+}
+
+/**
+ * Apply to the bodies the impulses the constraints gathered at the sub step before, the solver starting from them
+ * rather than from nothing (warm starting): what keeps a stack still
+ *
+ * */
+pub fn warmStart(dmut bodies: [SolverBody], constraints: [ContactConstraint]) {
+    for c in constraints {
+        let impulse = c.normal * c.normalImpulse + c.tangent1 * c.tangentImpulse1 + c.tangent2 * c.tangentImpulse2;
+        push(alias bodies, c.a, c.b, c.armA, c.armB, impulse);
+    }
+}
+
+/**
+ * Run a pass of the solver over the constraints during a sub step (projected Gauss-Seidel): the normal of each point,
+ * never pulling, then its friction, bounded by its friction times the impulse of its normal (the pyramid of the cone of
+ * friction)
+ *
+ * @params:
+ *    - h: the duration of the sub step
+ *    - correct: true to push the penetrations out (a pass of the sub step), false to relax the velocities the
+ *      correction left (the last pass of a sub step), the bodies staying where it moved them
+ *
+ * @info: a point apart closes in by its gap and no more, which stops a fast body at a thin wall; a point sunk is pushed
+ * out as by a spring of contactHertz damped by contactDamping (a soft contact, Box2D v3), maxCorrection at most; the
+ * impulses gathered are clamped, not the impulse of a pass, so a pass takes back what an earlier one overdid
+ *
+ * */
+pub fn solve(dmut bodies: [SolverBody], dmut constraints: [ContactConstraint], h: f32, settings: SolverSettings,
+             correct: bool) {
+    let soft = Softness(settings, h);
+    for i in 0us .. constraints.len {
+        let mut c = constraints[i];
+        let s = separationOf(bodies, c);
+        let mut target = 0.0f;
+        let mut massScale = 1.0f;
+        let mut impulseScale = 0.0f;
+        if s > 0.0f {
+            target = -s / h;
+        } else if correct {
+            target = comparison::min(-soft.biasRate * s, settings.maxCorrection);
+            massScale = soft.massScale;
+            impulseScale = soft.impulseScale;
+        }
+
+        let vn = relativeVelocity(bodies[c.a], bodies[c.b], c.armA, c.armB).dot(c.normal);
+        let oldN = c.normalImpulse;
+        c.normalImpulse = comparison::max(oldN - c.normalMass * massScale * (vn - target) - impulseScale * oldN, 0.0f);
+        c.maxNormalImpulse = comparison::max(c.maxNormalImpulse, c.normalImpulse);
+        push(alias bodies, c.a, c.b, c.armA, c.armB, c.normal * (c.normalImpulse - oldN));
+
+        let limit = c.friction * c.normalImpulse;
+        let v1 = relativeVelocity(bodies[c.a], bodies[c.b], c.armA, c.armB).dot(c.tangent1);
+        let old1 = c.tangentImpulse1;
+        c.tangentImpulse1 = clamped(old1 - c.tangentMass1 * v1, -limit, limit);
+        push(alias bodies, c.a, c.b, c.armA, c.armB, c.tangent1 * (c.tangentImpulse1 - old1));
+
+        let v2 = relativeVelocity(bodies[c.a], bodies[c.b], c.armA, c.armB).dot(c.tangent2);
+        let old2 = c.tangentImpulse2;
+        c.tangentImpulse2 = clamped(old2 - c.tangentMass2 * v2, -limit, limit);
+        push(alias bodies, c.a, c.b, c.armA, c.armB, c.tangent2 * (c.tangentImpulse2 - old2));
+
+        constraints[i] = c;
+    }
+}
+
+/**
+ * Make the points closing fast enough before the step bounce back by their restitution, once the sub steps are run:
+ * only those a sub step pushed on, a speculative point never reached bouncing nothing
+ *
+ * */
+pub fn applyRestitution(dmut bodies: [SolverBody], dmut constraints: [ContactConstraint]) {
+    for i in 0us .. constraints.len if constraints[i].bounce > 0.0f && constraints[i].maxNormalImpulse > 0.0f {
+        let mut c = constraints[i];
+        let vn = relativeVelocity(bodies[c.a], bodies[c.b], c.armA, c.armB).dot(c.normal);
+        let oldN = c.normalImpulse;
+        c.normalImpulse = comparison::max(oldN - c.normalMass * (vn - c.bounce), 0.0f);
+        push(alias bodies, c.a, c.b, c.armA, c.armB, c.normal * (c.normalImpulse - oldN));
+
+        constraints[i] = c;
+    }
+}
+
+/**
  * @returns:
  *    - 0: the friction of a contact between two bodies, the geometric mean of theirs, ice on rubber sliding
  *    - 1: the restitution of the contact, the larger of theirs, a ball bouncing off any floor
@@ -72,6 +179,35 @@ pub fn tangentsOf(n: vec3)-> (vec3, vec3) {
     let other = if math::abs(n.x) < TANGENT_FROM_X { makeVec3(1.0f, 0.0f, 0.0f) } else { makeVec3(0.0f, 1.0f, 0.0f) };
     let t1 = n.cross(other).normalized();
     (t1, n.cross(t1))
+}
+
+/**
+ * @returns: how far apart the bodies of a constraint are at its point now, its separation at the start of the step
+ * moved by how far the bodies moved and turned since (their arms turned with them)
+ * */
+fn separationOf(bodies: [SolverBody], c: ContactConstraint)-> f32 {
+    let ba = bodies[c.a], bb = bodies[c.b];
+    let da = ba.deltaPosition + ba.deltaRotation * c.armA - c.armA;
+    let db = bb.deltaPosition + bb.deltaRotation * c.armB - c.armB;
+    c.separation + (db - da).dot(c.normal)
+}
+
+/**
+ * Push two bodies apart by an impulse at their arms, the second along it, the first against it
+ * */
+fn push(dmut bodies: [SolverBody], a: usize, b: usize, ra: vec3, rb: vec3, impulse: vec3) {
+    let ba = bodies[a], bb = bodies[b];
+    bodies[a].linearVelocity = ba.linearVelocity - impulse * ba.inverseMass;
+    bodies[a].angularVelocity = ba.angularVelocity - ba.inverseInertia * ra.cross(impulse);
+    bodies[b].linearVelocity = bb.linearVelocity + impulse * bb.inverseMass;
+    bodies[b].angularVelocity = bb.angularVelocity + bb.inverseInertia * rb.cross(impulse);
+}
+
+/**
+ * @returns: a value within [low, high]
+ * */
+fn clamped(x: f32, low: f32, high: f32)-> f32 {
+    comparison::max(low, comparison::min(high, x))
 }
 
 /**
