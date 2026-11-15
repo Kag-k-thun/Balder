@@ -1,0 +1,334 @@
+in activity;
+
+use balder::math::_;
+use balder::core::{_, application::_};
+use balder::interface;
+use balder::interface::widget::layout::_;
+use balder::scene::node::{node3D::_, node3D::body, node3D::camera, node3D::visual::_, node3D::visual::material::_};
+use balder::scene::physics;
+use balder::utils::log;
+
+use sdl3::_;
+
+use std::{math, time};
+
+/**
+ * The crates stacked, and the side of a crate, in metres
+ * */
+def CRATES = 10;
+def CRATE = 1.0f;
+
+/**
+ * The angle of the slope, in radians (its tangent 0.31), the friction of its board, and the frictions of the two boxes
+ * on it, the friction of a contact being the geometric mean of the two: the first sticks (0.5), the second slides (0.16)
+ * */
+def SLOPE = 0.3f;
+def BOARD = 0.5f;
+def STICKING = 0.5f;
+def SLIDING = 0.05f;
+
+/**
+ * The radius of a ball, its mass and the impulse throwing it, in newton seconds
+ * */
+def BALL = 0.25f;
+def BALL_MASS = 2.0f;
+def THROW = 30.0f;
+
+/**
+ * The point the camera turns about
+ * */
+def CENTRE = makeVec3(0.0f, 2.5f, 0.0f);
+
+/**
+ * The solver of the physics to look at: a stack of crates on the ground, two boxes on a slope, one sticking, the other
+ * sliding, balls bouncing, and a ball thrown from the camera at each press of Space; the right button turns the camera,
+ * the wheel zooms
+ * */
+pub class CratesActivity over Activity {
+
+    let dmut _scene: (&Scene)? = none;
+    let dmut _cam: (&PerspectiveCamera)? = none;
+
+    // The materials of the crates, of the boxes on the slope and of the balls
+    let mut _crate: MaterialConfig = MaterialConfig();
+    let mut _ball: MaterialConfig = MaterialConfig();
+
+    // The balls thrown, named after their count
+    let mut _thrown: u32 = 0u32;
+
+    // The camera turning about the centre: its yaw and its pitch, in degrees, and its distance
+    let mut _yaw: f32 = 30.0f;
+    let mut _pitch: f32 = -15.0f;
+    let mut _distance: f32 = 16.0f;
+    let mut _turning: bool = false;
+    let mut _turnStart: (i32, i32) = (0, 0);
+
+    pub self (uid: usize, dmut app: &Application, dmut window: &Window)
+        with super(uid, alias app, alias window)
+    {
+        self._crate.baseColor = makeVec3(0.7f, 0.45f, 0.2f);
+        self._crate.roughness = 0.8f;
+        self._ball.baseColor = makeVec3(0.85f, 0.15f, 0.1f);
+        self._ball.roughness = 0.4f;
+    }
+
+    over onStart(mut self) {
+        self.input:.quit():.connect(self.box, &self:.onQuit);
+        self.input:.keyboard(KeyInfo(SDLK_SPACE, KeyEvent::DOWN)):.connect(self.box, &self:.onThrow);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::DOWN)):.connect(self.box, &self:.onTurnStart);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::RELEASE)):.connect(self.box, &self:.onTurnEnd);
+        self.input:.mouseMotion():.connect(self.box, &self:.onMouseMove);
+        self.input:.mouseWheel():.connect(self.box, &self:.onWheel);
+
+        {
+            self.gui:.loadStyleFile("res:/config/crates.style");
+            self.gui:.loadGUIFile("res:/config/crates.gui");
+        } catch {
+            err => {
+                log::error #("Crates", "Failed to load the interface", err);
+                return;
+            }
+        }
+
+        if let Ok(dmut w: &Scene3DLayout) = self.gui:.find("scene") {
+            self._scene = w:.getScene();
+        }
+
+        {
+            if let Ok(dmut s: &Scene) = alias self._scene {
+                s.background = makeVec3(0.25f, 0.55f, 1.0f);
+                s.ambient = makeVec3(0.35f, 0.4f, 0.5f);
+                s.ambientOcclusion = true;
+                self:.createLight(alias s);
+                self:.createGround(alias s);
+                self:.createStack(alias s);
+                self:.createSlope(alias s);
+                self:.createBalls(alias s);
+                self:.createCamera(alias s);
+            }
+        } catch {
+            err => {
+                log::error #("Crates", "Failed to build the scene", err);
+            }
+        }
+    }
+
+    over onUpdate(mut self, _: Duration) {
+        self:.followCentre();
+    }
+
+    pub fn onQuit(mut self) {
+        self.app:.close(alias self);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          INPUTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Throw a ball from the camera along the way it looks
+     * */
+    pub fn onThrow(mut self, _: KeyInfo) {
+        if let Ok(dmut s) = alias self._scene {
+            if let Ok(cam) = self._cam {
+                let look = (cam.target - cam.position).normalized();
+                self._thrown += 1u32;
+
+                self.window:.lockFrame();
+                {
+                    let dmut ball = self:.createBall(alias s, f"thrown-${self._thrown}", cam.position + look, 0.3f);
+                    ball:.applyImpulse(look * THROW);
+                } catch {
+                    err => {
+                        log::error #("Crates", "Failed to throw a ball", err);
+                    }
+                }
+
+                self.window:.unlockFrame();
+            }
+        }
+    }
+
+    pub fn onTurnStart(mut self, x: i32, y: i32, _: MouseInfo) {
+        self._turning = true;
+        self._turnStart = (x, y);
+    }
+
+    pub fn onTurnEnd(mut self, _: i32, _: i32, _: MouseInfo) {
+        self._turning = false;
+    }
+
+    pub fn onMouseMove(mut self, x: i32, y: i32, _: f32, _: f32) {
+        if !self._turning { return; }
+
+        self._yaw = (self._yaw + cast!f32(x - self._turnStart._0) * 0.2f) % 360.0f;
+        self._pitch = std::algorithm::comparison::clamp(self._pitch + cast!f32(self._turnStart._1 - y) * 0.2f, -80.0f, 10.0f);
+        self._turnStart = (x, y);
+    }
+
+    pub fn onWheel(mut self, _: i32, _: i32, _: i32, w: i32) {
+        self._distance = std::algorithm::comparison::clamp(self._distance - cast!f32(w), 3.0f, 60.0f);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCENE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The ground, a static plane drawn as a wide grey square
+     * */
+    fn createGround(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        let mut grey = MaterialConfig();
+        grey.baseColor = makeVec3(0.6f, 0.62f, 0.6f);
+        grey.roughness = 0.9f;
+
+        let dmut ground = copy PhysicsBody3D("ground", alias scene:.getRootNode(), shape-> ColliderShape::plane());
+        let (array, indices) = planeMesh();
+        let dmut floor = copy IndexedMesh3D("floor", alias ground, LodChain(indices), array, copy ConstantMaterial(grey));
+        floor.scale = makeVec3(60.0f, 1.0f, 60.0f);
+    }
+
+    /**
+     * The stack of CRATES crates, each one on the one under it
+     * */
+    fn createStack(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        for i in 0 .. CRATES {
+            let at = makeVec3(0.0f, CRATE * (0.5f + cast!f32(i)), 0.0f);
+            self:.createBox(alias scene, f"crate-${i}", at, vec3(), 0.5f);
+        }
+    }
+
+    /**
+     * The slope, a static board turned by SLOPE about Z, and two boxes put on it, the one of a friction above the tangent
+     * of the slope sticking, the other sliding down
+     * */
+    fn createSlope(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        let turn = Quaternion::fromAxisAngle(SLOPE, makeVec3(0.0f, 0.0f, 1.0f));
+        let size = makeVec3(8.0f, 0.2f, 4.0f);
+        let at = makeVec3(-8.0f, 1.5f, 0.0f);
+
+        let dmut board = copy PhysicsBody3D("slope", alias scene:.getRootNode(), shape-> ColliderShape::box(size),
+                                            settings-> BodySettings(friction-> BOARD));
+        board:.setTransform(at, turn, makeVec3(1.0f, 1.0f, 1.0f));
+
+        let mut grey = MaterialConfig();
+        grey.baseColor = makeVec3(0.35f, 0.4f, 0.45f);
+        grey.roughness = 0.7f;
+        let (array, indices) = cubeMesh();
+        let dmut mesh = copy IndexedMesh3D("board", alias board, LodChain(indices), array, copy ConstantMaterial(grey));
+        mesh.position = makeVec3(0.0f, -size.y / 2.0f, 0.0f);
+        mesh.scale = size;
+
+        // the boxes on the board, side by side across it, a little above it
+        let up = turn * makeVec3(0.0f, 1.0f, 0.0f);
+        for sticks in [true, false] {
+            let z = if sticks { -1.0f } else { 1.0f };
+            let place = at + up * (size.y / 2.0f + CRATE / 2.0f + 0.01f) + turn * makeVec3(2.0f, 0.0f, z);
+            let dmut box = self:.createBox(alias scene, if sticks { "sticking" } else { "sliding" }, place, vec3(),
+                                           if sticks { STICKING } else { SLIDING });
+            box:.setTransform(place, turn, makeVec3(1.0f, 1.0f, 1.0f));
+        }
+    }
+
+    /**
+     * A few balls dropped from various heights, bouncing on the ground
+     * */
+    fn createBalls(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        for i in 0 .. 4 {
+            let at = makeVec3(5.0f + cast!f32(i) * 1.2f, 2.0f + cast!f32(i) * 1.5f, -2.0f);
+            self:.createBall(alias scene, f"ball-${i}", at, 0.2f * cast!f32(i + 1));
+        }
+    }
+
+    /**
+     * @returns: a dynamic box of side CRATE, drawn as a cube of the colour of the crates
+     * */
+    fn createBox(mut self, dmut scene: &Scene, name: [c8], at: vec3, rotation: vec3, friction: f32)-> dmut &PhysicsBody3D
+        throws BalderError
+    {
+        let settings = BodySettings(motion-> BodyMotion::DYNAMIC, mass-> 10.0f, friction-> friction);
+        let dmut box = copy PhysicsBody3D(name, alias scene:.getRootNode(),
+                                          shape-> ColliderShape::box(makeVec3(CRATE, CRATE, CRATE)),
+                                          settings-> settings);
+        box:.setTransform(at, rotation, makeVec3(1.0f, 1.0f, 1.0f));
+
+        let (array, indices) = cubeMesh();
+        let dmut mesh = copy IndexedMesh3D(name ~ "-mesh", alias box, LodChain(indices), array,
+                                           copy ConstantMaterial(self._crate));
+        mesh.position = makeVec3(0.0f, -CRATE / 2.0f, 0.0f);
+        mesh.scale = makeVec3(CRATE, CRATE, CRATE);
+
+        alias box
+    }
+
+    /**
+     * @returns: a dynamic ball of radius BALL bouncing by a restitution, drawn as a red sphere
+     * */
+    fn createBall(mut self, dmut scene: &Scene, name: [c8], at: vec3, restitution: f32)-> dmut &PhysicsBody3D
+        throws BalderError
+    {
+        let settings = BodySettings(motion-> BodyMotion::DYNAMIC, mass-> BALL_MASS, restitution-> restitution);
+        let dmut ball = copy PhysicsBody3D(name, alias scene:.getRootNode(), shape-> ColliderShape::sphere(BALL),
+                                           settings-> settings);
+        ball.position = at;
+
+        let (array, indices) = sphereMesh();
+        let dmut mesh = copy IndexedMesh3D(name ~ "-mesh", alias ball, LodChain(indices), array,
+                                           copy ConstantMaterial(self._ball));
+        mesh.position = makeVec3(0.0f, -BALL, 0.0f);
+        mesh.scale = makeVec3(2.0f * BALL, 2.0f * BALL, 2.0f * BALL);
+
+        alias ball
+    }
+
+    /**
+     * A sun casting shadows
+     * */
+    fn createLight(mut self, dmut scene: &Scene) {
+        let dmut sun = copy Light("sun", scene:.getRootNode(), castShadow-> true);
+        sun.direction = makeVec3(-0.4f, -1.0f, -0.6f);
+        sun.intensity = 2.5f;
+        sun.color = makeVec3(1.0f, 0.95f, 0.85f);
+    }
+
+    fn createCamera(mut self, dmut scene: &Scene) {
+        let dmut cam = copy PerspectiveCamera("cam", scene:.getRootNode());
+        cam.fov = 60.0f;
+        cam.far = 200.0f;
+        self._cam = (alias cam)?;
+        self:.followCentre();
+    }
+
+    /**
+     * Place the camera about the centre, along the yaw and the pitch
+     * */
+    fn followCentre(mut self) {
+        if let Ok(dmut cam) = alias self._cam {
+            let pitch = math::utils::radian(self._pitch);
+            let yaw = math::utils::radian(self._yaw);
+            let look = makeVec3(-cos(pitch) * sin(yaw), sin(pitch), -cos(pitch) * cos(yaw));
+            let position = CENTRE - look * self._distance;
+            if position != cam.position {
+                cam.position = position;
+                cam.target = CENTRE;
+            }
+        }
+    }
+
+}
