@@ -47,41 +47,54 @@ pub record Face {
  * of a capsule lying across the direction; the point of its surface the farthest
  * along the direction otherwise
  *
+ * @params:
+ *    - scratch: the buffers the corners of the face are written in
+ *    - second: true for the face of the second shape of a pair, its corners in a buffer of their own
+ *
+ * @info: the corners are a view of the buffers of the scratch, valid until a face of the same side is asked for again
+ *
  * */
-pub fn supportFace(c: Collider, d: vec3)-> Face {
+pub fn supportFace(dmut scratch: &ContactScratch, c: Collider, d: vec3, second: bool)-> Face {
     let convex = c.convex();
     let n = d.normalized();
     match c.shape.kind {
         ColliderKind::BOX => {
-            return boxFace(convex, n);
+            return boxFace(alias scratch:.corners(second, 4us), convex, n);
         }
         ColliderKind::HULL => {
             if let Ok(h) = c.shape.convexHull {
-                return hullFace(h, c.transform, c.inverse, n);
+                return hullFace(alias scratch, second, h, c.transform, c.inverse, n);
             }
         }
         ColliderKind::CYLINDER => {
-            return cylinderFace(convex, n);
+            return cylinderFace(alias scratch, second, convex, n);
         }
         ColliderKind::CAPSULE => {
             let axis = convex.b - convex.a;
             if axis.dot(axis) > 0.0f && math::abs(axis.normalized().dot(n)) < ACROSS {
-                return Face(corners-> copy [convex.a + n * convex.margin, convex.b + n * convex.margin],
-                            normal-> n);
+                let dmut corners = alias scratch:.corners(second, 2us);
+                corners[0] = convex.a + n * convex.margin;
+                corners[1] = convex.b + n * convex.margin;
+                return Face(corners-> corners, normal-> n);
             }
         }
         _ => {}
     }
 
-    Face(corners-> copy [convex.support(n) + n * convex.margin], normal-> n)
+    let dmut corners = alias scratch:.corners(second, 1us);
+    corners[0] = convex.support(n) + n * convex.margin;
+    Face(corners-> corners, normal-> n)
 }
 
 /**
  * @returns: the face of a box (its centre a, its half sides u, v, w) the most
  * along a unit direction, its normal that of its plane when the box is sheared
  *
+ * @params:
+ *    - corners: where the four corners of the face are written
+ *
  * */
-fn boxFace(b: Convex, d: vec3)-> Face {
+fn boxFace(dmut corners: [vec3], b: Convex, d: vec3)-> Face {
     let axes = [b.u, b.v, b.w];
     let mut best = 0us;
     let mut normal = vec3();
@@ -104,11 +117,15 @@ fn boxFace(b: Convex, d: vec3)-> Face {
     let outward = if normal.dot(axes[best]) >= 0.0f { 1.0f } else { -1.0f };
     let c = b.a + axes[best] * outward;
     let s = axes[(best + 1us) % 3us], t = axes[(best + 2us) % 3us];
-    let corners = if outward > 0.0f {
-        copy [c - s - t, c + s - t, c + s + t, c - s + t]
+    corners[0] = c - s - t;
+    corners[2] = c + s + t;
+    if outward > 0.0f {
+        corners[1] = c + s - t;
+        corners[3] = c - s + t;
     } else {
-        copy [c - s - t, c - s + t, c + s + t, c + s - t]
-    };
+        corners[1] = c - s + t;
+        corners[3] = c + s - t;
+    }
 
     Face(corners-> corners,
          normal-> normal,
@@ -120,7 +137,7 @@ fn boxFace(b: Convex, d: vec3)-> Face {
  * corners and its normal in the world
  *
  * */
-fn hullFace(h: &ConvexHull, m: mat4, inverse: mat4, d: vec3)-> Face {
+fn hullFace(dmut scratch: &ContactScratch, second: bool, h: &ConvexHull, m: mat4, inverse: mat4, d: vec3)-> Face {
     let normals = inverse.mat3().transposed();
     let polygons = h.polygons;
     let mut best = 0us;
@@ -135,7 +152,11 @@ fn hullFace(h: &ConvexHull, m: mat4, inverse: mat4, d: vec3)-> Face {
 
     let p = polygons[best];
     let vertices = h.vertices;
-    let corners = copy [(m * makeVec4(vertices[c], 1.0f)).xyz for c in p.corners];
+    let dmut corners = alias scratch:.corners(second, p.corners.len);
+    for i in 0us .. p.corners.len {
+        corners[i] = (m * makeVec4(vertices[p.corners[i]], 1.0f)).xyz;
+    }
+
     Face(corners-> corners,
          normal-> (normals * p.normal).normalized(),
          index-> cast!u32(best))
@@ -148,7 +169,7 @@ fn hullFace(h: &ConvexHull, m: mat4, inverse: mat4, d: vec3)-> Face {
  * the rim the farthest along the direction otherwise
  *
  * */
-fn cylinderFace(c: Convex, d: vec3)-> Face {
+fn cylinderFace(dmut scratch: &ContactScratch, second: bool, c: Convex, d: vec3)-> Face {
     let mut axis = c.u.cross(c.w).normalized();
     if axis.dot(c.v) < 0.0f {
         axis = -axis;
@@ -158,10 +179,10 @@ fn cylinderFace(c: Convex, d: vec3)-> Face {
     if math::abs(along) > CAP_FACING {
         let sign = if along >= 0.0f { 1.0f } else { -1.0f };
         let centre = c.a + c.v * sign;
-        let mut corners: [vec3] = [];
+        let dmut corners = alias scratch:.corners(second, CAP_SIDES);
         for k in 0us .. CAP_SIDES {
             let angle = 2.0f * cast!f32(math::PI) * cast!f32(cast!u64(k)) / cast!f32(cast!u64(CAP_SIDES)) * sign;
-            corners ~= [centre + c.u * math::cos(angle) + c.w * math::sin(angle)];
+            corners[k] = centre + c.u * math::cos(angle) + c.w * math::sin(angle);
         }
 
         return Face(corners-> corners,
@@ -172,7 +193,10 @@ fn cylinderFace(c: Convex, d: vec3)-> Face {
     let du = d.dot(c.u), dw = d.dot(c.w);
     let radial = math::sqrt(du * du + dw * dw);
     let rim = if radial > 0.0f { c.u * (du / radial) + c.w * (dw / radial) } else { c.u };
-    Face(corners-> copy [c.a + rim - c.v, c.a + rim + c.v],
+    let dmut corners = alias scratch:.corners(second, 2us);
+    corners[0] = c.a + rim - c.v;
+    corners[1] = c.a + rim + c.v;
+    Face(corners-> corners,
          normal-> d,
          index-> 2u32)
 }

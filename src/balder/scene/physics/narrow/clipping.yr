@@ -21,23 +21,11 @@ def FACING = 0.95f;
 def CUT = 0x1000u32;
 
 /**
- * A corner of a polygon being clipped, and the feature it comes from
- * */
-@data
-record ClipVertex {
-
-    // The corner, in the world
-    let mut p: vec3 = vec3();
-
-    // The corner of the incident face it is, or the side and the edge cutting it
-    let mut id: u32 = 0u32;
-}
-
-/**
  * Clip the face of b against the face of a along a normal, or the other way
  * when the face of b is the most facing the other shape
  *
  * @params:
+ *    - scratch: the buffers the faces are clipped in
  *    - normal: the unit normal from a to b
  *    - speculative: the distance apart down to which the points are kept, of a negative depth
  *
@@ -52,8 +40,11 @@ record ClipVertex {
  * the push of a resting contact a little differently at each step
  *
  * */
-pub fn clipped(a: Collider, b: Collider, normal: vec3, speculative: f32)-> (vec3, [ContactPoint]) {
-    let fa = faces::supportFace(a, normal), fb = faces::supportFace(b, -normal);
+pub fn clipped(dmut scratch: &ContactScratch, a: Collider, b: Collider, normal: vec3, speculative: f32)
+    -> (vec3, [ContactPoint])
+{
+    let fa = faces::supportFace(alias scratch, a, normal, false);
+    let fb = faces::supportFace(alias scratch, b, -normal, true);
     let alignA = if fa.corners.len >= 3us { fa.normal.dot(normal) } else { -1.0f };
     let alignB = if fb.corners.len >= 3us { -fb.normal.dot(normal) } else { -1.0f };
     if comparison::max(alignA, alignB) < FACING {
@@ -62,10 +53,10 @@ pub fn clipped(a: Collider, b: Collider, normal: vec3, speculative: f32)-> (vec3
 
     // the reference face is the polygon the most facing the other shape
     if alignB > alignA + 1.0e-3f {
-        return (-fb.normal, clipFaces(fb, fa, true, speculative));
+        return (-fb.normal, clipFaces(alias scratch, fb, fa, true, speculative));
     }
 
-    (fa.normal, clipFaces(fa, fb, false, speculative))
+    (fa.normal, clipFaces(alias scratch, fa, fb, false, speculative))
 }
 
 /**
@@ -73,21 +64,31 @@ pub fn clipped(a: Collider, b: Collider, normal: vec3, speculative: f32)-> (vec3
  * a reference face, its corners under the reference plane kept
  *
  * @params:
+ *    - scratch: the buffers the polygons are clipped in, from one to the other at each side
  *    - reference: the polygon clipping, of the first shape unless flipped
  *    - incident: the face clipped, of the other shape
  *    - flipped: true when the reference face is of the second shape
  *    - speculative: the distance apart down to which the points are kept, of a negative depth
  *
- * @returns: the points of the incident face under the reference face, its
- * corners on the first shape then on the second, their feature telling the two
- * faces and the corner or the cut
+ * @returns: the points of the incident face under the reference face, four at
+ * most (see reduced), their corners on the first shape then on the second, their
+ * feature telling the two faces and the corner or the cut; a slice of their own
  *
  * */
-pub fn clipFaces(reference: faces::Face, incident: faces::Face, flipped: bool, speculative: f32)-> [ContactPoint] {
-    let mut polygon = copy [ClipVertex(p-> incident.corners[i], id-> cast!u32(i))
-                            for i in 0us .. incident.corners.len];
-
+pub fn clipFaces(dmut scratch: &ContactScratch, reference: faces::Face, incident: faces::Face, flipped: bool,
+                 speculative: f32)-> [ContactPoint] {
+    // a side cuts a convex polygon into one more corner at most
     let count = reference.corners.len;
+    let room = incident.corners.len + count;
+    let dmut polygon = alias scratch:.polygon(false, room);
+    let dmut polygonFeatures = alias scratch:.features(false, room);
+    let dmut clipped = alias scratch:.polygon(true, room);
+    let dmut clippedFeatures = alias scratch:.features(true, room);
+    for i in 0us .. incident.corners.len {
+        polygon[i] = incident.corners[i];
+        polygonFeatures[i] = cast!u32(i);
+    }
+
     let mut centre = vec3();
     for c in reference.corners {
         centre = centre + c;
@@ -96,6 +97,8 @@ pub fn clipFaces(reference: faces::Face, incident: faces::Face, flipped: bool, s
     centre = centre / cast!f32(cast!u64(count));
 
     let n = reference.normal;
+    let mut len = incident.corners.len;
+    let mut inClipped = false;
     for i in 0us .. count {
         let p = reference.corners[i], q = reference.corners[(i + 1us) % count];
         let mut side = (q - p).cross(n);
@@ -108,30 +111,46 @@ pub fn clipFaces(reference: faces::Face, incident: faces::Face, flipped: bool, s
             side = -side;
         }
 
-        polygon = clipBy(polygon, side, side.dot(p), cast!u32(i));
+        if inClipped {
+            len = clipBy(clipped, clippedFeatures, len, alias polygon, alias polygonFeatures, side, side.dot(p),
+                         cast!u32(i));
+        } else {
+            len = clipBy(polygon, polygonFeatures, len, alias clipped, alias clippedFeatures, side, side.dot(p),
+                         cast!u32(i));
+        }
+
+        inClipped = !inClipped;
     }
 
+    let corners = if inClipped { clipped } else { polygon };
+    let ids = if inClipped { clippedFeatures } else { polygonFeatures };
     let offset = n.dot(reference.corners[0]);
     let faces = ((reference.index & 0xFFu32) << 24u32) | ((incident.index & 0xFFu32) << 16u32)
               | (if flipped { 0x8000u32 } else { 0u32 });
 
-    let mut points: [ContactPoint] = [];
-    for v in polygon {
-        let depth = offset - n.dot(v.p);
+    let dmut points = alias scratch:.points(len);
+    let mut kept = 0us;
+    for k in 0us .. len {
+        let depth = offset - n.dot(corners[k]);
         if depth < -speculative {
             continue;
         }
 
-        let onReference = v.p + n * depth;
-        let (onA, onB) = if flipped { (v.p, onReference) } else { (onReference, v.p) };
-        points ~= [ContactPoint(point-> (onA + onB) / 2.0f,
-                                localA-> onA,
-                                localB-> onB,
-                                depth-> depth,
-                                feature-> faces | (v.id & 0x7FFFu32))];
+        let onReference = corners[k] + n * depth;
+        let (onA, onB) = if flipped { (corners[k], onReference) } else { (onReference, corners[k]) };
+        points[kept] = ContactPoint(point-> (onA + onB) / 2.0f,
+                                    localA-> onA,
+                                    localB-> onB,
+                                    depth-> depth,
+                                    feature-> faces | (ids[k] & 0x7FFFu32));
+        kept += 1us;
     }
 
-    points
+    if kept > 4us {
+        return reduced(points[0us .. kept], n);
+    }
+
+    copy points[0us .. kept]
 }
 
 /**
@@ -191,38 +210,52 @@ pub fn reduced(points: [ContactPoint], normal: vec3)-> [ContactPoint] {
 }
 
 /**
- * @returns: the part of a polygon (or a segment, or a point) behind a plane,
- * n.dot(p) <= offset, a point cut on an edge taking the id of the side and of
- * the edge
+ * Clip a polygon (or a segment, or a point) by a plane, the part behind it,
+ * n.dot(p) <= offset, written to another; a point cut on an edge taking the id
+ * of the side and of the edge
+ *
+ * @params:
+ *    - corners, ids: the corners of the polygon clipped and their features
+ *    - len: the number of corners of the polygon clipped
+ *    - outCorners, outIds: where the corners of the part behind the plane are written, one more than len at most
+ *
+ * @returns: the number of corners of the part behind the plane
  *
  * */
-fn clipBy(polygon: [ClipVertex], n: vec3, offset: f32, side: u32)-> [ClipVertex] {
-    if polygon.len == 0us {
-        return polygon;
+fn clipBy(corners: [vec3], ids: [u32], len: usize, dmut outCorners: [vec3], dmut outIds: [u32], n: vec3,
+          offset: f32, side: u32)-> usize {
+    if len == 0us {
+        return 0us;
     }
 
-    if polygon.len == 1us {
-        if n.dot(polygon[0].p) <= offset {
-            return polygon;
+    if len == 1us {
+        if n.dot(corners[0]) <= offset {
+            outCorners[0] = corners[0];
+            outIds[0] = ids[0];
+            return 1us;
         }
 
-        return [];
+        return 0us;
     }
 
-    if polygon.len == 2us {
-        return clipSegment(polygon[0], polygon[1], n, offset, side);
+    if len == 2us {
+        return clipSegment(corners, ids, alias outCorners, alias outIds, n, offset, side);
     }
 
-    let mut out: [ClipVertex] = [];
-    for i in 0us .. polygon.len {
-        let p = polygon[i], q = polygon[(i + 1us) % polygon.len];
-        let dp = n.dot(p.p) - offset, dq = n.dot(q.p) - offset;
+    let mut out = 0us;
+    for i in 0us .. len {
+        let j = (i + 1us) % len;
+        let dp = n.dot(corners[i]) - offset, dq = n.dot(corners[j]) - offset;
         if dp <= 0.0f {
-            out ~= [p];
+            outCorners[out] = corners[i];
+            outIds[out] = ids[i];
+            out += 1us;
         }
 
         if (dp < 0.0f && dq > 0.0f) || (dp > 0.0f && dq < 0.0f) {
-            out ~= [cut(p, q, dp, dq, side)];
+            outCorners[out] = cutOf(corners[i], corners[j], dp, dq);
+            outIds[out] = cutId(ids[i], side);
+            out += 1us;
         }
     }
 
@@ -230,31 +263,43 @@ fn clipBy(polygon: [ClipVertex], n: vec3, offset: f32, side: u32)-> [ClipVertex]
 }
 
 /**
- * @returns: the part of a segment behind a plane, its ends in their order
+ * Clip a segment by a plane, the part behind it written to another, its ends in their order
+ * @returns: the number of ends of the part behind the plane
  * */
-fn clipSegment(p: ClipVertex, q: ClipVertex, n: vec3, offset: f32, side: u32)-> [ClipVertex] {
-    let dp = n.dot(p.p) - offset, dq = n.dot(q.p) - offset;
+fn clipSegment(corners: [vec3], ids: [u32], dmut outCorners: [vec3], dmut outIds: [u32], n: vec3, offset: f32,
+               side: u32)-> usize {
+    let dp = n.dot(corners[0]) - offset, dq = n.dot(corners[1]) - offset;
     if dp > 0.0f && dq > 0.0f {
-        return [];
+        return 0us;
     }
 
     if dp <= 0.0f && dq <= 0.0f {
-        return copy [p, q];
+        outCorners[0] = corners[0]; outIds[0] = ids[0];
+        outCorners[1] = corners[1]; outIds[1] = ids[1];
+        return 2us;
     }
 
     if dp <= 0.0f {
-        return copy [p, cut(p, q, dp, dq, side)];
+        outCorners[0] = corners[0]; outIds[0] = ids[0];
+        outCorners[1] = cutOf(corners[0], corners[1], dp, dq); outIds[1] = cutId(ids[0], side);
+        return 2us;
     }
 
-    copy [cut(p, q, dp, dq, side), q]
+    outCorners[0] = cutOf(corners[0], corners[1], dp, dq); outIds[0] = cutId(ids[0], side);
+    outCorners[1] = corners[1]; outIds[1] = ids[1];
+    2us
 }
 
 /**
- * @returns: the point where an edge crosses a plane, of the id of the side
- * cutting it and of the corner the edge starts from
- *
+ * @returns: the point where an edge crosses a plane, its ends at signed distances dp and dq from it
  * */
-fn cut(p: ClipVertex, q: ClipVertex, dp: f32, dq: f32, side: u32)-> ClipVertex {
-    ClipVertex(p-> p.p + (q.p - p.p) * (dp / (dp - dq)),
-               id-> CUT | ((side & 0x3Fu32) << 6u32) | (p.id & 0x3Fu32))
+fn cutOf(p: vec3, q: vec3, dp: f32, dq: f32)-> vec3 {
+    p + (q - p) * (dp / (dp - dq))
+}
+
+/**
+ * @returns: the id of a point cut on an edge, of the side cutting it and of the corner the edge starts from
+ * */
+fn cutId(from: u32, side: u32)-> u32 {
+    CUT | ((side & 0x3Fu32) << 6u32) | (from & 0x3Fu32)
 }

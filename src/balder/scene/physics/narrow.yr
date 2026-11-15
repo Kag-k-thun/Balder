@@ -18,6 +18,20 @@ use std::algorithm::comparison;
 def ORTHOGONAL = 1.0e-4f;
 
 /**
+ * The distance under which a point of a step is the point of the step before,
+ * on both shapes, in their spaces
+ *
+ * */
+def PERSIST_DISTANCE = 0.02f;
+
+/**
+ * The cosine of the angle the normal may turn by between two steps, the
+ * friction of the points carried
+ *
+ * */
+def FRICTION_KEPT = 0.99f;
+
+/**
  * Find where two colliders touch, or are within a speculative distance of each
  * other
  *
@@ -31,28 +45,106 @@ def ORTHOGONAL = 1.0e-4f;
  * spaces of the colliders, four at most; none when the colliders are farther
  * apart than the speculative distance
  *
+ * @info: builds buffers of its own to clip the faces in; a world finding the contacts of many pairs reuses its own
+ * (see collideWith)
+ *
  * */
 pub fn collide(a: Collider, b: Collider, speculative: f32, previous: [ContactManifold] = [])-> [ContactManifold] {
-    let mut result: [ContactManifold] = [];
-    for m in subManifolds(a, b, speculative) {
-        let points = clipping::reduced(m.points, m.normal);
-        let local = copy [ContactPoint(point-> p.point,
-                                       localA-> (a.inverse * makeVec4(p.localA, 1.0f)).xyz,
-                                       localB-> (b.inverse * makeVec4(p.localB, 1.0f)).xyz,
-                                       depth-> p.depth,
-                                       feature-> p.feature)
-                          for p in points];
+    let dmut scratch = copy ContactScratch();
+    collideWith(alias scratch, a, b, speculative, previous)
+}
 
-        let mut placed = ContactManifold(m.key, m.normal, local);
-        for old in previous if old.key == placed.key {
-            placed = placed.persisted(old);
-            break;
+/**
+ * Find where two colliders touch, or are within a speculative distance of each other, the faces clipped in the
+ * buffers of a scratch (see collide)
+ *
+ * @params:
+ *    - scratch: the buffers the faces are clipped in, reused from pair to pair
+ *
+ * */
+pub fn collideWith(dmut scratch: &ContactScratch, a: Collider, b: Collider, speculative: f32,
+                   previous: [ContactManifold])-> [ContactManifold] {
+    if !a.isCompound && !b.isCompound && !a.isMesh && !b.isMesh {
+        if let Ok(m) = convexManifold(alias scratch, a, b, speculative) {
+            return copy [placed(a, b, m, previous)];
         }
 
-        result ~= [placed];
+        return [];
+    }
+
+    let mut result: [ContactManifold] = [];
+    for m in subManifolds(alias scratch, a, b, speculative) {
+        result ~= [placed(a, b, m, previous)];
     }
 
     result
+}
+
+/**
+ * @returns: a manifold of two colliders, its points reduced to four, in the
+ * spaces of the colliders, given the impulses of the points of the step before
+ * they are found again in: the point of the same feature, or the closest within
+ * PERSIST_DISTANCE on both shapes; the friction carried only while the normal
+ * turns little
+ *
+ * @params:
+ *    - m: the manifold, its points in the world
+ *    - previous: the manifolds of the pair at the step before, the one of the same key carrying its impulses
+ *
+ * */
+fn placed(a: Collider, b: Collider, m: ContactManifold, previous: [ContactManifold])-> ContactManifold {
+    let points = clipping::reduced(m.points, m.normal);
+    let dmut local = copy [ContactPoint(point-> p.point,
+                                        localA-> (a.inverse * makeVec4(p.localA, 1.0f)).xyz,
+                                        localB-> (b.inverse * makeVec4(p.localB, 1.0f)).xyz,
+                                        depth-> p.depth,
+                                        feature-> p.feature)
+                           for p in points];
+
+    for old in previous if old.key == m.key {
+        carryImpulses(alias local, m.normal, old);
+        break;
+    }
+
+    ContactManifold(m.key, m.normal, local)
+}
+
+/**
+ * Give the points of a manifold the impulses of the points of the manifold of the step before they are found again
+ * in (see placed)
+ *
+ * @params:
+ *    - points: the points, in the spaces of the colliders
+ *    - normal: the normal of their manifold
+ *    - previous: the manifold of the same key at the step before
+ *
+ * */
+fn carryImpulses(dmut points: [ContactPoint], normal: vec3, previous: ContactManifold) {
+    let keepFriction = normal.dot(previous.normal) >= FRICTION_KEPT;
+    for i in 0us .. points.len {
+        let p = points[i];
+        let mut best: (ContactPoint)? = none;
+        let mut closest = PERSIST_DISTANCE;
+        for old in previous.points {
+            if p.feature != NO_FEATURE && old.feature == p.feature {
+                best = old?;
+                break;
+            }
+
+            let d = comparison::max((old.localA - p.localA).length(), (old.localB - p.localB).length());
+            if d < closest {
+                closest = d;
+                best = old?;
+            }
+        }
+
+        if let Ok(old) = best {
+            points[i].normalImpulse = old.normalImpulse;
+            if keepFriction {
+                points[i].frictionImpulse = old.frictionImpulse;
+            }
+        }
+    }
 }
 
 /**
@@ -62,7 +154,7 @@ pub fn collide(a: Collider, b: Collider, speculative: f32, previous: [ContactMan
  * triangle in its low bits), or the two convex shapes
  *
  * */
-fn subManifolds(a: Collider, b: Collider, speculative: f32)-> [ContactManifold] {
+fn subManifolds(dmut scratch: &ContactScratch, a: Collider, b: Collider, speculative: f32)-> [ContactManifold] {
     if a.isCompound || b.isCompound {
         let partsA = if a.isCompound { a.parts } else { copy [a] };
         let partsB = if b.isCompound { b.parts } else { copy [b] };
@@ -78,7 +170,7 @@ fn subManifolds(a: Collider, b: Collider, speculative: f32)-> [ContactManifold] 
 
                 // the part of the compound (of a when both are), then the part of b or the triangle of a mesh
                 let high = if a.isCompound { i } else { j };
-                for m in subManifolds(pa, pb, speculative) {
+                for m in subManifolds(alias scratch, pa, pb, speculative) {
                     let low = if pa.isMesh || pb.isMesh {
                         m.key
                     } else if a.isCompound && b.isCompound {
@@ -96,14 +188,14 @@ fn subManifolds(a: Collider, b: Collider, speculative: f32)-> [ContactManifold] 
     }
 
     if a.isMesh {
-        return mesh::meshManifolds(a, b, speculative);
+        return mesh::meshManifolds(alias scratch, a, b, speculative);
     }
 
     if b.isMesh {
-        return copy [flipped(m) for m in mesh::meshManifolds(b, a, speculative)];
+        return copy [flipped(m) for m in mesh::meshManifolds(alias scratch, b, a, speculative)];
     }
 
-    if let Ok(m) = convexManifold(a, b, speculative) {
+    if let Ok(m) = convexManifold(alias scratch, a, b, speculative) {
         return copy [m];
     }
 
@@ -116,17 +208,17 @@ fn subManifolds(a: Collider, b: Collider, speculative: f32)-> [ContactManifold] 
  * penetration and the points of their faces clipped
  *
  * */
-fn convexManifold(a: Collider, b: Collider, speculative: f32)-> (ContactManifold)? {
+fn convexManifold(dmut scratch: &ContactScratch, a: Collider, b: Collider, speculative: f32)-> (ContactManifold)? {
     if a.isPlane && b.isPlane {
         return none;
     }
 
     if a.isPlane {
-        return planeManifold(a.plane, b, speculative);
+        return planeManifold(alias scratch, a.plane, b, speculative);
     }
 
     if b.isPlane {
-        if let Ok(m) = planeManifold(b.plane, a, speculative) {
+        if let Ok(m) = planeManifold(alias scratch, b.plane, a, speculative) {
             return flipped(m)?;
         }
 
@@ -135,7 +227,7 @@ fn convexManifold(a: Collider, b: Collider, speculative: f32)-> (ContactManifold
 
     // in the order of their kinds, so that a closed form is written for one order, the result flipped back
     if cast!u32(a.shape.kind) > cast!u32(b.shape.kind) {
-        if let Ok(m) = convexManifold(b, a, speculative) {
+        if let Ok(m) = convexManifold(alias scratch, b, a, speculative) {
             return flipped(m)?;
         }
 
@@ -161,7 +253,7 @@ fn convexManifold(a: Collider, b: Collider, speculative: f32)-> (ContactManifold
     }
 
     if ka == ColliderKind::BOX && kb == ColliderKind::BOX && orthogonal(ca) && orthogonal(cb) {
-        return boxManifold(a, b, ca, cb, speculative);
+        return boxManifold(alias scratch, a, b, ca, cb, speculative);
     }
 
     let mut normal = vec3();
@@ -176,7 +268,7 @@ fn convexManifold(a: Collider, b: Collider, speculative: f32)-> (ContactManifold
         normal = s.normal;
     }
 
-    let (faceNormal, points) = clipping::clipped(a, b, normal, speculative);
+    let (faceNormal, points) = clipping::clipped(alias scratch, a, b, normal, speculative);
     if points.len > 0us {
         return ContactManifold(0u64, faceNormal, points)?;
     }
@@ -191,14 +283,16 @@ fn convexManifold(a: Collider, b: Collider, speculative: f32)-> (ContactManifold
  * point of their penetration for two edges
  *
  * */
-fn boxManifold(a: Collider, b: Collider, ca: Convex, cb: Convex, speculative: f32)-> (ContactManifold)? {
+fn boxManifold(dmut scratch: &ContactScratch, a: Collider, b: Collider, ca: Convex, cb: Convex, speculative: f32)
+    -> (ContactManifold)?
+{
     let (normal, depth, face) = primitives::boxAxis(ca, cb);
     if depth < -speculative {
         return none;
     }
 
     if face {
-        let (faceNormal, points) = clipping::clipped(a, b, normal, speculative);
+        let (faceNormal, points) = clipping::clipped(alias scratch, a, b, normal, speculative);
         if points.len > 0us {
             return ContactManifold(0u64, faceNormal, points)?;
         }
@@ -214,29 +308,37 @@ fn boxManifold(a: Collider, b: Collider, ca: Convex, cb: Convex, speculative: f3
  * point
  *
  * */
-fn planeManifold(plane: Plane, other: Collider, speculative: f32)-> (ContactManifold)? {
+fn planeManifold(dmut scratch: &ContactScratch, plane: Plane, other: Collider, speculative: f32)
+    -> (ContactManifold)?
+{
     let convex = other.convex();
     if convex.kind == ConvexKind::POINT || convex.kind == ConvexKind::SEGMENT {
         return primitives::capsulePlane(plane, convex.a, convex.b, convex.margin, speculative);
     }
 
     let n = plane.normal;
-    let face = faces::supportFace(other, -n);
-    let mut points: [ContactPoint] = [];
+    let face = faces::supportFace(alias scratch, other, -n, true);
+    let dmut points = alias scratch:.points(face.corners.len);
+    let mut kept = 0us;
     for i in 0us .. face.corners.len {
         let corner = face.corners[i];
         let depth = -plane.signedDistance(corner);
         if depth >= -speculative {
-            points ~= [ContactPoint(point-> corner + n * (depth / 2.0f),
-                                    localA-> corner + n * depth,
-                                    localB-> corner,
-                                    depth-> depth,
-                                    feature-> ((face.index & 0xFFu32) << 16u32) | cast!u32(i))];
+            points[kept] = ContactPoint(point-> corner + n * (depth / 2.0f),
+                                        localA-> corner + n * depth,
+                                        localB-> corner,
+                                        depth-> depth,
+                                        feature-> ((face.index & 0xFFu32) << 16u32) | cast!u32(i));
+            kept += 1us;
         }
     }
 
-    if points.len > 0us {
-        return ContactManifold(0u64, n, points)?;
+    if kept > 4us {
+        return ContactManifold(0u64, n, clipping::reduced(points[0us .. kept], n))?;
+    }
+
+    if kept > 0us {
+        return ContactManifold(0u64, n, copy points[0us .. kept])?;
     }
 
     let lowest = convex.support(-n) - n * convex.margin;
