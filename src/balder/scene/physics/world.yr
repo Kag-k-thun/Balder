@@ -6,6 +6,7 @@ mod ::utils;
 use balder::core::config::physics;
 use balder::math::{bounds, matrix, quaternion, rigid_transform, vector};
 
+use std::math;
 use std::algorithm::{comparison, sorting};
 
 /**
@@ -40,6 +41,16 @@ def SPECULATIVE_FLOOR = 0.02f;
  *
  * */
 def STEP = 1.0f / 60.0f;
+
+/**
+ * The distance under which a kinematic body is not moved between two ticks, in metres
+ * */
+def STILL_MOVE = 1.0e-6f;
+
+/**
+ * The difference from 1 of the cosine of half the angle under which a kinematic body is not turned between two ticks
+ * */
+def STILL_TURN = 1.0e-6f;
 
 /**
  * The index of no island
@@ -128,6 +139,12 @@ pub class PhysicsWorld {
 
     // The poses of the bodies before the last step, by handle, the display interpolating from them
     let dmut _previous: [RigidTransform] = [];
+
+    // The poses of the kinematic bodies at the last derivation of their velocities, by handle
+    let dmut _kinematicFrom: [u32 => RigidTransform] = copy [];
+
+    // The kinematic bodies whose velocities were set rather than derived from their moves, until they move again
+    let dmut _kinematicSet: [u32 => bool] = copy [];
 
     pub self () {}
 
@@ -351,6 +368,8 @@ pub class PhysicsWorld {
 
         self:.unindex(handle, self._bodies[handle].collider.isPlane);
         self._moved:.remove(handle);
+        self._kinematicFrom:.remove(handle);
+        self._kinematicSet:.remove(handle);
         self._bodies[handle] = WorldBody(next-> self._free);
         self._states[handle] = BodyState();
         self._free = handle;
@@ -431,7 +450,46 @@ pub class PhysicsWorld {
 
         self._states[handle].linearVelocity = linear;
         self._states[handle].angularVelocity = angular;
+        if self._bodies[handle].settings.motion == BodyMotion::KINEMATIC {
+            self._kinematicSet[handle] = true;
+        }
+
         self:.wake(handle);
+    }
+
+    /**
+     * Give the kinematic bodies the velocities of their moves since the last call, the solver pushing and carrying
+     * what they touch with them: the displacement over the duration, the rotation from the orientation before to the
+     * one now
+     *
+     * @params:
+     *    - seconds: the time since the last call, a tick of a scene
+     *
+     * @info: a kinematic body not moved has no velocity, unless its velocity was set (see setVelocity), kept until it
+     * moves again; the steps do not move a kinematic body, the game placing it
+     *
+     * */
+    pub fn deriveKinematics(mut self, seconds: f32) {
+        if seconds <= 0.0f { return; }
+
+        for i in 0us .. self._bodies.len {
+            let h = cast!u32(i);
+            if !self.contains(h) || self._bodies[i].settings.motion != BodyMotion::KINEMATIC { continue; }
+
+            let now = self._states[i].pose;
+            if let Ok(before) = self._kinematicFrom[h] {
+                let moved = (now.position - before.position).length() > STILL_MOVE
+                         || math::abs(now.rotation.dot(before.rotation)) < 1.0f - STILL_TURN;
+                if moved || !(h in self._kinematicSet) {
+                    let (angle, axis) = (now.rotation * before.rotation.inversed()).normalized().axisAngle();
+                    self._states[i].linearVelocity = (now.position - before.position) / seconds;
+                    self._states[i].angularVelocity = axis * (angle / seconds);
+                    self._kinematicSet:.remove(h);
+                }
+            }
+
+            self._kinematicFrom[h] = now;
+        }
     }
 
     /**
