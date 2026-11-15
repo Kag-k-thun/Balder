@@ -1,0 +1,234 @@
+in manifolds;
+
+use balder::core::error;
+use balder::math::{matrix, quaternion, rigid_transform, utils, vector};
+use balder::scene::physics;
+use balder::scene::physics::narrow;
+
+use integration::utils::{compare, physics};
+
+use std::math;
+
+/**
+ * @returns: a box of side 2 at a position, turned
+ * */
+fn cubeAt(at: vec3, q: Quaternion = Quaternion())-> Collider {
+    Collider(cube(), translation(at) * q.matrix())
+}
+
+/**
+ * @returns: the hull of the corners of a cube of side 2 centred on the origin
+ * */
+fn cubeHull()-> ColliderShape
+    throws BalderError
+{
+    let mut corners: [vec3] = [];
+    for x in [-1.0f, 1.0f] {
+        for y in [-1.0f, 1.0f] {
+            for z in [-1.0f, 1.0f] {
+                corners ~= [makeVec3(x, y, z)];
+            }
+        }
+    }
+
+    ColliderShape::hull(copy ConvexHull(corners))
+}
+
+/**
+ * @returns: the ground, the half space under y = 0
+ * */
+fn ground()-> Collider {
+    Collider(ColliderShape::plane(), mat4())
+}
+
+__test the_flat_faces_of_a_hull_of_a_cube_are_its_six_squares {
+    if let Ok(h) = cubeHull().convexHull {
+        assert(h.faces.len == 12us && h.polygons.len == 6us);
+        for p in h.polygons {
+            assert(p.corners.len == 4us);
+
+            // counterclockwise around the normal
+            let v = h.vertices;
+            let a = v[p.corners[0]], b = v[p.corners[1]], c = v[p.corners[2]];
+            assert((b - a).cross(c - a).dot(p.normal) > 0.0f);
+        }
+    } else { assert(false); }
+}
+
+__test the_shared_diagonal_of_a_flat_floor_is_an_inactive_edge {
+    let shape = ColliderShape::mesh(floorMesh());
+    assert(shape.activeEdges.len == 2us);
+
+    // the diagonal is the edge ca of the first triangle, ab of the second
+    assert(shape.activeEdges[0] == 3u8 && shape.activeEdges[1] == 6u8);
+}
+
+__test a_box_resting_on_a_box_touches_at_the_four_corners_of_their_overlap {
+    let ms = narrow::collide(cubeAt(vec3()), cubeAt(makeVec3(0.3f, 1.99f, 0.0f)), 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 4us && ms[0].touching);
+    assert(near(ms[0].normal, makeVec3(0.0f, 1.0f, 0.0f), tolerance-> 0.001f));
+    for p in ms[0].points {
+        assert(near(p.depth, 0.01f, tolerance-> 0.001f) && p.feature != NO_FEATURE);
+        assert(p.point.x >= -0.701f && p.point.x <= 1.001f);
+    }
+}
+
+__test a_box_on_a_plane_touches_at_its_four_lowest_corners {
+    let ms = narrow::collide(ground(), cubeAt(makeVec3(0.0f, 0.99f, 0.0f)), 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 4us && near(ms[0].normal, makeVec3(0.0f, 1.0f, 0.0f)));
+    for p in ms[0].points {
+        assert(near(p.depth, 0.01f) && near(p.localA.y, 0.0f) && near(p.localB.y, -1.0f));
+    }
+
+    // the plane second: the normal from the box to the plane
+    let flipped = narrow::collide(cubeAt(makeVec3(0.0f, 0.99f, 0.0f)), ground(), 0.02f);
+    assert(flipped.len == 1us && near(flipped[0].normal, makeVec3(0.0f, -1.0f, 0.0f)));
+}
+
+__test a_box_tilted_on_a_plane_touches_at_its_lowest_edge {
+    let q = Quaternion::fromAxisAngle(cast!f32(math::PI) / 4.0f, makeVec3(0.0f, 0.0f, 1.0f));
+    let ms = narrow::collide(ground(), cubeAt(makeVec3(0.0f, math::sqrt(2.0f) - 0.01f, 0.0f), q-> q), 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 2us);
+    for p in ms[0].points {
+        assert(near(p.depth, 0.01f, tolerance-> 0.001f));
+    }
+}
+
+__test a_box_a_little_above_a_plane_makes_speculative_points {
+    let ms = narrow::collide(ground(), cubeAt(makeVec3(0.0f, 1.01f, 0.0f)), 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 4us && !ms[0].touching);
+    assert(near(ms[0].points[0].depth, -0.01f));
+
+    assert(narrow::collide(ground(), cubeAt(makeVec3(0.0f, 1.05f, 0.0f)), 0.02f).len == 0us);
+}
+
+__test two_boxes_crossed_edge_on_edge_touch_at_one_point {
+    let q = Quaternion::fromAxisAngle(cast!f32(math::PI) / 4.0f, makeVec3(1.0f, 0.0f, 0.0f));
+    let r = Quaternion::fromAxisAngle(cast!f32(math::PI) / 4.0f, makeVec3(0.0f, 0.0f, 1.0f));
+    let ms = narrow::collide(cubeAt(vec3(), q-> q), cubeAt(makeVec3(0.0f, 2.8f, 0.0f), q-> r), 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 1us);
+    assert(near(ms[0].normal, makeVec3(0.0f, 1.0f, 0.0f), tolerance-> 0.001f));
+    assert(near(ms[0].points[0].depth, 2.0f * math::sqrt(2.0f) - 2.8f, tolerance-> 0.001f));
+}
+
+__test a_capsule_lying_on_a_box_touches_at_its_two_ends {
+    let lying = Quaternion::fromAxisAngle(cast!f32(math::PI) / 2.0f, makeVec3(0.0f, 0.0f, 1.0f));
+    let capsule = Collider(ColliderShape::capsule(0.5f, 3.0f), translation(makeVec3(0.0f, 1.49f, 0.0f)) * lying.matrix());
+    let ms = narrow::collide(cubeAt(vec3()), capsule, 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 2us && near(ms[0].normal, makeVec3(0.0f, 1.0f, 0.0f), tolerance-> 0.001f));
+    for p in ms[0].points {
+        assert(near(p.depth, 0.01f, tolerance-> 0.001f));
+    }
+}
+
+__test a_sphere_on_a_box_takes_the_closed_form_in_either_order {
+    let ball = Collider(ColliderShape::sphere(0.5f), translation(makeVec3(0.2f, 1.49f, 0.0f)));
+    let ms = narrow::collide(cubeAt(vec3()), ball, 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 1us && near(ms[0].normal, makeVec3(0.0f, 1.0f, 0.0f)));
+    assert(near(ms[0].points[0].depth, 0.01f));
+
+    // the sphere first: the normal and the sides of the point turned over
+    let flipped = narrow::collide(ball, cubeAt(vec3()), 0.02f);
+    assert(flipped.len == 1us && near(flipped[0].normal, makeVec3(0.0f, -1.0f, 0.0f)));
+    assert(near(flipped[0].points[0].localA, makeVec3(0.0f, -0.5f, 0.0f)));
+    assert(near(flipped[0].points[0].localB, makeVec3(0.2f, 1.0f, 0.0f)));
+}
+
+__test a_hull_resting_on_a_box_or_a_plane_touches_at_the_corners_of_its_face {
+    let hull = Collider(cubeHull(), translation(makeVec3(0.0f, 1.99f, 0.0f)));
+    let ms = narrow::collide(cubeAt(vec3()), hull, 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 4us && near(ms[0].normal, makeVec3(0.0f, 1.0f, 0.0f), tolerance-> 0.001f));
+
+    let onGround = narrow::collide(Collider(cubeHull(), translation(makeVec3(0.0f, 0.99f, 0.0f))), ground(), 0.02f);
+    assert(onGround.len == 1us && onGround[0].points.len == 4us);
+}
+
+__test a_cylinder_standing_on_a_plane_touches_at_four_points_of_its_rim {
+    let can = Collider(ColliderShape::cylinder(0.5f, 2.0f), translation(makeVec3(0.0f, 0.99f, 0.0f)));
+    let ms = narrow::collide(ground(), can, 0.02f);
+    assert(ms.len == 1us && ms[0].points.len == 4us);
+    for p in ms[0].points {
+        assert(near(makeVec3(p.point.x, 0.0f, p.point.z).length(), 0.5f, tolerance-> 0.001f) && near(p.depth, 0.01f));
+    }
+
+    // lying on its side, along the segment of its side
+    let lying = Quaternion::fromAxisAngle(cast!f32(math::PI) / 2.0f, makeVec3(1.0f, 0.0f, 0.0f));
+    let side = narrow::collide(ground(), Collider(ColliderShape::cylinder(0.5f, 2.0f),
+                                                  translation(makeVec3(0.0f, 0.49f, 0.0f)) * lying.matrix()), 0.02f);
+    assert(side.len == 1us && side[0].points.len == 2us);
+}
+
+__test the_points_found_again_keep_their_impulses {
+    let a = cubeAt(vec3());
+    let first = narrow::collide(a, cubeAt(makeVec3(0.3f, 1.99f, 0.0f)), 0.02f);
+    let dmut points = copy first[0].points;
+    for i in 0us .. points.len {
+        points[i].normalImpulse = cast!f32(cast!u64(i + 1us));
+        points[i].frictionImpulse = makeVec3(1.0f, 0.0f, 0.0f);
+    }
+
+    // moved by a millimetre: the same corners, the same impulses
+    let previous = copy [ContactManifold(first[0].key, first[0].normal, points)];
+    let again = narrow::collide(a, cubeAt(makeVec3(0.301f, 1.99f, 0.0f)), 0.02f, previous-> previous);
+    let mut sum = 0.0f;
+    for p in again[0].points {
+        assert(p.normalImpulse > 0.0f && near(p.frictionImpulse, makeVec3(1.0f, 0.0f, 0.0f)));
+        sum += p.normalImpulse;
+    }
+
+    assert(near(sum, 10.0f));
+
+    // moved away from them: nothing found again
+    let far = narrow::collide(a, cubeAt(makeVec3(-0.5f, 1.99f, 0.5f)), 0.02f, previous-> previous);
+    for p in far[0].points {
+        assert(p.normalImpulse == 0.0f);
+    }
+}
+
+__test a_box_sliding_over_the_diagonal_of_a_floor_of_two_triangles_keeps_the_normal_of_the_floor {
+    let mesh = Collider(ColliderShape::mesh(floorMesh()), mat4());
+    for x in [-0.4f, -0.1f, 0.0f, 0.1f, 0.4f] {
+        let small = Collider(ColliderShape::box(makeVec3(0.4f, 0.4f, 0.4f)), translation(makeVec3(x, 0.19f, x)));
+        let ms = narrow::collide(mesh, small, 0.02f);
+        let mut count = 0us;
+        assert(ms.len > 0us);
+        for m in ms {
+            assert(near(m.normal, makeVec3(0.0f, 1.0f, 0.0f), tolerance-> 0.001f));
+            for p in m.points {
+                assert(near(p.depth, 0.01f, tolerance-> 0.001f));
+                count += 1us;
+            }
+        }
+
+        assert(count >= 4us);
+    }
+}
+
+__test a_compound_touches_by_each_part_that_reaches {
+    let parts = copy CompoundShape(copy [CompoundPart(shape-> ColliderShape::sphere(0.5f),
+                                                      place-> RigidTransform(position-> makeVec3(-3.0f, 0.0f, 0.0f))),
+                                         CompoundPart(shape-> ColliderShape::sphere(0.5f),
+                                                      place-> RigidTransform(position-> makeVec3(3.0f, 0.0f, 0.0f)))]);
+    let dumbbell = Collider(ColliderShape::compound(parts), translation(makeVec3(0.0f, 0.49f, 0.0f)));
+    let ms = narrow::collide(ground(), dumbbell, 0.02f);
+    assert(ms.len == 2us && ms[0].key != ms[1].key);
+    for m in ms {
+        assert(m.points.len == 1us && near(m.points[0].depth, 0.01f));
+    }
+}
+
+__test a_pair_of_the_world_keeps_its_manifolds_and_touches_by_them {
+    let dmut world = copy PhysicsWorld();
+    let floor = world:.add(ColliderShape::plane(), mat4());
+    let box = world:.add(cube(), translation(makeVec3(0.0f, 1.01f, 0.0f)),
+                         settings-> BodySettings(motion-> BodyMotion::KINEMATIC));
+
+    // a centimetre above: speculative points only, no contact
+    assert(world:.updateContacts().len == 0us);
+    assert(world.pairs.len == 1us && world.pairs[0].manifolds.len == 1us && !world.pairs[0].touching);
+
+    world:.setTransform(box, translation(makeVec3(0.0f, 0.99f, 0.0f)));
+    let events = world:.updateContacts();
+    assert(events.len == 1us && events[0].a == floor && events[0].b == box);
+    assert(world.pairs[0].manifolds[0].points.len == 4us && world.pairs[0].touching);
+}
