@@ -1,0 +1,273 @@
+in main;
+
+use balder::math::{bounds, matrix, quaternion, utils, vector};
+use balder::scene::physics;
+
+use std::{io, math, time};
+use std::algorithm::comparison;
+use std::config;
+use std::config::args;
+
+/**
+ * The duration of a step, at 60 steps a second
+ * */
+def DT = 1.0f / 60.0f;
+
+/**
+ * What a run of the benchmark builds and steps
+ * */
+@data
+record Run {
+
+    // The scene: pile, pyramid, spheres or mix
+    let mut scene: [c8] = "pile";
+
+    // The dynamic bodies of the scene
+    let mut count: u32 = 1000u32;
+
+    // The steps run
+    let mut steps: u32 = 600u32;
+
+    // The steps averaged on a line of the report
+    let mut window: u32 = 60u32;
+
+    // False when the bodies never sleep, every step solving them all
+    let mut canSleep: bool = true;
+}
+
+/**
+ * The sums of the timings of the steps of a window, and the costliest step
+ * */
+@data
+record Window {
+    let mut pairs: u64 = 0u64;
+    let mut manifolds: u64 = 0u64;
+    let mut islands: u64 = 0u64;
+    let mut solve: u64 = 0u64;
+    let mut sleep: u64 = 0u64;
+    let mut total: u64 = 0u64;
+    let mut worst: u64 = 0u64;
+    let mut steps: u64 = 0u64;
+    let mut last: StepTimings = StepTimings();
+}
+
+/**
+ * @returns: the settings of a dynamic body
+ * */
+fn dynamic(canSleep: bool)-> BodySettings {
+    BodySettings(motion-> BodyMotion::DYNAMIC, mass-> 1.0f, friction-> 0.6f, canSleep-> canSleep)
+}
+
+/**
+ * Add the static floor of a scene: a plane, or a grid of triangles for the spheres
+ * */
+fn addFloor(dmut world: &PhysicsWorld, mesh: bool) {
+    if !mesh {
+        world:.add(ColliderShape::plane(), mat4());
+        return;
+    }
+
+    let side = 64u32, size = 1.0f;
+    let mut positions: [vec3] = [];
+    let half = cast!f32(side) * size / 2.0f;
+    for z in 0u32 .. side + 1u32 {
+        for x in 0u32 .. side + 1u32 {
+            positions ~= [makeVec3(cast!f32(x) * size - half, 0.0f, cast!f32(z) * size - half)];
+        }
+    }
+
+    let mut indices: [u32] = [];
+    for z in 0u32 .. side {
+        for x in 0u32 .. side {
+            let i = z * (side + 1u32) + x;
+            indices ~= [i, i + side + 1u32, i + 1u32, i + 1u32, i + side + 1u32, i + side + 2u32];
+        }
+    }
+
+    world:.add(ColliderShape::mesh(copy TriangleBvh(positions, indices)), mat4());
+}
+
+/**
+ * Build a pile: columns of unit boxes on a plane, ten high, a little apart and turned so that they topple
+ * */
+fn pile(dmut world: &PhysicsWorld, run: Run) {
+    addFloor(alias world, false);
+    let columns = cast!u32(math::ceil(math::sqrt(cast!f32(run.count) / 10.0f)));
+    let mut n = 0u32;
+    for y in 0u32 .. 10u32 {
+        for z in 0u32 .. columns {
+            for x in 0u32 .. columns {
+                if n == run.count { return; }
+
+                let at = makeVec3(cast!f32(x) * 1.6f, 0.5f + cast!f32(y) * 1.1f, cast!f32(z) * 1.6f);
+                let turn = Quaternion::fromAxisAngle(0.1f * cast!f32(n % 7u32), makeVec3(0.0f, 1.0f, 0.0f));
+                world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)), translation(at) * turn.matrix(),
+                           settings-> dynamic(run.canSleep));
+                n += 1u32;
+            }
+        }
+    }
+}
+
+/**
+ * Build pyramids of unit boxes, each a wall of rows one box shorter than the row under it, side by side until count
+ * */
+fn pyramid(dmut world: &PhysicsWorld, run: Run) {
+    addFloor(alias world, false);
+    let base = 20u32;
+    let mut n = 0u32;
+    let mut wall = 0u32;
+    while n < run.count {
+        for row in 0u32 .. base {
+            for i in 0u32 .. base - row {
+                if n == run.count { return; }
+
+                let x = cast!f32(i) * 1.02f + cast!f32(row) * 0.51f;
+                let at = makeVec3(x, 0.5f + cast!f32(row), cast!f32(wall) * 3.0f);
+                world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)), translation(at),
+                           settings-> dynamic(run.canSleep));
+                n += 1u32;
+            }
+        }
+
+        wall += 1u32;
+    }
+}
+
+/**
+ * Build a rain of spheres falling on a floor of triangles
+ * */
+fn spheres(dmut world: &PhysicsWorld, run: Run) {
+    addFloor(alias world, true);
+    let columns = cast!u32(math::ceil(math::sqrt(cast!f32(run.count) / 10.0f)));
+    let mut n = 0u32;
+    for y in 0u32 .. 10u32 {
+        for z in 0u32 .. columns {
+            for x in 0u32 .. columns {
+                if n == run.count { return; }
+
+                let at = makeVec3(cast!f32(x) * 1.2f - 20.0f + cast!f32(y % 2u32) * 0.3f, 0.5f + cast!f32(y) * 1.2f,
+                                  cast!f32(z) * 1.2f - 20.0f);
+                world:.add(ColliderShape::sphere(0.5f), translation(at), settings-> dynamic(run.canSleep));
+                n += 1u32;
+            }
+        }
+    }
+}
+
+/**
+ * Build a pile of boxes, spheres, capsules and cylinders on a plane
+ * */
+fn mix(dmut world: &PhysicsWorld, run: Run) {
+    addFloor(alias world, false);
+    let columns = cast!u32(math::ceil(math::sqrt(cast!f32(run.count) / 10.0f)));
+    let mut n = 0u32;
+    for y in 0u32 .. 10u32 {
+        for z in 0u32 .. columns {
+            for x in 0u32 .. columns {
+                if n == run.count { return; }
+
+                let shape = match n % 4u32 {
+                    0u32 => { ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)) }
+                    1u32 => { ColliderShape::sphere(0.5f) }
+                    2u32 => { ColliderShape::capsule(0.3f, 1.0f) }
+                    _    => { ColliderShape::cylinder(0.4f, 0.8f) }
+                };
+
+                let at = makeVec3(cast!f32(x) * 1.6f, 0.6f + cast!f32(y) * 1.3f, cast!f32(z) * 1.6f);
+                let turn = Quaternion::fromAxisAngle(0.3f * cast!f32(n % 5u32), makeVec3(1.0f, 0.0f, 0.0f));
+                world:.add(shape, translation(at) * turn.matrix(), settings-> dynamic(run.canSleep));
+                n += 1u32;
+            }
+        }
+    }
+}
+
+/**
+ * @returns: microseconds as milliseconds, three decimals
+ * */
+fn ms(micros: u64, steps: u64)-> f64 {
+    if steps == 0u64 { return 0.0; }
+    cast!f64(micros) / cast!f64(steps) / 1000.0
+}
+
+/**
+ * Print the averages of a window of steps
+ * */
+fn report(first: u32, w: Window) {
+    let l = w.last;
+    println(f"${first}\t${ms(w.total, w.steps)}\t${ms(w.worst, 1u64)}\t${ms(w.pairs, w.steps)}\t${ms(w.manifolds, w.steps)}\t${ms(w.islands, w.steps)}\t${ms(w.solve, w.steps)}\t${ms(w.sleep, w.steps)}\t${l.awakeCount}\t${l.pairCount}\t${l.constraintCount}\t${l.islandCount}");
+}
+
+/**
+ * Build the scene of a run and step it, a line of averages printed every window of steps
+ * */
+fn bench(run: Run) {
+    let dmut world = copy PhysicsWorld();
+    let built = Instant::now();
+    match run.scene {
+        "pyramid" => { pyramid(alias world, run); }
+        "spheres" => { spheres(alias world, run); }
+        "mix"     => { mix(alias world, run); }
+        _         => { pile(alias world, run); }
+    }
+
+    let buildMs = cast!f64((Instant::now() - built).allMicros) / 1000.0;
+    println(f"# scene ${run.scene}, ${run.count} bodies, ${run.steps} steps of ${DT} s, sleep ${run.canSleep}, built in ${buildMs} ms");
+    println("# step\tms/step\tworst\tpairs\tnarrow\tislands\tsolve\tsleep\tawake\tpairs#\tpoints#\tislands#");
+
+    let mut w = Window();
+    let mut all = Window();
+    let mut first = 0u32;
+    for s in 0u32 .. run.steps {
+        world:.step(DT);
+        let t = world.timings;
+        w.pairs += t.pairs; w.manifolds += t.manifolds; w.islands += t.islands; w.solve += t.solve;
+        w.sleep += t.sleep; w.total += t.total; w.worst = comparison::max(w.worst, t.total); w.steps += 1u64;
+        w.last = t;
+        all.total += t.total; all.worst = comparison::max(all.worst, t.total); all.steps += 1u64;
+
+        if w.steps == cast!u64(run.window) || s + 1u32 == run.steps {
+            report(first, w);
+            w = Window();
+            first = s + 1u32;
+        }
+    }
+
+    println(f"# mean ${ms(all.total, all.steps)} ms/step, worst ${ms(all.worst, 1u64)} ms");
+}
+
+/**
+ * @returns: the run the command line asks for, none when the benchmark must not run
+ * */
+fn readArguments(args: [[c8]])-> (Run)? {
+    let parser = (copy ArgumentParser)
+        :.help("help", short-> "h", comments-> "print this help and exit")
+        :.option!{[c8]} ("scene", comments-> "pile (columns of boxes), pyramid (walls of boxes), spheres (on a floor of triangles) or mix (boxes, spheres, capsules and cylinders); pile by default")
+        :.option!{i64} ("count", default-> 1000, short-> "n", comments-> "the dynamic bodies of the scene")
+        :.option!{i64} ("steps", default-> 600, comments-> "the steps run, 60 a second")
+        :.option!{i64} ("window", default-> 60, comments-> "the steps averaged on a line of the report")
+        :.flag("no-sleep", comments-> "the bodies never sleep, every step solving all of them");
+
+    {
+        let cfg = parser.parse(args);
+        let mut run = Run();
+        if let Ok(Str(value-> scene)) = cfg["scene"]? { run.scene = scene; }
+        if let Ok(Int(value-> n)) = cfg["count"]? { run.count = cast!u32(comparison::max(n, 1i64)); }
+        if let Ok(Int(value-> n)) = cfg["steps"]? { run.steps = cast!u32(comparison::max(n, 1i64)); }
+        if let Ok(Int(value-> n)) = cfg["window"]? { run.window = cast!u32(comparison::max(n, 1i64)); }
+        run.canSleep = !(cfg["no-sleep"].to!{bool} () ?? false);
+        run?
+    } catch {
+        err: &std::config::args::CommandLineError => {
+            eprintln(parser.explain(err, usage-> "physbench"));
+            none
+        }
+    }
+}
+
+fn main(args: [[c8]]) {
+    if let Ok(run) = readArguments(args) {
+        bench(run);
+    }
+}
