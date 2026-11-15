@@ -1,0 +1,167 @@
+in body_states;
+
+use balder::math::{bounds, inertia, matrix, quaternion, rigid_transform, utils, vector};
+use balder::scene::physics;
+use balder::core::error;
+
+use std::math;
+
+
+/**
+ * @returns: true iif two numbers are equal, give or take the rounding errors
+ * */
+fn near(a: f32, b: f32, tolerance: f32 = 0.001f)-> bool {
+    math::abs(a - b) < tolerance
+}
+
+/**
+ * @returns: true iif two vectors are equal, give or take the rounding errors
+ * */
+fn near(a: vec3, b: vec3, tolerance: f32 = 0.001f)-> bool {
+    (a - b).length() < tolerance
+}
+
+/**
+ * @returns: true iif two tensors are equal, give or take the rounding errors
+ * */
+fn nearTensor(a: mat3, b: mat3)-> bool {
+    let d = a - b;
+    let res = abs(d.a1) + abs(d.b1) + abs(d.c1)
+        + abs(d.a2) + abs(d.b2) + abs(d.c2)
+        + abs(d.a3) + abs(d.b3) + abs(d.c3);
+
+    res < 0.0001f
+}
+
+/**
+ * @returns: the distance at which a ray hits a collider, -1 when it misses it
+ * */
+fn distanceOf(collider: Collider, ray: Ray)-> f32 {
+    if let Ok(hit) = collider.raycast(ray) { hit.distance } else { -1.0f }
+}
+
+/**
+ * @returns: a floor of two triangles, the square of side 2 centred on the origin in the plane y = 0
+ * */
+fn floorMesh()-> dmut &TriangleBvh {
+    let positions = copy [makeVec3(-1.0f, 0.0f, -1.0f), makeVec3(1.0f, 0.0f, -1.0f), makeVec3(1.0f, 0.0f, 1.0f),
+                          makeVec3(-1.0f, 0.0f, 1.0f)];
+    copy TriangleBvh(positions, copy [0u32, 1u32, 2u32, 0u32, 2u32, 3u32])
+}
+
+/**
+ * @returns: the hull of the corners of a cube of side 2 centred on the origin, the hull of the box of size 2
+ * */
+fn cube()-> ColliderShape
+    throws BalderError
+{
+    let mut corners: [vec3] = [];
+    for x in [-1.0f, 1.0f] for y in [-1.0f, 1.0f] for z in [-1.0f, 1.0f] {
+        corners ~= [makeVec3(x, y, z)];
+    }
+
+    ColliderShape::hull(copy ConvexHull(corners))
+}
+
+fn dynamic(mass: f32 = 1.0f)-> BodySettings {
+    BodySettings(motion-> BodyMotion::DYNAMIC, mass-> mass)
+}
+
+__test the_volumes_of_the_shapes {
+    let pi = cast!f32(math::PI);
+    assert(near(ColliderShape::box(makeVec3(1.0f, 2.0f, 3.0f)).volume, 6.0f));
+    assert(near(ColliderShape::sphere(1.0f).volume, 4.0f / 3.0f * pi));
+    assert(near(ColliderShape::cylinder(1.0f, 2.0f).volume, 2.0f * pi));
+    // a capsule as high as wide is a sphere
+    assert(near(ColliderShape::capsule(1.0f, 2.0f).volume, 4.0f / 3.0f * pi));
+    assert(near(ColliderShape::plane().volume, 0.0f));
+}
+
+__test two_boxes_side_by_side_weigh_as_the_box_they_make {
+    let half = ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f));
+    let pair = ColliderShape::compound(copy CompoundShape(copy [
+        CompoundPart(shape-> half,
+                     place-> RigidTransform(position-> makeVec3(-0.5f, 0.0f, 0.0f))),
+        CompoundPart(shape-> half,
+                     place-> RigidTransform(position-> makeVec3(0.5f, 0.0f, 0.0f)))]));
+
+    let a = MassProperties(pair, 4.0f), b = MassProperties(ColliderShape::box(makeVec3(2.0f, 1.0f, 1.0f)), 4.0f);
+    assert(near(a.centre, vec3()));
+    assert(nearTensor(a.inertia, b.inertia));
+}
+
+__test the_centre_of_mass_of_a_compound_leans_to_its_larger_part {
+    let shape = ColliderShape::compound(copy CompoundShape(copy [
+        CompoundPart(shape-> ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)),
+                     place-> RigidTransform(position-> makeVec3(0.0f, 0.0f, 0.0f))),
+        CompoundPart(shape-> ColliderShape::box(makeVec3(1.0f, 1.0f, 3.0f)),
+                     place-> RigidTransform(position-> makeVec3(4.0f, 0.0f, 0.0f)))]));
+
+    // a volume of 1 at 0, of 3 at 4
+    assert(near(MassProperties(shape, 1.0f).centre, makeVec3(3.0f, 0.0f, 0.0f)));
+}
+
+__test a_capsule_scaled_keeps_its_caps_round {
+    let s = ColliderShape::capsule(0.5f, 3.0f).scaled(makeVec3(2.0f, 1.0f, 1.0f));
+    assert(near(s.radius, 1.0f) && near(s.height, 4.0f));
+}
+
+__test a_dynamic_body_weighs_its_mass_and_turns_its_inertia_with_it {
+    let dmut world = copy PhysicsWorld();
+    let q = Quaternion::fromAxisAngle(1.5707963f, makeVec3(0.0f, 0.0f, 1.0f));
+    let body = world:.add(ColliderShape::box(makeVec3(1.0f, 2.0f, 4.0f)), translation(makeVec3(0.0f, 3.0f, 0.0f)) * q.matrix(),
+                          settings-> dynamic(mass-> 2.0f));
+
+    let state = world.getState(body);
+    let local = inverseMoments(boxInertia(2.0f, makeVec3(1.0f, 2.0f, 4.0f)));
+    assert(near(state.inverseMass, 0.5f));
+    assert(near(state.worldCentre, makeVec3(0.0f, 3.0f, 0.0f)));
+    assert(nearTensor(state.inverseInertia, worldInverseInertia(q, local)));
+}
+
+__test a_scaled_dynamic_body_weighs_its_scaled_shape_and_is_placed_rigidly {
+    let dmut world = copy PhysicsWorld();
+    let body = world:.add(cube(), scaling(makeVec3(2.0f, 1.0f, 1.0f)), settings-> dynamic());
+    let state = world.getState(body);
+    assert(near(state.scale, makeVec3(2.0f, 1.0f, 1.0f)));
+    assert(nearTensor(state.localInverseInertia, diagonalTensor(inverseMoments(boxInertia(1.0f, makeVec3(4.0f, 2.0f, 2.0f))))));
+    assert(near(world.getCollider(body).bounds.max, makeVec3(2.0f, 1.0f, 1.0f)));
+}
+
+__test a_static_body_and_a_dynamic_mesh_push_nothing {
+    let dmut world = copy PhysicsWorld();
+    let wall = world:.add(cube(), mat4());
+    let floor = world:.add(ColliderShape::mesh(floorMesh()), mat4(), settings-> dynamic());
+    assert(world.getState(wall).inverseMass == 0.0f && !world.getState(wall).awake);
+    assert(world.getSettings(floor).motion == BodyMotion::STATIC && world.getState(floor).inverseMass == 0.0f);
+}
+
+__test a_body_still_for_long_enough_is_ready_to_sleep_and_wakes_when_pushed {
+    let dmut world = copy PhysicsWorld();
+    let body = world:.add(cube(), mat4(), settings-> dynamic());
+    // a body that never sleeps, never reported ready
+    let _ = world:.add(cube(),
+                       translation(makeVec3(5.0f, 0.0f, 0.0f)),
+                       settings-> BodySettings(motion-> BodyMotion::DYNAMIC, canSleep-> false));
+
+    for _ in 0 .. 29 { assert(world:.updateSleep(1.0f / 60.0f).len == 0us); }
+    assert(world:.updateSleep(1.0f / 60.0f) == [body]);
+
+    world:.sleep(body);
+    assert(!world.getState(body).awake);
+
+    world:.setVelocity(body, makeVec3(0.0f, 1.0f, 0.0f), vec3());
+    assert(world.getState(body).awake && world.getState(body).stillTime == 0.0f);
+    assert(world:.updateSleep(1.0f).len == 0us);
+}
+
+__test a_body_moved_keeps_its_velocities_and_wakes {
+    let dmut world = copy PhysicsWorld();
+    let body = world:.add(cube(), mat4(), settings-> dynamic());
+    world:.setVelocity(body, makeVec3(1.0f, 0.0f, 0.0f), makeVec3(0.0f, 2.0f, 0.0f));
+    world:.sleep(body);
+
+    world:.setTransform(body, translation(makeVec3(0.0f, 4.0f, 0.0f)));
+    let state = world.getState(body);
+    assert(state.awake && near(state.pose.position, makeVec3(0.0f, 4.0f, 0.0f)));
+}
