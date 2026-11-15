@@ -175,7 +175,10 @@ the polytope failing on two faces barely touching. The manifold of two faces cli
 face, exact where the normal of the penetration is only within the tolerance of the expansion.
 
 The manifolds live on the pairs of the broadphase (`BroadPair::manifolds`), and their points carry the impulses of the
-step before when they are found again: by the features making them, or within 2 cm on both shapes. A pair touches when
+step before when they are found again: by the features making them, or within 2 cm on both shapes. The faces are clipped
+in the buffers of a `ContactScratch` the world keeps (`narrow::collideWith`): the corners of the two faces, the two
+polygons the side planes clip between, the points kept; what a pair keeps is copied once, its points reduced to four
+(`narrow::collide` builds a scratch of its own, for a query or a test). A pair touches when
 a point of its manifolds is not speculative; a trigger only tells whether it overlaps.
 
 The speculative points cover what two bodies may travel toward each other in a step (2 cm at least, plus their relative
@@ -190,15 +193,17 @@ A step (`PhysicsWorld::step`) updates the pairs and their manifolds once (a pair
 keeps its own), groups the bodies in islands, then solves and moves each awake island in `substeps` sub steps (4 by
 default, `solveIsland`, after Box2D v3):
 
-- each point of contact is a `ContactConstraint`, prepared once a step: its arms, its masses along the normal and two
-  tangents, its separation, the speed it bounces back with; the bodies are copied as `SolverBody`s (their velocities,
-  their centre, their inverse mass and inertia, gravity and their forces, none for a static or a kinematic body) the sub
-  steps read and write without reaching the world;
+- each manifold is a `ContactConstraint` (its bodies, its normal and two tangents, its friction) over a range of
+  `ConstraintPoint`s, prepared once a step: the arms of each point, its masses along the normal and the tangents, its
+  separation, the speed it bounces back with; the bodies are copied as `SolverBody`s (their velocities, their centre,
+  their inverse mass and inertia, gravity and their forces, none for a static or a kinematic body) the sub steps read
+  and write without reaching the world;
 - at each sub step, the velocities take gravity, the forces and the damping (`v / (1 + c h)`); the impulses the points
-  gathered are applied first (warm starting), which is what lets a stack hold; `iterations` passes (2 by default) push
-  the normal of each point, the impulse gathered never pulling, then its friction, bounded by its friction times the
-  impulse of its normal (the pyramid of the cone); the bodies move by their velocities; a last pass relaxes the
-  velocities the correction of the penetrations left, so pushing a body out gives it no speed;
+  gathered are applied first (warm starting), which is what lets a stack hold; `iterations` passes (2 by default) push,
+  manifold by manifold, the normal of each of its points, the impulse gathered never pulling, then their friction,
+  bounded by the friction times the impulse of the normal (the pyramid of the cone); the velocities of the two bodies
+  of a manifold are loaded once for its points and written back once; the bodies move by their velocities; a last pass
+  relaxes the velocities the correction of the penetrations left, so pushing a body out gives it no speed;
 - the separation of a point follows the motion of its bodies through the sub steps (their arms turned with them), the
   contacts being found once a step;
 - once the sub steps are run, the points that closed faster than `bounce-threshold` (1 m/s) before the step and that
@@ -219,7 +224,9 @@ times cheaper.
 ### Islands and sleep
 
 The islands are built again at each step, by union-find over the dynamic bodies: two of them share an island when
-their pair has a point of contact, even speculative. A static or a kinematic body joins no island, else the ground would
+their pair has a point of contact, even speculative. An `IslandSet` lays the bodies and the pairs of the islands out
+island after island; it and the buffers of the solver (the solver bodies, the constraints and their points) are kept
+from step to step and only grow, so a step builds no map nor array for them. A static or a kinematic body joins no island, else the ground would
 make the whole level one. An awake body, or a moving kinematic body, wakes the sleeping bodies it is in contact with,
 their whole island with them: a stack wakes at once rather than a crate a step. An island whose bodies all stayed under
 `sleep-linear` and `sleep-angular` for `sleep-time` sleeps, their velocities dropped; a body that cannot sleep keeps its
@@ -232,6 +239,22 @@ since the last tick gets the velocities of its move (`deriveKinematics`): the di
 between its two orientations. The steps do not move it, it is where the game put it, but the solver pushes and carries
 what it touches by its velocity, so a crate rides a platform. A kinematic body not moved has no velocity, unless the
 game set one (`setVelocity`), kept until it moves again: a conveyor belt.
+
+## Measuring a step
+
+`PhysicsWorld::timings` tells what the last step cost (`StepTimings`): the microseconds of its phases (the pairs, the
+manifolds, the islands, the solve, the sleep, the whole step) and what it ran over (the pairs, the points solved, the
+islands, the awake bodies). The `physbench` example builds a scene of dynamic bodies without a window and steps it,
+printing the averages of a window of steps:
+
+```
+gyllir build physbench --release
+./physbench --scene pile --count 1000 --steps 600 --window 60 [--no-sleep]
+```
+
+The scenes are `pile` (columns of boxes ten high), `pyramid` (walls of boxes, twenty at their base), `spheres` (on a
+floor of triangles) and `mix` (boxes, spheres, capsules and cylinders). `--no-sleep` keeps every body awake, each step
+solving them all.
 
 ## Threads
 
