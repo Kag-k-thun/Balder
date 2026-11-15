@@ -1,0 +1,176 @@
+in primitives;
+
+
+use balder::math::{bounds, vector};
+
+use std::math;
+use std::algorithm::comparison;
+
+
+/**
+ * @returns: the contact of two spheres, apart by at most 'speculative'
+ *
+ * */
+pub fn spheres(a: vec3, ra: f32, b: vec3, rb: f32, speculative: f32)-> (ContactManifold)? {
+    let d = b - a;
+    let l = d.length();
+    let depth = ra + rb - l;
+    if depth < -speculative { return none; }
+
+    let n = if l > 1.0e-6f { d / l } else { makeVec3(0.0f, 1.0f, 0.0f) };
+    ContactManifold(0u64, n, copy [pointOf(a + n * ra, b - n * rb, depth)])?
+}
+
+
+/**
+ * @returns: the contact of a sphere and a capsule, the sphere against the
+ * closest point of the segment
+ *
+ * */
+pub fn sphereCapsule(c: vec3, rc: f32, p: vec3, q: vec3, rq: f32, speculative: f32)-> (ContactManifold)? {
+    spheres(c, rc, closestOnSegment(c, p, q), rq, speculative)
+}
+
+/**
+ * @returns: the contact of two capsules, at the closest points of their
+ * segments, at the two ends of their overlap when they lie side by side
+ *
+ * */
+pub fn capsules(p1: vec3, q1: vec3, r1: f32, p2: vec3, q2: vec3, r2: f32, speculative: f32)-> (ContactManifold)? {
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let cross = d1.cross(d2);
+    let parallel = cross.dot(cross) <= 1.0e-6f * d1.dot(d1) * d2.dot(d2);
+
+    if parallel && d1.dot(d1) > 0.0f {
+        let l = d1.dot(d1);
+        let s0 = comparison::max(0.0f, comparison::min((p2 - p1).dot(d1) / l, (q2 - p1).dot(d1) / l));
+        let s1 = comparison::min(1.0f, comparison::max((p2 - p1).dot(d1) / l, (q2 - p1).dot(d1) / l));
+
+        if s1 - s0 > 1.0e-3f {
+            let mut points: [ContactPoint] = [];
+            let mut normal = vec3();
+            for s in (s0, s1) {
+                let on1 = p1 + d1 * s;
+                if let Ok(m) = spheres(on1, r1, closestOnSegment(on1, p2, q2), r2, speculative) {
+                    points ~= m.points;
+                    normal = m.normal;
+                }
+            }
+
+            if points.len > 0us {
+                return ContactManifold(0u64, normal, points)?;
+            }
+
+            return none;
+        }
+    }
+
+    let (on1, on2) = closestOfSegments(p1, q1, p2, q2);
+    spheres(on1, r1, on2, r2, speculative)
+}
+
+
+/**
+ * @returns: the contact of a sphere and a box of orthogonal axes, the centre clamped into the box; inside it, the face
+ * closest to the centre
+ * @params:
+ *    - u, v, w: the half sides of the box, orthogonal
+ * */
+pub fn sphereBox(c: vec3, r: f32, centre: vec3, u: vec3, v: vec3, w: vec3, speculative: f32)-> (ContactManifold)? {
+    let axes = [u, v, w];
+    let local = c - centre;
+    let mut closest = centre;
+    let mut inside = true;
+    let mut face = vec3();
+    let mut shallowest = f32::max;
+    for axis in axes {
+        let h = axis.length();
+        let dir = axis / h;
+        let t = local.dot(dir);
+        if t > h || t < -h { inside = false; }
+        closest = closest + dir * comparison::max(-h, comparison::min(h, t));
+
+        // the face the centre is the closest to, when it is inside
+        let room = h - math::abs(t);
+        if room < shallowest {
+            shallowest = room;
+            face = if t >= 0.0f { dir } else { -dir };
+        }
+    }
+
+    if !inside {
+        // from the box (first) to the sphere (second)
+        return spheres(closest, 0.0f, c, r, speculative);
+    }
+
+    let onBox = c + face * shallowest;
+    ContactManifold(0u64, face, copy [pointOf(onBox, c - face * r, shallowest + r)])?
+}
+
+/**
+ * @returns: the contact of a capsule (or a sphere, its ends equal) with the half space under a plane: an end, or both
+ * ends when it lies on it
+ * */
+pub fn capsulePlane(plane: Plane, p: vec3, q: vec3, r: f32, speculative: f32)-> (ContactManifold)? {
+    let mut points: [ContactPoint] = [];
+    for end in (if (p - q).length() > 1.0e-6f { copy [p, q] } else { copy [p] }) {
+        let depth = r - plane.signedDistance(end);
+        if depth >= -speculative {
+            points ~= [pointOf(end - plane.normal * plane.signedDistance(end), end - plane.normal * r, depth)];
+        }
+    }
+
+    if points.len == 0us { return none; }
+    ContactManifold(0u64, plane.normal, points)?
+}
+
+
+/**
+ * @returns: the point midway between the points of the two shapes, its depth along the normal
+ * */
+pub fn pointOf(onA: vec3, onB: vec3, depth: f32)-> ContactPoint {
+    ContactPoint(point-> (onA + onB) / 2.0f, localA-> onA, localB-> onB, depth-> depth)
+}
+
+
+/**
+ * @returns: the point of a segment closest to a point, its start when it has no length
+ * */
+fn closestOnSegment(point: vec3, p: vec3, q: vec3)-> vec3 {
+    let d = q - p;
+    let dd = d.dot(d);
+    if dd <= 1.0e-12f { return p; }
+
+    p + d * comparison::clamp((point - p).dot(d) / dd, 0.0f, 1.0f)
+}
+
+/**
+ * @info: the closest points of the two lines clamped to the segments, the second clamped first then the first again
+ * (Ericson, Real-Time Collision Detection, 5.1.9); the start of the first when they are parallel
+ * @returns: the points of two segments closest to each other, on the first then on the second
+ * */
+fn closestOfSegments(p1: vec3, q1: vec3, p2: vec3, q2: vec3)-> (vec3, vec3) {
+    let d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+    let a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+
+    if a <= 1.0e-12f && e <= 1.0e-12f { return (p1, p2); }
+    if a <= 1.0e-12f { return (p1, p2 + d2 * comparison::clamp(f / e, 0.0f, 1.0f)); }
+
+    let c = d1.dot(r);
+    if e <= 1.0e-12f { return (p1 + d1 * comparison::clamp(-c / a, 0.0f, 1.0f), p2); }
+
+    let b = d1.dot(d2);
+    let denom = a * e - b * b;
+    let mut s = if denom > 0.0f { comparison::clamp((b * f - c * e) / denom, 0.0f, 1.0f) } else { 0.0f };
+    let mut t = (b * s + f) / e;
+    if t < 0.0f {
+        t = 0.0f;
+        s = comparison::clamp(-c / a, 0.0f, 1.0f);
+    } else if t > 1.0f {
+        t = 1.0f;
+        s = comparison::clamp((b - c) / a, 0.0f, 1.0f);
+    }
+
+    (p1 + d1 * s, p2 + d2 * t)
+}
