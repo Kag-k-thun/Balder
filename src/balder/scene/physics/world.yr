@@ -6,7 +6,7 @@ mod ::utils;
 use balder::core::config::physics;
 use balder::math::{bounds, matrix, quaternion, rigid_transform, vector};
 
-use std::math;
+use std::{math, time};
 use std::algorithm::{comparison, sorting};
 
 /**
@@ -154,6 +154,9 @@ pub class PhysicsWorld {
     // The kinematic bodies whose velocities were set rather than derived from their moves, until they move again
     let dmut _kinematicSet: [u32 => bool] = copy [];
 
+    // What the last step cost, phase by phase
+    let mut _timings: StepTimings = StepTimings();
+
     pub self () {}
 
     /*!
@@ -163,6 +166,14 @@ pub class PhysicsWorld {
      * ====================================================================================================
      * ====================================================================================================
      */
+
+    /**
+     * @returns: what the last step cost, the time of each of its phases and what it ran over
+     * */
+    @field
+    pub fn timings(self)-> StepTimings {
+        self._timings
+    }
 
     /**
      * @returns: the number of bodies in the world
@@ -700,25 +711,45 @@ pub class PhysicsWorld {
     pub fn step(mut self, dt: f32) {
         if dt <= 0.0f { return; }
 
+        let start = Instant::now();
+        let mut timings = StepTimings();
         self._step = dt;
         for i in 0us .. self._states.len { self._previous[i] = self._states[i].pose; }
 
+        let beforePairs = Instant::now();
         self:.updatePairs();
+        let beforeManifolds = Instant::now();
         self:.updateAllManifolds();
 
+        let beforeIslands = Instant::now();
         let islands = self.islands();
         self:.wakeTouched(islands);
-
         let slots = self.slotsOf(islands);
+
+        let beforeSolve = Instant::now();
         for k in 0us .. islands.len if self._states[islands[k][0]].awake {
             if let Ok(s) = slots[k] {
-                self:.solveIsland(islands[k], s, dt);
+                timings.constraintCount += self:.solveIsland(islands[k], s, dt);
             } else {
-                self:.solveIsland(islands[k], [], dt);
+                timings.constraintCount += self:.solveIsland(islands[k], [], dt);
             }
+
+            timings.awakeCount += islands[k].len;
         }
 
+        let beforeSleep = Instant::now();
         self:.sleepIslands(islands, dt);
+        let end = Instant::now();
+
+        timings.pairs = utils::microsBetween(beforePairs, beforeManifolds);
+        timings.manifolds = utils::microsBetween(beforeManifolds, beforeIslands);
+        timings.islands = utils::microsBetween(beforeIslands, beforeSolve);
+        timings.solve = utils::microsBetween(beforeSolve, beforeSleep);
+        timings.sleep = utils::microsBetween(beforeSleep, end);
+        timings.total = utils::microsBetween(start, end);
+        timings.pairCount = self._pairs.len;
+        timings.islandCount = islands.len;
+        self._timings = timings;
     }
 
     /*!
@@ -1051,12 +1082,14 @@ pub class PhysicsWorld {
      *    - island: the dynamic bodies of the island
      *    - slots: the slots of the pairs in contact of the island
      *
+     * @returns: the number of points of contact solved
+     *
      * @info: the contacts are found once a step, the sub steps moving the separation of each point by the motion of
      * its bodies (Box2D v3, solver2d); a stack holds still at a shorter step where more passes over the contacts of a
      * longer one leave it swaying
      *
      * */
-    fn solveIsland(mut self, island: [u32], slots: [usize], dt: f32) {
+    fn solveIsland(mut self, island: [u32], slots: [usize], dt: f32)-> usize {
         let dmut index: [u32 => usize] = copy [];
         let dmut bodies: [SolverBody] = [];
         for b in island {
@@ -1114,6 +1147,8 @@ pub class PhysicsWorld {
 
             self:.place(sb.handle, Collider(self._bodies[sb.handle].collider.shape, s.placement));
         }
+
+        constraints.len
     }
 
     /**
