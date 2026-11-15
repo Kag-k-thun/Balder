@@ -2,8 +2,8 @@ in utils;
 
 use balder::math::{bounds, matrix, vector};
 
-use std::algorithm::comparison;
 use std::math;
+use std::algorithm::comparison;
 
 /**
  * @returns: a point of the space of a body in the world
@@ -39,19 +39,47 @@ pub fn convexOf(shape: ColliderShape, m: mat4)-> Convex {
         ColliderKind::MESH => {
             return Convex::sphere(centre, 0.0f);
         }
-        _ => {}
+        ColliderKind::CYLINDER => {
+            return Convex::cylinder(centre, x * shape.radius, y * (shape.height / 2.0f), z * shape.radius);
+        }
+        ColliderKind::HULL => {
+            if let Ok(h) = shape.convexHull {
+                return Convex::hull(centre, pointTo(m, h.centroid), x, y, z, h.vertices);
+            }
+
+            return Convex::sphere(centre, 0.0f);
+        }
+        ColliderKind::BOX | ColliderKind::PLANE | ColliderKind::COMPOUND => {
+            let h = shape.size / 2.0f;
+            return Convex::box(centre, x * h.x, y * h.y, z * h.z);
+        }
+    }
+}
+
+/**
+ * @returns: the colliders of the parts of a compound placed in the world by the
+ * transformation of its body, none for another kind
+ *
+ * */
+pub fn partOf(shape: ColliderShape, m: mat4)-> [Collider] {
+    if let Ok(c) = shape.parts {
+        return copy [Collider(p.shape, m * p.place.matrix())
+                     for p in c.parts];
     }
 
-    let h = shape.size / 2.0f;
-    Convex::box(centre, x * h.x, y * h.y, z * h.z)
+    []
 }
 
 /**
  * @returns: the box enclosing a shape placed in the world by a transformation
  * */
 pub fn worldBox(shape: ColliderShape, m: mat4)-> Aabb {
-    if shape.kind == ColliderKind::MESH {
+    if shape.kind == ColliderKind::MESH || shape.kind == ColliderKind::COMPOUND {
         return shape.localBox().transformed(m);
+    }
+
+    if shape.kind == ColliderKind::PLANE {
+        return Aabb();
     }
 
     convexOf(shape, m).bounds
@@ -221,6 +249,106 @@ pub fn rayMesh(ray: Ray, shape: ColliderShape, m: mat4, inverse: mat4)-> (Surfac
 }
 
 /**
+ * In the space of the unit cylinder (radius 1, from y = -1 to y = 1), the
+ * direction of the ray not normalized so that the distances are those of the
+ * world, the normal brought back by the transpose of the inverse transformation
+ *
+ * @returns: the point where a ray hits a cylinder first, its side or a cap
+ *
+ * @params:
+ *    - inverse: the transformation from the world to the space of the unit cylinder
+ * */
+pub fn rayUnitCylinder(ray: Ray, inverse: mat4)-> (SurfaceHit)? {
+    let local = localRay(ray, inverse);
+    let o = local.origin;
+    let d = local.direction;
+
+    if o.x * o.x + o.z * o.z <= 1.0f && math::abs(o.y) <= 1.0f {
+        return inside(ray);
+    }
+
+    let mut best = ray.length;
+    let mut face: (vec3)? = none;
+
+    let a = d.x * d.x + d.z * d.z;
+    if a > 1.0e-12f {
+        let b = o.x * d.x + o.z * d.z;
+        let c = o.x * o.x + o.z * o.z - 1.0f;
+        let disc = b * b - a * c;
+        if disc >= 0.0f {
+            let t = (-b - math::sqrt(disc)) / a;
+            if t >= 0.0f && t <= best && math::abs(o.y + t * d.y) <= 1.0f {
+                best = t;
+                face = makeVec3(o.x + t * d.x, 0.0f, o.z + t * d.z)?;
+            }
+        }
+    }
+
+    if math::abs(d.y) > 1.0e-12f {
+        for s in (-1.0f, 1.0f) {
+            let t = (s - o.y) / d.y;
+            let x = o.x + t * d.x;
+            let z = o.z + t * d.z;
+            if t >= 0.0f && t <= best && x * x + z * z <= 1.0f {
+                best = t;
+                face = makeVec3(0.0f, s, 0.0f)?;
+            }
+        }
+    }
+
+    if let Ok(n) = face {
+        return SurfaceHit(distance-> best,
+                          point-> ray.at(best),
+                          normal-> (inverse.mat3().transposed() * n).normalized())?;
+    }
+
+    none
+}
+
+/**
+ * In the space of the body, the ray clipped by the planes of the faces (Cyrus
+ * and Beck), its direction not normalized there so that the distances are those
+ * of the world
+ *
+ * @returns: the point where a ray hits a convex hull first, on the face it
+ * enters last
+ *
+ * */
+pub fn rayHull(ray: Ray, hull: &ConvexHull, inverse: mat4)-> (SurfaceHit)? {
+    let local = localRay(ray, inverse);
+    let mut near = 0.0f;
+    let mut far = ray.length;
+    let mut entered: (vec3)? = none;
+    for f in hull.faces {
+        let room = f.offset - f.normal.dot(local.origin);
+        let speed = f.normal.dot(local.direction);
+        if math::abs(speed) <= 1.0e-12f {
+            if room < 0.0f { return none; }
+        } else {
+            let t = room / speed;
+            if speed < 0.0f {
+                if t > near {
+                    near = t;
+                    entered = f.normal?;
+                }
+            } else if t < far {
+                far = t;
+            }
+
+            if near > far { return none; }
+        }
+    }
+
+    if let Ok(n) = entered {
+        return SurfaceHit(distance-> near,
+                          point-> ray.at(near),
+                          normal-> (inverse.mat3().transposed() * n).normalized())?;
+    }
+
+    inside(ray)
+}
+
+/**
  * @returns: the distance from a point to a segment
  * */
 pub fn distanceToSegment(point: vec3, p: vec3, q: vec3)-> f32 {
@@ -230,4 +358,74 @@ pub fn distanceToSegment(point: vec3, p: vec3, q: vec3)-> f32 {
 
     let t = comparison::max(0.0f, comparison::min(1.0f, (point - p).dot(d) / dd));
     (point - (p + d * t)).length()
+}
+
+/**
+ * @returns: the plane of the world bounding a half space shape, its normal the
+ * Y axis of its body brought by the transpose of the inverse transformation
+ *
+ * */
+pub fn planeOf(m: mat4, inverse: mat4)-> Plane {
+    let n = (inverse.mat3().transposed() * makeVec3(0.0f, 1.0f, 0.0f)).normalized();
+    Plane(makeVec4(n, -n.dot(pointTo(m, vec3()))))
+}
+
+/**
+ * @returns: the height of a convex shape over a plane, its lowest point along
+ * the normal, its margin taken off; negative under the plane
+ *
+ * */
+pub fn heightOver(plane: Plane, shape: Convex)-> f32 {
+    plane.signedDistance(shape.support(-plane.normal)) - shape.margin
+}
+
+/**
+ * @returns: the point where a ray hits the half space under a plane, at its
+ * origin when it starts under it
+ *
+ * */
+pub fn rayPlane(ray: Ray, plane: Plane)-> (SurfaceHit)? {
+    let s = plane.signedDistance(ray.origin);
+    if s <= 0.0f {
+        return inside(ray);
+    }
+
+    let dn = plane.normal.dot(ray.direction);
+    if dn >= 0.0f {
+        return none;
+    }
+
+    let t = -s / dn;
+    if t > ray.length {
+        return none;
+    }
+
+    SurfaceHit(distance-> t,
+               point-> ray.at(t),
+               normal-> plane.normal)?
+}
+
+/**
+ * @returns: the point where a convex shape moving along a direction meets the
+ * half space under a plane
+ *
+ * */
+pub fn sweepPlane(moving: Convex, direction: vec3, length: f32, plane: Plane)-> (SurfaceHit)? {
+    let lowest = moving.support(-plane.normal);
+    let h = heightOver(plane, moving);
+    if h <= 0.0f {
+        return SurfaceHit(distance-> 0.0f,
+                          point-> lowest - plane.normal * moving.margin,
+                          normal-> plane.normal)?;
+    }
+
+    let speed = -plane.normal.dot(direction);
+    if speed <= 0.0f || h / speed > length {
+        return none;
+    }
+
+    let t = h / speed;
+    SurfaceHit(distance-> t,
+               point-> lowest + direction * t - plane.normal * moving.margin,
+               normal-> plane.normal)?
 }

@@ -10,11 +10,15 @@ use std::algorithm::comparison;
 /**
  * The kinds of the shapes of a collider
  * */
-pub enum ColliderKind : u32
-| BOX     = 0u32 // a box, of a side along each axis
-| SPHERE  = 1u32 // a sphere, of a radius
-| CAPSULE = 2u32 // a cylinder along the Y axis capped by two half spheres, of a radius and a height
-| MESH    = 3u32; // the triangles of a mesh, a surface holding no volume
+pub enum ColliderKind: u32
+| BOX      = 0u32 // a box, of a side along each axis
+| SPHERE   = 1u32 // a sphere, of a radius
+| CAPSULE  = 2u32 // a cylinder along the Y axis capped by two half spheres, of a radius and a height
+| MESH     = 3u32 // the triangles of a mesh, a surface holding no volume
+| CYLINDER = 4u32 // a cylinder along the Y axis, of a radius and a height
+| PLANE    = 5u32 // the half space under the XZ plane of its body, its normal along Y, holding no box
+| HULL     = 6u32 // a convex hull of points
+| COMPOUND = 7u32; // convex parts lpaced in the space of the body
 
 /**
  * The shape of a collider, in the space of its body, centred on its origin: a box, a sphere, a capsule standing along
@@ -45,6 +49,12 @@ pub record ColliderShape {
 
     // The hierarchy of the boxes of the triangles of a mesh, built with the shape, none for the other kinds
     pub let hierarchy: (&Bvh)?;
+
+    // The convex hull, none for the other kinds
+    pub let convexHull: (&ConvexHull)? = none;
+
+    // The parts of a compound, none for the other kinds
+    pub let parts: (&CompoundShape)? = none;
 
     /**
      * A box of a unit side
@@ -117,7 +127,70 @@ pub record ColliderShape {
         , radius = 0.0f
         , height = 0.0f
         , hierarchy = (triangles:.hierarchy())?
-        , triangles = (triangles)?
+    , triangles = (triangles)?
+    {}
+
+    /**
+     * @params:
+     *    - radius: the radius of the cylinder, MIN_VOLUME_SIZE at least
+     *    - height: the height of the cylinder along the Y axis of its body,
+     *              MIN_VOLUME_SIZE at least
+     *
+     * */
+    pub self cylinder(radius: f32, height: f32)
+        with kind = ColliderKind::CYLINDER
+        , size = vec3()
+        , radius = comparison::max(radius, MIN_VOLUME_SIZE)
+        , height = comparison::max(height, MIN_VOLUME_SIZE)
+        , triangles = none
+        , hierarchy = none
+    {}
+
+    /**
+     * The half space under the XZ plane of the body, its normal along the Y
+     * axis: the ground
+     *
+     * @info: it has no box (see localBox), the world testing its planes apart
+     * from its hierarchy
+     *
+     * */
+    pub self plane()
+        with kind = ColliderKind::PLANE
+        , size = vec3()
+        , radius = 0.0f
+        , height = 0.0f
+        , triangles = none
+        , hierarchy = none
+    {}
+
+    /**
+     * A convex hull, shared by the colliders of the shape
+     * @example:
+     * ```
+     * let shape = ColliderShape::hull(copy ConvexHull(array.positions));
+     * ```
+     * */
+    pub self hull(hull: &ConvexHull)
+        with kind = ColliderKind::HULL
+        , size = vec3()
+        , radius = 0.0f
+        , height = 0.0f
+        , triangles = none
+        , hierarchy = none
+        , convexHull = (hull)?
+    {}
+
+    /**
+     * Convex parts placed in the space of the body, shared by the colliders of the shape
+     * */
+    pub self compound(parts: &CompoundShape)
+        with kind = ColliderKind::COMPOUND
+        , size = vec3()
+        , radius = 0.0f
+        , height = 0.0f
+        , triangles = none
+        , hierarchy = none
+        , parts = (parts)?
     {}
 
     /**
@@ -125,16 +198,100 @@ pub record ColliderShape {
      * */
     pub fn localBox(self)-> Aabb {
         let half = match self.kind {
-            ColliderKind::SPHERE  => { makeVec3(self.radius, self.radius, self.radius) }
+            ColliderKind::SPHERE => { makeVec3(self.radius, self.radius, self.radius) }
             ColliderKind::CAPSULE => { makeVec3(self.radius, self.height / 2.0f, self.radius) }
-            ColliderKind::MESH    => {
+            ColliderKind::CYLINDER => { makeVec3(self.radius, self.height / 2.0f, self.radius) }
+            ColliderKind::PLANE => { return Aabb(); }
+            ColliderKind::COMPOUND => {
+                if let Ok(c) = self.parts { return c.bounds; }
+                return Aabb();
+            }
+            ColliderKind::HULL => {
+                if let Ok(h) = self.convexHull { return h.bounds; }
+                return Aabb();
+            }
+            ColliderKind::MESH => {
                 if let Ok(h) = self.hierarchy { return h.bounds; }
                 return Aabb();
             }
-            _ => { self.size / 2.0f }
+            ColliderKind::BOX => { self.size / 2.0f }
         };
 
         Aabb(-half, half)
+    }
+
+    /**
+     * @returns: the volume of the shape, 0 for a mesh and a plane, the sum of
+     * the volumes of the parts of a compound
+     *
+     * */
+    @field
+    pub fn volume(self)-> f32 {
+        let pi = cast!f32(math::PI);
+        let r = self.radius;
+        match self.kind {
+            ColliderKind::BOX => { self.size.x * self.size.y * self.size.z }
+            ColliderKind::SPHERE => { 4.0f / 3.0f * pi * r * r * r }
+            ColliderKind::CAPSULE => { pi * r * r * (self.height - 2.0f * r + 4.0f / 3.0f * r) }
+            ColliderKind::CYLINDER => { pi * r * r * self.height }
+            ColliderKind::HULL => {
+                if let Ok(h) = self.convexHull {
+                    h.volume
+                } else {
+                    0.0f
+                }
+            }
+            ColliderKind::COMPOUND => {
+                if let Ok(c) = self.parts {
+                    c.volume
+                } else {
+                    0.0f
+                }
+            }
+            ColliderKind::PLANE | ColliderKind::MESH => { 0.0f }
+        }
+    }
+
+    /**
+     * @returns: the shape a transformation of a scale makes of it, as a
+     * collider scales it (see Collider): the shape whose mass a scaled body has
+     *
+     * */
+    pub fn scaled(self, scale: vec3)-> ColliderShape {
+        let s = makeVec3(math::abs(scale.x), math::abs(scale.y), math::abs(scale.z));
+        let across = comparison::max(s.x, s.z);
+        match self.kind {
+            ColliderKind::BOX => {
+                ColliderShape::box(makeVec3(self.size.x * s.x, self.size.y * s.y, self.size.z * s.z))
+            }
+            ColliderKind::SPHERE => {
+                ColliderShape::sphere(self.radius * comparison::max(across, s.y))
+            }
+            ColliderKind::CAPSULE => {
+                let r = self.radius * across;
+                ColliderShape::capsule(r, 2.0f * r + (self.height - 2.0f * self.radius) * s.y)
+            }
+            ColliderKind::CYLINDER => {
+                ColliderShape::cylinder(self.radius * across, self.height * s.y)
+            }
+            ColliderKind::HULL => {
+                if let Ok(h) = self.convexHull {
+                    ColliderShape::hull(h.scaled(scale))
+                } else {
+                    self
+                }
+            }
+            ColliderKind::COMPOUND => {
+                if let Ok(c) = self.parts {
+                    ColliderShape::compound(c.scaled(scale))
+                } else {
+                    self
+                }
+            }
+            ColliderKind::PLANE | ColliderKind::MESH => {
+                self
+            }
+        }
     }
 
 }
