@@ -3,9 +3,10 @@ in world;
 mod ::islands;
 mod ::utils;
 
-use balder::math::{bounds, matrix, quaternion, vector};
+use balder::core::config::physics;
+use balder::math::{bounds, matrix, quaternion, rigid_transform, vector};
 
-use std::algorithm::sorting;
+use std::algorithm::{comparison, sorting};
 
 /**
  * The handle of no body
@@ -34,11 +35,16 @@ def PREDICTION = 2.0f;
 def SPECULATIVE_FLOOR = 0.02f;
 
 /**
- * The duration of a step of the solver, in seconds, the speculative distances
- * covering what the bodies travel in a step
+ * The duration of a step of the solver until a step is run, in seconds, the
+ * speculative distances covering what the bodies travel in a step
  *
  * */
 def STEP = 1.0f / 60.0f;
+
+/**
+ * The index of no island
+ * */
+def NO_ISLAND = usize::max;
 
 /**
  * A slot of the bodies of a world, holding a body or free
@@ -111,6 +117,18 @@ pub class PhysicsWorld {
     // The pairs of bodies whose enlarged boxes overlap and that may touch
     let dmut _pairs: &PairCache = copy PairCache();
 
+    // The acceleration of the dynamic bodies falling, in metres a second squared
+    let mut _gravity: vec3 = makeVec3(0.0f, -9.81f, 0.0f);
+
+    // How the solver iterates over the contacts and corrects their penetrations
+    let mut _solver: SolverSettings = SolverSettings();
+
+    // The duration of the last step, the speculative distances covering what the bodies travel in a step
+    let mut _step: f32 = STEP;
+
+    // The poses of the bodies before the last step, by handle, the display interpolating from them
+    let dmut _previous: [RigidTransform] = [];
+
     pub self () {}
 
     /*!
@@ -143,6 +161,54 @@ pub class PhysicsWorld {
     @field
     pub fn sleepThresholds(mut self, thresholds: SleepThresholds) {
         self._sleep = thresholds;
+    }
+
+    /**
+     * @returns: the acceleration of the dynamic bodies falling, in metres a second squared
+     * */
+    @field
+    pub fn gravity(self)-> vec3 {
+        self._gravity
+    }
+
+    /**
+     * Change the acceleration of the dynamic bodies falling, in metres a second squared
+     * */
+    @field
+    pub fn gravity(mut self, gravity: vec3) {
+        self._gravity = gravity;
+    }
+
+    /**
+     * @returns: how the solver iterates over the contacts and corrects their penetrations
+     * */
+    @field
+    pub fn solverSettings(self)-> SolverSettings {
+        self._solver
+    }
+
+    /**
+     * Change how the solver iterates over the contacts and corrects their penetrations
+     * */
+    @field
+    pub fn solverSettings(mut self, settings: SolverSettings) {
+        self._solver = settings;
+    }
+
+    /**
+     * Set the gravity, the solver and the sleep of the world from the configuration of the physics
+     * */
+    pub fn configure(mut self, config: PhysicsConfig) {
+        self._gravity = config.gravity;
+        self._solver = SolverSettings(substeps-> config.substeps,
+                                      iterations-> config.iterations,
+                                      contactHertz-> config.contactHertz,
+                                      contactDamping-> config.contactDamping,
+                                      maxCorrection-> config.maxCorrection,
+                                      bounceThreshold-> config.bounceThreshold);
+        self._sleep = SleepThresholds(linear-> config.sleepLinear,
+                                      angular-> config.sleepAngular,
+                                      time-> config.sleepTime);
     }
 
     /**
@@ -196,6 +262,17 @@ pub class PhysicsWorld {
         self._states[handle]
     }
 
+    /**
+     * @returns: the pose of a body before the last step, the display placing it between that pose and the one of its
+     * state (see RigidTransform::interpolated)
+     *
+     * @warning: the body is in the world (see contains)
+     *
+     * */
+    pub fn getPrevious(self, handle: u32)-> RigidTransform {
+        self._previous[handle]
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -220,6 +297,7 @@ pub class PhysicsWorld {
         } else {
             self._bodies = self._bodies ~ copy [WorldBody()];
             self._states = self._states ~ copy [BodyState()];
+            self._previous = self._previous ~ copy [RigidTransform()];
             cast!u32(self._bodies.len - 1us)
         };
 
@@ -229,6 +307,7 @@ pub class PhysicsWorld {
 
         self._bodies[handle] = WorldBody(collider-> collider, settings-> taken, used-> true);
         self._states[handle] = state;
+        self._previous[handle] = state.pose;
 
         if collider.isPlane {
             self._planes ~= [cast!usize(handle)];
@@ -290,6 +369,7 @@ pub class PhysicsWorld {
         let body = self._bodies[handle];
         let state = utils::movedState(self._states[handle], body.collider.shape, transform, body.settings);
         self._states[handle] = state;
+        self._previous[handle] = state.pose;
 
         let placement = utils::placementOf(state, transform, body.settings);
         self:.place(handle, Collider(self._bodies[handle].collider.shape, placement));
@@ -528,6 +608,46 @@ pub class PhysicsWorld {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ======================================          STEP          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Advance the dynamic bodies by a step: the pairs and their manifolds updated, the bodies grouped in islands, each
+     * awake island solved and moved in sub steps (see solveIsland), the islands still for long enough put to sleep
+     *
+     * @params:
+     *    - dt: the duration of the step, in seconds
+     *
+     * */
+    pub fn step(mut self, dt: f32) {
+        if dt <= 0.0f { return; }
+
+        self._step = dt;
+        for i in 0us .. self._states.len { self._previous[i] = self._states[i].pose; }
+
+        self:.updatePairs();
+        self:.updateAllManifolds();
+
+        let islands = self.islands();
+        self:.wakeTouched(islands);
+
+        let slots = self.slotsOf(islands);
+        for k in 0us .. islands.len if self._states[islands[k][0]].awake {
+            if let Ok(s) = slots[k] {
+                self:.solveIsland(islands[k], s, dt);
+            } else {
+                self:.solveIsland(islands[k], [], dt);
+            }
+        }
+
+        self:.sleepIslands(islands, dt);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * =====================================          PAIRS          ======================================
      * ====================================================================================================
      * ====================================================================================================
@@ -753,6 +873,201 @@ pub class PhysicsWorld {
      */
 
     /**
+     * Find the manifolds of the pairs, a pair whose bodies are both asleep or static keeping its own (a trigger
+     * always looking again)
+     * */
+    fn updateAllManifolds(mut self) {
+        for slot in 0us .. self._pairs.len {
+            let p = self._pairs.get(slot);
+            let a = self._bodies[p.a], b = self._bodies[p.b];
+            let still = !self._states[p.a].awake && !self._states[p.b].awake;
+            if still && !a.settings.trigger && !b.settings.trigger { continue; }
+
+            self:.updateManifolds(slot);
+        }
+    }
+
+    /**
+     * Count the time the bodies of each awake island stayed still during a step, the island sleeping when all its
+     * bodies stayed still for long enough and may sleep
+     * */
+    fn sleepIslands(mut self, islands: [[u32]], dt: f32) {
+        for island in islands if self._states[island[0]].awake {
+            let mut ready = true;
+            for b in island {
+                let mut s = self._states[b];
+                let still = s:.updateSleep(dt, self._sleep);
+                self._states[b] = s;
+                if !still || !self._bodies[b].settings.canSleep { ready = false; }
+            }
+
+            if ready {
+                for b in island { self:.sleep(b); }
+            }
+        }
+    }
+
+    /**
+     * @returns: the slots of the pairs in contact of each island, by the index of the island, a pair being in the
+     * island of its dynamic bodies
+     * */
+    fn slotsOf(self, islands: [[u32]])-> [usize => [usize]] {
+        let dmut islandOf = copy [NO_ISLAND ; self._bodies.len];
+        for k in 0us .. islands.len {
+            for b in islands[k] { islandOf[b] = k; }
+        }
+
+        let dmut result: [usize => [usize]] = copy [];
+        for slot in 0us .. self._pairs.len {
+            let p = self._pairs.get(slot);
+            if !utils::inContact(p) { continue; }
+
+            let k = if islandOf[p.a] != NO_ISLAND { islandOf[p.a] } else { islandOf[p.b] };
+            if k == NO_ISLAND { continue; }
+
+            if let Ok(s) = result[k] {
+                result[k] = s ~ [slot];
+            } else {
+                result[k] = copy [slot];
+            }
+        }
+
+        result
+    }
+
+    /**
+     * Solve and move an island during a step: its dynamic bodies, and the static and kinematic bodies they touch,
+     * copied as solver bodies, the constraints of their points prepared, then, at each sub step, the velocities
+     * changed by gravity and the forces, the constraints warm started and solved, the bodies moved, the velocities the
+     * correction of the penetrations left relaxed; the impulses written back to the points for the next step, the
+     * velocities and the poses to the states
+     *
+     * @params:
+     *    - island: the dynamic bodies of the island
+     *    - slots: the slots of the pairs in contact of the island
+     *
+     * @info: the contacts are found once a step, the sub steps moving the separation of each point by the motion of
+     * its bodies (Box2D v3, solver2d); a stack holds still at a shorter step where more passes over the contacts of a
+     * longer one leave it swaying
+     *
+     * */
+    fn solveIsland(mut self, island: [u32], slots: [usize], dt: f32) {
+        let dmut index: [u32 => usize] = copy [];
+        let dmut bodies: [SolverBody] = [];
+        for b in island {
+            index[b] = bodies.len;
+            bodies = bodies ~ copy [self.solverBodyOf(b)];
+        }
+
+        let dmut constraints: [ContactConstraint] = [];
+        for slot in slots {
+            let p = self._pairs.get(slot);
+            for h in [p.a, p.b] if !(h in index) {
+                index[h] = bodies.len;
+                bodies = bodies ~ copy [self.solverBodyOf(h)];
+            }
+
+            let ia = self.indexOf(index, p.a), ib = self.indexOf(index, p.b);
+            let (friction, restitution) = solver::materialOf(self._bodies[p.a].settings, self._bodies[p.b].settings);
+            for m in 0us .. p.manifolds.len {
+                let manifold = p.manifolds[m];
+                for k in 0us .. manifold.points.len {
+                    let mut c = solver::prepare(bodies, ia, ib, manifold.normal, manifold.points[k], friction,
+                                                restitution, self._solver);
+                    c.slot = slot;
+                    c.manifold = m;
+                    c.point = k;
+                    constraints = constraints ~ copy [c];
+                }
+            }
+        }
+
+        let substeps = comparison::max(self._solver.substeps, 1u32);
+        let h = dt / cast!f32(substeps);
+        for _ in 0u32 .. substeps {
+            solver::integrateVelocities(alias bodies, h);
+            solver::warmStart(alias bodies, constraints);
+            for _ in 0u32 .. self._solver.iterations {
+                solver::solve(alias bodies, alias constraints, h, self._solver, true);
+            }
+
+            solver::integratePositions(alias bodies, h);
+            solver::solve(alias bodies, alias constraints, h, self._solver, false);
+        }
+
+        solver::applyRestitution(alias bodies, alias constraints);
+        self:.storeImpulses(constraints);
+
+        for sb in bodies if self.isDynamic(sb.handle) {
+            let mut s = self._states[sb.handle];
+            s.linearVelocity = sb.linearVelocity;
+            s.angularVelocity = sb.angularVelocity;
+            s.pose.rotation = (sb.deltaRotation * s.pose.rotation).normalized();
+            s.pose.position = sb.centre + sb.deltaPosition - s.pose.rotation * s.centre;
+            s:.refresh();
+            self._states[sb.handle] = s;
+
+            self:.place(sb.handle, Collider(self._bodies[sb.handle].collider.shape, s.placement));
+        }
+    }
+
+    /**
+     * Write the impulses the constraints gathered back to their points, the constraints of a pair following each other
+     * */
+    fn storeImpulses(mut self, constraints: [ContactConstraint]) {
+        let mut k = 0us;
+        while k < constraints.len {
+            let slot = constraints[k].slot;
+            let mut p = self._pairs.get(slot);
+            let dmut manifolds = copy p.manifolds;
+            while k < constraints.len && constraints[k].slot == slot {
+                let c = constraints[k];
+                let m = manifolds[c.manifold];
+                let dmut points = copy m.points;
+                points[c.point].normalImpulse = c.normalImpulse;
+                points[c.point].frictionImpulse = c.tangent1 * c.tangentImpulse1 + c.tangent2 * c.tangentImpulse2;
+                manifolds[c.manifold] = ContactManifold(m.key, m.normal, points);
+                k += 1us;
+            }
+
+            p.manifolds = manifolds;
+            self._pairs:.set(slot, p);
+        }
+    }
+
+    /**
+     * @returns: a body as the solver pushes and moves it, gravity and its forces accelerating a dynamic body, nothing
+     * pushing nor moving a static or a kinematic body
+     * */
+    fn solverBodyOf(self, handle: u32)-> SolverBody {
+        let s = self._states[handle];
+        let mut b = SolverBody(handle-> handle,
+                               linearVelocity-> s.linearVelocity,
+                               angularVelocity-> s.angularVelocity,
+                               centre-> s.worldCentre);
+        if self.isDynamic(handle) {
+            let settings = self._bodies[handle].settings;
+            b.inverseMass = s.inverseMass;
+            b.inverseInertia = s.inverseInertia;
+            b.linearAcceleration = self._gravity + s.force * s.inverseMass;
+            b.angularAcceleration = s.inverseInertia * s.torque;
+            b.linearDamping = settings.linearDamping;
+            b.angularDamping = settings.angularDamping;
+        }
+
+        b
+    }
+
+    /**
+     * @returns: the index of a body in the solver bodies of an island
+     * @warning: the body is in the island
+     * */
+    fn indexOf(self, index: [u32 => usize], handle: u32)-> usize {
+        if let Ok(i) = index[handle] { return i; }
+        panic;
+    }
+
+    /**
      * @returns: the islands of the dynamic bodies, those in contact through their pairs (a point of a manifold, even
      * speculative) put in one island, a static or a kinematic body joining none; a dynamic body in contact with no
      * other an island of its own; the sleeping bodies in their islands too
@@ -862,7 +1177,7 @@ pub class PhysicsWorld {
         let sa = self._states[p.a], sb = self._states[p.b];
         let reachA = sa.angularVelocity.length() * self.reachOf(p.a);
         let reachB = sb.angularVelocity.length() * self.reachOf(p.b);
-        SPECULATIVE_FLOOR + ((sa.linearVelocity - sb.linearVelocity).length() + reachA + reachB) * STEP
+        SPECULATIVE_FLOOR + ((sa.linearVelocity - sb.linearVelocity).length() + reachA + reachB) * self._step
     }
 
     /**
