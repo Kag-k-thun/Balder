@@ -1,5 +1,6 @@
 in world;
 
+mod ::islands;
 mod ::utils;
 
 use balder::math::{bounds, matrix, quaternion, vector};
@@ -261,8 +262,9 @@ pub class PhysicsWorld {
             let p = self._pairs.get(slot);
             if p.a != handle && p.b != handle { slot += 1us; continue; }
 
-            // the last pair is moved into the slot, looked at next
+            // the last pair is moved into the slot, looked at next, what the body held up woken
             self._pairs:.remove(pairKey(p.a, p.b));
+            self:.wakeIfAsleep(if p.a == handle { p.b } else { p.a });
             if p.touching {
                 ended ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
             }
@@ -291,6 +293,7 @@ pub class PhysicsWorld {
 
         let placement = utils::placementOf(state, transform, body.settings);
         self:.place(handle, Collider(self._bodies[handle].collider.shape, placement));
+        self:.wakeContactsOf(handle);
     }
 
     /**
@@ -665,6 +668,17 @@ pub class PhysicsWorld {
     }
 
     /**
+     * Wake the dynamic bodies a body is in contact with, a body moved by the game not leaving them asleep in the air
+     * */
+    pub fn wakeContactsOf(mut self, handle: u32) {
+        for slot in 0us .. self._pairs.len {
+            let p = self._pairs.get(slot);
+            if p.a == handle { self:.wakeIfAsleep(p.b); }
+            else if p.b == handle { self:.wakeIfAsleep(p.a); }
+        }
+    }
+
+    /**
      * Put a dynamic body to sleep, its velocities dropped, until something
      * wakes it (see wake)
      *
@@ -737,6 +751,79 @@ pub class PhysicsWorld {
      * ====================================================================================================
      * ====================================================================================================
      */
+
+    /**
+     * @returns: the islands of the dynamic bodies, those in contact through their pairs (a point of a manifold, even
+     * speculative) put in one island, a static or a kinematic body joining none; a dynamic body in contact with no
+     * other an island of its own; the sleeping bodies in their islands too
+     *
+     * */
+    fn islands(self)-> [[u32]] {
+        let dmut parent = copy [0u32 ; self._bodies.len];
+        for i in 0us .. parent.len { parent[i] = cast!u32(i); }
+
+        for p in self._pairs.pairs if utils::inContact(p) && self.isDynamic(p.a) && self.isDynamic(p.b) {
+            islands::join(alias parent, p.a, p.b);
+        }
+
+        let dmut byRoot: [u32 => [u32]] = copy [];
+        for i in 0us .. self._bodies.len if self.isDynamic(cast!u32(i)) {
+            let r = islands::rootOf(alias parent, cast!u32(i));
+            if let Ok(members) = byRoot[r] {
+                byRoot[r] = members ~ [cast!u32(i)];
+            } else {
+                byRoot[r] = copy [cast!u32(i)];
+            }
+        }
+
+        let mut result: [[u32]] = [];
+        for _, members in byRoot { result ~= [members]; }
+        result
+    }
+
+    /**
+     * Wake the sleeping dynamic bodies in contact with an awake dynamic body or a moving kinematic body, their whole
+     * island with them: a stack woken at once, not a body a step
+     *
+     * */
+    fn wakeTouched(mut self, islands: [[u32]]) {
+        for p in self._pairs.pairs if utils::inContact(p) {
+            if self.pushes(p.a) { self:.wakeIfAsleep(p.b); }
+            if self.pushes(p.b) { self:.wakeIfAsleep(p.a); }
+        }
+
+        for island in islands {
+            let mut awake = false;
+            for b in island if self._states[b].awake { awake = true; }
+
+            if awake {
+                for b in island { self:.wakeIfAsleep(b); }
+            }
+        }
+    }
+
+    /**
+     * Wake a dynamic body if it sleeps, an awake body counting its time still on
+     * */
+    fn wakeIfAsleep(mut self, handle: u32) {
+        if self.isDynamic(handle) && !self._states[handle].awake {
+            self:.wake(handle);
+        }
+    }
+
+    /**
+     * @returns: true iif a body wakes those it is in contact with: a dynamic body awake, a kinematic body moving
+     * */
+    fn pushes(self, handle: u32)-> bool {
+        let s = self._states[handle];
+        match self._bodies[handle].settings.motion {
+            BodyMotion::DYNAMIC => { s.awake }
+            BodyMotion::KINEMATIC => {
+                s.linearVelocity.dot(s.linearVelocity) > 0.0f || s.angularVelocity.dot(s.angularVelocity) > 0.0f
+            }
+            _ => { false }
+        }
+    }
 
     /**
      * Find the manifolds of a pair that is not a trigger from those of the step
