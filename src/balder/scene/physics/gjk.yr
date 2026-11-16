@@ -2,6 +2,7 @@ in gjk;
 
 use balder::math::vector;
 
+use std::math;
 use std::algorithm::comparison;
 
 /**
@@ -15,10 +16,35 @@ def MAX_ITERATIONS = 32us;
 def MAX_CAST_STEPS = 32us;
 
 /**
- * The number of advances of a shape along the motion of its body at most (see advance), a shape grazing another one
- * advancing by smaller and smaller steps
+ * The number of advances of a shape along the motion of its body at most (see advance), each one a search of the
+ * closest points then of a root of the separation along their axis
  * */
-pub def MAX_ADVANCES = 64us;
+def MAX_ADVANCES = 20us;
+
+/**
+ * The number of deepest points along an axis whose separation is followed back to its root at most, each one deeper
+ * than the one before at that root (see impactAlong)
+ * */
+def MAX_PUSHES = 8us;
+
+/**
+ * The number of parts of the rest of a step whose ends the separation along an axis is looked at at most, a shape
+ * turning by less between them than lets one of its points come closer between the two than at either (see impactAlong)
+ * */
+def MAX_TURN_PARTS = 64u32;
+
+/**
+ * The number of bisections and secants of the search of a root of the separation along an axis at most (see rootOf)
+ * */
+def MAX_ROOT_STEPS = 50us;
+
+/**
+ * The distance a shape advanced along the motion of its body aims at from what it hits, over the distance it stops at,
+ * and how far from it the separation may stop, so that it stops between half that distance and that distance (see
+ * advance)
+ * */
+def IMPACT_AIM = 0.75f;
+def IMPACT_TOLERANCE = 0.25f;
 
 /**
  * The progress toward the origin, relative to its squared distance, under which the search of the closest points stops
@@ -111,6 +137,15 @@ record CoreSearch {
 
 
 /**
+ * What the search of the fraction at which a shape moving along the motion of its body comes to a distance of a still
+ * one along an axis found (see impactAlong)
+ * */
+enum Impact : u32
+| SEPARATED = 0u32 // farther than the distance along the axis until the end of the step
+| REACHED   = 1u32 // at the distance along the axis at a later fraction, the closest points to search again there
+| HIT       = 2u32; // within the distance from the fraction it started at, or out of deepest points
+
+/**
  * A triangle of the polytope of the expansion, its corners in the vertices,
  * counterclockwise from outside
  *
@@ -125,11 +160,16 @@ record PolytopeFace {
 }
 
 
-fn closestCores(a: Convex, b: Convex)-> CoreSearch {
-    let mut start = a.centre - b.centre;
-    if start.dot(start) <= TOUCHING { start = makeVec3(1.0f, 0.0f, 0.0f); }
+/**
+ * @params:
+ *    - start: the direction the first vertex of the search is the farthest along, in the difference of the cores: from
+ *    the centre of the second toward the first, or the normal found last to start from its closest vertex
+ * */
+fn closestCores(a: Convex, b: Convex, start: vec3)-> CoreSearch {
+    let mut first = start;
+    if first.dot(first) <= TOUCHING { first = makeVec3(1.0f, 0.0f, 0.0f); }
 
-    let mut simplex = single(vertexAlong(a, b, start));
+    let mut simplex = single(vertexAlong(a, b, first));
     let mut closest = simplex.vertices[0].w;
     for _ in 0us .. MAX_ITERATIONS {
         let squared = closest.dot(closest);
@@ -195,7 +235,7 @@ fn closestCores(a: Convex, b: Convex)-> CoreSearch {
  *
  * */
 pub fn separation(a: Convex, b: Convex)-> Separation {
-    let s = closestCores(a, b);
+    let s = closestCores(a, b, a.centre - b.centre);
     let margins = a.margin + b.margin;
     if s.overlapping || s.distance <= margins {
         return Separation(overlapping-> true);
@@ -252,34 +292,183 @@ pub fn sweep(moving: Convex, direction: vec3, length: f32, target: Convex)-> (Su
 
 /**
  * Advance a convex shape along the motion of its body over a step, its rotation included, until it comes within a
- * distance of another one, by conservative advancement (Mirtich): no point of the core gets closer to the other shape
- * along the normal between them than by the displacement along that normal plus the angle times the reach of the core
- * from the centre of the mass, so the shape can advance by the distance between them over that bound without passing
- * through; each advance stops half the distance short, so that the shapes never meet
+ * distance of another one, by the time of impact of Catto (Box2D, b2TimeOfImpact): the closest points of the shapes give
+ * an axis, along which the shape comes to the distance at a fraction of the step found along its actual motion (see
+ * impactAlong); the separation along an axis never exceeds the distance between the shapes, so the shape comes no
+ * closer before that fraction; the closest points are searched again there, from the normal found last, until the
+ * shapes are within the distance or the shape stays farther along an axis to the end of the step
  * @params:
  *    - moving: the shape moved, where it starts
  *    - motion: the motion of its body over the step
  *    - target: the shape it may hit, still
  *    - stop: the distance it stops at from the target, above 0
- * @returns: the fraction of the step at which the shape comes within the stop distance of the target, 0 when it starts
- * within it; none when it stays farther over the whole step; the fraction reached when it runs out of advances, before
- * the impact
+ * @returns: the fraction of the step at which the shape comes within the stop distance of the target, more than half
+ * of it away; 0 when it starts within it; none when it stays farther over the whole step; the fraction reached when it
+ * runs out of advances, before the impact
  * */
 pub fn advance(moving: Convex, motion: StepMotion, target: Convex, stop: f32)-> (f32)? {
-    let turning = motion.angle * moving.reachFrom(motion.pivot);
+    let aim = IMPACT_AIM * stop, tolerance = IMPACT_TOLERANCE * stop;
+    let margins = moving.margin + target.margin;
+    let reach = moving.reachFrom(motion.pivot);
     let mut fraction = 0.0f;
+    let mut start = moving.centre - target.centre;
     for _ in 0us .. MAX_ADVANCES {
-        let s = separation(motion.moved(moving, fraction), target);
-        if s.overlapping || s.distance <= stop { return fraction?; }
+        let s = closestCores(motion.moved(moving, fraction), target, start);
+        if s.overlapping || s.distance - margins <= stop { return fraction?; }
 
-        let closing = motion.displacement.dot(s.normal) + turning;
-        if closing <= 1.0e-6f { return none; }
+        let offset = s.normal.dot(target.support(-s.normal)) - target.margin;
+        let (impact, reached) = impactAlong(moving, motion, reach, s.normal, offset, fraction, aim, tolerance);
+        match impact {
+            Impact::SEPARATED => { return none; }
+            Impact::HIT => { return reached?; }
+            _ => { fraction = reached; }
+        }
 
-        fraction += (s.distance - stop / 2.0f) / closing;
-        if fraction >= 1.0f { return none; }
+        start = s.normal;
     }
 
     fraction?
+}
+
+/**
+ * Advance a convex shape along the motion of its body over a step until it comes within a distance of a still half
+ * space, all that lies beyond an offset along an axis (see advance), the separation along the axis being the distance
+ * @params:
+ *    - axis: the unit axis from the shape toward the half space
+ *    - offset: where the half space starts along the axis
+ * @returns: the fraction of the step at which the shape comes within the stop distance of the half space, 0 when it
+ * starts within it; none when it stays farther over the whole step
+ * */
+pub fn advanceAlong(moving: Convex, motion: StepMotion, axis: vec3, offset: f32, stop: f32)-> (f32)? {
+    let aim = IMPACT_AIM * stop, tolerance = IMPACT_TOLERANCE * stop;
+    let reach = moving.reachFrom(motion.pivot);
+    let mut fraction = 0.0f;
+    for _ in 0us .. MAX_ADVANCES {
+        let at = motion.moved(moving, fraction);
+        if offset - axis.dot(at.support(axis)) - at.margin <= stop { return fraction?; }
+
+        let (impact, reached) = impactAlong(moving, motion, reach, axis, offset, fraction, aim, tolerance);
+        match impact {
+            Impact::SEPARATED => { return none; }
+            Impact::HIT => { return reached?; }
+            _ => { fraction = reached; }
+        }
+    }
+
+    fraction?
+}
+
+/**
+ * Find the fraction of a step at which a shape moving along the motion of its body comes to a distance of a still one
+ * along a fixed axis, part of the rest of the step after part (see pushedBack): a point turning by an angle about the
+ * centre of the mass comes closer along the axis between two fractions than at the closer of them by its reach times
+ * the square of the angle over 8 at most, so the parts turn by little enough that no point of the shape comes closer
+ * within one than at its ends by more than the tolerance
+ * @params:
+ *    - moving: the shape moved, where it starts
+ *    - motion: the motion of its body over the step
+ *    - reach: the distance from the centre of the mass to the farthest point of the core of the shape
+ *    - axis: the unit axis from the shape toward the other one
+ *    - offset: where the other one starts along the axis, its margin taken off
+ *    - from: the fraction the shape starts at, farther than the distance
+ *    - aim: the distance
+ *    - tolerance: how far from the distance the separation may end
+ * @returns: what the search found, and the fraction the shape reached
+ * */
+fn impactAlong(moving: Convex, motion: StepMotion, reach: f32, axis: vec3, offset: f32, from: f32, aim: f32,
+               tolerance: f32)-> (Impact, f32) {
+    let turn = motion.angle * (1.0f - from);
+    let mut parts = 1u32;
+    if reach > 0.0f && turn > 0.0f {
+        let most = math::sqrt(8.0f * tolerance / reach);
+        parts = cast!u32(comparison::min(math::ceil(turn / most), cast!f32(MAX_TURN_PARTS)));
+        parts = comparison::max(parts, 1u32);
+    }
+
+    let mut start = from;
+    for i in 1u32 .. parts + 1u32 {
+        let end = if i == parts { 1.0f } else { from + (1.0f - from) * cast!f32(i) / cast!f32(parts) };
+        let (impact, reached) = pushedBack(moving, motion, axis, offset, start, end, aim, tolerance);
+        if impact != Impact::SEPARATED { return (impact, reached); }
+
+        start = end;
+    }
+
+    (Impact::SEPARATED, 1.0f)
+}
+
+/**
+ * Find the fraction between two at which a shape moving along the motion of its body comes to a distance of a still one
+ * along a fixed axis: the point of the shape the deepest along the axis at the later fraction is followed along the
+ * motion back to the fraction its separation reaches the distance (see rootOf), then the point the deepest there, until
+ * the deepest one is at the distance (Catto, "Continuous Collision", GDC 2013)
+ * @params:
+ *    - from, until: the fractions, the shape farther than the distance at the first
+ * @returns: what the search found, separated when the shape is still farther at the later fraction, and the fraction
+ * the shape reached
+ * */
+fn pushedBack(moving: Convex, motion: StepMotion, axis: vec3, offset: f32, from: f32, until: f32, aim: f32,
+              tolerance: f32)-> (Impact, f32) {
+    let mut to = until;
+    for _ in 0us .. MAX_PUSHES {
+        let deepest = moving.support(motion.rotationAt(to).conjugate() * axis);
+        let s2 = separationAlong(moving, motion, axis, offset, deepest, to);
+        if s2 > aim + tolerance {
+            if to >= until { return (Impact::SEPARATED, to); }
+            return (Impact::REACHED, to);
+        }
+
+        if s2 > aim - tolerance { return (Impact::REACHED, to); }
+
+        let s1 = separationAlong(moving, motion, axis, offset, deepest, from);
+        if s1 <= aim + tolerance { return (Impact::HIT, from); }
+
+        to = rootOf(moving, motion, axis, offset, deepest, (from, s1), (to, s2), aim, tolerance);
+    }
+
+    (Impact::HIT, from)
+}
+
+/**
+ * @returns: the fraction between two others at which the separation of a point of a shape moving along the motion of its
+ * body reaches a distance along an axis, within a tolerance, by bisections and secants in turn; the latest fraction
+ * found farther when it runs out of steps
+ * @params:
+ *    - point: the point of the shape, where it starts
+ *    - before, after: two fractions and the separation of the point at them, farther and closer than the distance
+ * */
+fn rootOf(moving: Convex, motion: StepMotion, axis: vec3, offset: f32, point: vec3, before: (f32, f32), after: (f32, f32),
+          aim: f32, tolerance: f32)-> f32 {
+    let mut t1 = before._0;
+    let mut s1 = before._1;
+    let mut t2 = after._0;
+    let mut s2 = after._1;
+    for k in 0us .. MAX_ROOT_STEPS {
+        let t = if k % 2us == 1us { t1 + (aim - s1) * (t2 - t1) / (s2 - s1) } else { (t1 + t2) / 2.0f };
+        let s = separationAlong(moving, motion, axis, offset, point, t);
+        if math::abs(s - aim) < tolerance { return t; }
+
+        if s > aim {
+            t1 = t;
+            s1 = s;
+        } else {
+            t2 = t;
+            s2 = s;
+        }
+    }
+
+    t1
+}
+
+/**
+ * @returns: the separation along an axis between a point of a shape moving along the motion of its body, at a fraction
+ * of the step, and an offset along the axis, the margin of the shape taken off
+ * @params:
+ *    - point: the point, where the shape starts
+ * */
+fn separationAlong(moving: Convex, motion: StepMotion, axis: vec3, offset: f32, point: vec3, fraction: f32)-> f32 {
+    let at = motion.pivot + motion.displacement * fraction + motion.rotationAt(fraction) * (point - motion.pivot);
+    offset - axis.dot(at) - moving.margin
 }
 
 /**
@@ -469,7 +658,7 @@ fn nearest(x: Simplex, y: Simplex)-> Simplex {
  *
  * */
 pub fn penetration(a: Convex, b: Convex)-> (Penetration)? {
-    let s = closestCores(a, b);
+    let s = closestCores(a, b, a.centre - b.centre);
     let margins = a.margin + b.margin;
     if !s.overlapping {
         if s.distance > margins { return none; }
