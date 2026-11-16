@@ -254,12 +254,29 @@ A body whose settings are a `bullet` is advanced at each step, once its island i
 against the static and the kinematic bodies it touches by their layers and masks, triggers and bodies a joint holds
 apart left out (`PhysicsWorld::impactOf`). Its motion (`StepMotion`) is the straight line of the centre of its mass and
 its rotation about it by the angle and the axis it turned through over the sub steps (`Quaternion::turn`, beyond half a
-turn when it spins that fast). Each convex part of its collider is advanced by conservative advancement
-(`gjk::advance`, Mirtich): no point of its core closes in on another shape along the normal between them faster than
-the displacement along the normal plus the angle times the reach of the core from the centre of the mass, so the shape
-can advance by the distance between them over that bound without passing through. The bullet is stopped at the first
-impact, 5 mm from what it hits (`IMPACT_DISTANCE`), its velocities kept: the rest of its step is dropped, and its
-speculative points take over at the next step, stopping it, bouncing it back by its restitution or letting it slide.
+turn when it spins that fast). The bullet is stopped at the first impact, 5 mm from what it hits (`IMPACT_DISTANCE`),
+its velocities kept: the rest of its step is dropped, and its speculative points take over at the next step, stopping
+it, bouncing it back by its restitution or letting it slide.
+
+Each convex part of its collider is advanced by the time of impact of Catto (`gjk::advance`, after `b2TimeOfImpact` of
+Box2D, "Continuous Collision", GDC 2013). The closest points of the part and of the shape it may hit (`gjk`, its simplex
+of four vertices at most held in place, started from the normal found last) give an axis. The point of the part the
+deepest along the axis at the end of the step is followed along its actual motion back to the fraction at which its
+separation along the axis comes to the stop distance (bisections and secants in turn), then the point the deepest
+there, until the deepest one is at that distance. The separation along an axis never exceeds the distance between two
+shapes, so the part comes no closer before that fraction; the closest points are searched again there, until the
+shapes are within the stop distance, or the part stays farther along an axis to the end of the step. A point turning
+about the centre of the mass may come closer along the axis between two fractions than at either of them, by its reach
+times the square of the angle over 8 at most: the rest of the step is looked at in parts turning by little enough that
+no point comes closer within one than at its ends by more than a quarter of the stop distance, so that the end of a
+plank sweeping into a wall and back out within a step is caught. A half space (a plane) is its own axis, the
+separation along its normal being the distance.
+
+Only a fast bullet is advanced (after Box2D v3): what the cores of its shape travel over the step, its displacement
+plus its angle times their reach from the centre of its mass, reaches half its half thickness, the thinnest of its
+parts (both measured once a step, `PhysicsWorld::measureBullet`). A slower bullet sinks by less than that into what it
+meets, and is left to its speculative points, which cover its speed as for any other body: a bullet resting or rolling
+slowly moves as a body that is not one, and costs no more.
 
 A part the bullet starts against (within 5 mm) is left to the contacts, else a bullet resting or sliding on the ground
 would never move: its shape eroded by half its half thickness (`Convex::eroded`) is advanced instead, so that it sinks
@@ -267,13 +284,13 @@ by a part of its thickness and no more, then, sunk that deep, its core, a sphere
 triangle of a mesh whose plane the bullet lies against but which it is apart from is left out, the bullet sliding onto
 it from a neighbour over an inner edge (`Collider::advance`).
 
-Against the static and the kinematic bodies, the speculative points of a bullet cover the spin of the cores of its shape
-only (none for a ball), its advancement covering its speed: a corner it passes by gets no point. A bullet against a
-dynamic body has the speculative points of any other body. A kinematic body is still during the steps, the game moving
+Against the static and the kinematic bodies, the speculative points of a fast bullet cover the spin of the cores of its
+shape only (none for a ball), its advancement covering its speed: a corner it passes by gets no point. A bullet against
+a dynamic body has the speculative points of any other body. A kinematic body is still during the steps, the game moving
 it between them, so a bullet is advanced against where it is.
 
-Advancing a thin plank spinning against a wall made its steps three times as long in the tests, the advances shrinking
-as it turns toward the wall: the flag is for the few bodies that need it.
+The `bullets` scene of `physbench` (see Measuring a step) throws planks spinning at thin walls and balls grazing low
+blocks, again every two seconds: their advancement is about a fifth of a step there, the solver most of the rest.
 
 ## The solver
 
@@ -479,8 +496,9 @@ gyllir build physbench --release
 ```
 
 The scenes are `pile` (columns of boxes ten high), `pyramid` (walls of boxes, twenty at their base), `spheres` (on a
-floor of triangles) and `mix` (boxes, spheres, capsules and cylinders). `--no-sleep` keeps every body awake, each step
-solving them all.
+floor of triangles), `mix` (boxes, spheres, capsules and cylinders) and `bullets` (a lane by bullet, a plank 2 cm thick
+spinning at 50 rad/s thrown at 50 m/s at a thin wall, or a ball thrown at 40 m/s over a low block, all thrown again
+every two seconds). `--no-sleep` keeps every body awake, each step solving them all.
 
 ## Threads
 

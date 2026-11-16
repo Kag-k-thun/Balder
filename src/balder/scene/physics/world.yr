@@ -43,6 +43,13 @@ def SPECULATIVE_FLOOR = 0.02f;
 def IMPACT_DISTANCE = 0.005f;
 
 /**
+ * The reach of the motion of a bullet over a step, over its half thickness, from which it is advanced along it, slower
+ * bullets sinking by less than that into what they meet and left to their speculative points (Box2D v3)
+ *
+ * */
+def FAST_RATIO = 0.5f;
+
+/**
  * The duration of a step of the solver until a step is run, in seconds, the
  * speculative distances covering what the bodies travel in a step
  *
@@ -97,6 +104,11 @@ record WorldBody {
 
     // The next free slot after a free one, NO_BODY for the last
     pub let mut next: u32 = NO_BODY;
+
+    // For a bullet, the distance from its centre of mass to the farthest point of the cores of its shape, and the
+    // thinnest half thickness of its parts, measured at the start of each step (see PhysicsWorld::measureBullet)
+    pub let mut coreReach: f32 = 0.0f;
+    pub let mut halfThickness: f32 = 0.0f;
 
 }
 
@@ -986,7 +998,10 @@ pub class PhysicsWorld {
         let start = Instant::now();
         let mut timings = StepTimings();
         self._step = dt;
-        for i in 0us .. self._states.len { self._previous[i] = self._states[i].pose; }
+        for i in 0us .. self._states.len {
+            self._previous[i] = self._states[i].pose;
+            if self.isBullet(cast!u32(i)) { self:.measureBullet(cast!u32(i)); }
+        }
 
         let beforePairs = Instant::now();
         self:.updatePairs();
@@ -1431,9 +1446,11 @@ pub class PhysicsWorld {
             let mut shift = sb.deltaPosition;
             if self._bodies[sb.handle].settings.bullet {
                 let motion = StepMotion(sb.centre, sb.deltaPosition, sb.deltaRotation);
-                if let Ok(f) = self.impactOf(sb.handle, motion) {
-                    turn = motion.rotationAt(f);
-                    shift = sb.deltaPosition * f;
+                if self.isFast(sb.handle, motion.displacement.length(), motion.angle) {
+                    if let Ok(f) = self.impactOf(sb.handle, motion) {
+                        turn = motion.rotationAt(f);
+                        shift = sb.deltaPosition * f;
+                    }
                 }
             }
 
@@ -1726,37 +1743,58 @@ pub class PhysicsWorld {
     }
 
     /**
-     * @returns: the motion of a body the speculative points of its pair with another one cover; for a bullet against a
-     * body that is not dynamic, its spin only, at the reach of the cores of its shape (none for a ball), so that a corner
-     * it passes by gets no point slowing it
+     * @returns: the motion of a body the speculative points of its pair with another one cover; for a fast bullet
+     * against a body that is not dynamic, its spin only, at the reach of the cores of its shape (none for a ball), so
+     * that a corner it passes by gets no point slowing it
      *    - 0: its linear velocity
      *    - 1: the speed of its spin at the reach of its box, or of its cores
      * */
     fn coveredOf(self, handle: u32, other: u32)-> (vec3, f32) {
         let s = self._states[handle];
         let spin = s.angularVelocity.length();
-        if self.isBullet(handle) && !self.isDynamic(other) {
-            return (vec3(), spin * self.coreReachOf(handle));
+        if self.isBullet(handle) && !self.isDynamic(other)
+            && self.isFast(handle, s.linearVelocity.length() * self._step, spin * self._step)
+        {
+            return (vec3(), spin * self._bodies[handle].coreReach);
         }
 
         (s.linearVelocity, spin * self.reachOf(handle))
     }
 
     /**
-     * @returns: the distance from the centre of the mass of a body to the farthest point of the cores of its shape, its
-     * parts for a compound (see Convex::reachFrom)
+     * Measure a bullet at the start of a step: the distance from its centre of mass to the farthest point of the cores
+     * of its shape, its parts for a compound (see Convex::reachFrom), and the thinnest half thickness of its parts (see
+     * Convex::halfThickness)
      * */
-    fn coreReachOf(self, handle: u32)-> f32 {
+    fn measureBullet(mut self, handle: u32) {
         let collider = self._bodies[handle].collider;
         let centre = self._states[handle].worldCentre;
-        if !collider.isCompound { return collider.convex().reachFrom(centre); }
-
-        let mut far = 0.0f;
-        for p in collider.parts {
-            far = comparison::max(far, p.convex().reachFrom(centre));
+        let mut reach = 0.0f;
+        let mut thinnest = f32::max;
+        if collider.isCompound {
+            for p in collider.parts {
+                let part = p.convex();
+                reach = comparison::max(reach, part.reachFrom(centre));
+                thinnest = comparison::min(thinnest, part.halfThickness);
+            }
+        } else if !collider.isPlane && !collider.isMesh {
+            let shape = collider.convex();
+            reach = shape.reachFrom(centre);
+            thinnest = shape.halfThickness;
         }
 
-        far
+        self._bodies[handle].coreReach = reach;
+        self._bodies[handle].halfThickness = if thinnest == f32::max { 0.0f } else { thinnest };
+    }
+
+    /**
+     * @returns: true iif a bullet moving by a distance and turning by an angle over a step is advanced along its motion
+     * (see impactOf): what the cores of its shape travel reaches FAST_RATIO of its half thickness, a slower bullet
+     * sinking by less into what it meets, its speculative points covering its speed (Box2D v3)
+     * */
+    fn isFast(self, handle: u32, distance: f32, angle: f32)-> bool {
+        let body = self._bodies[handle];
+        distance + angle * body.coreReach >= FAST_RATIO * body.halfThickness
     }
 
     /**
