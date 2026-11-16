@@ -4,14 +4,14 @@ use balder::core::application::fixed_step;
 use balder::core::config::physics;
 use balder::math::{bounds, matrix, quaternion, rigid_transform, vector};
 use balder::scene::debug;
-use balder::scene::node::node3D::body;
+use balder::scene::node::node3D::{body, joint};
 
 use std::time;
 
 /**
- * The physics of a scene: the world of the bodies that entered it, stepped in the ticks of the scene, the poses of the
- * dynamic bodies written back to their nodes, the queries giving the nodes they hit, and the signals of the contacts
- * emitted on the nodes
+ * The physics of a scene: the world of the bodies and the joints that entered it, stepped in the ticks of the scene, the
+ * poses of the dynamic bodies written back to their nodes, the queries giving the nodes they hit, and the signals of
+ * the contacts and of the joints broken emitted on the nodes
  * @info: the scene guards it with its lock (see Scene::raycast); the signals are emitted under the lock, their slots
  * running later, in the threads emptying the slot emitters they were connected with
  * */
@@ -26,6 +26,12 @@ pub class ScenePhysics {
 
     // The steps of the simulation, at the rate of the configuration (see configure)
     let mut _steps: FixedStep = FixedStep(60u32);
+
+    // The nodes of the joints made in the world, by handle
+    let dmut _joints: [u32 => &Joint3D] = copy [];
+
+    // The nodes of the joints in the scene waiting for their two bodies to be, by their uniq id
+    let dmut _waiting: [usize => &Joint3D] = copy [];
 
     // The handle of the body whose node the simulation is placing, its move not going back to the world
     let mut _writing: (u32)? = none;
@@ -105,11 +111,12 @@ pub class ScenePhysics {
 
     /**
      * Remove the body of a node from the world, its contacts ended at once, contactEnded being emitted on the two bodies
-     * of each of them
+     * of each of them; its joints taken out of the world, made again at the first tick it is back
      * @info: does nothing for a node whose body is not in the world
      * */
     pub fn remove(mut self, dmut body: &PhysicsBody3D) {
         if let Ok(h) = body.handle {
+            self:.unmakeJointsOf(h);
             for e in self._world:.remove(h) {
                 self:.emit(e);
             }
@@ -209,6 +216,69 @@ pub class ScenePhysics {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * =====================================          JOINTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Keep the joint of a node to make in the world at the next tick, the node then given its handle, or at a later tick
+     * once its two bodies are in the world (see advance)
+     * @info: the joint is made from where the node and its bodies are then, a node placed after it entered the scene
+     * being joined where it was placed; a node whose joint is in the world already, or waiting, is left as it is
+     * */
+    pub fn registerJoint(mut self, dmut joint: &Joint3D) {
+        if joint.handle.hasValue { return; }
+
+        self._waiting[joint.uid] = alias joint;
+    }
+
+    /**
+     * Take the joint of a node out of the world, waking its bodies, or stop it waiting for them
+     * */
+    pub fn removeJoint(mut self, dmut joint: &Joint3D) {
+        self._waiting:.remove(joint.uid);
+        if let Ok(h) = joint.handle {
+            self._world:.removeJoint(h);
+            self._joints:.remove(h);
+            joint:.setHandle(none);
+        }
+    }
+
+    /**
+     * Change how the joint of a node holds its bodies to the settings of the node
+     * */
+    pub fn jointChanged(mut self, joint: &Joint3D) {
+        if let Ok(h) = joint.handle {
+            self._world:.setJointSettings(h, joint.settings);
+        }
+    }
+
+    /**
+     * @returns: the position of the joint of a node (see PhysicsWorld::jointPosition), 0 for a joint not made
+     * */
+    pub fn jointPositionOf(self, joint: &Joint3D)-> f32 {
+        if let Ok(h) = joint.handle {
+            return self._world.jointPosition(h);
+        }
+
+        0.0f
+    }
+
+    /**
+     * @returns: true iif the joint of a node broke
+     * */
+    pub fn isJointBroken(self, joint: &Joint3D)-> bool {
+        if let Ok(h) = joint.handle {
+            return self._world.getJoint(h).broken;
+        }
+
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ====================================          STEPS          =====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -227,14 +297,15 @@ pub class ScenePhysics {
     }
 
     /**
-     * Advance the simulation by the steps a tick covers: the kinematic bodies given the velocities of their moves, the
-     * steps run, the forces dropped, the poses of the dynamic bodies written to their nodes between the last two steps,
-     * the contacts of the tick emitted (see updateContacts)
+     * Advance the simulation by the steps a tick covers: the joints waiting whose bodies are in the world made, the
+     * kinematic bodies given the velocities of their moves, the steps run, the forces dropped, the poses of the dynamic bodies written to their nodes between the last two steps,
+     * the contacts of the tick emitted (see updateContacts), then broken on the joints the steps broke
      * @params:
      *    - delta: the duration of the tick
      * @info: a tick running no step updates the contacts where the bodies were moved, the dynamic bodies staying
      * */
     pub fn advance(mut self, delta: Duration) {
+        self:.makeWaiting();
         self._world:.deriveKinematics(cast!f32(delta.allMicros) / 1_000_000.0f);
 
         let steps = self._steps:.advance(delta);
@@ -248,6 +319,10 @@ pub class ScenePhysics {
         let events = if steps == 0u32 { self._world:.updateContacts() } else { self._world:.contactEvents() };
         for e in events {
             self:.emit(e);
+        }
+
+        for j in self._world:.takeBroken() {
+            if let Ok(dmut node) = alias self._joints[j] { node:.broken():.emit(); }
         }
     }
 
@@ -368,6 +443,46 @@ pub class ScenePhysics {
         for h in awake {
             self:.place(h, self._world.getPrevious(h).interpolated(self._world.getState(h).pose, alpha));
         }
+    }
+
+    /**
+     * Make the joints waiting whose two bodies are in the world, from where their nodes and their bodies are
+     * */
+    fn makeWaiting(mut self) {
+        let mut made: [usize] = [];
+        for uid, dmut node in alias self._waiting {
+            if let Ok(a) = node.bodyA.handle {
+                if let Ok(b) = node.bodyB.handle {
+                    let h = self._world:.addJoint(a, b, node.frame, settings-> node.settings);
+                    if h != NO_JOINT {
+                        node:.setHandle((h)?);
+                        self._joints[h] = alias node;
+                    }
+
+                    made ~= [uid];
+                }
+            }
+        }
+
+        for uid in made { self._waiting:.remove(uid); }
+    }
+
+    /**
+     * Take the joints of a body leaving the world out of it, their nodes waiting for it to be back
+     * */
+    fn unmakeJointsOf(mut self, body: u32) {
+        let mut taken: [u32] = [];
+        for h, dmut node in alias self._joints {
+            let j = self._world.getJoint(h);
+            if j.a == body || j.b == body {
+                self._world:.removeJoint(h);
+                node:.setHandle(none);
+                self._waiting[node.uid] = alias node;
+                taken ~= [h];
+            }
+        }
+
+        for h in taken { self._joints:.remove(h); }
     }
 
     /**
