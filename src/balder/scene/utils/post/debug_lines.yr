@@ -1,0 +1,280 @@
+in debug_lines;
+
+use balder::core::{dispose, error};
+use balder::core::application::window;
+use balder::core::config::shader;
+use balder::core::memory::in_flight;
+use balder::core::shader::desc_set;
+use balder::scene::debug;
+use balder::scene::utils::post::{effect, input, pass, space, stage};
+
+use ::vulkan::core;
+
+/**
+ * The storage buffer of the shader drawing the segments
+ * */
+def SEGMENTS = "segments";
+
+/**
+ * The offset of the segments in their buffer, after their number and the opacity of their hidden parts
+ * */
+def SEGMENTS_OFFSET = 16us;
+
+/**
+ * The size of a segment in the buffer (the Segment struct of the shader, std430)
+ * */
+def SEGMENT_SIZE = 32us;
+
+/**
+ * The passes of the effect: the image copied, then the segments drawn over the copy
+ * */
+def COPY = 0us;
+def DRAW = 1us;
+
+/**
+ * The drawing of debug segments of the world over the image of a scene, in display space after the other effects and
+ * before the gizmo (see PostEffect::runsLast): the image is copied, then each segment is walked texel by texel, one
+ * invocation by segment, its depth tested against the depth of the g-buffer (see DebugDepth)
+ * @info:
+ * =====
+ * The segments come in named layers (the bodies of the physics, a frustum...), each set on its own (see setLines), the
+ * layers drawn one after the other in the order they were first set, MAX_DEBUG_SEGMENTS segments at most. They are
+ * written in a buffer the frames read without being recorded again, so the pass drawing them is dispatched for
+ * MAX_DEBUG_SEGMENTS invocations, those past the number of segments returning at once.
+ * The segments are drawn after the anti-aliasing, a texel wide, and by the view-projection of the camera without its
+ * jitter; the parts hidden by the scene are tested against the depth of the frame, a little behind it so that the
+ * outline of a shape lying on a surface stays drawn.
+ * ====
+ * */
+@final
+pub class DebugLinesEffect over PostEffect {
+
+    // The names of the layers, in the order they are drawn
+    let mut _layers: [[c8]] = [];
+
+    // The segments of each layer, in the order of the layers
+    let mut _lines: [[DebugSegment]] = [];
+
+    // The opacity of the parts of the SEE_THROUGH segments the scene hides, over their own
+    let mut _hiddenOpacity: f32 = 0.3f;
+
+    // The number of segments, the segments, read by the shader
+    let dmut _segments: (&InFlightBuffer)? = none;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - name: the name of the effect in its chain
+     * */
+    pub self (name: [c8] = "debug_lines")
+        with super(name, PostSpace::DISPLAY, copy [DefaultShaders::DEBUG_LINES_COPY_3D, DefaultShaders::DEBUG_LINES_DRAW_3D],
+                   reads-> copy [PostInput::DEPTH],
+                   readsCamera-> true,
+                   runsLast-> true)
+    {}
+
+    /**
+     * Load the shaders of the effect, and the buffer of the segments
+     * */
+    pub over configure(mut self, dmut win: &Window)
+        throws BalderError
+    {
+        self.__super__:.configure(alias win);
+
+        let dmut buffer = win:.getVulkanDevice()
+            :.getMemoryAllocator()
+            :.allocInFlightBuffer(SEGMENTS_OFFSET + MAX_DEBUG_SEGMENTS * SEGMENT_SIZE,
+                                  cast!u32(VkBufferUsageFlagBits::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+        self._segments = (alias buffer)?;
+        self:.writeSegments();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SEGMENTS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw other segments in a layer from the next frame, the layer added after the others the first time it is set
+     * @info: nothing is written when the segments are those drawn already, so the frames are not requested again; the
+     * segments past MAX_DEBUG_SEGMENTS, all layers counted, are not drawn
+     * */
+    pub fn setLines(mut self, layer: [c8], segments: [DebugSegment]) {
+        for i, name in self._layers if name == layer {
+            if sameSegments(self._lines[i], segments) { return; }
+
+            self._lines = self._lines[0us .. i] ~ [segments] ~ self._lines[i + 1us .. $];
+            self:.writeSegments();
+            return;
+        }
+
+        if segments.len == 0us { return; }
+
+        self._layers = self._layers ~ [layer];
+        self._lines = self._lines ~ [segments];
+        self:.writeSegments();
+    }
+
+    /**
+     * @returns: the segments of a layer, none for a layer never set
+     * */
+    pub fn getLines(self, layer: [c8])-> [DebugSegment] {
+        for i, name in self._layers if name == layer {
+            return self._lines[i];
+        }
+
+        []
+    }
+
+    /**
+     * @returns: the number of segments of every layer, those past MAX_DEBUG_SEGMENTS included
+     * */
+    @field
+    pub fn len(self)-> usize {
+        let mut count = 0us;
+        for l in self._lines {
+            count += l.len;
+        }
+
+        count
+    }
+
+    /**
+     * @returns: the opacity of the parts of the SEE_THROUGH segments the scene hides, over their own
+     * */
+    @field
+    pub fn hiddenOpacity(self)-> f32 {
+        self._hiddenOpacity
+    }
+
+    /**
+     * Set the opacity of the parts of the SEE_THROUGH segments the scene hides, over their own, from 0 to 1
+     * */
+    @field
+    pub fn hiddenOpacity(mut self, opacity: f32) {
+        self._hiddenOpacity = opacity;
+        if let Ok(dmut buffer) = alias self._segments {
+            buffer:.setData(4us, opacity);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          PASSES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the copy of the image the stage before wrote into the image of the stage, then the drawing of the
+     * segments over it
+     * */
+    pub over passes(self, stage: PostStage, width: u32, height: u32)-> [PostPass] {
+        let input: [c8] = PostBindings::INPUT;
+        let depth: [c8] = PostInput::DEPTH;
+        let image = stage.image(width, height);
+        copy [PostPass(effect-> self.name,
+                       name-> stage.pass ~ "_copy",
+                       index-> COPY,
+                       shader-> COPY,
+                       textures-> copy [input],
+                       images-> copy [stage.input],
+                       output-> stage.output,
+                       image-> image,
+                       imported-> stage.last),
+              PostPass(effect-> self.name,
+                       name-> stage.pass,
+                       index-> DRAW,
+                       shader-> DRAW,
+                       textures-> copy [depth],
+                       images-> stage.reads,
+                       output-> stage.output,
+                       image-> image,
+                       imported-> stage.last,
+                       drawsOver-> true,
+                       invocations-> cast!u32(MAX_DEBUG_SEGMENTS))]
+    }
+
+    prot over bindTextures(self, dmut set: &DescriptorSet, pass: PostPass, frame: i32) {
+        if pass.index != DRAW { return; }
+        if let Ok(buffer) = self._segments {
+            set:.setBuffer(SEGMENTS, buffer, cast!u32(frame));
+        }
+    }
+
+    /**
+     * Write the segments of the layers in the buffer the shader reads, MAX_DEBUG_SEGMENTS at most
+     * */
+    fn writeSegments(mut self) {
+        let dmut buffer = if let Ok(dmut b) = alias self._segments { alias b } else { return; };
+
+        let mut offset = SEGMENTS_OFFSET;
+        let mut count = 0us;
+        for l in self._lines {
+            if count == MAX_DEBUG_SEGMENTS { break; }
+
+            let kept = if count + l.len > MAX_DEBUG_SEGMENTS { l[0us .. MAX_DEBUG_SEGMENTS - count] } else { l };
+            if kept.len != 0us {
+                buffer:.setData(offset, kept);
+            }
+
+            offset += kept.len * SEGMENT_SIZE;
+            count += kept.len;
+        }
+
+        buffer:.setData(0us, cast!u32(count));
+        buffer:.setData(4us, self._hiddenOpacity);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+
+        /**
+         * Release the buffer of the segments with the shaders of the effect, the segments kept for a chain configuring
+         * it again
+         * */
+        pub over dispose(mut self) {
+            if let Ok(dmut buffer) = alias self._segments {
+                if let Ok(dmut win) = alias self._window {
+                    win:.retire(alias buffer);
+                } else {
+                    buffer:.dispose();
+                }
+            }
+
+            self._segments = none;
+            self.__super__:.dispose();
+        }
+    }
+
+}
+
+/**
+ * @returns: true iif two lists hold the same segments in the same order
+ * */
+fn sameSegments(a: [DebugSegment], b: [DebugSegment])-> bool {
+    if a.len != b.len { return false; }
+    for i in 0us .. a.len if !a[i].isSame(b[i]) {
+        return false;
+    }
+
+    true
+}

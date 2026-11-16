@@ -1,0 +1,178 @@
+in debug_view;
+
+use balder::math::{bounds, vector};
+use balder::scene::debug;
+
+/**
+ * The colours of the debug view, encoded in sRGB, and their opacity
+ * */
+def STATIC_COLOR = makeVec4(0.6f, 0.6f, 0.6f, 1.0f);
+def KINEMATIC_COLOR = makeVec4(0.3f, 0.6f, 1.0f, 1.0f);
+def AWAKE_COLOR = makeVec4(1.0f, 0.6f, 0.1f, 1.0f);
+def SLEEPING_COLOR = makeVec4(0.3f, 0.75f, 0.45f, 1.0f);
+def TRIGGER_COLOR = makeVec4(1.0f, 0.9f, 0.2f, 1.0f);
+def BOX_COLOR = makeVec4(0.9f, 0.3f, 0.9f, 0.8f);
+def LEAF_COLOR = makeVec4(0.2f, 0.9f, 0.9f, 0.6f);
+def TOUCHING_COLOR = makeVec4(1.0f, 0.15f, 0.15f, 1.0f);
+def SPECULATIVE_COLOR = makeVec4(1.0f, 0.6f, 0.6f, 0.5f);
+def NORMAL_COLOR = makeVec4(1.0f, 1.0f, 0.3f, 1.0f);
+
+/**
+ * The colours of the parents of the hierarchy, by their depth
+ * */
+def DEPTH_COLORS = [makeVec4(1.0f, 0.3f, 0.3f, 0.5f), makeVec4(1.0f, 0.7f, 0.2f, 0.5f), makeVec4(0.4f, 1.0f, 0.3f, 0.5f),
+                    makeVec4(0.3f, 0.6f, 1.0f, 0.5f), makeVec4(0.7f, 0.4f, 1.0f, 0.5f)];
+
+/**
+ * The size of the cross of a contact point and the length of its normal, in metres
+ * */
+def POINT_SIZE = 0.08f;
+def NORMAL_LENGTH = 0.3f;
+
+/**
+ * The half side of the square a plane is drawn as, and the distance between its lines, in metres
+ * */
+def PLANE_REACH = 10.0f;
+def PLANE_STEP = 2.0f;
+
+/**
+ * Draw the debug view of a world in debug lines
+ * @params:
+ *    - categories: what is drawn, the bits of PhysicsDebug
+ * @info: the colliders are coloured by their bodies: grey for a static body, blue for a kinematic one, orange for an
+ * awake dynamic one, green for a sleeping one, yellow for a trigger; the contact points are red crosses (pale when
+ * speculative), their normals yellow arrows from the first body to the second
+ * */
+pub fn drawWorld(dmut lines: &DebugLines, world: &PhysicsWorld, categories: u32) {
+    if (categories & PhysicsDebug::BROADPHASE) != 0u32 {
+        drawHierarchy(alias lines, world.hierarchy);
+    }
+
+    for h in world.handles() {
+        let collider = world.getCollider(h);
+        if (categories & PhysicsDebug::SHAPES) != 0u32 {
+            drawCollider(alias lines, collider, colorOf(world, h));
+        }
+
+        if (categories & PhysicsDebug::BOXES) != 0u32 && !collider.isPlane {
+            lines:.box(collider.bounds, BOX_COLOR);
+        }
+    }
+
+    if (categories & PhysicsDebug::CONTACTS) != 0u32 {
+        drawContacts(alias lines, world);
+    }
+}
+
+/**
+ * Draw the outline of a collider: the edges of a box, of a hull, of the triangles of a mesh, the circles of a sphere, a
+ * capsule or a cylinder, a grid around the origin of a plane, the parts of a compound
+ * */
+pub fn drawCollider(dmut lines: &DebugLines, collider: Collider, color: vec4) {
+    if collider.isCompound {
+        for p in collider.parts {
+            drawCollider(alias lines, p, color);
+        }
+
+        return;
+    }
+
+    if collider.isPlane {
+        drawPlane(alias lines, collider, color);
+        return;
+    }
+
+    if collider.isMesh {
+        for t in collider.trianglesIn(collider.bounds) {
+            lines:.polygon(copy [t.a, t.b, t.c], color);
+        }
+
+        return;
+    }
+
+    let c = collider.convex();
+    match c.kind {
+        ConvexKind::POINT => { lines:.sphere(c.a, c.margin, color); }
+        ConvexKind::SEGMENT => { lines:.capsule(c.a, c.b, c.margin, color); }
+        ConvexKind::TRIANGLE => { lines:.polygon(copy [c.a, c.b, c.c], color); }
+        ConvexKind::BOX => { lines:.orientedBox(c.a, c.u, c.v, c.w, color); }
+        ConvexKind::CYLINDER => { lines:.cylinder(c.a, c.u, c.v, c.w, color); }
+        ConvexKind::HULL => { drawHull(alias lines, collider, color); }
+    }
+}
+
+/**
+ * @returns: the colour of the collider of a body, by its motion, its sleep and whether it is a trigger
+ * */
+fn colorOf(world: &PhysicsWorld, handle: u32)-> vec4 {
+    let settings = world.getSettings(handle);
+    if settings.trigger { return TRIGGER_COLOR; }
+
+    match settings.motion {
+        BodyMotion::STATIC => { STATIC_COLOR }
+        BodyMotion::KINEMATIC => { KINEMATIC_COLOR }
+        BodyMotion::DYNAMIC => {
+            if world.getState(handle).awake { AWAKE_COLOR } else { SLEEPING_COLOR }
+        }
+    }
+}
+
+/**
+ * Draw the flat faces of a hull, placed in the world by its collider
+ * */
+fn drawHull(dmut lines: &DebugLines, collider: Collider, color: vec4) {
+    if let Ok(hull) = collider.shape.convexHull {
+        let vertices = hull.vertices;
+        for p in hull.polygons {
+            lines:.polygon(copy [(collider.transform * makeVec4(vertices[i], 1.0f)).xyz for i in p.corners], color);
+        }
+    }
+}
+
+/**
+ * Draw a plane as a grid of PLANE_REACH metres about its origin
+ * */
+fn drawPlane(dmut lines: &DebugLines, collider: Collider, color: vec4) {
+    let m = collider.transform;
+    let origin = (m * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    let x = (m * makeVec4(1.0f, 0.0f, 0.0f, 0.0f)).xyz.normalized() * PLANE_REACH;
+    let z = (m * makeVec4(0.0f, 0.0f, 1.0f, 0.0f)).xyz.normalized() * PLANE_REACH;
+
+    let count = cast!i32(2.0f * PLANE_REACH / PLANE_STEP);
+    for i in 0 .. count + 1 {
+        let t = cast!f32(i) / cast!f32(count) * 2.0f - 1.0f;
+        lines:.line(origin + x * t - z, origin + x * t + z, color);
+        lines:.line(origin + z * t - x, origin + z * t + x, color);
+    }
+
+    lines:.arrow(origin, origin + collider.plane.normal * PLANE_STEP, color);
+}
+
+/**
+ * Draw the boxes of the hierarchy, its parents coloured by their depth and its leaves (the enlarged boxes of the bodies)
+ * in cyan
+ * */
+fn drawHierarchy(dmut lines: &DebugLines, bvh: &Bvh) {
+    let colors = DEPTH_COLORS;
+    for node in bvh.nodeBoxes() {
+        let (box, depth, leaf) = node;
+        lines:.box(box, if leaf { LEAF_COLOR } else { colors[cast!usize(depth) % colors.len] });
+    }
+}
+
+/**
+ * Draw the points of the manifolds of the pairs and their normals
+ * */
+fn drawContacts(dmut lines: &DebugLines, world: &PhysicsWorld) {
+    for p in world.pairs {
+        for m in p.manifolds {
+            for c in m.points {
+                let touching = c.depth >= 0.0f;
+                lines:.cross(c.point, POINT_SIZE, if touching { TOUCHING_COLOR } else { SPECULATIVE_COLOR });
+                if touching {
+                    lines:.arrow(c.point, c.point + m.normal * NORMAL_LENGTH, NORMAL_COLOR);
+                }
+            }
+        }
+    }
+}

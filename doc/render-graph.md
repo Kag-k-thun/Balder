@@ -351,7 +351,9 @@ pass `post_<effect>_<scene>` samples the image before it and stores its own, a t
 `post_<effect>_out_<scene>` (rgba16f in HDR space, rgba8 in display space), the last effect storing the output of the
 scene. An effect of several passes (the bloom) writes transient images of its own between them, each pass naming the
 shader it dispatches, the images it binds to the textures of that shader, the image it writes and its size, the size
-of its dispatch. The graph derives the barriers between them and shares the memory of their images. Adding, removing, moving,
+of its dispatch. A pass drawing over the image a pass of its effect wrote before it (`drawsOver`) reads and writes it
+in place, creating none, and a pass by item rather than by texel names the number of its invocations
+(`invocations`, dispatched along x). The graph derives the barriers between them and shares the memory of their images. Adding, removing, moving,
 enabling or disabling an effect declares the stages again, between `lockFrame` and `unlockFrame`, the graph being
 compiled at the next frame; a disabled effect is not declared, so `--graph` shows the effects that run. No change to
 `Scene::configure` is needed: an effect is a subclass of `PostEffect`.
@@ -414,6 +416,32 @@ The parameters change without recording the frames again (`updateParams`).
 - **FXAA** (`FxaaEffect`): FXAA 3.11, its quality version at preset 12, on the colours of the screen after the tone
   mapping, the edges found from their luma; it smooths everything drawn, so it runs after the effects changing the
   colours (put it after a grading).
+
+### Debug lines
+
+`Scene::setDebugLines (layer, segments)` draws segments of the world over the image of the scene, in named layers each
+set on its own (the debug view of the physics draws in `physics`, see `doc/physics.md`), an empty list clearing a
+layer. A `DebugLines` builds the segments of outlines: lines, polygons, boxes (`box`, `orientedBox`), circles,
+spheres, capsules, cylinders, arrows, crosses and the frustum of a view-projection; each segment (`DebugSegment`, 32
+bytes, std430) holds its two ends, its colour packed in sRGB and how it is drawn where the scene hides it
+(`DebugDepth`: `HIDDEN`, `SEE_THROUGH` faded by `hiddenOpacity`, or `ON_TOP`).
+
+```
+let dmut lines = copy DebugLines ();
+lines:.frustum (camera.viewProj, makeVec4 (1.0f, 1.0f, 0.0f, 1.0f));
+lines:.box (light.bounds, makeVec4 (1.0f, 0.5f, 0.0f, 0.8f));
+scene:.setDebugLines ("lights", lines.segments);
+```
+
+The segments are drawn by a `DebugLinesEffect` the scene adds to its chain the first time a layer holds some, in
+display space, running last and before the gizmo, and disabled while no layer holds any. Its two passes copy the
+image before it (`post_debug_lines_<scene>_copy`), then walk each segment texel by texel over the copy
+(`post_debug_lines_<scene>`, `drawsOver`), one invocation by segment: the segment is cut to the clip volume, then
+each texel tests its depth against the depth of the g-buffer, a little behind the surface so that the outline of a
+shape lying on it stays drawn. The segments are written in an `InFlightBuffer` the recordings read, `MAX_DEBUG_SEGMENTS`
+(65536) at most, the pass being dispatched for all of them, so setting them requests a frame without recording it
+again; setting the segments a layer holds already writes nothing. They are drawn a texel wide after the
+anti-aliasing, by the view-projection of the camera without its jitter.
 
 A `Scene3D` of a `.gui` file describes its chain with `post: taa, bloom, vignette(0.6, 0.35), lut("res:/lut/film.png"),
 invert(off);`, the kinds of effects created by the `PostRegistry` of the widget manager (see `doc/gui.md`). The demo

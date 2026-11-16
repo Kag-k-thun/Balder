@@ -1,0 +1,174 @@
+#version 450 core
+
+layout (local_size_x = 64) in;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          BINDINGS          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// The number of segments drawn at most (balder::scene::debug::MAX_DEBUG_SEGMENTS)
+#define MAX_SEGMENTS 65536
+
+// How a segment is drawn where the scene hides it (balder::scene::debug::DebugDepth)
+#define HIDDEN      0u
+#define SEE_THROUGH 1u
+#define ON_TOP      2u
+
+// The texels a segment covers at most, the longest diagonal of an image
+#define MAX_STEPS 16384
+
+// The distance a segment is drawn behind the surface of the scene, over the distance of the surface and in metres, so
+// that the outline of a shape lying on a surface is not hidden by it
+#define RELATIVE_BIAS 0.004
+#define ABSOLUTE_BIAS 0.004
+
+// A segment of the world (balder::scene::debug::DebugSegment)
+struct Segment {
+    // The start of the segment, in the world
+    vec3 a;
+
+    // The colour, encoded in sRGB, and its opacity, a byte each from red in the lowest byte
+    uint color;
+
+    // The end of the segment, in the world
+    vec3 b;
+
+    // HIDDEN, SEE_THROUGH or ON_TOP
+    uint depth;
+};
+
+// The colours of the screen, encoded in sRGB, copied by the pass before it, the segments drawn over them
+layout (set = 0, binding = 0, rgba8) uniform image2D outTex;
+
+// The depth of the g-buffer, 1 where nothing is drawn
+layout (binding = 1) uniform sampler2D depthTex;
+
+// The camera of the scene, the segments seen through its view-projection
+layout (binding = 2) uniform Camera {
+    mat4 proj;
+    mat4 view;
+    mat4 viewProj;
+    vec3 eyePos;
+    float exposure;
+} camera;
+
+// The segments (balder::scene::utils::post::debug_lines::DebugLinesEffect)
+layout (std430, binding = 3) readonly buffer Segments {
+    // The number of segments
+    uint count;
+
+    // The opacity of the parts of the SEE_THROUGH segments the scene hides, over their own
+    float hiddenOpacity;
+
+    uint pad0;
+    uint pad1;
+
+    Segment segments [];
+} lines;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          CLIPPING          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * Cut the part of a segment on the negative side of a plane of clip space, the distances of its two ends to the plane
+ * given
+ * @returns: false when the segment is on the negative side whole
+ */
+bool clipAgainst (float da, float db, inout float t0, inout float t1) {
+    if (da < 0.0 && db < 0.0) {
+        return false;
+    }
+
+    if (da < 0.0) {
+        t0 = max (t0, da / (da - db));
+    } else if (db < 0.0) {
+        t1 = min (t1, da / (da - db));
+    }
+
+    return t0 <= t1;
+}
+
+/**
+ * @returns: the distance from the eye along the axis of the view of a depth of the projection
+ */
+float viewDistance (float d) {
+    mat4 p = camera.proj;
+    return -(p [3][2] - d * p [3][3]) / (d * p [2][3] - p [2][2]);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          MAIN          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+void main () {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= min (lines.count, uint (MAX_SEGMENTS))) {
+        return;
+    }
+
+    Segment s = lines.segments [index];
+    vec4 ca = camera.viewProj * vec4 (s.a, 1.0);
+    vec4 cb = camera.viewProj * vec4 (s.b, 1.0);
+
+    // the segment cut to the volume the camera sees, its depth in [0, w]
+    float t0 = 0.0, t1 = 1.0;
+    if (!clipAgainst (ca.z, cb.z, t0, t1) || !clipAgainst (ca.w - ca.z, cb.w - cb.z, t0, t1) ||
+        !clipAgainst (ca.w + ca.x, cb.w + cb.x, t0, t1) || !clipAgainst (ca.w - ca.x, cb.w - cb.x, t0, t1) ||
+        !clipAgainst (ca.w + ca.y, cb.w + cb.y, t0, t1) || !clipAgainst (ca.w - ca.y, cb.w - cb.y, t0, t1)) {
+        return;
+    }
+
+    vec4 start = mix (ca, cb, t0), end = mix (ca, cb, t1);
+    if (start.w <= 1e-6 || end.w <= 1e-6) {
+        return;
+    }
+
+    // the depth over w is affine on the image, interpolated along the texels
+    ivec2 size = imageSize (outTex);
+    vec2 depthScale = vec2 (textureSize (depthTex, 0)) / vec2 (size);
+    vec2 pa = (start.xy / start.w + 1.0) * 0.5 * vec2 (size);
+    vec2 pb = (end.xy / end.w + 1.0) * 0.5 * vec2 (size);
+    float da = start.z / start.w, db = end.z / end.w;
+
+    vec2 delta = pb - pa;
+    int steps = clamp (int (ceil (max (abs (delta.x), abs (delta.y)))), 1, MAX_STEPS);
+    vec4 color = unpackUnorm4x8 (s.color);
+
+    for (int k = 0; k <= steps; k++) {
+        float t = float (k) / float (steps);
+        ivec2 texel = ivec2 (floor (pa + delta * t));
+        if (texel.x < 0 || texel.y < 0 || texel.x >= size.x || texel.y >= size.y) {
+            continue;
+        }
+
+        float alpha = color.a;
+        if (s.depth != ON_TOP) {
+            float scene = texelFetch (depthTex, ivec2 (vec2 (texel) * depthScale), 0).r;
+            float surface = viewDistance (scene);
+            bool hidden = scene < 1.0 && viewDistance (mix (da, db, t)) > surface * (1.0 + RELATIVE_BIAS) + ABSOLUTE_BIAS;
+            if (hidden) {
+                if (s.depth == HIDDEN) {
+                    continue;
+                }
+
+                alpha *= lines.hiddenOpacity;
+            }
+        }
+
+        vec4 under = imageLoad (outTex, texel);
+        imageStore (outTex, texel, vec4 (mix (under.rgb, color.rgb, alpha), under.a));
+    }
+}
