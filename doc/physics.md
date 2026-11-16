@@ -17,6 +17,8 @@ A `PhysicsBody3D` is a `Node3D` holding the shape of its collider (`ColliderShap
   weighs, slides, bounces, slows down and sleeps;
 - **rollingFriction**, **spinningFriction** (0 by default): how a ball or a cylinder rolling on a floor, or a top
   spinning on its point, slows down to rest (see The solver);
+- **bullet**: a dynamic body advanced along its motion at each step against the static and the kinematic bodies, and
+  stopped where it hits one: a projectile, a thin object thrown spinning (see Bullets);
 - **trigger**: a trigger reports the bodies it overlaps and stops none of them; the queries skip it unless their
   filter asks for the triggers;
 - **layer** and **mask**: the layers the body is in, and the layers of the bodies it touches, one bit by layer. Two
@@ -136,7 +138,9 @@ if crate.sleeping { ... }
 
 `PhysicsWorld` knows the bodies by their handles, the index of their slot. A handle is free once its body is removed,
 and a later body may get it. The world boxes of the colliders are kept in a `Bvh`, the broadphase of the queries and of
-the contacts, refit when a body moves.
+the contacts, refit when a body moves or its velocity changes. The box of a body covers what it travels in the next step
+at its velocity (its spin at the reach of its box growing it on every side), stretched by two more steps of it, so that
+a body thrown at a thin wall pairs with it at its first step, its speculative points stopping it there.
 
 `ScenePhysics` is the world of a scene with the nodes of its bodies: its queries give back the nodes they hit, and it
 emits the signals of the contacts on them. The scene guards it with its lock.
@@ -236,9 +240,40 @@ a point of its manifolds is not speculative; a trigger only tells whether it ove
 
 The speculative points cover what two bodies may travel toward each other in a step (2 cm at least, plus their relative
 speed and their spins at the reach of their boxes): the solver will let them close in by that much and no more, so a
-fast body does not pass through a thin one. That is the continuous collision of Balder; a body spinning faster than its
-box accounts for, or slowed by a speculative point at a corner it only brushes past, would need conservative
-advancement (`gjk::sweep`) for the few bodies flagged as bullets.
+fast body does not pass through a thin one. That is the continuous collision of Balder, the bullets aside.
+
+### Bullets
+
+The speculative points leave two cases out. They are found once a step at the closest features of two bodies, so a thin
+body spinning fast (a plank 2 cm thick thrown at 50 m/s spinning at 50 rad/s) may turn another part of itself into a
+thin wall, or sink into it lying flat against it past its middle, the normal then pushing it through. And they cover a
+whole step ahead, so a fast body passing by a corner gets a point there and is slowed by it (a ghost collision: a ball
+at 50 m/s passing 1 cm over the edge of a box is nearly stopped).
+
+A body whose settings are a `bullet` is advanced at each step, once its island is solved, along its motion of the step
+against the static and the kinematic bodies it touches by their layers and masks, triggers and bodies a joint holds
+apart left out (`PhysicsWorld::impactOf`). Its motion (`StepMotion`) is the straight line of the centre of its mass and
+its rotation about it by the angle and the axis it turned through over the sub steps (`Quaternion::turn`, beyond half a
+turn when it spins that fast). Each convex part of its collider is advanced by conservative advancement
+(`gjk::advance`, Mirtich): no point of its core closes in on another shape along the normal between them faster than
+the displacement along the normal plus the angle times the reach of the core from the centre of the mass, so the shape
+can advance by the distance between them over that bound without passing through. The bullet is stopped at the first
+impact, 5 mm from what it hits (`IMPACT_DISTANCE`), its velocities kept: the rest of its step is dropped, and its
+speculative points take over at the next step, stopping it, bouncing it back by its restitution or letting it slide.
+
+A part the bullet starts against (within 5 mm) is left to the contacts, else a bullet resting or sliding on the ground
+would never move: its shape eroded by half its half thickness (`Convex::eroded`) is advanced instead, so that it sinks
+by a part of its thickness and no more, then, sunk that deep, its core, a sphere about its centre (after Box2D v3). A
+triangle of a mesh whose plane the bullet lies against but which it is apart from is left out, the bullet sliding onto
+it from a neighbour over an inner edge (`Collider::advance`).
+
+Against the static and the kinematic bodies, the speculative points of a bullet cover the spin of the cores of its shape
+only (none for a ball), its advancement covering its speed: a corner it passes by gets no point. A bullet against a
+dynamic body has the speculative points of any other body. A kinematic body is still during the steps, the game moving
+it between them, so a bullet is advanced against where it is.
+
+Advancing a thin plank spinning against a wall made its steps three times as long in the tests, the advances shrinking
+as it turns toward the wall: the flag is for the few bodies that need it.
 
 ## The solver
 
@@ -488,7 +523,8 @@ sleep-time = 0.5
 The `crates` example (`./crates`) shows a stack of crates, two boxes on a slope (one sticking, one sliding), balls
 bouncing, a chain swinging from a beam, a door closed by a weak motor against the lower limit of its hinge, a ragdoll
 tumbling down stairs, and teapots falling on each other, the hulls of their decomposition
-(`res/models/teapot/teapot.hulls`) their shape; Space throws a ball from the camera.
+(`res/models/teapot/teapot.hulls`) their shape; Space throws a ball from the camera, `P` fires a plank spinning, a
+bullet.
 
 A body turns by its angular velocity through `Quaternion::integrated`, and is placed by a `RigidTransform` (a rotation
 then a translation). A `Node3D` holds its rotation as a quaternion: the Euler angles it is given are kept for the editor

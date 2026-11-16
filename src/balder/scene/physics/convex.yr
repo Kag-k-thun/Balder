@@ -1,8 +1,9 @@
 in convex;
 
-use balder::math::{bounds, vector};
+use balder::math::{bounds, quaternion, vector};
 
 use std::math;
+use std::algorithm::comparison;
 
 /**
  * The kinds of the cores of a convex shape
@@ -198,6 +199,134 @@ pub record Convex {
     }
 
     /**
+     * @returns: the shape turned about a point, then moved by an offset
+     * @params:
+     *    - rotation: the rotation, a unit quaternion
+     *    - pivot: the point of the world it turns about
+     *    - offset: the translation after the rotation
+     * */
+    pub fn transformed(self, rotation: Quaternion, pivot: vec3, offset: vec3)-> Convex {
+        let to = pivot + offset;
+        Convex(self.kind,
+               to + rotation * (self.a - pivot),
+               to + rotation * (self.b - pivot),
+               to + rotation * (self.c - pivot),
+               rotation * self.u,
+               rotation * self.v,
+               rotation * self.w,
+               self.margin,
+               points-> self.points)
+    }
+
+    /**
+     * @returns: the distance from a point to the farthest point of the core, its margin left out, or more: the farthest
+     * corner of a box, the distance to the centre of a cylinder plus the reach of its rim
+     * @info: the margin grows the core alike in every direction, so a sphere turning about its centre moves none of its
+     * surface toward another shape (see gjk::advance)
+     * */
+    pub fn reachFrom(self, point: vec3)-> f32 {
+        match self.kind {
+            ConvexKind::POINT => { (self.a - point).length() }
+            ConvexKind::SEGMENT => { comparison::max((self.a - point).length(), (self.b - point).length()) }
+            ConvexKind::TRIANGLE => {
+                comparison::max((self.a - point).length(),
+                                comparison::max((self.b - point).length(), (self.c - point).length()))
+            }
+            ConvexKind::BOX => {
+                let mut far = 0.0f;
+                for su in [-1.0f, 1.0f] {
+                    for sv in [-1.0f, 1.0f] {
+                        for sw in [-1.0f, 1.0f] {
+                            let corner = self.a + self.u * su + self.v * sv + self.w * sw;
+                            far = comparison::max(far, (corner - point).length());
+                        }
+                    }
+                }
+
+                far
+            }
+            ConvexKind::CYLINDER => {
+                let radius = comparison::max(self.u.length(), self.w.length());
+                (self.a - point).length() + math::sqrt(radius * radius + self.v.dot(self.v))
+            }
+            ConvexKind::HULL => {
+                let mut far = 0.0f;
+                for p in self.points {
+                    let vertex = self.a + self.u * p.x + self.v * p.y + self.w * p.z;
+                    far = comparison::max(far, (vertex - point).length());
+                }
+
+                far
+            }
+        }
+    }
+
+    /**
+     * @returns: half the thinnest extent of the shape through its centre, its margin included: the radius of a sphere
+     * or of a capsule, the smallest half side of a box, the smaller of the radius and the half height of a cylinder,
+     * the nearest of the supports of a hull along its axes; a sphere of that radius about the centre stays inside the
+     * shape, or nearly for a hull
+     * */
+    @field
+    pub fn halfThickness(self)-> f32 {
+        let core = match self.kind {
+            ConvexKind::BOX => {
+                comparison::min(self.u.length(), comparison::min(self.v.length(), self.w.length()))
+            }
+            ConvexKind::CYLINDER => {
+                comparison::min(self.v.length(), comparison::min(self.u.length(), self.w.length()))
+            }
+            ConvexKind::HULL => {
+                let centre = self.centre;
+                let mut near = f32::max;
+                for axis in [self.u, self.v, self.w] if axis.dot(axis) > 0.0f {
+                    let d = axis.normalized();
+                    near = comparison::min(near, (self.support(d) - centre).dot(d));
+                    near = comparison::min(near, (centre - self.support(-d)).dot(d));
+                }
+
+                if near == f32::max { 0.0f } else { comparison::max(near, 0.0f) }
+            }
+            _ => { 0.0f }
+        };
+
+        core + self.margin
+    }
+
+    /**
+     * @returns: the shape eroded by a depth, its points at least that deep inside it or within it: a sphere or a capsule
+     * of a smaller radius, a box and a cylinder of shorter half sides, a hull scaled about its centroid so that its
+     * nearest face comes in by the depth (its farther faces by more); a triangle as it is
+     * @params:
+     *    - depth: the depth, under the half thickness of the shape
+     * */
+    pub fn eroded(self, depth: f32)-> Convex {
+        match self.kind {
+            ConvexKind::POINT => {
+                Convex(self.kind, self.a, self.b, self.c, self.u, self.v, self.w, comparison::max(self.margin - depth, 0.0f))
+            }
+            ConvexKind::SEGMENT => {
+                Convex(self.kind, self.a, self.b, self.c, self.u, self.v, self.w, comparison::max(self.margin - depth, 0.0f))
+            }
+            ConvexKind::BOX => {
+                Convex(self.kind, self.a, self.b, self.c, shortened(self.u, depth), shortened(self.v, depth),
+                       shortened(self.w, depth), self.margin)
+            }
+            ConvexKind::CYLINDER => {
+                Convex(self.kind, self.a, self.b, self.c, shortened(self.u, depth), shortened(self.v, depth),
+                       shortened(self.w, depth), self.margin)
+            }
+            ConvexKind::HULL => {
+                let half = self.halfThickness;
+                let scale = if half > 0.0f { comparison::max(1.0f - depth / half, 0.0f) } else { 1.0f };
+                Convex(self.kind, self.b + (self.a - self.b) * scale, self.b, self.c, self.u * scale, self.v * scale,
+                       self.w * scale, self.margin, points-> self.points)
+            }
+            ConvexKind::TRIANGLE => { self }
+        }
+    }
+
+    /**
      * @returns: the smallest box aligned with the axes enclosing the shape, its margin included
      * */
     @field
@@ -226,4 +355,14 @@ pub record Convex {
         Aabb(core.min - grow, core.max + grow)
     }
 
+}
+
+/**
+ * @returns: a vector shortened by a length, nothing when it is shorter
+ * */
+fn shortened(v: vec3, by: f32)-> vec3 {
+    let length = v.length();
+    if length <= by { return vec3(); }
+
+    v * ((length - by) / length)
 }

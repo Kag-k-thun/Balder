@@ -22,8 +22,8 @@ def NO_BODY = u32::max;
 def BROAD_MARGIN = 0.05f;
 
 /**
- * The ratio of the displacement expected before the next move to the last
- * displacement of a body
+ * The number of steps of its velocity the box of a body is stretched by in the hierarchy, beyond the step its
+ * speculative points cover, so that a moving body is not inserted again at each step
  *
  * */
 def PREDICTION = 2.0f;
@@ -34,6 +34,13 @@ def PREDICTION = 2.0f;
  *
  * */
 def SPECULATIVE_FLOOR = 0.02f;
+
+/**
+ * The distance a bullet stops at from the body it hits along its motion, in metres, its speculative points against it
+ * taking over at the next step
+ *
+ * */
+def IMPACT_DISTANCE = 0.005f;
 
 /**
  * The duration of a step of the solver until a step is run, in seconds, the
@@ -570,6 +577,7 @@ pub class PhysicsWorld {
         }
 
         self:.wake(handle);
+        self:.refit(handle);
     }
 
     /**
@@ -600,6 +608,7 @@ pub class PhysicsWorld {
                     self._states[i].linearVelocity = (now.position - before.position) / seconds;
                     self._states[i].angularVelocity = axis * (angle / seconds);
                     self._kinematicSet:.remove(h);
+                    self:.refit(h);
                 }
             }
 
@@ -622,6 +631,7 @@ pub class PhysicsWorld {
         let mut state = self._states[handle];
         state:.applyImpulse(impulse, at);
         self._states[handle] = state;
+        self:.refit(handle);
     }
 
     /**
@@ -1417,11 +1427,21 @@ pub class PhysicsWorld {
         self:.storeJoints(held, h);
 
         for sb in bodies if self.isDynamic(sb.handle) {
+            let mut turn = sb.deltaRotation;
+            let mut shift = sb.deltaPosition;
+            if self._bodies[sb.handle].settings.bullet {
+                let motion = StepMotion(sb.centre, sb.deltaPosition, sb.deltaRotation);
+                if let Ok(f) = self.impactOf(sb.handle, motion) {
+                    turn = motion.rotationAt(f);
+                    shift = sb.deltaPosition * f;
+                }
+            }
+
             let mut s = self._states[sb.handle];
             s.linearVelocity = sb.linearVelocity;
             s.angularVelocity = sb.angularVelocity;
-            s.pose.rotation = (sb.deltaRotation * s.pose.rotation).normalized();
-            s.pose.position = sb.centre + sb.deltaPosition - s.pose.rotation * s.centre;
+            s.pose.rotation = (turn * s.pose.rotation).normalized();
+            s.pose.position = sb.centre + shift - s.pose.rotation * s.centre;
             s:.refresh();
             self._states[sb.handle] = s;
 
@@ -1695,14 +1715,105 @@ pub class PhysicsWorld {
      * @returns: the distance apart down to which a pair makes speculative
      * points: what its bodies may travel toward each other in a step, by their
      * speeds and by their spins at the reach of their boxes, SPECULATIVE_FLOOR at
-     * least
+     * least; the speed of a bullet left out against a body that is not dynamic,
+     * its advancement stopping it there (see impactOf)
      *
      * */
     fn speculativeOf(self, p: BroadPair)-> f32 {
-        let sa = self._states[p.a], sb = self._states[p.b];
-        let reachA = sa.angularVelocity.length() * self.reachOf(p.a);
-        let reachB = sb.angularVelocity.length() * self.reachOf(p.b);
-        SPECULATIVE_FLOOR + ((sa.linearVelocity - sb.linearVelocity).length() + reachA + reachB) * self._step
+        let (va, spinA) = self.coveredOf(p.a, p.b);
+        let (vb, spinB) = self.coveredOf(p.b, p.a);
+        SPECULATIVE_FLOOR + ((va - vb).length() + spinA + spinB) * self._step
+    }
+
+    /**
+     * @returns: the motion of a body the speculative points of its pair with another one cover; for a bullet against a
+     * body that is not dynamic, its spin only, at the reach of the cores of its shape (none for a ball), so that a corner
+     * it passes by gets no point slowing it
+     *    - 0: its linear velocity
+     *    - 1: the speed of its spin at the reach of its box, or of its cores
+     * */
+    fn coveredOf(self, handle: u32, other: u32)-> (vec3, f32) {
+        let s = self._states[handle];
+        let spin = s.angularVelocity.length();
+        if self.isBullet(handle) && !self.isDynamic(other) {
+            return (vec3(), spin * self.coreReachOf(handle));
+        }
+
+        (s.linearVelocity, spin * self.reachOf(handle))
+    }
+
+    /**
+     * @returns: the distance from the centre of the mass of a body to the farthest point of the cores of its shape, its
+     * parts for a compound (see Convex::reachFrom)
+     * */
+    fn coreReachOf(self, handle: u32)-> f32 {
+        let collider = self._bodies[handle].collider;
+        let centre = self._states[handle].worldCentre;
+        if !collider.isCompound { return collider.convex().reachFrom(centre); }
+
+        let mut far = 0.0f;
+        for p in collider.parts {
+            far = comparison::max(far, p.convex().reachFrom(centre));
+        }
+
+        far
+    }
+
+    /**
+     * @returns: true iif a body of the world is a dynamic bullet, advanced along its motion at each step
+     * */
+    fn isBullet(self, handle: u32)-> bool {
+        self.isDynamic(handle) && self._bodies[handle].settings.bullet
+    }
+
+    /**
+     * Advance a bullet along its motion of a step against the static and the kinematic bodies it may touch (see
+     * Collider::advance), each convex part of its collider where it starts
+     * @params:
+     *    - handle: the bullet
+     *    - motion: its motion over the step, from the pose of its collider
+     * @returns: the earliest fraction of the step at which the bullet comes within IMPACT_DISTANCE of one of them, none
+     * when it hits none
+     * */
+    fn impactOf(self, handle: u32, motion: StepMotion)-> (f32)? {
+        let collider = self._bodies[handle].collider;
+        if !collider.isCompound {
+            return self.impactOfPart(handle, collider.convex(), motion);
+        }
+
+        let mut best: (f32)? = none;
+        for part in collider.parts {
+            best = earliest(best, self.impactOfPart(handle, part.convex(), motion));
+        }
+
+        best
+    }
+
+    /**
+     * @returns: the earliest fraction of the step at which a convex part of a bullet comes within IMPACT_DISTANCE of a
+     * static or a kinematic body, none when it hits none
+     * */
+    fn impactOfPart(self, handle: u32, moving: Convex, motion: StepMotion)-> (f32)? {
+        let swept = motion.bounds(moving.reachFrom(motion.pivot) + moving.margin);
+        let mut best: (f32)? = none;
+        for id in self.candidates(swept) if self.stops(handle, cast!u32(id)) {
+            best = earliest(best, self._bodies[id].collider.advance(moving, motion, IMPACT_DISTANCE));
+        }
+
+        best
+    }
+
+    /**
+     * @returns: true iif a body stops a bullet advanced along its motion: a static or a kinematic body that is not a
+     * trigger, touching it by their layers and masks, held apart from it by no joint
+     * */
+    fn stops(self, bullet: u32, other: u32)-> bool {
+        if other == bullet || !self.contains(other) { return false; }
+
+        let body = self._bodies[other];
+        if body.settings.motion == BodyMotion::DYNAMIC || body.settings.trigger { return false; }
+
+        utils::canTouch(self._bodies[bullet], body) && !(pairKey(bullet, other) in self._apart)
     }
 
     /**
@@ -1738,12 +1849,24 @@ pub class PhysicsWorld {
             return;
         }
 
-        let displacement = (collider.bounds.center - before.bounds.center) * PREDICTION;
-        if self._bvh:.moveBox(cast!usize(handle), collider.bounds, BROAD_MARGIN,
-                              displacement-> displacement)
+        // the box covers what the body travels in the next step, its speculative points needing their pairs
+        let s = self._states[handle];
+        let travel = s.linearVelocity * self._step;
+        let turn = s.angularVelocity.length() * collider.bounds.extent.length() * self._step;
+        let grow = makeVec3(turn, turn, turn);
+        let ahead = Aabb(collider.bounds.min - grow, collider.bounds.max + grow);
+        if self._bvh:.moveBox(cast!usize(handle), ahead.merged(Aabb(ahead.min + travel, ahead.max + travel)), BROAD_MARGIN,
+                              displacement-> travel * PREDICTION)
         {
             self._moved[handle] = true;
         }
+    }
+
+    /**
+     * Fit the box of a body in the hierarchy again to what it travels in the next step, after its velocities changed
+     * */
+    fn refit(mut self, handle: u32) {
+        self:.place(handle, self._bodies[handle].collider);
     }
 
     /**
