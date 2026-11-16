@@ -1,0 +1,372 @@
+in hulls_panel;
+
+use main::editor;
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface;
+use balder::interface::widget;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget::button::check;
+use balder::interface::widget::text::_;
+use balder::math::{bounds, vector};
+use balder::scene::debug;
+use balder::scene::node::node3D::solid;
+use balder::scene::physics;
+use balder::scene::physics::{convex_decomposition, debug_view};
+use balder::utils::log;
+
+use std::time;
+
+// The path of the panel of the hulls in the interface of the editor
+def HULLS = "BODY/MAIN/INSPECTOR/HULLS";
+
+// The layer of the debug lines of the scene the hulls are drawn in
+def HULLS_LAYER = "hulls";
+
+// The colours of the hulls, one after the other, encoded in sRGB
+def COLORS = [makeVec4(1.0f, 0.6f, 0.1f, 1.0f), makeVec4(0.3f, 0.75f, 1.0f, 1.0f), makeVec4(0.4f, 0.9f, 0.4f, 1.0f),
+              makeVec4(1.0f, 0.4f, 0.7f, 1.0f), makeVec4(1.0f, 0.9f, 0.3f, 1.0f), makeVec4(0.7f, 0.5f, 1.0f, 1.0f),
+              makeVec4(0.3f, 0.95f, 0.85f, 1.0f), makeVec4(1.0f, 0.45f, 0.35f, 1.0f)];
+
+/**
+ * The panel of the convex hulls of the model selected last, under the panel of its transform, mounted under the
+ * behavior 'hulls': the settings its concave model is decomposed with (see ConvexDecomposition), the hulls drawn over
+ * the model in the debug lines of the scene, decomposed on demand and saved next to the model file, where the game reads
+ * them (see SolidObjectModel::decomposition)
+ * @info: the decomposition runs on a thread of its own, slow by nature, the panel telling it runs; its hulls are those of
+ * the model selected when it started, dropped if another node is selected before it ends. A model selected shows the
+ * hulls saved next to its file and their settings, or the default settings. Saving writes the file, out of the history
+ * of the scene: it is not undone
+ * */
+pub class HullsPanel over Behavior {
+
+    // The interface holding the fields
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the slots of the selection and of the decompositions are emitted in
+    let dmut _box: &SlotEmitter;
+
+    // Shows a message in the status bar
+    let _status: dg ([c8])-> void;
+
+    // The editor of the scene, once bound
+    let dmut _editor: (&SceneEditor)? = none;
+
+    // The model inspected, the node selected last when it is a model
+    let dmut _model: (&SolidObjectModel)? = none;
+
+    // The settings the next decomposition runs with
+    let mut _settings: DecompositionSettings = DecompositionSettings();
+
+    // The hulls of the model inspected, saved or decomposed, none when it has none
+    let mut _hulls: (&ConvexDecomposition)? = none;
+
+    // True when the hulls are those of the model file
+    let mut _saved: bool = false;
+
+    // True when the hulls are drawn over the model
+    let mut _shown: bool = true;
+
+    // The number of the decomposition started last, a decomposition ending after another node was selected being dropped
+    let mut _job: u64 = 0u64;
+
+    // True while a decomposition runs
+    let mut _running: bool = false;
+
+    // The thread of the decomposition running
+    let mut _thread: (future-> void)? = none;
+
+    // Emitted by the thread of a decomposition with its number and its hulls, or the reason it failed
+    let dmut _decomposed: &Signal!{u64, &ConvexDecomposition} = copy Signal!{u64, &ConvexDecomposition} ();
+    let dmut _failed: &Signal!{u64, [c8]} = copy Signal!{u64, [c8]} ();
+
+    /**
+     * @params:
+     *    - gui: the interface holding the fields
+     *    - box: the mailbox the slots of the selection and of the decompositions are emitted in
+     *    - status: shows a message in the status bar
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, status: dg ([c8])-> void)
+        with _gui = alias gui
+        , _box = alias box
+        , _status = status
+    {
+        self:.slot("concavity", &self:.onConcavity);
+        self:.slot("count", &self:.onCount);
+        self:.slot("vertices", &self:.onVertices);
+        self:.slot("resolution", &self:.onResolution);
+        self:.slot("shown", &self:.onShown);
+        self:.slot("decompose", &self:.onDecompose);
+        self:.slot("save", &self:.onSave);
+
+        self._decomposed:.connect(alias self._box, &self:.onDecomposed);
+        self._failed:.connect(alias self._box, &self:.onFailed);
+    }
+
+    /**
+     * Follow the model selected last in the scene of an editor, once the interface is loaded
+     * */
+    pub fn bind(mut self, dmut editor: &SceneEditor) {
+        let dmut scene = alias editor.scene;
+        let dmut selection = alias scene.selection;
+        selection:.changed():.connect(alias self._box, &self:.onSelectionChanged);
+        self._editor = (alias editor)?;
+
+        self:.onSelectionChanged();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSPECTING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Inspect the node selected last when it is a model: the hulls saved next to its file and their settings, or the
+     * default settings
+     * */
+    fn onSelectionChanged(mut self) {
+        let dmut model: (&SolidObjectModel)? = none;
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            let dmut nodes = alias selection.nodes;
+            if nodes.len != 0us {
+                if let dmut m: &SolidObjectModel = alias nodes[$ - 1us] {
+                    model = (alias m)?;
+                }
+            }
+        }
+
+        // the model selected last stays inspected, keeping the hulls decomposed and not saved yet
+        if let Ok(old) = self._model {
+            if let Ok(m) = model && m.uid == old.uid { return; }
+        }
+
+        self:.inspect(alias model);
+    }
+
+    /**
+     * Inspect a model, its hulls redrawn each time it moves
+     * */
+    fn inspect(mut self, dmut model: (&SolidObjectModel)?) {
+        if let Ok(dmut old) = alias self._model {
+            old:.transformationChanged():.disconnect(&self:.draw);
+        }
+
+        self._job += 1u64;
+        self._hulls = none;
+        self._saved = false;
+        self._settings = DecompositionSettings();
+        if let Ok(dmut m) = alias model {
+            m:.transformationChanged():.connect(alias self._box, &self:.draw);
+            {
+                let saved = m.decomposition();
+                self._hulls = (saved)?;
+                self._settings = saved.settings;
+                self._saved = true;
+            } catch {
+                _ => {}
+            }
+        }
+
+        self._model = alias model;
+        self:.refresh();
+        self:.draw();
+    }
+
+    /**
+     * Write the settings and what the panel knows of the hulls in its fields, without emitting their signals
+     * */
+    fn refresh(mut self) {
+        self:.setNumber("CONCAVITY", self._settings.concavity * 100.0f);
+        self:.setNumber("COUNT", cast!f32(self._settings.maxHulls));
+        self:.setNumber("VERTICES", cast!f32(self._settings.maxVertices));
+        self:.setNumber("RESOLUTION", cast!f32(self._settings.resolution));
+        if let Ok(dmut c: &CheckBox) = self._gui:.find(HULLS ~ "/SHOWN") {
+            c:.setChecked(self._shown);
+        }
+
+        let mut state = "No hulls saved";
+        if self._running {
+            state = "Decomposing…";
+        } else if let Ok(h) = self._hulls {
+            let saved = if self._saved { "saved" } else { "not saved" };
+            state = f"${h.hulls.len} hulls of ${h.vertexCount} vertices, ${saved}";
+        }
+
+        if let Ok(dmut l: &Label) = self._gui:.find(HULLS ~ "/STATE") {
+            l:.setText(state);
+        }
+    }
+
+    /**
+     * Write a number in the spin box of a row of the panel (see NumberRow)
+     * */
+    fn setNumber(mut self, row: [c8], value: f32) {
+        if let Ok(dmut s: &SpinBox) = self._gui:.find(HULLS ~ "/" ~ row ~ "/VALUE") {
+            s:.setValue(value);
+        }
+    }
+
+    /**
+     * Draw the hulls over the model inspected in their layer of the debug lines of the scene, each hull in its colour,
+     * or clear the layer when there are none to draw
+     * */
+    fn draw(mut self) {
+        let dmut lines = copy DebugLines();
+        if let Ok(m) = self._model && self._shown {
+            if let Ok(h) = self._hulls {
+                let colors = COLORS;
+                for i, hull in h.hulls {
+                    debug_view::drawCollider(alias lines, Collider(ColliderShape::hull(hull), m.transformation),
+                                             colors[i % colors.len]);
+                }
+            }
+        }
+
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            scene:.setDebugLines(HULLS_LAYER, lines.segments);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTINGS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onConcavity(mut self, value: f32) {
+        self._settings.concavity = value / 100.0f;
+    }
+
+    fn onCount(mut self, value: f32) {
+        self._settings.maxHulls = cast!u32(value + 0.5f);
+    }
+
+    fn onVertices(mut self, value: f32) {
+        self._settings.maxVertices = cast!u32(value + 0.5f);
+    }
+
+    fn onResolution(mut self, value: f32) {
+        self._settings.resolution = cast!u32(value + 0.5f);
+    }
+
+    fn onShown(mut self, shown: bool) {
+        self._shown = shown;
+        self:.draw();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          DECOMPOSITION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Decompose the model inspected with the settings of the panel, on a thread of its own
+     * */
+    fn onDecompose(mut self, _: u8) {
+        if self._running {
+            self._status("A decomposition is running already");
+            return;
+        }
+
+        if let Ok(dmut m) = alias self._model {
+            let triangles = {
+                m:.triangles()
+            } catch {
+                err => {
+                    self._status(f"Failed to decompose ${m.name.file()}: ${err}");
+                    return;
+                }
+            };
+
+            self._job += 1u64;
+            self._running = true;
+            self._thread = (spawn self:.decomposeApart(self._job, triangles, self._settings, m.file))?;
+            self:.refresh();
+        }
+    }
+
+    /**
+     * Decompose triangles, emitting the hulls (or why they failed) for the slots of the panel to take them on the
+     * thread of its mailbox
+     * @info: runs on a thread of its own, reading nothing of the panel
+     * @params:
+     *    - job: the number of the decomposition
+     *    - file: the project path of the model file, its checksum written with the hulls
+     * */
+    fn decomposeApart(mut self, job: u64, triangles: [Triangle], settings: DecompositionSettings, file: [c8]) {
+        {
+            let start = Instant::now();
+            let source = ConvexDecomposition::checksumOf(file);
+            let hulls = copy ConvexDecomposition(triangles, settings-> settings, source-> source);
+            log::info #("HullsPanel", f"Decomposed ${file} in ${(Instant::now() - start).allMillis} ms");
+            self._decomposed:.emit(job, hulls);
+        } catch {
+            err => {
+                self._failed:.emit(job, f"${err}");
+            }
+        }
+    }
+
+    /**
+     * A decomposition ended: its hulls are drawn over the model, unless another node was selected since
+     * */
+    fn onDecomposed(mut self, job: u64, hulls: &ConvexDecomposition) {
+        self._running = false;
+        if job == self._job {
+            self._hulls = (hulls)?;
+            self._saved = false;
+            self._status(f"Decomposed into ${hulls.hulls.len} hulls of ${hulls.vertexCount} vertices");
+            self:.draw();
+        }
+
+        self:.refresh();
+    }
+
+    /**
+     * A decomposition failed
+     * */
+    fn onFailed(mut self, job: u64, reason: [c8]) {
+        self._running = false;
+        if job == self._job {
+            self._status(f"Failed to decompose the model: ${reason}");
+        }
+
+        self:.refresh();
+    }
+
+    /**
+     * Save the hulls of the model inspected next to its file
+     * */
+    fn onSave(mut self, _: u8) {
+        if let Ok(m) = self._model {
+            if let Ok(h) = self._hulls {
+                let file = ConvexDecomposition::fileOf(m.file);
+                {
+                    h.save(file);
+                    self._saved = true;
+                    self._status(f"Saved the hulls of ${m.file} in ${file}");
+                } catch {
+                    err => {
+                        self._status(f"${err}");
+                    }
+                }
+
+                self:.refresh();
+            } else {
+                self._status("No hulls to save: decompose the model first");
+            }
+        }
+    }
+
+}
