@@ -1,0 +1,497 @@
+in character_controller;
+
+use balder::math::{matrix, utils, vector};
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The length under which what is left of a move is dropped, in metres
+ * */
+def MIN_MOVE = 1.0e-5f;
+
+/**
+ * The distance below the character the floor is looked for after a motion, beyond the skin, in metres
+ * */
+def FLOOR_PROBE = 0.02f;
+
+/**
+ * The cosine of the angle from the up direction beyond which the normal of a surface over the character is a ceiling
+ * */
+def CEILING = 0.5f;
+
+/**
+ * A character moved through the level by queries, not by the solver: a kinematic body (a capsule, usually) that slides
+ * along what it meets, steps onto low ledges, keeps to the ground walking down a slope, and pushes the dynamic bodies it
+ * walks into without being pushed by them
+ * @info:
+ * =====
+ * A move (moveAndSlide) first pushes the body out of what it sinks into (PhysicsWorld::penetrations), then moves it by
+ * the velocity asked for over a duration, across the up direction then along it: each part casts the shape of the body
+ * (PhysicsWorld::shapeCast), stops a skin short of the first surface met, and turns what is left of the move along it,
+ * along the crease of two surfaces met one after the other, maxSlides times at most.
+ * Walking (on the floor, across the up direction), a move stopped by a side too steep to walk up is tried again raised
+ * by stepOffset and put down on what is under it; it is kept when it went farther and landed on a floor. A slope
+ * steeper than slopeLimit acts as a wall to a move that does not go down, so the character slides down it and never
+ * climbs it; a floor stops a move going down, so the character does not slide down a slope it stands on.
+ * After the motion, the floor is looked for a skin and FLOOR_PROBE under the body; a character that was on the floor and
+ * is not going up is put back on the ground within snapDistance, so that it does not leave a slope or a stair it walks
+ * down. The character can jump while it is on the floor, and coyoteTime after it walked off it (see canJump).
+ * The dynamic bodies met across the up direction are pushed by an impulse at the point met, the speed of the
+ * character against them times the smaller of pushMass and their mass; the body of the character is kinematic, so the
+ * solver never pushes it back.
+ * ====
+ * */
+pub class CharacterController {
+
+    // How the character moves
+    let mut _settings: CharacterSettings;
+
+    // True when the last move ended on a floor
+    let mut _onFloor: bool = false;
+
+    // The normal of the floor under the character, and its body, at the end of the last move
+    let mut _floorNormal: vec3 = vec3();
+    let mut _floorBody: (u32)? = none;
+
+    // True when the last move met a wall, a ceiling
+    let mut _onWall: bool = false;
+    let mut _onCeiling: bool = false;
+
+    // The time since the character left the floor, in seconds
+    let mut _sinceFloor: f32 = f32::max;
+
+    // True once the character jumped since it last stood on the floor, its coyote time spent
+    let mut _jumped: bool = false;
+
+    /**
+     * @params:
+     *    - settings: how the character moves
+     * */
+    pub self (settings: CharacterSettings = CharacterSettings())
+        with _settings = settings
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: how the character moves
+     * */
+    @field
+    pub fn settings(self)-> CharacterSettings {
+        self._settings
+    }
+
+    /**
+     * Move the character by other settings from the next move
+     * */
+    @field
+    pub fn settings(mut self, settings: CharacterSettings) {
+        self._settings = settings;
+    }
+
+    /**
+     * @returns: true iif the last move ended on a floor, a surface no steeper than the slope limit
+     * */
+    @field
+    pub fn onFloor(self)-> bool {
+        self._onFloor
+    }
+
+    /**
+     * @returns: the unit normal of the floor under the character at the end of the last motion, zero off the floor
+     * */
+    @field
+    pub fn floorNormal(self)-> vec3 {
+        self._floorNormal
+    }
+
+    /**
+     * @returns: the handle of the body of the floor under the character at the end of the last motion, none off the floor
+     * */
+    @field
+    pub fn floorBody(self)-> (u32)? {
+        self._floorBody
+    }
+
+    /**
+     * @returns: true iif the last move met a wall, or a slope too steep to walk on
+     * */
+    @field
+    pub fn onWall(self)-> bool {
+        self._onWall
+    }
+
+    /**
+     * @returns: true iif the last move met a ceiling
+     * */
+    @field
+    pub fn onCeiling(self)-> bool {
+        self._onCeiling
+    }
+
+    /**
+     * @returns: the time since the character left the floor, in seconds, 0 while it is on it
+     * */
+    @field
+    pub fn sinceFloor(self)-> f32 {
+        self._sinceFloor
+    }
+
+    /**
+     * @returns: true iif the character can jump: it is on the floor, or left it less than coyoteTime ago without jumping
+     * */
+    @field
+    pub fn canJump(self)-> bool {
+        !self._jumped && (self._onFloor || self._sinceFloor <= self._settings.coyoteTime)
+    }
+
+    /**
+     * Tell the controller the character jumped, its coyote time spent until it is on the floor again
+     * @info: the game gives the character a velocity up; a move going up is not put back on the ground
+     * */
+    pub fn jumped(mut self) {
+        self._jumped = true;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          MOVE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Move the body of the character by a velocity over a duration, sliding along what it meets
+     * @params:
+     *    - world: the world of the body, the dynamic bodies met pushed in it
+     *    - handle: the body of the character, kinematic; the world does not move it, the game placing it where the move
+     *              ends (see CharacterBody3D)
+     *    - velocity: the velocity of the character, gravity included
+     *    - seconds: the duration of the move
+     * @returns: where the move ended and the velocity left once the surfaces met stopped it; the position of the body
+     * and no hit when the world has no such body
+     * */
+    pub fn moveAndSlide(mut self, dmut world: &PhysicsWorld, handle: u32, velocity: vec3, seconds: f32)-> CharacterMove {
+        if !world.contains(handle) { return CharacterMove(velocity-> velocity); }
+
+        let collider = world.getCollider(handle);
+        let base = collider.transform;
+        let start = originOf(base);
+        let body = Moving(shape-> collider.shape, base-> base, start-> start,
+                          filter-> QueryFilter(mask-> world.getSettings(handle).mask, exclude-> copy [handle]));
+
+        let up = self._settings.up.normalized();
+        let wasOnFloor = self._onFloor;
+        let rising = velocity.dot(up) > MIN_MOVE;
+        self._onWall = false;
+        self._onCeiling = false;
+
+        let mut hits: [PhysicsHit] = [];
+        let mut pos = self.depenetrate(world, body, start);
+
+        let motion = velocity * seconds;
+        let vertical = up * motion.dot(up);
+        let across = motion - vertical;
+        pos = if wasOnFloor { self.walk(world, body, pos, across, ref hits) } else { self.slide(world, body, pos, across, false, ref hits) };
+        pos = self.slide(world, body, pos, vertical, true, ref hits);
+
+        pos = self:.findFloor(world, body, pos, rising, wasOnFloor, ref hits);
+        self:.classify(hits);
+        self.push(alias world, hits, velocity);
+
+        if self._onFloor {
+            self._sinceFloor = 0.0f;
+            if !rising { self._jumped = false; }
+        } else if self._sinceFloor != f32::max {
+            self._sinceFloor += seconds;
+        }
+
+        CharacterMove(position-> pos, velocity-> self.clipped(velocity, hits), hits-> hits)
+    }
+
+    /**
+     * @returns: a position pushed out of the bodies the shape sinks into, the deepest first, depenetrations times at most
+     * */
+    fn depenetrate(self, world: &PhysicsWorld, body: Moving, from: vec3)-> vec3 {
+        let mut pos = from;
+        for _ in 0u32 .. self._settings.depenetrations {
+            let contacts = world.penetrations(body.shape, body.at(pos), filter-> body.filter);
+            if contacts.len == 0us { break; }
+
+            let mut deepest = contacts[0];
+            for c in contacts if c.depth > deepest.depth {
+                deepest = c;
+            }
+
+            pos = pos - deepest.normal * (deepest.depth + self._settings.skin);
+        }
+
+        pos
+    }
+
+    /**
+     * @returns: where a move across the up direction ends, stepping onto a ledge when a side too steep to walk up
+     * stopped it and a step from stepOffset above goes farther and lands on a floor
+     * */
+    fn walk(self, world: &PhysicsWorld, body: Moving, from: vec3, motion: vec3, ref mut hits: [PhysicsHit])-> vec3 {
+        let mut flat: [PhysicsHit] = [];
+        let plain = self.slide(world, body, from, motion, false, ref flat);
+
+        let up = self._settings.up.normalized();
+        let mut blocked = false;
+        for h in flat if !self.walkable(h.normal) && h.normal.dot(up) > -CEILING {
+            blocked = true;
+        }
+
+        if !blocked || self._settings.stepOffset <= 0.0f {
+            hits = hits ~ flat;
+            return plain;
+        }
+
+        // raised by the step, as far as the ceiling lets it
+        let skin = self._settings.skin;
+        let raise = if let Ok(h) = world.shapeCast(body.shape, body.at(from), up, self._settings.stepOffset + skin, filter-> body.filter) {
+            comparison::max(h.distance - skin, 0.0f)
+        } else {
+            self._settings.stepOffset
+        };
+
+        if raise <= skin {
+            hits = hits ~ flat;
+            return plain;
+        }
+
+        let mut stepped: [PhysicsHit] = [];
+        let over = self.slide(world, body, from + up * raise, motion, false, ref stepped);
+        if let Ok(h) = world.shapeCast(body.shape, body.at(over), -up, raise + skin, filter-> body.filter) {
+            let landed = over - up * comparison::max(h.distance - skin, 0.0f);
+            if self.walkable(h.normal) && acrossOf(landed - from, up).length() > acrossOf(plain - from, up).length() + MIN_MOVE {
+                hits = hits ~ stepped ~ [h];
+                return landed;
+            }
+        }
+
+        hits = hits ~ flat;
+        plain
+    }
+
+    /**
+     * @returns: where a move ends, the shape stopping a skin short of each surface met and the rest of the move turned
+     * along it, maxSlides surfaces at most
+     * @params:
+     *    - down: true for the move along the up direction, a floor met stopping it
+     * */
+    fn slide(self, world: &PhysicsWorld, body: Moving, from: vec3, motion: vec3, down: bool, ref mut hits: [PhysicsHit])-> vec3 {
+        let skin = self._settings.skin;
+        let mut pos = from;
+        let mut rest = motion;
+        let mut last: (vec3)? = none;
+        for _ in 0u32 .. self._settings.maxSlides {
+            let len = rest.length();
+            if len <= MIN_MOVE { break; }
+
+            let dir = rest / len;
+            let hit = world.shapeCast(body.shape, body.at(pos), dir, len + skin, filter-> body.filter);
+            let h = if let Ok(h) = hit { h } else {
+                pos = pos + rest;
+                break;
+            };
+
+            let travel = comparison::max(h.distance - skin, 0.0f);
+            pos = pos + dir * comparison::min(travel, len);
+            hits = hits ~ [h];
+            if down && self.walkable(h.normal) { break; }
+
+            let n = self.slidingNormal(h.normal, dir);
+            rest = dir * comparison::max(len - travel, 0.0f);
+            rest = rest - n * rest.dot(n);
+            if let Ok(previous) = last {
+                if rest.dot(previous) < 0.0f {
+                    let crease = previous.cross(n);
+                    rest = if crease.length() > MIN_MOVE {
+                        let c = crease.normalized();
+                        c * rest.dot(c)
+                    } else { vec3() };
+                }
+            }
+
+            // a move turned back against itself only shakes the character in a corner
+            if rest.dot(motion) <= 0.0f { break; }
+            last = n?;
+        }
+
+        pos
+    }
+
+    /**
+     * Look for the floor under the character after a motion, in the surfaces it met or under it, and put a character that
+     * was on the floor and is not going up back on the ground within snapDistance
+     * @returns: the position, moved down onto the ground when it is snapped to it
+     * */
+    fn findFloor(mut self, world: &PhysicsWorld, body: Moving, pos: vec3, rising: bool, wasOnFloor: bool, ref mut hits: [PhysicsHit])-> vec3 {
+        self._onFloor = false;
+        self._floorNormal = vec3();
+        self._floorBody = none;
+        if rising { return pos; }
+
+        let up = self._settings.up.normalized();
+        let skin = self._settings.skin;
+        for h in hits if self.walkable(h.normal) {
+            self:.standOn(h);
+        }
+
+        if self._onFloor { return pos; }
+
+        let reach = if wasOnFloor { comparison::max(self._settings.snapDistance, skin + FLOOR_PROBE) } else { skin + FLOOR_PROBE };
+        if let Ok(h) = world.shapeCast(body.shape, body.at(pos), -up, reach + skin, filter-> body.filter) {
+            if self.walkable(h.normal) {
+                self:.standOn(h);
+                hits = hits ~ [h];
+                return pos - up * comparison::max(h.distance - skin, 0.0f);
+            }
+        }
+
+        pos
+    }
+
+    /**
+     * Stand the character on a floor met
+     * */
+    fn standOn(mut self, h: PhysicsHit) {
+        self._onFloor = true;
+        self._floorNormal = h.normal;
+        self._floorBody = h.body?;
+    }
+
+    /**
+     * Tell whether the surfaces met were walls or ceilings
+     * */
+    fn classify(mut self, hits: [PhysicsHit]) {
+        let up = self._settings.up.normalized();
+        for h in hits if !self.walkable(h.normal) {
+            if h.normal.dot(up) <= -CEILING {
+                self._onCeiling = true;
+            } else {
+                self._onWall = true;
+            }
+        }
+    }
+
+    /**
+     * Push the dynamic bodies met across the up direction, by an impulse at the point met, the speed of the character
+     * against them times the smaller of pushMass and their mass
+     * */
+    fn push(self, dmut world: &PhysicsWorld, hits: [PhysicsHit], velocity: vec3) {
+        if self._settings.pushMass <= 0.0f { return; }
+
+        let up = self._settings.up.normalized();
+        for h in hits if world.isDynamic(h.body) && !self.walkable(h.normal) && h.normal.dot(up) > -CEILING {
+            let into = -acrossOf(h.normal, up);
+            if into.length() <= MIN_MOVE { continue; }
+
+            let dir = into.normalized();
+            let speed = velocity.dot(dir);
+            if speed <= 0.0f { continue; }
+
+            let inverse = world.getState(h.body).inverseMass;
+            let mass = if inverse > 0.0f { comparison::min(self._settings.pushMass, 1.0f / inverse) } else { self._settings.pushMass };
+            world:.applyImpulse(h.body, dir * (speed * mass), h.point);
+        }
+    }
+
+    /**
+     * @returns: a velocity without what the surfaces met stopped, nor its fall once on the floor
+     * @info: a character on the floor keeps its velocity across the floors met, walking up a slope not turning it up,
+     * for the next move not to be taken for a jump leaving the floor
+     * */
+    fn clipped(self, velocity: vec3, hits: [PhysicsHit])-> vec3 {
+        let up = self._settings.up.normalized();
+        let mut v = velocity;
+        for h in hits if !(self._onFloor && self.walkable(h.normal)) {
+            let n = self.slidingNormal(h.normal, v);
+            let against = v.dot(n);
+            if against < 0.0f { v = v - n * against; }
+        }
+
+        if self._onFloor && v.dot(up) < 0.0f {
+            v = v - up * v.dot(up);
+        }
+
+        v
+    }
+
+    /**
+     * @returns: the normal a move slides along on a surface: a slope too steep to walk on facing up is a wall to a move
+     * that does not go down, so that the character never climbs it
+     * */
+    fn slidingNormal(self, normal: vec3, motion: vec3)-> vec3 {
+        if self.walkable(normal) { return normal; }
+
+        let up = self._settings.up.normalized();
+        let along = normal.dot(up);
+        if along > 0.0f && motion.dot(up) >= -MIN_MOVE {
+            let wall = normal - up * along;
+            if wall.length() > MIN_MOVE { return wall.normalized(); }
+        }
+
+        normal
+    }
+
+    /**
+     * @returns: true iif a surface of a normal is a floor, no steeper than the slope limit
+     * */
+    fn walkable(self, normal: vec3)-> bool {
+        normal.dot(self._settings.up.normalized()) >= math::cos(self._settings.slopeLimit) - 1.0e-4f
+    }
+
+}
+
+/**
+ * The body of a character moved: its shape, placed where it started, and the bodies it meets
+ * */
+record Moving {
+
+    // The shape of the body
+    pub let shape: ColliderShape;
+
+    // The transformation of the body where the move started, and its origin
+    pub let base: mat4;
+    pub let start: vec3;
+
+    // The bodies the body meets, itself excluded
+    pub let filter: QueryFilter;
+
+    pub self (shape: ColliderShape, base: mat4, start: vec3, filter: QueryFilter)
+        with shape = shape, base = base, start = start, filter = filter
+    {}
+
+    /**
+     * @returns: the transformation of the body moved to a position
+     * */
+    pub fn at(self, position: vec3)-> mat4 {
+        translation(position - self.start) * self.base
+    }
+
+}
+
+/**
+ * @returns: the origin of a transformation, its translation
+ * */
+fn originOf(m: mat4)-> vec3 {
+    (m * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz
+}
+
+/**
+ * @returns: the part of a vector across the up direction
+ * */
+fn acrossOf(v: vec3, up: vec3)-> vec3 {
+    v - up * v.dot(up)
+}
