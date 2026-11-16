@@ -1,0 +1,471 @@
+in joint_solver;
+
+use balder::math::{matrix, quaternion, vector};
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The axes of the frame of a joint: X its axis, Y and Z across it
+ * */
+def X_AXIS = makeVec3(1.0f, 0.0f, 0.0f);
+def Y_AXIS = makeVec3(0.0f, 1.0f, 0.0f);
+def Z_AXIS = makeVec3(0.0f, 0.0f, 1.0f);
+
+/**
+ * The velocities of the two bodies of a joint while the solver pushes on them, loaded once for the rows of the joint
+ * and written back once
+ * */
+@data
+record Motion {
+
+    // The linear and the angular velocities of the first body
+    let mut vA: vec3 = vec3();
+    let mut wA: vec3 = vec3();
+
+    // The linear and the angular velocities of the second body
+    let mut vB: vec3 = vec3();
+    let mut wB: vec3 = vec3();
+}
+
+/**
+ * Where the frames of a joint are at a sub step, its bodies moved and turned since the start of the step
+ * */
+@data
+record Placement {
+
+    // The arms from the centres of the masses to the anchors, in the world
+    let mut rA: vec3 = vec3();
+    let mut rB: vec3 = vec3();
+
+    // The rotations of the two frames in the world
+    let mut qA: Quaternion = Quaternion();
+    let mut qB: Quaternion = Quaternion();
+
+    // The anchor of the second body less that of the first, 0 for a joint holding
+    let mut d: vec3 = vec3();
+
+    // The axis of the frame of the first body, and the two directions across it
+    let mut axis: vec3 = vec3();
+    let mut t1: vec3 = vec3();
+    let mut t2: vec3 = vec3();
+}
+
+/**
+ * @returns: a joint as the solver pushes on it during a step, its arms and its frames in the world at the start of
+ * the step, its impulses those it kept from the step before
+ *
+ * @params:
+ *    - bodies: the solver bodies of the island
+ *    - a, b: the indices of the two bodies in them
+ *    - index: the index of the joint in the world
+ *    - joint: the joint
+ *    - stateA, stateB: the states of its two bodies
+ *
+ * */
+pub fn prepare(bodies: [SolverBody], a: usize, b: usize, index: u32, joint: Joint, stateA: BodyState,
+               stateB: BodyState)-> JointConstraint {
+    let rotA = stateA.pose.rotation, rotB = stateB.pose.rotation;
+    JointConstraint(joint-> index, a-> a, b-> b, settings-> joint.settings,
+                    armA-> rotA * (joint.frameA.position - stateA.centre),
+                    armB-> rotB * (joint.frameB.position - stateB.centre),
+                    basisA-> rotA * joint.frameA.rotation,
+                    basisB-> rotB * joint.frameB.rotation,
+                    deltaCentre-> bodies[b].centre - bodies[a].centre,
+                    linearImpulse-> joint.linearImpulse,
+                    angularImpulse-> joint.angularImpulse,
+                    motorImpulse-> joint.motorImpulse,
+                    lowerImpulse-> joint.lowerImpulse,
+                    upperImpulse-> joint.upperImpulse)
+}
+
+/**
+ * Apply to the bodies the impulses the joints gathered at the sub step before (warm starting), what keeps a chain
+ * still, before the contacts are warm started
+ * */
+pub fn warmStart(dmut bodies: [SolverBody], joints: [JointConstraint]) {
+    for c in joints {
+        let ba = bodies[c.a], bb = bodies[c.b];
+        let p = placementOf(ba, bb, c);
+        let mut m = Motion(vA-> ba.linearVelocity, wA-> ba.angularVelocity, vB-> bb.linearVelocity,
+                           wB-> bb.angularVelocity);
+        let axial = c.motorImpulse + c.lowerImpulse - c.upperImpulse;
+        match c.settings.kind {
+            JointKind::FIXED => {
+                m = pushed(m, ba, bb, c.linearImpulse, p.rA.cross(c.linearImpulse), p.rB.cross(c.linearImpulse));
+                m = pushed(m, ba, bb, vec3(), c.angularImpulse, c.angularImpulse);
+            }
+            JointKind::BALL => {
+                m = pushed(m, ba, bb, c.linearImpulse, p.rA.cross(c.linearImpulse), p.rB.cross(c.linearImpulse));
+            }
+            JointKind::HINGE => {
+                m = pushed(m, ba, bb, c.linearImpulse, p.rA.cross(c.linearImpulse), p.rB.cross(c.linearImpulse));
+                let turn = p.t1 * c.angularImpulse.x + p.t2 * c.angularImpulse.y + p.axis * axial;
+                m = pushed(m, ba, bb, vec3(), turn, turn);
+            }
+            JointKind::SLIDER => {
+                let push = p.t1 * c.linearImpulse.x + p.t2 * c.linearImpulse.y + p.axis * axial;
+                m = pushed(m, ba, bb, push, (p.rA + p.d).cross(push), p.rB.cross(push));
+                m = pushed(m, ba, bb, vec3(), c.angularImpulse, c.angularImpulse);
+            }
+        }
+
+        store(alias bodies, c, m);
+    }
+}
+
+/**
+ * Run a pass of the solver over the joints during a sub step: for each joint its motor, its limits, then the rows of
+ * its kind, angular then linear (projected Gauss-Seidel), before the contacts
+ *
+ * @params:
+ *    - joints: the joints of the island, their impulses gathered
+ *    - h: the duration of the sub step
+ *    - correct: true to pull the errors of the joints back (a pass of the sub step), false to relax the velocities the
+ *      correction left (the last pass of a sub step)
+ *
+ * @info: an error is pulled back as by a spring of jointHertz damped by jointDamping (a soft joint, Box2D v3); a
+ * limit not reached lets its position close in by what is left of it and no more, a limit passed is pushed back like
+ * an error; a motor drives its position at its speed, its impulse bounded by its force over the sub step
+ *
+ * */
+pub fn solve(dmut bodies: [SolverBody], dmut joints: [JointConstraint], h: f32, settings: SolverSettings,
+             correct: bool) {
+    let soft = if correct { Softness(settings.jointHertz, settings.jointDamping, h) } else { Softness::rigid() };
+    for i in 0us .. joints.len {
+        let mut c = joints[i];
+        let ba = bodies[c.a], bb = bodies[c.b];
+        let p = placementOf(ba, bb, c);
+        let mut m = Motion(vA-> ba.linearVelocity, wA-> ba.angularVelocity, vB-> bb.linearVelocity,
+                           wB-> bb.angularVelocity);
+
+        match c.settings.kind {
+            JointKind::FIXED => {
+                m = solveRotation(m, ba, bb, ref c, p, soft);
+                m = solvePoint(m, ba, bb, ref c, p, soft);
+            }
+            JointKind::BALL => {
+                m = solvePoint(m, ba, bb, ref c, p, soft);
+            }
+            JointKind::HINGE => {
+                m = solveAxial(m, ba, bb, ref c, p, vec3(), p.axis, p.axis, twistOf(p.qA, p.qB), true, h, soft);
+                m = solveHingeAxis(m, ba, bb, ref c, p, soft);
+                m = solvePoint(m, ba, bb, ref c, p, soft);
+            }
+            JointKind::SLIDER => {
+                let uA = p.rA + p.d;
+                m = solveAxial(m, ba, bb, ref c, p, p.axis, uA.cross(p.axis), p.rB.cross(p.axis), p.d.dot(p.axis), false,
+                               h, soft);
+                m = solveRotation(m, ba, bb, ref c, p, soft);
+                m = solveSliderAxis(m, ba, bb, ref c, p, soft);
+            }
+        }
+
+        joints[i] = c;
+        store(alias bodies, c, m);
+    }
+}
+
+/**
+ * @returns: the position of a joint, from the rotations of its two frames and the anchor of its second body less
+ * that of the first: the angle a hinge turned by about its axis, in [-pi, pi], the distance a slider slid along its
+ * axis; 0 for another joint
+ * */
+pub fn positionOf(kind: JointKind, qA: Quaternion, qB: Quaternion, d: vec3)-> f32 {
+    match kind {
+        JointKind::HINGE => { twistOf(qA, qB) }
+        JointKind::SLIDER => { d.dot(qA * X_AXIS) }
+        _ => { 0.0f }
+    }
+}
+
+/**
+ * @returns: what a joint held its bodies by during a sub step, from the impulses it gathered
+ *    - 0: the force of its linear rows, in newtons
+ *    - 1: the torque of its angular rows, in newton metres
+ * @info: the motor and the limits push along the axis, linearly for a slider, angularly for a hinge
+ * */
+pub fn loadsOf(c: JointConstraint, h: f32)-> (f32, f32) {
+    let axial = c.motorImpulse + c.lowerImpulse - c.upperImpulse;
+    let linear = c.linearImpulse, angular = c.angularImpulse;
+    let (l, a) = match c.settings.kind {
+        JointKind::HINGE => {
+            (linear.length(), math::sqrt(angular.x * angular.x + angular.y * angular.y + axial * axial))
+        }
+        JointKind::SLIDER => {
+            (math::sqrt(linear.x * linear.x + linear.y * linear.y + axial * axial), angular.length())
+        }
+        _ => { (linear.length(), angular.length()) }
+    };
+
+    (l / h, a / h)
+}
+
+/**
+ * Keep the anchors of a joint on each other: a block of three rows, solved at once
+ * */
+fn solvePoint(m: Motion, ba: SolverBody, bb: SolverBody, ref mut c: JointConstraint, p: Placement,
+              soft: Softness)-> Motion {
+    let k = pointMass(ba, bb, p.rA, p.rB);
+    let speed = (m.vB + m.wB.cross(p.rB)) - (m.vA + m.wA.cross(p.rA));
+    let solved = k.inversed() * (speed + p.d * soft.biasRate);
+    let impulse = solved * (-soft.massScale) - c.linearImpulse * soft.impulseScale;
+    c.linearImpulse = c.linearImpulse + impulse;
+
+    pushed(m, ba, bb, impulse, p.rA.cross(impulse), p.rB.cross(impulse))
+}
+
+/**
+ * Keep the frames of a joint turned as one: a block of three angular rows, solved at once
+ * */
+fn solveRotation(m: Motion, ba: SolverBody, bb: SolverBody, ref mut c: JointConstraint, p: Placement,
+                 soft: Softness)-> Motion {
+    let k = ba.inverseInertia + bb.inverseInertia;
+    let solved = k.inversed() * ((m.wB - m.wA) + rotationError(p.qA, p.qB) * soft.biasRate);
+    let impulse = solved * (-soft.massScale) - c.angularImpulse * soft.impulseScale;
+    c.angularImpulse = c.angularImpulse + impulse;
+
+    pushed(m, ba, bb, vec3(), impulse, impulse)
+}
+
+/**
+ * Keep the axis of the second frame of a hinge on that of the first: two angular rows across the axis, solved at once
+ * */
+fn solveHingeAxis(m: Motion, ba: SolverBody, bb: SolverBody, ref mut c: JointConstraint, p: Placement,
+                  soft: Softness)-> Motion {
+    let inertia = ba.inverseInertia + bb.inverseInertia;
+    let k11 = p.t1.dot(inertia * p.t1), k12 = p.t1.dot(inertia * p.t2), k22 = p.t2.dot(inertia * p.t2);
+
+    // the axes apart by a small angle, their cross product is that angle about the direction turning one to the other
+    let error = p.axis.cross(p.qB * X_AXIS);
+    let spin = m.wB - m.wA;
+    let (s1, s2) = solved2(k11, k12, k22, spin.dot(p.t1) + error.dot(p.t1) * soft.biasRate,
+                           spin.dot(p.t2) + error.dot(p.t2) * soft.biasRate);
+
+    let i1 = -soft.massScale * s1 - soft.impulseScale * c.angularImpulse.x;
+    let i2 = -soft.massScale * s2 - soft.impulseScale * c.angularImpulse.y;
+    c.angularImpulse = makeVec3(c.angularImpulse.x + i1, c.angularImpulse.y + i2, 0.0f);
+
+    let turn = p.t1 * i1 + p.t2 * i2;
+    pushed(m, ba, bb, vec3(), turn, turn)
+}
+
+/**
+ * Keep the anchor of the second body of a slider on the axis of the first: two linear rows across the axis, solved at
+ * once
+ * */
+fn solveSliderAxis(m: Motion, ba: SolverBody, bb: SolverBody, ref mut c: JointConstraint, p: Placement,
+                   soft: Softness)-> Motion {
+    let uA = p.rA + p.d;
+    let jA1 = uA.cross(p.t1), jB1 = p.rB.cross(p.t1);
+    let jA2 = uA.cross(p.t2), jB2 = p.rB.cross(p.t2);
+    let k11 = massAlong(ba, bb, p.t1, jA1, jB1);
+    let k22 = massAlong(ba, bb, p.t2, jA2, jB2);
+    let k12 = jA1.dot(ba.inverseInertia * jA2) + jB1.dot(bb.inverseInertia * jB2);
+
+    let (s1, s2) = solved2(k11, k12, k22, speedAlong(m, p.t1, jA1, jB1) + p.d.dot(p.t1) * soft.biasRate,
+                           speedAlong(m, p.t2, jA2, jB2) + p.d.dot(p.t2) * soft.biasRate);
+
+    let i1 = -soft.massScale * s1 - soft.impulseScale * c.linearImpulse.x;
+    let i2 = -soft.massScale * s2 - soft.impulseScale * c.linearImpulse.y;
+    c.linearImpulse = makeVec3(c.linearImpulse.x + i1, c.linearImpulse.y + i2, 0.0f);
+
+    pushed(m, ba, bb, p.t1 * i1 + p.t2 * i2, jA1 * i1 + jA2 * i2, jB1 * i1 + jB2 * i2)
+}
+
+/**
+ * Drive the position of a hinge or a slider by its motor, then keep it within its limits, along a row of the axis
+ *
+ * @params:
+ *    - n, jA, jB: the row: the linear direction (0 for a hinge) and the angular directions of the two bodies
+ *    - position: the position of the joint
+ *    - pinned: true for a hinge, the row solved with its anchors kept on each other: each impulse along the axis comes
+ *      with the impulse at the anchors leaving them where they are, its mass that of the bodies turning about the
+ *      anchor rather than about their centres
+ *    - h: the duration of the sub step, the motor pushing by its force over it at most
+ *
+ * @info: a door hinged at its edge turns about its hinge, five times heavier to turn than about its centre; its limit
+ * solved alone stops it about its centre, the point of the hinge then turning it on, and it bounces back off its
+ * limit however many passes run
+ *
+ * */
+fn solveAxial(m: Motion, ba: SolverBody, bb: SolverBody, ref mut c: JointConstraint, p: Placement, n: vec3, jA: vec3,
+              jB: vec3, position: f32, pinned: bool, h: f32, soft: Softness)-> Motion {
+    let s = c.settings;
+
+    // the speed the anchors part at by a unit impulse along the row, and the impulse at the anchors undoing it
+    let mut anchorBack = vec3();
+    let mut k = massAlong(ba, bb, n, jA, jB);
+    if pinned {
+        let parting = (bb.inverseInertia * jB).cross(p.rB) + (ba.inverseInertia * jA).cross(p.rA);
+        anchorBack = (pointMass(ba, bb, p.rA, p.rB).inversed() * parting) * -1.0f;
+        k = k + parting.dot(anchorBack);
+    }
+
+    let mass = inverseOf(k);
+    let mut result = m;
+    if s.motor {
+        let impulse = -mass * (speedAlong(result, n, jA, jB) - s.motorSpeed);
+        let most = h * s.maxMotorForce;
+        let total = clamped(c.motorImpulse + impulse, -most, most);
+        let applied = total - c.motorImpulse;
+        c.motorImpulse = total;
+        result = pushedAxial(result, ba, bb, ref c, p, n, jA, jB, anchorBack, applied);
+    }
+
+    if !s.limited { return result; }
+
+    {
+        let (bias, massScale, impulseScale) = limitBias(position - s.lower, h, soft);
+        let impulse = -mass * massScale * (speedAlong(result, n, jA, jB) + bias) - impulseScale * c.lowerImpulse;
+        let total = comparison::max(c.lowerImpulse + impulse, 0.0f);
+        let applied = total - c.lowerImpulse;
+        c.lowerImpulse = total;
+        result = pushedAxial(result, ba, bb, ref c, p, n, jA, jB, anchorBack, applied);
+    }
+
+    {
+        let (bias, massScale, impulseScale) = limitBias(s.upper - position, h, soft);
+        let impulse = -mass * massScale * (-speedAlong(result, n, jA, jB) + bias) - impulseScale * c.upperImpulse;
+        let total = comparison::max(c.upperImpulse + impulse, 0.0f);
+        let applied = total - c.upperImpulse;
+        c.upperImpulse = total;
+        result = pushedAxial(result, ba, bb, ref c, p, n, jA, jB, anchorBack, -applied);
+    }
+
+    result
+}
+
+/**
+ * @returns: the velocities of two bodies pushed along the row of the axis, with the impulse at the anchors keeping them
+ * on each other for a hinge, gathered with the impulse of the point
+ * @params:
+ *    - anchorBack: the impulse at the anchors by unit impulse along the row, 0 for a slider
+ *    - amount: the impulse along the row
+ * */
+fn pushedAxial(m: Motion, ba: SolverBody, bb: SolverBody, ref mut c: JointConstraint, p: Placement, n: vec3, jA: vec3,
+               jB: vec3, anchorBack: vec3, amount: f32)-> Motion {
+    let result = pushed(m, ba, bb, n * amount, jA * amount, jB * amount);
+    let back = anchorBack * amount;
+    c.linearImpulse = c.linearImpulse + back;
+
+    pushed(result, ba, bb, back, p.rA.cross(back), p.rB.cross(back))
+}
+
+/**
+ * @returns: how a limit pushes at a sub step, by how far its position is from it (positive within the limit)
+ *    - 0: the speed added to the speed toward the limit: what is left of the way to it over the sub step, a limit not
+ *      reached closing in by that much and no more; a limit passed pushed back by the spring of the joint
+ *    - 1, 2: the mass scale and the impulse scale of the softness
+ * */
+fn limitBias(gap: f32, h: f32, soft: Softness)-> (f32, f32, f32) {
+    if gap > 0.0f { return (gap / h, 1.0f, 0.0f); }
+
+    (gap * soft.biasRate, soft.massScale, soft.impulseScale)
+}
+
+/**
+ * @returns: where the frames of a joint are at a sub step, turned and moved with its bodies
+ * */
+fn placementOf(ba: SolverBody, bb: SolverBody, c: JointConstraint)-> Placement {
+    let rA = ba.deltaRotation * c.armA, rB = bb.deltaRotation * c.armB;
+    let qA = ba.deltaRotation * c.basisA, qB = bb.deltaRotation * c.basisB;
+    Placement(rA-> rA, rB-> rB, qA-> qA, qB-> qB,
+              d-> (bb.deltaPosition - ba.deltaPosition) + (rB - rA) + c.deltaCentre,
+              axis-> qA * X_AXIS, t1-> qA * Y_AXIS, t2-> qA * Z_AXIS)
+}
+
+/**
+ * @returns: the angle a frame turned by about the X axis of another, the twist of the second in the first, in [-pi, pi]
+ * */
+fn twistOf(qA: Quaternion, qB: Quaternion)-> f32 {
+    let r = qA.inversed() * qB;
+    if r.w < 0.0f { return 2.0f * atan2(-r.x, -r.w); }
+
+    2.0f * atan2(r.x, r.w)
+}
+
+/**
+ * @returns: the rotation from a frame to another, its angle about its direction, small when the joint holds
+ * */
+fn rotationError(qA: Quaternion, qB: Quaternion)-> vec3 {
+    let e = qB * qA.inversed();
+    let v = makeVec3(e.x, e.y, e.z) * 2.0f;
+    if e.w < 0.0f { -v } else { v }
+}
+
+/**
+ * @returns: the mass matrix of a point shared by two bodies, what a unit impulse along each axis there changes the
+ * relative speed of the two by, its columns built axis by axis
+ * */
+fn pointMass(ba: SolverBody, bb: SolverBody, rA: vec3, rB: vec3)-> mat3 {
+    let m = ba.inverseMass + bb.inverseMass;
+    let x = X_AXIS * m + (ba.inverseInertia * rA.cross(X_AXIS)).cross(rA) + (bb.inverseInertia * rB.cross(X_AXIS)).cross(rB);
+    let y = Y_AXIS * m + (ba.inverseInertia * rA.cross(Y_AXIS)).cross(rA) + (bb.inverseInertia * rB.cross(Y_AXIS)).cross(rB);
+    let z = Z_AXIS * m + (ba.inverseInertia * rA.cross(Z_AXIS)).cross(rA) + (bb.inverseInertia * rB.cross(Z_AXIS)).cross(rB);
+    makeMat3(x.x, x.y, x.z, y.x, y.y, y.z, z.x, z.y, z.z)
+}
+
+/**
+ * @returns: the velocities of two bodies pushed by an impulse along a row, the first body pushed back
+ * @params:
+ *    - linear: the linear impulse
+ *    - angularA, angularB: the angular impulses of the two bodies, the arm of each crossed with the linear impulse
+ * */
+fn pushed(m: Motion, ba: SolverBody, bb: SolverBody, linear: vec3, angularA: vec3, angularB: vec3)-> Motion {
+    Motion(vA-> m.vA - linear * ba.inverseMass, wA-> m.wA - ba.inverseInertia * angularA,
+           vB-> m.vB + linear * bb.inverseMass, wB-> m.wB + bb.inverseInertia * angularB)
+}
+
+/**
+ * @returns: the relative speed of two bodies along a row
+ * */
+fn speedAlong(m: Motion, n: vec3, jA: vec3, jB: vec3)-> f32 {
+    n.dot(m.vB - m.vA) + jB.dot(m.wB) - jA.dot(m.wA)
+}
+
+/**
+ * @returns: what a unit impulse along a row changes the relative speed of two bodies along it by
+ * */
+fn massAlong(ba: SolverBody, bb: SolverBody, n: vec3, jA: vec3, jB: vec3)-> f32 {
+    (ba.inverseMass + bb.inverseMass) * n.dot(n) + jA.dot(ba.inverseInertia * jA) + jB.dot(bb.inverseInertia * jB)
+}
+
+/**
+ * @returns: the solution of a symmetric system of two rows, none (0, 0) when it has no single one
+ * */
+fn solved2(k11: f32, k12: f32, k22: f32, r1: f32, r2: f32)-> (f32, f32) {
+    let det = k11 * k22 - k12 * k12;
+    if det == 0.0f { return (0.0f, 0.0f); }
+
+    ((k22 * r1 - k12 * r2) / det, (k11 * r2 - k12 * r1) / det)
+}
+
+/**
+ * Write back the velocities of the two bodies of a joint, those of a body nothing pushes left as they were
+ * */
+fn store(dmut bodies: [SolverBody], c: JointConstraint, m: Motion) {
+    if bodies[c.a].inverseMass > 0.0f {
+        bodies[c.a].linearVelocity = m.vA;
+        bodies[c.a].angularVelocity = m.wA;
+    }
+
+    if bodies[c.b].inverseMass > 0.0f {
+        bodies[c.b].linearVelocity = m.vB;
+        bodies[c.b].angularVelocity = m.wB;
+    }
+}
+
+/**
+ * @returns: a value within [low, high]
+ * */
+fn clamped(x: f32, low: f32, high: f32)-> f32 {
+    comparison::max(low, comparison::min(high, x))
+}
+
+/**
+ * @returns: the inverse of a mass along a row, 0 when nothing moves along it
+ * */
+fn inverseOf(k: f32)-> f32 {
+    if k > 0.0f { 1.0f / k } else { 0.0f }
+}
