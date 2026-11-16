@@ -57,8 +57,54 @@ transformation. A capsule is scaled along its axis by the scale of Y (its cylind
 scales of X and Z.
 
 `SolidObjectModel::hulls` gives the compound of the hulls of the meshes of a model, one by material, before the model
-enters a scene that does not keep its triangles. A concave model is authored by hand as a compound: there is no convex
-decomposition. A plane has no box: the world keeps its planes apart from its hierarchy and tests them in every query.
+enters a scene that does not keep its triangles. A concave model (a chair, a mug, a teapot) is a compound of the hulls of
+its convex decomposition (see below), `SolidObjectModel::decomposition`. A plane has no box: the world keeps its planes
+apart from its hierarchy and tests them in every query.
+
+### Convex decomposition
+
+A triangle mesh is static only; a dynamic concave model is the compound of convex hulls approximating it. A
+`ConvexDecomposition` splits the triangles of a model (`SolidObjectModel::triangles`, in the space of the model) into
+hulls, by its `DecompositionSettings`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `concavity` | 0.01 | the volume a hull may hold outside the model, over the volume of the model |
+| `maxHulls` | 16 | the hulls at most |
+| `maxVertices` | 32 | the vertices of a hull at most, four at least |
+| `resolution` | 64 | the voxels along the longest side of the model |
+
+The decomposition (`Decomposer`, approximate like V-HACD) works on the voxels of the model (`VoxelGrid`): the voxels a
+triangle overlaps (`Triangle::overlaps`) are its surface, those a fill from a corner of the grid does not reach its
+inside, so that the inside of a surface that is not closed (an open mug) is outside. The solid voxels are taken in their
+connected pieces. A piece is measured by the hull of the corners of its voxels, built slice by slice (the outline of
+each slice, simplified by half a voxel): the volume the hull holds past its voxels, and past the steps of the voxels
+along its faces (none along a face across an axis, half a voxel over a ball), is the volume it holds outside the model.
+The piece holding the most is split across an axis by the plane leaving the least outside the hulls of its two sides,
+each side giving its connected pieces, until each holds less than the concavity, or until there are twice as many pieces
+as hulls asked. Then the two hulls whose hull holds the least outside them are merged, as long as there are more hulls
+than asked or that hull holds less than the concavity. Each hull is kept in the box of the model, then reduced to
+`maxVertices` by taking the vertex farthest out of the hull of those taken. `shape` gives the compound of the hulls.
+
+It is slow by nature (seconds to tens of seconds for a model of a few thousand triangles), so it runs offline, at
+import or in the editor, never at load: the hulls are saved next to the model file (`ConvexDecomposition::fileOf`,
+`mug.glb` giving `mug.hulls`), a toml holding the version of the format, the settings, the CRC-32 of the model file
+they were made from (`checksumOf`) and a `[[hull]]` table of the coordinates of the vertices of each hull. The game reads
+it (`SolidObjectModel::decomposition`, `ConvexDecomposition::fromFile`), a warning telling when the model file changed
+since:
+
+```
+let dmut mug = copy SolidObjectModel::fromFile("mug", alias body, "res:/models/mug/mug.glb");
+body.shape = mug.decomposition().shape();
+```
+
+The `decompose` tool (`tools/src/decompose`) decomposes a model at import, and the panel of the hulls of a model in the
+editor (see `doc/editor.md`) tunes the settings with the hulls drawn over the model:
+
+```
+cd tools && gyllir build decompose && cd ..
+./tools/decompose res:/models/teapot/teapot.obj --concavity 0.01 --hulls 16 --vertices 32 --resolution 64
+```
 
 ## Body state
 
@@ -426,8 +472,9 @@ sleep-time = 0.5
 ```
 
 The `crates` example (`./crates`) shows a stack of crates, two boxes on a slope (one sticking, one sliding), balls
-bouncing, a chain swinging from a beam, a door closed by a weak motor against the lower limit of its hinge, and a ragdoll
-tumbling down stairs; Space throws a ball from the camera.
+bouncing, a chain swinging from a beam, a door closed by a weak motor against the lower limit of its hinge, a ragdoll
+tumbling down stairs, and teapots falling on each other, the hulls of their decomposition
+(`res/models/teapot/teapot.hulls`) their shape; Space throws a ball from the camera.
 
 A body turns by its angular velocity through `Quaternion::integrated`, and is placed by a `RigidTransform` (a rotation
 then a translation). A `Node3D` holds its rotation as a quaternion: the Euler angles it is given are kept for the editor
