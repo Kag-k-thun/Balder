@@ -1,0 +1,167 @@
+in stack_scenes;
+
+use balder::math::{matrix, utils, vector};
+use balder::scene::physics;
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The duration of a step, at 60 steps a second
+ * */
+def DT = 1.0f / 60.0f;
+
+/**
+ * @returns: the settings of a dynamic body
+ * */
+fn dynamic(mass: f32 = 1.0f)-> BodySettings {
+    BodySettings(motion-> BodyMotion::DYNAMIC, mass-> mass, friction-> 0.5f, linearDamping-> 0.05f,
+                 angularDamping-> 0.05f)
+}
+
+/**
+ * @returns: a box of side 1
+ * */
+fn crate()-> ColliderShape {
+    ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f))
+}
+
+/**
+ * Step a world for a duration
+ * */
+fn run(dmut world: &PhysicsWorld, seconds: f32) {
+    for _ in 0 .. cast!i32(seconds / DT + 0.5f) { world:.step(DT); }
+}
+
+/**
+ * Add a plane to a world, a crate of 1 kg on it and a crate of a mass on that one
+ * @returns:
+ *    - 0: the light crate
+ *    - 1: the heavy one
+ * */
+fn lightUnderHeavy(dmut world: &PhysicsWorld, heavy: f32)-> (u32, u32) {
+    world:.add(ColliderShape::plane(), mat4());
+    let low = world:.add(crate(), translation(makeVec3(0.0f, 0.5f, 0.0f)), settings-> dynamic());
+    let high = world:.add(crate(), translation(makeVec3(0.0f, 1.5f, 0.0f)), settings-> dynamic(mass-> heavy));
+    (low, high)
+}
+
+/**
+ * @returns: the solver bodies of an island of two bodies of a mass each
+ * */
+fn islandOf(a: f32, b: f32)-> [SolverBody] {
+    copy [SolverBody(inverseMass-> 1.0f / a), SolverBody(inverseMass-> 1.0f / b), SolverBody()]
+}
+
+__test the_sub_steps_of_an_island_grow_with_the_ratio_of_its_masses {
+    // 4 sqrt (r g / 0.005) / (2 pi 60) sub steps, for a crate under one r times as heavy to sink 5 mm at most
+    let settings = SolverSettings();
+    assert (solver::substepsOf(islandOf(1.0f, 1.0f), DT, 9.81f, settings) == 4u32);
+    assert (solver::substepsOf(islandOf(1.0f, 100.0f), DT, 9.81f, settings) == 5u32);
+    assert (solver::substepsOf(islandOf(500.0f, 1.0f), DT, 9.81f, settings) == 11u32);
+    assert (solver::substepsOf(islandOf(1.0f, 1.0e6f), DT, 9.81f, settings) == 16u32);
+
+    // the static bodies count for nothing, nor does a ratio without gravity
+    assert (solver::substepsOf(copy [SolverBody(), SolverBody(inverseMass-> 1.0f)], DT, 9.81f, settings) == 4u32);
+    assert (solver::substepsOf(islandOf(1.0f, 500.0f), DT, 0.0f, settings) == 4u32);
+
+    // no more than substeps, or no sink, solves every island in substeps
+    assert (solver::substepsOf(islandOf(1.0f, 500.0f), DT, 9.81f, SolverSettings(maxSubsteps-> 4u32)) == 4u32);
+    assert (solver::substepsOf(islandOf(1.0f, 500.0f), DT, 9.81f, SolverSettings(maxSink-> 0.0f)) == 4u32);
+}
+
+__test the_contacts_of_an_island_given_more_sub_steps_are_stiffer_by_as_many {
+    let settings = SolverSettings();
+    assert (math::abs(solver::softnessOf(settings, 4u32, DT / 4.0f).hertz - 60.0f) < 0.01f);
+    assert (math::abs(solver::softnessOf(settings, 11u32, DT / 11.0f).hertz - 165.0f) < 0.01f);
+}
+
+__test the_impulses_carried_to_the_next_step_are_those_over_a_step_whatever_the_sub_steps {
+    // a crate of 2 kg resting on a plane is held by 2 g dt over a step
+    for substeps in [4u32, 8u32] {
+        let dmut world = copy PhysicsWorld();
+        world.solverSettings = SolverSettings(substeps-> substeps);
+        world:.add(ColliderShape::plane(), mat4());
+        world:.add(crate(), translation(makeVec3(0.0f, 0.5f, 0.0f)), settings-> dynamic(mass-> 2.0f));
+
+        run(alias world, 0.5f);
+        let mut held = 0.0f;
+        for m in world.pairs[0].manifolds {
+            for p in m.points { held += p.normalImpulse; }
+        }
+
+        assert (math::abs(held - 2.0f * 9.81f * DT) < 0.01f * 2.0f * 9.81f * DT);
+    }
+}
+
+__test thirty_crates_stacked_hold_still_and_sleep {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let mut crates: [u32] = [];
+    for i in 0 .. 30 {
+        crates ~= [world:.add(crate(), translation(makeVec3(0.0f, 0.5f + cast!f32(i), 0.0f)), settings-> dynamic())];
+    }
+
+    // the crates of the same mass, the stack is solved in four sub steps, each contact sinking 2.5 mm at most on
+    // average under the crates it carries
+    let start = world.getState(crates[29]).pose.position;
+    run(alias world, 2.0f);
+    let top = world.getState(crates[29]).pose.position;
+    assert (math::sqrt(math::pow(top.x - start.x, 2.0f) + math::pow(top.z - start.z, 2.0f)) < 0.01f);
+    assert (top.y > start.y - 30.0f * 0.0025f && top.y <= start.y);
+    for c in crates { assert (!world.getState(c).awake); }
+
+    run(alias world, 3.0f);
+    assert ((world.getState(crates[29]).pose.position - top).length() < 0.001f);
+}
+
+__test a_light_crate_under_a_heavy_one_holds_it_and_sleeps {
+    for heavy in [100.0f, 500.0f, 1000.0f] {
+        let dmut world = copy PhysicsWorld();
+        let (low, high) = lightUnderHeavy(alias world, heavy);
+
+        // each of the two contacts sinks 5 mm at most, its island solved in more sub steps
+        run(alias world, 1.5f);
+        let l = world.getState(low), h = world.getState(high);
+        assert (l.pose.position.y > 0.5f - 0.0055f && l.pose.position.y < 0.5f);
+        assert (h.pose.position.y > 1.5f - 2.0f * 0.0055f && h.pose.position.y < 1.5f);
+        assert (math::abs(h.pose.position.x) < 0.005f && math::abs(h.pose.position.z) < 0.005f);
+        assert (!l.awake && !h.awake);
+    }
+}
+
+__test a_light_crate_under_a_heavy_one_in_the_sub_steps_of_any_island_sinks_by_the_ratio_of_their_masses {
+    // 0.07 mm for a crate alone at 60 Hz (g / (2 pi 60)^2), 500 times as deep under a crate of 500 kg
+    let dmut world = copy PhysicsWorld();
+    world.solverSettings = SolverSettings(maxSubsteps-> 4u32);
+    let (low, high) = lightUnderHeavy(alias world, 500.0f);
+    run(alias world, 1.5f);
+    let l = world.getState(low), h = world.getState(high);
+    assert (l.pose.position.y < 0.5f - 0.03f);
+    assert (h.pose.position.y < 1.5f - 0.06f);
+}
+
+__test a_pyramid_of_a_hundred_and_five_boxes_settles_and_sleeps {
+    // a wall of rows of boxes, fourteen at its base, each row one box shorter, its boxes 2 cm apart
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let mut boxes: [u32] = [];
+    let mut starts: [vec3] = [];
+    for row in 0 .. 14 {
+        for i in 0 .. 14 - row {
+            let at = makeVec3(cast!f32(i) * 1.02f + cast!f32(row) * 0.51f, 0.5f + cast!f32(row), 0.0f);
+            boxes ~= [world:.add(crate(), translation(at), settings-> dynamic())];
+            starts ~= [at];
+        }
+    }
+
+    run(alias world, 1.5f);
+    let mut moved = 0.0f;
+    for k in 0us .. boxes.len {
+        let s = world.getState(boxes[k]);
+        assert (!s.awake);
+        moved = comparison::max(moved, (s.pose.position - starts[k]).length());
+    }
+
+    assert (boxes.len == 105us && moved < 0.01f);
+}

@@ -296,7 +296,7 @@ blocks, again every two seconds: their advancement is about a fifth of a step th
 
 A step (`PhysicsWorld::step`) updates the pairs and their manifolds once (a pair whose bodies both sleep or are static
 keeps its own), groups the bodies in islands, then solves and moves each awake island in `substeps` sub steps (4 by
-default, `solveIsland`, after Box2D v3):
+default, more for an island of bodies of very different masses, see below; `solveIsland`, after Box2D v3):
 
 - each manifold is a `ContactConstraint` (its bodies, its normal and two tangents, its frictions) over a range of
   `ConstraintPoint`s, prepared once a step: the arms of each point, its masses along the normal and the tangents, its
@@ -314,7 +314,9 @@ default, `solveIsland`, after Box2D v3):
   contacts being found once a step;
 - once the sub steps are run, the points that closed faster than `bounce-threshold` (1 m/s) before the step and that
   a sub step pushed on bounce back by their restitution; the impulses are written back to the points of the manifolds,
-  for the next step, and the velocities and the poses to the states.
+  for the next step, and the velocities and the poses to the states. They are kept as those over a step (those of a
+  sub step times the sub steps, the angular impulses of the manifolds and those of the joints alike), so that they
+  carry over to a step of other sub steps.
 
 A point apart (speculative) closes in by its gap and no more, which stops a fast body at a thin wall. A point sunk is
 pushed out as by a spring of `contact-hertz` (60 Hz, a quarter of the rate of the sub steps at most) damped by
@@ -336,7 +338,31 @@ radius `r` rolling at `v` on a floor of the same rolling friction `c` stops with
 A stack of ten crates holds still with the sub steps and the soft contacts, and falls asleep within two seconds: at a
 step of 1/60 s, more passes over the contacts left it swaying, and a rigid correction of the penetrations (Baumgarte)
 acted as a spring with no damping. Finding the contacts once a step rather than at each sub step makes a step about five
-times cheaper.
+times cheaper. A stack of thirty crates holds still too and sleeps within two seconds, its top 6 cm lower than it was
+built, each contact giving 2 mm on average under the crates it carries; a pyramid of a hundred and five boxes, fourteen
+at its base, sleeps within a second, no box moving by more than 5 mm. The correction of the penetrations gives the bodies
+no speed, the last pass of a sub step relaxing the velocities it left: there is no need for split impulses.
+
+### Large mass ratios
+
+A soft contact is a spring on the mass of its point: under a load giving that mass an acceleration `a`, it sinks by
+`a / ω²` (`ω` the angular frequency of the spring), so a crate of 1 kg alone on a floor sinks 0.07 mm at 60 Hz, but
+under a crate of 500 kg, both its contacts carrying the weight of the heavy one, it sinks 500 times as deep, 3.5 cm
+each. The frequency of the spring is bound by the rate of the sub steps (a quarter of it): stiffer, the springs no
+longer converge in a few passes and the bodies bounce (a spring stiffened by the load of each point did, as did a
+contact without give).
+
+An island is therefore solved in more sub steps when its lightest body carrying its heaviest one would sink deeper
+than `max-sink` (5 mm): the depth being `r g / ω²` for a ratio `r` of their masses, and its contacts stiffened by as
+many more sub steps as it is given (`contact-hertz` being their frequency at `substeps`, `solver::softnessOf`), it takes
+`substeps · sqrt(r g / max-sink) / ω` of them, `max-substeps` (16) at most (`solver::substepsOf`): 5 for a ratio of
+100, 11 for 500, 15 for 1000. A crate of 1 kg then holds one of 100, 500 or 1000 kg and both sleep within a second,
+each contact sinking 5 mm at most. The ratio is read from the masses, not from the impulses the points gathered: those
+swell and shrink as the bodies bounce on the contacts, and sub steps following them stiffened the springs while they
+were compressed and softened them while they were not, which kept the heavy crate bouncing. An island of bodies of the
+same mass (a stack, a pile, a pyramid) keeps its `substeps`, whatever its height. `max-substeps` at `substeps` or less
+(or `max-sink` at 0) solves every island in `substeps`, the depth of a light crate under a heavy one growing back with
+the ratio of their masses.
 
 ### Islands and sleep
 
@@ -526,6 +552,8 @@ the solver are those of the `[physics]` table of the configuration:
 [physics]
 gravity = [0.0, -9.81, 0.0]
 substeps = 4
+max-substeps = 16
+max-sink = 0.005
 iterations = 2
 contact-hertz = 60.0
 contact-damping = 10.0
