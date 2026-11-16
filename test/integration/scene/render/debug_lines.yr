@@ -1,0 +1,191 @@
+in debug_lines;
+
+use balder::core::error;
+use balder::core::driver::graph;
+use balder::math::{bounds, utils, vector};
+use balder::scene::debug;
+use balder::scene::utils::post::_;
+
+use integration::utils::{compare, graph};
+
+use std::math;
+
+use ::vulkan::core;
+
+/**
+ * @returns: the names around the chain of a scene named "scene"
+ * */
+fn sources()-> PostSources {
+    PostSources(scene-> "scene",
+                submission-> "compose",
+                radiance-> "radiance",
+                output-> "output",
+                depth-> "depth",
+                normals-> "normals",
+                velocity-> "velocity")
+}
+
+/**
+ * @returns: the graph of a scene, its g-buffer writing the depth and its composition the light, the passes of a chain
+ * declared after them in the subpass of the composition, and the screen reading the output
+ * */
+fn graphOf(chain: &PostChain)-> dmut &RenderGraph
+    throws BalderError
+{
+    let dmut g = copy RenderGraph("screen");
+    g:.addSubmission("screen");
+    g:.addSubmission("deferred");
+    g:.addSubmission("compose");
+
+    g:.createImage("depth", ImageDesc(width-> 32u32, height-> 32u32, depth-> true));
+    g:.createImage("radiance", ImageDesc(format-> VkFormat::VK_FORMAT_R16G16B16A16_SFLOAT, width-> 32u32, height-> 32u32, storage-> true));
+    g:.importImage("output");
+
+    g:.declarePass(GraphPass(name-> "screen",
+                             submission-> "screen",
+                             uses-> copy [ResourceUse(resource-> "output", usage-> Usage::SAMPLED_FRAGMENT)]));
+    g:.declarePass(GraphPass(name-> "gbuffer",
+                             submission-> "deferred",
+                             uses-> copy [ResourceUse(resource-> "depth", usage-> Usage::DEPTH_ATTACHMENT)]));
+    g:.declarePass(GraphPass(name-> "compose",
+                             submission-> "compose",
+                             kind-> PassKind::COMPUTE,
+                             uses-> copy [ResourceUse(resource-> "depth", usage-> Usage::SAMPLED_COMPUTE),
+                                          ResourceUse(resource-> "radiance", usage-> Usage::STORAGE_WRITE)]));
+
+    for p in chain.passes(sources(), 32u32, 32u32) {
+        if p.createsImage {
+            g:.createImage(p.output, p.image);
+        }
+
+        g:.declarePass(p.toPass("compose", none));
+    }
+
+    alias g
+}
+
+/**
+ * @returns: the passes of a chain, by their names
+ * */
+fn passOf(chain: &PostChain, name: [c8])-> PostPass {
+    for p in chain.passes(sources(), 32u32, 32u32) if p.name == name {
+        return p;
+    }
+
+    PostPass()
+}
+
+__test the_shapes_of_the_debug_lines_are_made_of_the_segments_of_their_outlines {
+    let dmut lines = copy DebugLines();
+    let red = makeVec4(1.0f, 0.0f, 0.0f, 1.0f);
+
+    lines:.line(vec3(), makeVec3(1.0f, 0.0f, 0.0f), red);
+    assert(lines.len == 1us);
+
+    lines:.box(Aabb(makeVec3(-1.0f, -1.0f, -1.0f), makeVec3(1.0f, 1.0f, 1.0f)), red);
+    assert(lines.len == 13us);
+
+    // the edges of a box join its corners, each corner the end of three of them
+    for s in lines.segments[1us .. $] {
+        assert(near((s.b - s.a).length(), 2.0f));
+        for p in [s.a, s.b] {
+            assert(near(math::abs(p.x), 1.0f) && near(math::abs(p.y), 1.0f) && near(math::abs(p.z), 1.0f));
+        }
+    }
+
+    lines:.box(Aabb(), red);
+    assert(lines.len == 13us);
+
+    lines:.clear();
+    lines:.polygon(copy [vec3(), makeVec3(1.0f, 0.0f, 0.0f), makeVec3(0.0f, 1.0f, 0.0f)], red);
+    assert(lines.len == 3us && near(lines.segments[2].b, vec3()));
+    lines:.polygon(copy [vec3(), makeVec3(1.0f, 0.0f, 0.0f), makeVec3(0.0f, 1.0f, 0.0f)], red, closed-> false);
+    assert(lines.len == 5us);
+
+    // three circles of a sphere, the points of each at its radius
+    lines:.clear();
+    lines:.sphere(makeVec3(0.0f, 2.0f, 0.0f), 0.5f, red);
+    assert(lines.len == 3us * 24us);
+    for s in lines.segments {
+        assert(near((s.a - makeVec3(0.0f, 2.0f, 0.0f)).length(), 0.5f, tolerance-> 0.001f));
+    }
+
+    // a capsule: two circles, four lines along it and four half circles; a cross, an arrow and its head
+    lines:.clear();
+    lines:.capsule(vec3(), makeVec3(0.0f, 1.0f, 0.0f), 0.5f, red);
+    assert(lines.len == 2us * 24us + 4us + 4us * 12us);
+    lines:.clear();
+    lines:.cross(vec3(), 1.0f, red);
+    lines:.arrow(vec3(), makeVec3(0.0f, 0.0f, 2.0f), red);
+    assert(lines.len == 3us + 5us);
+}
+
+__test the_frustum_of_a_camera_joins_its_near_and_far_corners {
+    let proj = perspective!{f32}(radian(90.0f), 1.0f, 1.0f, 10.0f);
+    let view = lookAt!{f32}(vec3(), makeVec3(0.0f, 0.0f, -1.0f), makeVec3(0.0f, 1.0f, 0.0f));
+    let dmut lines = copy DebugLines();
+    lines:.frustum(proj * view, makeVec4(1.0f, 1.0f, 1.0f, 1.0f));
+
+    // the depth 0 of the projection, the near plane of Vulkan, is 2 * near * far / (near + far) from the eye
+    let closest = 2.0f * 10.0f / 11.0f;
+    assert(lines.len == 12us);
+    for s in lines.segments {
+        for p in [s.a, s.b] {
+            let atNear = near(p.z, -closest, tolerance-> 0.001f) && near(math::abs(p.x), closest, tolerance-> 0.001f);
+            let atFar = near(p.z, -10.0f, tolerance-> 0.01f) && near(math::abs(p.x), 10.0f, tolerance-> 0.01f);
+            assert(atNear || atFar);
+        }
+    }
+}
+
+__test a_segment_packs_its_colour_and_keeps_the_depth_mode_of_its_lines {
+    let s = DebugSegment(vec3(), vec3(), makeVec4(1.0f, 0.5f, 0.0f, 2.0f));
+    assert(s.color == (0xffu32 | (0x80u32 << 8u32) | (0xffu32 << 24u32)));
+    assert(s.depth == cast!u32(DebugDepth::SEE_THROUGH));
+
+    let dmut lines = copy DebugLines(depth-> DebugDepth::ON_TOP);
+    lines:.line(vec3(), makeVec3(1.0f, 0.0f, 0.0f), makeVec4(1.0f, 1.0f, 1.0f, 1.0f));
+    lines.depth = DebugDepth::HIDDEN;
+    lines:.line(vec3(), makeVec3(1.0f, 0.0f, 0.0f), makeVec4(1.0f, 1.0f, 1.0f, 1.0f));
+    assert(lines.segments[0].depth == cast!u32(DebugDepth::ON_TOP) && lines.segments[1].depth == cast!u32(DebugDepth::HIDDEN));
+}
+
+__test the_layers_of_the_debug_lines_are_set_on_their_own {
+    let red = makeVec4(1.0f, 0.0f, 0.0f, 1.0f);
+    let dmut effect = copy DebugLinesEffect();
+    assert(effect.len == 0us && effect.getLines("physics").len == 0us);
+
+    effect:.setLines("physics", copy [DebugSegment(vec3(), makeVec3(1.0f, 0.0f, 0.0f), red)]);
+    effect:.setLines("frustum", copy [DebugSegment(vec3(), makeVec3(0.0f, 1.0f, 0.0f), red),
+                                      DebugSegment(vec3(), makeVec3(0.0f, 0.0f, 1.0f), red)]);
+    assert(effect.len == 3us && effect.getLines("frustum").len == 2us);
+
+    effect:.setLines("physics", []);
+    assert(effect.len == 2us && effect.getLines("physics").len == 0us && effect.getLines("frustum").len == 2us);
+}
+
+__test the_debug_lines_copy_the_image_then_draw_over_it_before_the_gizmo {
+    let dmut chain = PostChain();
+    chain:.add(copy GizmoEffect());
+    chain:.add(copy DebugLinesEffect());
+    chain:.reorder("debug_lines", 0us);
+    chain:.add(copy FxaaEffect());
+
+    let copying = passOf(chain, "post_debug_lines_scene_copy");
+    let drawing = passOf(chain, "post_debug_lines_scene");
+    assert(copying.output == drawing.output && copying.createsImage && !drawing.createsImage);
+    assert(copying.invocations == 0u32 && drawing.invocations == 65536u32);
+    assert(drawing.textures == ["depth"] && drawing.images == ["depth"]);
+
+    let uses = drawing.uses();
+    assert(uses[uses.len - 1us].resource == drawing.output && uses[uses.len - 1us].usage == Usage::STORAGE_READ_WRITE);
+
+    let s = graphOf(chain).compile();
+    assert(passNames(s, "compose") == ["compose", "post_tonemap_scene", "post_fxaa_scene", "post_debug_lines_scene_copy",
+                                       "post_debug_lines_scene", "post_gizmo_scene"]);
+
+    // the drawing reads and writes what the copy wrote, the gizmo samples what the drawing wrote
+    let over = barrierOf(s, "post_debug_lines_scene", drawing.output);
+    assert(over.srcAccess == 0x00000040u32 && over.dstAccess == (0x00000020u32 | 0x00000040u32));
+    assert(barrierOf(s, "post_gizmo_scene", drawing.output).newLayout == VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
