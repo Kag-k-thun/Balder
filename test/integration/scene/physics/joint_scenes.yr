@@ -1,0 +1,355 @@
+in joint_scenes;
+
+use balder::math::{matrix, quaternion, utils, vector};
+use balder::scene::physics;
+
+use integration::utils::physics;
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * The duration of a step, at 60 steps a second
+ * */
+def DT = 1.0f / 60.0f;
+
+/**
+ * @returns: the settings of a dynamic body, not slowed by the air
+ * */
+fn dynamic(mass: f32 = 1.0f, damping: f32 = 0.0f)-> BodySettings {
+    BodySettings(motion-> BodyMotion::DYNAMIC, mass-> mass, linearDamping-> damping, angularDamping-> damping)
+}
+
+/**
+ * @returns: the distance between the frames of a joint on its two bodies, 0 for a joint holding exactly
+ * */
+fn gapOf(world: &PhysicsWorld, joint: u32)-> f32 {
+    let (fa, fb) = world.jointFrames(joint);
+    (fb.position - fa.position).length()
+}
+
+/**
+ * @returns: a static anchor, a small box nothing touches
+ * */
+fn anchor(dmut world: &PhysicsWorld, at: vec3)-> u32 {
+    world:.add(ColliderShape::box(makeVec3(0.1f, 0.1f, 0.1f)), translation(at))
+}
+
+/**
+ * Step a world for a duration
+ * */
+fn run(dmut world: &PhysicsWorld, seconds: f32) {
+    for _ in 0 .. cast!i32(seconds / DT + 0.5f) { world:.step(DT); }
+}
+
+/**
+ * @returns: true iif a vector is finite, holding no NaN nor infinity
+ * */
+fn finite(v: vec3)-> bool {
+    let m = 1.0e6f;
+    math::abs(v.x) < m && math::abs(v.y) < m && math::abs(v.z) < m
+}
+
+__test a_pendulum_keeps_its_period_and_its_amplitude {
+    let length = 2.0f;
+    let start = 0.2f;
+    let dmut world = copy PhysicsWorld();
+    let pivot = anchor(alias world, makeVec3(0.0f, 5.0f, 0.0f));
+    let at = makeVec3(length * math::sin(start), 5.0f - length * math::cos(start), 0.0f);
+    let ball = world:.add(ColliderShape::sphere(0.1f), translation(at), settings-> dynamic());
+    world:.addJoint(pivot, ball, frameAt(makeVec3(0.0f, 5.0f, 0.0f)));
+
+    // the times the ball crosses the vertical toward -x, a period apart
+    let mut crossings: [f32] = [];
+    let mut widest = 0.0f;
+    let mut x = at.x;
+    for i in 0 .. 600 {
+        world:.step(DT);
+        let now = world.getState(ball).pose.position.x;
+        if x > 0.0f && now <= 0.0f {
+            crossings ~= [(cast!f32(i) + x / (x - now)) * DT];
+        }
+
+        if i > 480 { widest = comparison::max(widest, math::abs(now)); }
+        x = now;
+    }
+
+    // T = 2 pi sqrt (L / g) (1 + a^2 / 16), the sphere about its centre adding (2/5 r^2) / L^2 / 2 to it
+    let expected = 2.0f * cast!f32(math::PI) * math::sqrt(length / 9.81f) * (1.0f + start * start / 16.0f) * 1.0005f;
+    assert (crossings.len >= 3us);
+    let period = (crossings[crossings.len - 1us] - crossings[0]) / cast!f32(cast!u64(crossings.len - 1us));
+    assert (math::abs(period - expected) < 0.01f * expected);
+    assert (widest > 0.9f * at.x);
+    assert (gapOf(world, 0u32) < 0.005f);
+}
+
+__test a_chain_of_ten_links_hangs_still_and_sleeps {
+    let dmut world = copy PhysicsWorld();
+    let top = makeVec3(0.0f, 10.0f, 0.0f);
+    let mut previous = anchor(alias world, top);
+    let mut links: [u32] = [];
+    let mut joints: [u32] = [];
+    for i in 0 .. 10 {
+        let centre = top - makeVec3(0.0f, 0.25f + 0.5f * cast!f32(i), 0.0f);
+        let link = world:.add(ColliderShape::capsule(0.1f, 0.5f), translation(centre), settings-> dynamic(damping-> 0.05f));
+        joints ~= [world:.addJoint(previous, link, frameAt(centre + makeVec3(0.0f, 0.25f, 0.0f)))];
+        links ~= [link];
+        previous = link;
+    }
+
+    run(alias world, 2.0f);
+    for l in links {
+        let s = world.getState(l);
+        assert (s.linearVelocity.length() < 0.02f && s.angularVelocity.length() < 0.05f);
+        assert (math::abs(s.pose.position.x) < 0.001f && math::abs(s.pose.position.z) < 0.001f);
+    }
+
+    for j in joints { assert (gapOf(world, j) < 0.005f); }
+    let bottom = world.getState(links[9]).pose.position.y;
+    assert (math::abs(bottom - (top.y - 4.75f)) < 0.02f);
+
+    run(alias world, 2.0f);
+    for l in links { assert (!world.getState(l).awake); }
+}
+
+__test a_door_on_a_hinge_turns_about_its_axis_and_is_stopped_by_its_limit {
+    let dmut world = copy PhysicsWorld();
+    let hinge = makeVec3(0.0f, 1.0f, 0.0f);
+    let post = anchor(alias world, hinge);
+    let door = world:.add(ColliderShape::box(makeVec3(1.0f, 2.0f, 0.1f)), translation(makeVec3(0.6f, 1.0f, 0.0f)),
+                          settings-> dynamic(mass-> 20.0f));
+
+    let upper = cast!f32(math::PI) / 2.0f;
+    let settings = JointSettings(kind-> JointKind::HINGE, limited-> true, lower-> -0.5f, upper-> upper);
+    let j = world:.addJoint(post, door, frameAt(hinge, axis-> makeVec3(0.0f, 1.0f, 0.0f)), settings-> settings);
+    assert (math::abs(world.jointPosition(j)) < 1.0e-5f);
+
+    // slammed open, turning about +y
+    world:.setVelocity(door, makeVec3(0.0f, 0.0f, -0.6f * 4.0f), makeVec3(0.0f, 4.0f, 0.0f));
+    let mut widest = 0.0f;
+    for _ in 0 .. 120 {
+        world:.step(DT);
+        widest = comparison::max(widest, world.jointPosition(j));
+
+        // the door stays upright on its hinge, its weight held
+        let up = world.getState(door).pose.rotation * makeVec3(0.0f, 1.0f, 0.0f);
+        assert (up.y > 0.999f);
+        assert (gapOf(world, j) < 0.01f);
+    }
+
+    assert (widest < upper + 0.02f);
+    assert (world.jointPosition(j) > upper - 0.1f);
+    assert (world.getState(door).angularVelocity.length() < 0.05f);
+}
+
+__test a_ragdoll_of_capsules_falls_on_stairs_without_exploding {
+    let dmut world = copy PhysicsWorld();
+    for i in 0 .. 6 {
+        let h = 0.3f * cast!f32(i + 1);
+        world:.add(ColliderShape::box(makeVec3(4.0f, h, 0.6f)), translation(makeVec3(0.0f, h / 2.0f, -0.6f * cast!f32(i))));
+    }
+
+    // the body standing over the top step, its limbs hanging, the knees and the elbows hinges
+    let base = makeVec3(0.0f, 4.0f, -3.0f);
+    let torso = world:.add(ColliderShape::capsule(0.15f, 0.7f), translation(base), settings-> dynamic(mass-> 10.0f));
+    let head = world:.add(ColliderShape::sphere(0.12f), translation(base + makeVec3(0.0f, 0.5f, 0.0f)),
+                          settings-> dynamic(mass-> 3.0f));
+    let mut bodies: [u32] = copy [torso, head];
+    let mut joints: [u32] = copy [world:.addJoint(torso, head, frameAt(base + makeVec3(0.0f, 0.38f, 0.0f)))];
+
+    let elbow = JointSettings(kind-> JointKind::HINGE, limited-> true, lower-> 0.0f, upper-> 2.5f);
+    let knee = JointSettings(kind-> JointKind::HINGE, limited-> true, lower-> -2.5f, upper-> 0.0f);
+    for side in [-1.0f, 1.0f] {
+        let shoulder = base + makeVec3(side * 0.22f, 0.28f, 0.0f);
+        let arm = world:.add(ColliderShape::capsule(0.05f, 0.3f), translation(shoulder - makeVec3(0.0f, 0.15f, 0.0f)),
+                             settings-> dynamic(mass-> 2.0f));
+        let forearm = world:.add(ColliderShape::capsule(0.05f, 0.3f), translation(shoulder - makeVec3(0.0f, 0.45f, 0.0f)),
+                                 settings-> dynamic(mass-> 1.5f));
+        joints ~= [world:.addJoint(torso, arm, frameAt(shoulder)),
+                   world:.addJoint(arm, forearm, frameAt(shoulder - makeVec3(0.0f, 0.3f, 0.0f)), settings-> elbow)];
+
+        let hip = base + makeVec3(side * 0.1f, -0.38f, 0.0f);
+        let thigh = world:.add(ColliderShape::capsule(0.07f, 0.45f), translation(hip - makeVec3(0.0f, 0.225f, 0.0f)),
+                               settings-> dynamic(mass-> 4.0f));
+        let shin = world:.add(ColliderShape::capsule(0.06f, 0.45f), translation(hip - makeVec3(0.0f, 0.675f, 0.0f)),
+                              settings-> dynamic(mass-> 3.0f));
+        joints ~= [world:.addJoint(torso, thigh, frameAt(hip)),
+                   world:.addJoint(thigh, shin, frameAt(hip - makeVec3(0.0f, 0.45f, 0.0f)), settings-> knee)];
+        bodies ~= [arm, forearm, thigh, shin];
+    }
+
+    // pushed off the top step, it tumbles down the stairs
+    world:.setVelocity(torso, makeVec3(0.3f, 0.0f, 2.0f), makeVec3(1.0f, 0.0f, 0.0f));
+    for _ in 0 .. 360 {
+        world:.step(DT);
+        for b in bodies {
+            let s = world.getState(b);
+            assert (finite(s.pose.position) && s.linearVelocity.length() < 12.0f && s.angularVelocity.length() < 40.0f);
+        }
+    }
+
+    for j in joints { assert (gapOf(world, j) < 0.05f); }
+    for b in bodies {
+        let p = world.getState(b).pose.position;
+        assert (p.y > -0.5f && p.y < 3.0f && math::abs(p.x) < 3.0f && p.z > -5.0f && p.z < 5.0f);
+    }
+
+    run(alias world, 4.0f);
+    for b in bodies { assert (world.getState(b).linearVelocity.length() < 0.5f); }
+}
+
+__test a_fixed_joint_moves_two_boxes_as_one {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let turn = Quaternion::fromAxisAngle(0.4f, makeVec3(0.0f, 0.0f, 1.0f));
+    let a = world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)),
+                       translation(makeVec3(0.0f, 3.0f, 0.0f)) * turn.matrix(), settings-> dynamic(mass-> 1.0f));
+    let b = world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)),
+                       translation(makeVec3(0.0f, 3.0f, 0.0f) + turn * makeVec3(1.0f, 0.0f, 0.0f)) * turn.matrix(),
+                       settings-> dynamic(mass-> 5.0f));
+    let settings = JointSettings(kind-> JointKind::FIXED);
+    let j = world:.addJoint(a, b, frameAt(makeVec3(0.0f, 3.0f, 0.0f) + turn * makeVec3(0.5f, 0.0f, 0.0f)), settings-> settings);
+
+    let before = world.getState(a).pose.inversed() * world.getState(b).pose;
+    for _ in 0 .. 180 {
+        world:.step(DT);
+        let now = world.getState(a).pose.inversed() * world.getState(b).pose;
+        assert ((now.position - before.position).length() < 0.01f);
+        assert (math::abs(now.rotation.dot(before.rotation)) > 0.9999f);
+    }
+
+    // landed, the two rest on the ground as one body would, neither sunk
+    assert (world.getState(a).linearVelocity.length() < 0.05f);
+    assert (gapOf(world, j) < 0.005f);
+}
+
+__test a_slider_keeps_its_body_on_its_axis_and_within_its_limits {
+    let dmut world = copy PhysicsWorld();
+    world.gravity = vec3();
+    let rail = anchor(alias world, vec3());
+    let block = world:.add(ColliderShape::box(makeVec3(0.5f, 0.5f, 0.5f)), translation(makeVec3(0.0f, 1.0f, 0.0f)),
+                           settings-> dynamic());
+    let settings = JointSettings(kind-> JointKind::SLIDER, limited-> true, lower-> -0.5f, upper-> 1.0f);
+    let j = world:.addJoint(rail, block, frameAt(makeVec3(0.0f, 1.0f, 0.0f)), settings-> settings);
+
+    // thrown along the axis and across it, spun, the block only slides
+    world:.setVelocity(block, makeVec3(2.0f, 1.0f, -1.0f), makeVec3(1.0f, 2.0f, 3.0f));
+    let mut farthest = 0.0f;
+    for _ in 0 .. 90 {
+        world:.step(DT);
+        let s = world.getState(block);
+        assert (math::abs(s.pose.position.y - 1.0f) < 0.01f && math::abs(s.pose.position.z) < 0.01f);
+        assert (math::abs(s.pose.rotation.w) > 0.9999f);
+        farthest = comparison::max(farthest, world.jointPosition(j));
+    }
+
+    assert (farthest < 1.0f + 0.02f && farthest > 0.95f);
+    assert (math::abs(world.getState(block).linearVelocity.x) < 0.05f);
+}
+
+__test a_motor_drives_a_slider_and_a_hinge_at_its_speed_under_its_force {
+    let dmut world = copy PhysicsWorld();
+    world.gravity = vec3();
+    let base = anchor(alias world, vec3());
+
+    // a slider pushing 2 kg by 4 N at most accelerates at 2 m/s2 up to 1 m/s
+    let block = world:.add(ColliderShape::box(makeVec3(0.5f, 0.5f, 0.5f)), translation(makeVec3(0.0f, 2.0f, 0.0f)),
+                           settings-> dynamic(mass-> 2.0f));
+    world:.addJoint(base, block, frameAt(makeVec3(0.0f, 2.0f, 0.0f)),
+                    settings-> JointSettings(kind-> JointKind::SLIDER, motor-> true, motorSpeed-> 1.0f, maxMotorForce-> 4.0f));
+
+    // a hinge turning a wheel about +z
+    let wheel = world:.add(ColliderShape::cylinder(0.5f, 0.2f), translation(makeVec3(3.0f, 0.0f, 0.0f)) * Quaternion::fromAxisAngle(1.5707963f, makeVec3(1.0f, 0.0f, 0.0f)).matrix(),
+                           settings-> dynamic(mass-> 2.0f));
+    let inertia = 2.0f * 0.5f * 0.5f / 2.0f;
+    world:.addJoint(base, wheel, frameAt(makeVec3(3.0f, 0.0f, 0.0f), axis-> makeVec3(0.0f, 0.0f, 1.0f)),
+                    settings-> JointSettings(kind-> JointKind::HINGE, motor-> true, motorSpeed-> 5.0f, maxMotorForce-> 1.0f));
+
+    run(alias world, 0.25f);
+    assert (math::abs(world.getState(block).linearVelocity.x - 0.5f) < 0.02f);
+    assert (math::abs(world.getState(wheel).angularVelocity.z - 0.25f / inertia) < 0.05f);
+
+    run(alias world, 2.0f);
+    assert (math::abs(world.getState(block).linearVelocity.x - 1.0f) < 0.01f);
+    assert (math::abs(world.getState(wheel).angularVelocity.z - 5.0f) < 0.01f);
+    assert (world.getState(wheel).angularVelocity.xy.length() < 0.01f);
+}
+
+__test a_joint_breaks_above_its_force_and_lets_its_body_fall {
+    for strength in [50.0f, 200.0f] {
+        let dmut world = copy PhysicsWorld();
+        let hook = anchor(alias world, makeVec3(0.0f, 5.0f, 0.0f));
+        let weight = world:.add(ColliderShape::sphere(0.2f), translation(makeVec3(0.0f, 4.0f, 0.0f)),
+                                settings-> dynamic(mass-> 10.0f));
+        let j = world:.addJoint(hook, weight, frameAt(makeVec3(0.0f, 5.0f, 0.0f)),
+                                settings-> JointSettings(breakForce-> strength));
+
+        run(alias world, 0.5f);
+
+        // the weight pulls by 98 N
+        let broken = world.getJoint(j).broken;
+        assert (broken == (strength < 98.1f));
+        if broken {
+            assert (world:.takeBroken() == [j]);
+            assert (world.getState(weight).pose.position.y < 4.0f - 0.5f);
+        } else {
+            assert (world:.takeBroken().len == 0us);
+            assert (math::abs(world.getState(weight).pose.position.y - 4.0f) < 0.01f);
+        }
+    }
+}
+
+__test two_bodies_joined_wake_and_sleep_together {
+    let dmut world = copy PhysicsWorld();
+    world:.add(ColliderShape::plane(), mat4());
+    let a = world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)), translation(makeVec3(-1.5f, 0.5f, 0.0f)),
+                       settings-> dynamic(damping-> 0.05f));
+    let b = world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)), translation(makeVec3(1.5f, 0.5f, 0.0f)),
+                       settings-> dynamic(damping-> 0.05f));
+    world:.addJoint(a, b, frameAt(makeVec3(0.0f, 0.5f, 0.0f)));
+
+    run(alias world, 2.0f);
+    assert (!world.getState(a).awake && !world.getState(b).awake);
+
+    // pushing one wakes the other with it, the two in one island
+    world:.applyImpulse(a, makeVec3(0.0f, 0.0f, 1.0f), world.getState(a).worldCentre);
+    world:.step(DT);
+    assert (world.getState(a).awake && world.getState(b).awake);
+    assert (world.getState(b).linearVelocity.z > 0.0f);
+}
+
+__test two_bodies_joined_touch_each_other_only_when_their_joint_says_so {
+    for collide in [false, true] {
+        let dmut world = copy PhysicsWorld();
+        world.gravity = vec3();
+        let a = world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)), mat4(), settings-> dynamic());
+        let b = world:.add(ColliderShape::box(makeVec3(1.0f, 1.0f, 1.0f)), translation(makeVec3(0.8f, 0.0f, 0.0f)),
+                           settings-> dynamic());
+        let j = world:.addJoint(a, b, frameAt(makeVec3(0.4f, 0.0f, 0.0f)),
+                                settings-> JointSettings(kind-> JointKind::FIXED, collide-> collide));
+        world:.step(DT);
+        assert ((world.pairs.len == 1us) == collide);
+
+        // without the joint, the two touch again
+        world:.removeJoint(j);
+        world:.step(DT);
+        assert (world.pairs.len == 1us && world.jointCount == 0us);
+    }
+}
+
+__test removing_a_body_removes_its_joints_and_a_bad_joint_is_refused {
+    let dmut world = copy PhysicsWorld();
+    let a = anchor(alias world, vec3());
+    let b = world:.add(ColliderShape::sphere(0.2f), translation(makeVec3(0.0f, -1.0f, 0.0f)), settings-> dynamic());
+    let c = world:.add(ColliderShape::sphere(0.2f), translation(makeVec3(0.0f, -2.0f, 0.0f)), settings-> dynamic());
+    let ab = world:.addJoint(a, b, frameAt(vec3()));
+    let bc = world:.addJoint(b, c, frameAt(makeVec3(0.0f, -1.5f, 0.0f)));
+    assert (world.jointCount == 2us && world.containsJoint(ab) && world.containsJoint(bc));
+
+    world:.remove(c);
+    assert (world.jointCount == 1us && world.containsJoint(ab) && !world.containsJoint(bc));
+
+    assert (world:.addJoint(a, a, frameAt(vec3())) == NO_JOINT);
+    assert (world:.addJoint(a, 42u32, frameAt(vec3())) == NO_JOINT);
+    assert (world.jointCount == 1us);
+}
