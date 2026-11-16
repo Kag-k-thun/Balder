@@ -69,6 +69,45 @@ pub fn preparePoint(bodies: [SolverBody], c: ContactConstraint, p: ContactPoint,
 }
 
 /**
+ * @returns: the constraint of a manifold given its rolling and its spinning friction, their limits scaled by its
+ * radius, their angular masses, and the angular impulse the manifold carried from the step before (projected on the
+ * normal and the tangents of the step); the constraint as it was when neither friction is set
+ *
+ * @params:
+ *    - bodies: the solver bodies of the island
+ *    - c: the constraint of the manifold
+ *    - points: the points of the manifold, prepared (see preparePoint)
+ *    - rolling, spinning: the rolling and the spinning friction of the contact (see rollingOf)
+ *    - carried: the angular impulse of the manifold at the step before, in the world
+ *
+ * @info: the radius is the largest distance along the normal from the centre of the mass of a body the solver moves
+ * to a point of the manifold: the radius of a ball, of a cylinder on its side, the height of the tip of a top
+ *
+ * */
+pub fn prepareRolling(bodies: [SolverBody], c: ContactConstraint, points: [ConstraintPoint], rolling: f32,
+                      spinning: f32, carried: vec3)-> ContactConstraint {
+    if rolling <= 0.0f && spinning <= 0.0f { return c; }
+
+    let ba = bodies[c.a], bb = bodies[c.b];
+    let mut radius = 0.0f;
+    for p in points {
+        if ba.inverseMass > 0.0f { radius = comparison::max(radius, math::abs(p.armA.dot(c.normal))); }
+        if bb.inverseMass > 0.0f { radius = comparison::max(radius, math::abs(p.armB.dot(c.normal))); }
+    }
+
+    let mut result = c;
+    result.rolling = rolling * radius;
+    result.spinning = spinning * radius;
+    result.rollingMass1 = inverseOf(angularMassAbout(ba, bb, c.tangent1));
+    result.rollingMass2 = inverseOf(angularMassAbout(ba, bb, c.tangent2));
+    result.spinningMass = inverseOf(angularMassAbout(ba, bb, c.normal));
+    result.rollingImpulse1 = carried.dot(c.tangent1);
+    result.rollingImpulse2 = carried.dot(c.tangent2);
+    result.spinningImpulse = carried.dot(c.normal);
+    result
+}
+
+/**
  * Change the velocities of the bodies that move by their accelerations during a sub step, then slow them down by
  * their damping (v / (1 + c h), stable whatever c)
  * */
@@ -93,8 +132,9 @@ pub fn integratePositions(dmut bodies: [SolverBody], h: f32) {
 }
 
 /**
- * Apply to the bodies the impulses the points gathered at the sub step before, the solver starting from them rather
- * than from nothing (warm starting): what keeps a stack still
+ * Apply to the bodies the impulses the points gathered at the sub step before, and the angular impulses of the
+ * rolling and the spinning of their manifolds, the solver starting from them rather than from nothing (warm starting):
+ * what keeps a stack still
  *
  * */
 pub fn warmStart(dmut bodies: [SolverBody], constraints: [ContactConstraint], points: [ConstraintPoint]) {
@@ -114,6 +154,10 @@ pub fn warmStart(dmut bodies: [SolverBody], constraints: [ContactConstraint], po
             wB = wB + iB * p.armB.cross(impulse);
         }
 
+        let turn = c.tangent1 * c.rollingImpulse1 + c.tangent2 * c.rollingImpulse2 + c.normal * c.spinningImpulse;
+        wA = wA - iA * turn;
+        wB = wB + iB * turn;
+
         store(alias bodies, c, vA, wA, vB, wB);
     }
 }
@@ -121,7 +165,9 @@ pub fn warmStart(dmut bodies: [SolverBody], constraints: [ContactConstraint], po
 /**
  * Run a pass of the solver over the constraints during a sub step (projected Gauss-Seidel): the normal of each point
  * of a manifold, never pulling, then the friction of each, bounded by its friction times the impulse of its normal
- * (the pyramid of the cone of friction)
+ * (the pyramid of the cone of friction), then the rolling friction of the manifold, an angular impulse against the
+ * rolling about the axes across its normal bounded by its rolling friction times the impulse of all its normals (a
+ * disc), and its spinning friction, the same about its normal
  *
  * @params:
  *    - h: the duration of the sub step
@@ -133,10 +179,11 @@ pub fn warmStart(dmut bodies: [SolverBody], constraints: [ContactConstraint], po
  * impulses gathered are clamped, not the impulse of a pass, so a pass takes back what an earlier one overdid
  *
  * */
-pub fn solve(dmut bodies: [SolverBody], constraints: [ContactConstraint], dmut points: [ConstraintPoint], h: f32,
+pub fn solve(dmut bodies: [SolverBody], dmut constraints: [ContactConstraint], dmut points: [ConstraintPoint], h: f32,
              settings: SolverSettings, correct: bool) {
     let soft = Softness(settings.contactHertz, settings.contactDamping, h);
-    for c in constraints {
+    for k in 0us .. constraints.len {
+        let c = constraints[k];
         let mA = bodies[c.a].inverseMass, mB = bodies[c.b].inverseMass;
         let iA = bodies[c.a].inverseInertia, iB = bodies[c.b].inverseInertia;
         let dpA = bodies[c.a].deltaPosition, dqA = bodies[c.a].deltaRotation;
@@ -200,6 +247,36 @@ pub fn solve(dmut bodies: [SolverBody], constraints: [ContactConstraint], dmut p
             points[j].tangentImpulse2 = impulse2;
         }
 
+        if c.rolling > 0.0f || c.spinning > 0.0f {
+            let mut pressed = 0.0f;
+            for j in c.first .. c.first + c.count { pressed += points[j].normalImpulse; }
+
+            let rollingLimit = c.rolling * pressed;
+            let w = wB - wA;
+            let mut rolling1 = c.rollingImpulse1 - c.rollingMass1 * w.dot(c.tangent1);
+            let mut rolling2 = c.rollingImpulse2 - c.rollingMass2 * w.dot(c.tangent2);
+            let rollingLength = math::sqrt(rolling1 * rolling1 + rolling2 * rolling2);
+            if rollingLength > rollingLimit {
+                rolling1 = rolling1 * rollingLimit / rollingLength;
+                rolling2 = rolling2 * rollingLimit / rollingLength;
+            }
+
+            let roll = c.tangent1 * (rolling1 - c.rollingImpulse1) + c.tangent2 * (rolling2 - c.rollingImpulse2);
+            wA = wA - iA * roll;
+            wB = wB + iB * roll;
+
+            let spinningLimit = c.spinning * pressed;
+            let spinning = clamped(c.spinningImpulse - c.spinningMass * (wB - wA).dot(c.normal), -spinningLimit,
+                                   spinningLimit);
+            let spin = c.normal * (spinning - c.spinningImpulse);
+            wA = wA - iA * spin;
+            wB = wB + iB * spin;
+
+            constraints[k].rollingImpulse1 = rolling1;
+            constraints[k].rollingImpulse2 = rolling2;
+            constraints[k].spinningImpulse = spinning;
+        }
+
         store(alias bodies, c, vA, wA, vB, wB);
     }
 }
@@ -250,6 +327,15 @@ pub fn materialOf(a: BodySettings, b: BodySettings)-> (f32, f32) {
 }
 
 /**
+ * @returns:
+ *    - 0: the rolling friction of a contact between two bodies, the geometric mean of theirs, like the friction
+ *    - 1: the spinning friction of the contact, the geometric mean of theirs
+ * */
+pub fn rollingOf(a: BodySettings, b: BodySettings)-> (f32, f32) {
+    (math::sqrt(a.rollingFriction * b.rollingFriction), math::sqrt(a.spinningFriction * b.spinningFriction))
+}
+
+/**
  * @returns: two unit tangents across a unit normal, orthogonal to each other, (normal, t1, t2) direct
  * */
 pub fn tangentsOf(n: vec3)-> (vec3, vec3) {
@@ -286,6 +372,13 @@ fn clamped(x: f32, low: f32, high: f32)-> f32 {
 fn massAlong(a: SolverBody, b: SolverBody, ra: vec3, rb: vec3, d: vec3)-> f32 {
     let ca = ra.cross(d), cb = rb.cross(d);
     a.inverseMass + b.inverseMass + ca.dot(a.inverseInertia * ca) + cb.dot(b.inverseInertia * cb)
+}
+
+/**
+ * @returns: what a unit angular impulse about a direction changes the relative angular speed of two bodies about it by
+ * */
+fn angularMassAbout(a: SolverBody, b: SolverBody, d: vec3)-> f32 {
+    d.dot(a.inverseInertia * d) + d.dot(b.inverseInertia * d)
 }
 
 /**
