@@ -15,6 +15,8 @@ A `PhysicsBody3D` is a `Node3D` holding the shape of its collider (`ColliderShap
   `DYNAMIC` (a crate, a ball, moved by the solver; never a mesh nor a plane);
 - **mass**, **friction**, **restitution**, **linearDamping**, **angularDamping**, **canSleep**: how a dynamic body
   weighs, slides, bounces, slows down and sleeps;
+- **rollingFriction**, **spinningFriction** (0 by default): how a ball or a cylinder rolling on a floor, or a top
+  spinning on its point, slows down to rest (see The solver);
 - **trigger**: a trigger reports the bodies it overlaps and stops none of them; the queries skip it unless their
   filter asks for the triggers;
 - **layer** and **mask**: the layers the body is in, and the layers of the bodies it touches, one bit by layer. Two
@@ -244,7 +246,7 @@ A step (`PhysicsWorld::step`) updates the pairs and their manifolds once (a pair
 keeps its own), groups the bodies in islands, then solves and moves each awake island in `substeps` sub steps (4 by
 default, `solveIsland`, after Box2D v3):
 
-- each manifold is a `ContactConstraint` (its bodies, its normal and two tangents, its friction) over a range of
+- each manifold is a `ContactConstraint` (its bodies, its normal and two tangents, its frictions) over a range of
   `ConstraintPoint`s, prepared once a step: the arms of each point, its masses along the normal and the tangents, its
   separation, the speed it bounces back with; the bodies are copied as `SolverBody`s (their velocities, their centre,
   their inverse mass and inertia, gravity and their forces, none for a static or a kinematic body) the sub steps read
@@ -252,7 +254,8 @@ default, `solveIsland`, after Box2D v3):
 - at each sub step, the velocities take gravity, the forces and the damping (`v / (1 + c h)`); the impulses the points
   gathered are applied first (warm starting), which is what lets a stack hold; `iterations` passes (2 by default) push,
   manifold by manifold, the normal of each of its points, the impulse gathered never pulling, then their friction,
-  bounded by the friction times the impulse of the normal (the pyramid of the cone); the velocities of the two bodies
+  bounded by the friction times the impulse of the normal (the pyramid of the cone), then the rolling and the spinning
+  friction of the manifold (see below); the velocities of the two bodies
   of a manifold are loaded once for its points and written back once; the bodies move by their velocities; a last pass
   relaxes the velocities the correction of the penetrations left, so pushing a body out gives it no speed;
 - the separation of a point follows the motion of its bodies through the sub steps (their arms turned with them), the
@@ -266,6 +269,17 @@ pushed out as by a spring of `contact-hertz` (60 Hz, a quarter of the rate of th
 `contact-damping` (a ratio of 10), `max-correction` (2 m/s) at most (a soft contact, `Softness`). The material of a
 contact is the geometric mean of the frictions (ice on rubber slides) and the larger restitution (a ball bounces off any
 floor).
+
+The friction acts at the points, so a ball rolling on a floor, or a top spinning on its point, would lose speed through
+its damping only. The rolling friction is an angular impulse per manifold against the rolling of its two bodies about
+the axes across its normal, bounded together (a disc) by the rolling friction times the impulse of all the normals of
+the manifold times its radius; the spinning friction the same about the normal. The radius is the largest distance
+along the normal from the centre of the mass of a body the solver moves to a point of the manifold: the radius of a
+ball, of a cylinder on its side, the height of a top (`solver::prepareRolling`). The two frictions of a contact are the
+geometric means of those of its bodies, like the friction, so a floor of none lets any ball roll. Their angular impulse
+is carried by the manifold to the next step while its normal turns little, as the friction of its points. A ball of
+radius `r` rolling at `v` on a floor of the same rolling friction `c` stops within `7 v² / (10 c g)` (its torque
+`c m g r`, its inertia `2/5 m r²`), and a ball spinning on it slows by `5/2 c g / r`.
 
 A stack of ten crates holds still with the sub steps and the soft contacts, and falls asleep within two seconds: at a
 step of 1/60 s, more passes over the contacts left it swaying, and a rigid correction of the penetrations (Baumgarte)
