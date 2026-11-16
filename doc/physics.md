@@ -104,6 +104,7 @@ The scene runs them under its lock, from any thread:
 | `sphereCast (origin, radius, direction, length, ...)`  | the body a moving sphere hits first                    |
 | `shapeCast (shape, transform, direction, length, ...)` | the body a moving box, sphere or capsule hits first    |
 | `overlapSphere`, `overlapBox`, `overlapShape`          | the bodies sharing a point with the shape              |
+| `penetrations (shape, transform, filter)`              | how deep the shape sinks into each body it overlaps    |
 | `pickBody (pixel, filter)`                             | the body the camera sees first through a pixel         |
 
 A `BodyHit` gives the body, the distance along the ray (or travelled by the shape), the point hit and the normal of the
@@ -112,6 +113,10 @@ opposite the ray; a shape cast starting against a body hits it at distance 0 too
 
 A `QueryFilter` chooses the bodies hit: the layers of its `mask`, the triggers when `triggers` is set, and none of the
 handles in `exclude` (the body of a character casting a ray from itself).
+
+`penetrations` gives a `ShapeContact` by sub shape the shape sinks into (a part of a compound, a triangle of a mesh):
+the body, the normal from the shape to the body, the depth and the deepest point. The shape gets out of it by moving
+against the normal by the depth; a shape barely touching a body sinks into nothing.
 
 `pickBody` picks a body by its collider, where `Scene::pick` picks a visual instance by its triangles.
 
@@ -240,6 +245,59 @@ between its two orientations. The steps do not move it, it is where the game put
 what it touches by its velocity, so a crate rides a platform. A kinematic body not moved has no velocity, unless the
 game set one (`setVelocity`), kept until it moves again: a conveyor belt.
 
+## Characters
+
+A `CharacterBody3D` is a kinematic capsule (0.4 metres of radius and 1.8 of height by default, its origin at its
+centre) moved through the level by a `CharacterController`, by queries rather than by the solver. The game moves it
+once a tick by a velocity it keeps from tick to tick, gravity added to it:
+
+```
+velocity.y -= 9.81f * seconds;
+if jumping && character.canJump { velocity.y = 5.0f; character:.jumped (); }
+velocity = character:.moveAndSlide (velocity, delta);
+```
+
+A move (`CharacterController::moveAndSlide`, `Scene::moveCharacter` under the lock of the scene) first pushes the
+capsule out of what it sinks into (`penetrations`, `depenetrations` passes at most), then moves it across the up
+direction, then along it. Each part casts the capsule (`shapeCast`), stops it a `skin` short of the first surface met
+and turns what is left of the move along it, along the crease of two surfaces met one after the other, `maxSlides`
+surfaces at most. The `CharacterSettings`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `up` | +Y | the up direction, gravity pulling the other way |
+| `slopeLimit` | 45° | the steepest floor; a steeper slope is a wall to a move that does not go down, the character sliding down it |
+| `stepOffset` | 0.3 m | the highest ledge stepped onto: a walk stopped by a side too steep is tried again raised by it and put down on what is under it, kept when it went farther and landed on a floor |
+| `snapDistance` | 0.3 m | how far below a character that was on the floor and does not go up it is put back on the ground, walking down a slope or a stair |
+| `skin` | 0.01 m | the distance kept from the surfaces |
+| `coyoteTime` | 0.15 s | the time the character can still jump once it walked off the floor (`canJump`, spent by `jumped`) |
+| `pushMass` | 40 kg | the mass the character pushes the dynamic bodies it walks into with |
+| `maxSlides`, `depenetrations` | 4, 4 | the surfaces slid along and the passes out of the bodies at most in a move |
+
+After the motion, the floor is looked for a skin and a little more under the capsule (`onFloor`, `floorNormal`,
+`floorBody`); `onWall` and `onCeiling` tell what else the move met. The velocity given back has lost what the walls
+stopped and, on the floor, its fall; a floor does not turn it up a slope, so the next move is not taken for a jump.
+The dynamic bodies met across the up direction are pushed by an impulse at the point met, the speed of the character
+against them times the smaller of `pushMass` and their mass; the solver never pushes the character back, its body
+being kinematic.
+
+## The debug view
+
+`Scene::physicsDebug` draws what the physics holds over the image of the scene, the bits of `PhysicsDebug` chosen:
+
+| Category | Drawn |
+|---|---|
+| `SHAPES` | the colliders: grey static, blue kinematic, orange awake, green sleeping, yellow triggers; a plane as a grid and its normal |
+| `CONTACTS` | the points of the manifolds, red crosses (pale when speculative), and their normals, yellow arrows |
+| `BOXES` | the boxes of the colliders in the world |
+| `BROADPHASE` | the hierarchy of the enlarged boxes (`Bvh::nodeBoxes`), the parents coloured by depth, the leaves cyan |
+
+The scene draws them at each tick after the steps (`ScenePhysics::drawDebug`, `debug_view::drawWorld`) in the
+`physics` layer of its debug lines (see the debug lines of `doc/render-graph.md`), and clears the layer once no
+category is drawn. `debug_view::drawCollider` draws a single collider in any `DebugLines`. In the `crates` example,
+`--debug` draws the shapes and the contacts from the start, and `S`, `C`, `B` and `T` toggle the shapes, the contacts,
+the boxes and the hierarchy.
+
 ## Measuring a step
 
 `PhysicsWorld::timings` tells what the last step cost (`StepTimings`): the microseconds of its phases (the pairs, the
@@ -303,5 +361,5 @@ and the scene files, and read from the quaternion once it is set as one (`orient
 
 - joints (fixed, hinge, ball and socket, slider), the same solver with other rows (BAL-197);
 - the bodies in the scene files and in the editor (their panel, their wires);
-- the debug view of the colliders and a character controller.
+- an example walking a character through a level.
 
