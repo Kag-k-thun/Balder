@@ -64,6 +64,14 @@ gyllir build editor
   its type does not use left out (no position for a direction light, no direction for a point light, a cone for a spot
   light only). A name is applied when Enter is pressed; a field changed gives its value to every node selected of the
   kind of the panel, each keeping its other values. One direction light casts shadows at a time.
+- **Convex hulls**: a model has a panel of the convex decomposition its dynamic body is made of (see the convex
+  decomposition of `doc/physics.md`): its concavity (in % of the volume of the model), the hulls and the vertices of a
+  hull at most, the voxels along its longest side. *Decompose* splits the model with them on a thread of its own, the
+  panel telling it runs, and draws the hulls over the model, each in its colour, in the `hulls` layer of the debug lines
+  of the scene (*Show the hulls* hides them); the settings are tuned and the model decomposed again until the hulls fit.
+  *Save* writes them next to the model file (`teapot.obj` giving `teapot.hulls`), where the game reads them; a model
+  selected shows the hulls saved and their settings. The hulls are no change of the scene: neither decomposing nor
+  saving is undone, and a decomposition ending after another node was selected is dropped (`HullsPanel`).
 - **Menus**: *Scene* opens a new scene or a scene file and saves the scene (Ctrl+S) or saves it in another file
   (Ctrl+Shift+S), *Add* adds a cube, a sphere, a plane, a model read from a
   file, an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume or a light where the

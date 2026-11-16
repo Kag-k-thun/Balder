@@ -1,0 +1,167 @@
+in utils;
+
+use balder::core::error;
+use balder::math::vector;
+use balder::utils::path;
+
+use std::{config, conv, fs};
+
+/**
+ * The version of the format of the files of the decompositions
+ * */
+def VERSION = 1i64;
+
+/**
+ * The digits written after the decimal point of a coordinate
+ * */
+def DIGITS = 6u32;
+
+/**
+ * @returns: the text of the file of a decomposition, a toml holding its settings, the checksum of its model and, in a
+ * table [[hull]] by hull, the coordinates of the vertices of the hull:
+ * ```
+ * version = 1
+ * source = 3735928559
+ * concavity = 0.01
+ * max-hulls = 16
+ * max-vertices = 32
+ * resolution = 64
+ *
+ * [[hull]]
+ * points = [
+ *     -0.5, 0.0, -0.5,
+ *     ...
+ * ]
+ * ```
+ * */
+pub fn textOf(hulls: [&ConvexHull], settings: DecompositionSettings, source: u32)-> [c8] {
+    let mut text = "# The convex decomposition of a model, its hulls in the space of the model (see ConvexDecomposition)\n";
+    text ~= f"version = ${VERSION}\n";
+    text ~= f"source = ${source}\n";
+    text ~= f"concavity = ${decimalOf(settings.concavity)}\n";
+    text ~= f"max-hulls = ${settings.maxHulls}\n";
+    text ~= f"max-vertices = ${settings.maxVertices}\n";
+    text ~= f"resolution = ${settings.resolution}\n";
+
+    for h in hulls {
+        // no comma after the last number, the toml of the std refusing it
+        text ~= "\n[[hull]]\npoints = [";
+        for i, v in h.vertices {
+            let separator = if i + 1us < h.vertices.len { "," } else { "" };
+            text ~= f"\n    ${decimalOf(v.x)}, ${decimalOf(v.y)}, ${decimalOf(v.z)}${separator}";
+        }
+
+        text ~= "\n]\n";
+    }
+
+    text
+}
+
+/**
+ * @returns: the hulls, the settings and the checksum of the model of the decomposition written in a file (see textOf)
+ * @throws: BalderError when the file cannot be read, is not a toml, is of another version, or holds an entry of the
+ * wrong type, no hull, or a hull spanning no volume
+ * */
+pub fn read(path: [c8])-> ([&ConvexHull], DecompositionSettings, u32)
+    throws BalderError
+{
+    let cfg = {
+        toml::parse(readFile(projectPath(path)))
+    } catch {
+        err => {
+            throw copy BalderError(f"Failed to read the hulls of ${path}: ${err}");
+        }
+    };
+
+    if integerOf(cfg, "version", path) != VERSION {
+        throw copy BalderError(f"The hulls of ${path} are of another version than ${VERSION}");
+    }
+
+    let source = cast!u32(integerOf(cfg, "source", path));
+    let settings = DecompositionSettings(concavity-> numberOf(cfg, "concavity", path),
+                                         maxHulls-> cast!u32(integerOf(cfg, "max-hulls", path)),
+                                         maxVertices-> cast!u32(integerOf(cfg, "max-vertices", path)),
+                                         resolution-> cast!u32(integerOf(cfg, "resolution", path)));
+
+    let mut hulls: [&ConvexHull] = [];
+    if let Ok(tables: &Array) = cfg["hull"]? {
+        for t in tables[] {
+            hulls ~= [copy ConvexHull(pointsOf(t, path))];
+        }
+    }
+
+    if hulls.len == 0us {
+        throw copy BalderError(f"The file ${path} holds no hull");
+    }
+
+    (hulls, settings, source)
+}
+
+/**
+ * @returns: the integer of an entry of the file of a decomposition
+ * @throws: BalderError when the entry is missing, or not a positive integer
+ * */
+fn integerOf(cfg: &Config, key: [c8], path: [c8])-> i64
+    throws BalderError
+{
+    if let Ok(Int(value-> i)) = cfg[key]? {
+        if i >= 0i64 && i <= cast!i64(u32::max) { return i; }
+    }
+
+    throw copy BalderError(f"The ${key} of the hulls of ${path} must be a positive integer");
+}
+
+/**
+ * @returns: the number of an entry of the file of a decomposition
+ * @throws: BalderError when the entry is missing, or not a number
+ * */
+fn numberOf(cfg: &Config, key: [c8], path: [c8])-> f32
+    throws BalderError
+{
+    match cfg[key]? {
+        Ok(Float(value-> f)) => { return cast!f32(f); }
+        Ok(Int(value-> i)) => { return cast!f32(i); }
+        _ => {
+            throw copy BalderError(f"The ${key} of the hulls of ${path} must be a number");
+        }
+    }
+}
+
+/**
+ * @returns: the points of a table [[hull]], three numbers by point
+ * @throws: BalderError when the table holds no array of numbers whose length is a multiple of three
+ * */
+fn pointsOf(table: &Config, path: [c8])-> [vec3]
+    throws BalderError
+{
+    let mut values: [f32] = [];
+    if let Ok(numbers: &Array) = table["points"]? {
+        for v in numbers[] {
+            match v {
+                Float(value-> f) => { values ~= [cast!f32(f)]; }
+                Int(value-> i) => { values ~= [cast!f32(i)]; }
+                _ => {
+                    throw copy BalderError(f"The points of a hull of ${path} must be numbers");
+                }
+            }
+        }
+    }
+
+    if values.len == 0us || values.len % 3us != 0us {
+        throw copy BalderError(f"The points of a hull of ${path} must be three numbers by point");
+    }
+
+    copy [makeVec3(values[3us * i], values[3us * i + 1us], values[3us * i + 2us]) for i in 0us .. values.len / 3us]
+}
+
+/**
+ * @returns: a number written with DIGITS digits after the decimal point at most, the trailing zeros dropped
+ * */
+fn decimalOf(f: f32)-> [c8] {
+    let text = to!{[c8]}(f, prec-> DIGITS);
+    let mut end = text.len;
+    while end > 0us && text[end - 1us] == '0' { end -= 1us; }
+    if end > 0us && text[end - 1us] == '.' { end += 1us; }
+
+    if text[0us .. end] == "-0.0" { "0.0" } else { text[0us .. end] }
+}

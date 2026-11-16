@@ -1,0 +1,719 @@
+in decomposer;
+
+use balder::core::error;
+use balder::math::{bounds, vector};
+
+use std::math;
+use std::algorithm::{comparison, sorting};
+
+/**
+ * The pieces are split until there are that many times the number of hulls at most, before they are merged
+ * */
+def SPLIT_FACTOR = 2u32;
+
+/**
+ * The planes tried across an axis to split a piece, before the planes around the best of them
+ * */
+def CANDIDATE_CUTS = 8u32;
+
+/**
+ * The levels between the slices of a side of a cut whose corners make the hull measuring it, at most
+ * */
+def CANDIDATE_LEVELS = 6u32;
+
+/**
+ * The distance a vertex of the outline of a slice may be from its neighbours' edge to be dropped, in voxels
+ * */
+def SIMPLIFICATION = 0.5f;
+
+/**
+ * The margin over the steps of the voxels along the faces of a hull a hull may exceed its voxels by without being
+ * concave (see Decomposer::excessOf)
+ * */
+def STEP_MARGIN = 1.25f;
+
+/**
+ * The first coordinate of a line of voxels holding none
+ * */
+def NO_LINE = u32::max;
+
+/**
+ * The voxels of a piece of the model, connected, and the hull of their corners
+ * */
+@data
+record Piece {
+
+    // The indices of the voxels in the grid
+    let mut voxels: [u32] = [];
+
+    // The coordinates of the voxels, the lowest and the highest along each axis
+    let mut low: [u32 ; 3] = [0u32 ; 3];
+    let mut high: [u32 ; 3] = [0u32 ; 3];
+
+    // The vertices of the hull of the corners of the voxels
+    let mut points: [vec3] = [];
+
+    // The volume the hull holds outside the voxels (see Decomposer::excessOf)
+    let mut error: f32 = 0.0f;
+
+    // False once no plane splits the piece
+    let mut splittable: bool = true;
+}
+
+/**
+ * A hull of the decomposition: the hull of pieces merged
+ * */
+@data
+record Part {
+
+    // The vertices of the hull
+    let mut points: [vec3] = [];
+
+    // The number of voxels of its pieces
+    let mut voxels: u64 = 0u64;
+
+    // The volume the hull holds outside the voxels of its pieces
+    let mut error: f32 = 0.0f;
+
+    // The id of the part, keying the hulls of the pairs of parts
+    let mut id: u32 = 0u32;
+}
+
+/**
+ * The voxels of a piece in slices across an axis, the outlines of the slices and of the levels between them in the
+ * coordinates of the grid along the two other axes
+ * */
+@data
+record Slices {
+
+    // The axis the slices are across
+    let mut axis: u32 = 0u32;
+
+    // The coordinate of the first slice along the axis
+    let mut base: u32 = 0u32;
+
+    // The outline of each slice
+    let mut outlines: [[(i64, i64)]] = [];
+
+    // The outline of each level, the lower face of the slice of the same index: the hull of the outlines of the slices
+    // on both of its sides, the outline of the first slice for the first level
+    let mut levels: [[(i64, i64)]] = [];
+
+    // The number of voxels of each slice
+    let mut voxels: [u32] = [];
+}
+
+/**
+ * The approximate convex decomposition of the voxels of a model: the solid voxels in their connected pieces, the piece
+ * whose hull holds the most volume outside the model split by a plane of the grid, then the hulls the closest to the
+ * voxels they hold merged, each hull reduced to a number of vertices at most
+ *
+ * @info:
+ * =====
+ * A piece is measured by the hull of the corners of its voxels, slice by slice across an axis: the outline of a slice is
+ * the 2D hull of the corners of its lines of voxels across another axis (the first and the last voxel of a line enough),
+ * the outline of the level between two slices the hull of their two outlines, each outline simplified by half a voxel at
+ * most. The volume of the hull past the volume of the voxels and past the steps of the voxels along its faces is the
+ * volume it holds outside the model. A piece holding more than the concavity of the settings is split across one of
+ * the three axes by the plane leaving the least volume outside the hulls of the two sides, the planes being tried by
+ * steps then around the best of them, each side measured by a few of its levels; each side gives its connected pieces.
+ * The pieces are split until each is under the concavity, or until there are twice as many as the hulls asked. Then
+ * the two hulls whose hull holds the least volume outside them are merged, as long as there are more hulls than asked
+ * or that volume is under the concavity. The vertices of each hull are kept in the box of the model,
+ * then reduced by taking the vertex farthest out of the hull of those taken until there are as many as asked.
+ * =====
+ * */
+pub class Decomposer {
+
+    // The voxels of the model
+    let _grid: &VoxelGrid;
+
+    // The settings of the decomposition
+    let _settings: DecompositionSettings;
+
+    // The box of the triangles of the model, the hulls being kept in it
+    let _bounds: Aabb;
+
+    // The label of each voxel, telling the pieces apart
+    let dmut _labels: [u32] = [];
+
+    // The last label given
+    let mut _label: u32 = 0u32;
+
+    // The volume a hull may hold outside the model (the concavity times the volume of the model)
+    let mut _tolerance: f32;
+
+    /**
+     * @params:
+     *    - triangles: the triangles of the surface of the model
+     *    - settings: the settings of the decomposition
+     * @throws: BalderError when the triangles span no volume
+     * */
+    pub self (triangles: [Triangle], settings: DecompositionSettings)
+        with _grid = copy VoxelGrid(triangles, settings.resolution)
+        , _settings = settings
+        , _bounds = Decomposer::boundsOf(triangles)
+        , _tolerance = 0.0f
+        throws BalderError
+    {
+        self._labels = copy [0u32; self._grid.len];
+        let solid = self._grid.solidVoxels();
+        let side = self._grid.voxelSize;
+        self._tolerance = settings.concavity * cast!f32(cast!u64(solid.len)) * side * side * side;
+    }
+
+    /**
+     * @returns: the hulls of the decomposition
+     * @throws: BalderError when the voxels of the model span no volume
+     * */
+    pub fn hulls(mut self)-> [&ConvexHull]
+        throws BalderError
+    {
+        let mut pieces: [Piece] = [];
+        for c in self:.componentsOf(self._grid.solidVoxels()) {
+            pieces ~= [self.pieceOf(c)];
+        }
+
+        if pieces.len == 0us {
+            throw copy BalderError("The model holds no voxel");
+        }
+
+        let mut result: [&ConvexHull] = [];
+        for p in self:.merged(self:.split(pieces)) {
+            result ~= [self.finalHull(p)];
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PIECES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the pieces split, the one holding the most volume outside the model first, until each holds less than
+     * the tolerance or there are SPLIT_FACTOR times as many pieces as hulls asked
+     * */
+    fn split(mut self, pieces: [Piece])-> [Piece]
+        throws BalderError
+    {
+        let limit = cast!usize(comparison::max(self._settings.maxHulls, 1u32) * SPLIT_FACTOR);
+        let mut result = pieces;
+        while result.len < limit {
+            let mut worst = result.len;
+            for i, p in result if p.splittable && p.error > self._tolerance {
+                if worst == result.len || p.error > result[worst].error {
+                    worst = i;
+                }
+            }
+
+            if worst == result.len { break; }
+
+            let sides = self:.cut(result[worst]);
+            if sides.len == 0us {
+                let dmut marked = copy result;
+                marked[worst].splittable = false;
+                result = marked;
+            } else {
+                result = result[0us .. worst] ~ result[worst + 1us .. $] ~ sides;
+            }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the connected pieces of the two sides of the plane leaving the least volume outside their hulls, none
+     * when no plane splits the piece
+     * */
+    fn cut(mut self, piece: Piece)-> [Piece]
+        throws BalderError
+    {
+        let mut bestError = f32::max;
+        let mut bestAxis = 0u32;
+        let mut bestCut = 0u32;
+        for axis in 0u32 .. 3u32 {
+            let count = piece.high[axis] - piece.low[axis] + 1u32;
+            if count < 2u32 { continue; }
+
+            let slices = self.slicesOf(piece, axis);
+            let step = comparison::max(count / CANDIDATE_CUTS, 1u32);
+            let mut axisError = f32::max;
+            let mut axisCut = 0u32;
+            let mut k = step;
+            while k < count {
+                let e = self.cutError(slices, k);
+                if e < axisError { axisError = e; axisCut = k; }
+                k += step;
+            }
+
+            let from = if axisCut > step { axisCut - step + 1u32 } else { 1u32 };
+            for refined in from .. comparison::min(axisCut + step, count) if refined % step != 0u32 {
+                let e = self.cutError(slices, refined);
+                if e < axisError { axisError = e; axisCut = refined; }
+            }
+
+            if axisError < bestError {
+                bestError = axisError;
+                bestAxis = axis;
+                bestCut = piece.low[axis] + axisCut;
+            }
+        }
+
+        if bestError == f32::max { return []; }
+
+        let mut below: [u32] = [];
+        let mut above: [u32] = [];
+        for v in piece.voxels {
+            if self.coordinatesOf(v)[bestAxis] < bestCut { below ~= [v]; } else { above ~= [v]; }
+        }
+
+        let mut result: [Piece] = [];
+        for c in self:.componentsOf(below) ~ self:.componentsOf(above) {
+            result ~= [self.pieceOf(c)];
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the volume the hulls of the two sides of a cut hold outside their voxels, each hull made of
+     * CANDIDATE_LEVELS levels of its side at most
+     * @params:
+     *    - slices: the slices of the piece across the axis of the cut
+     *    - k: the number of slices below the cut
+     * */
+    fn cutError(self, slices: Slices, k: u32)-> f32
+        throws BalderError
+    {
+        let count = cast!u32(slices.outlines.len);
+        let mut below = 0u64;
+        let mut above = 0u64;
+        for i in 0u32 .. count {
+            if i < k { below += cast!u64(slices.voxels[i]); } else { above += cast!u64(slices.voxels[i]); }
+        }
+
+        self.excessOf(copy ConvexHull(self.cornersOf(slices, 0u32, k, CANDIDATE_LEVELS)), below)
+            + self.excessOf(copy ConvexHull(self.cornersOf(slices, k, count, CANDIDATE_LEVELS)), above)
+    }
+
+    /**
+     * @returns: the corners of the slices from a slice to another (excluded) the hull of the slices needs: the outline of
+     * the first slice on its lower face, the outline of the last one on its upper face, and the outlines of the levels
+     * between them, `most` levels at most evenly spread
+     * */
+    fn cornersOf(self, slices: Slices, from: u32, to: u32, most: u32)-> [vec3] {
+        let mut result = self.cornersAt(slices, from, slices.outlines[from])
+            ~ self.cornersAt(slices, to, slices.outlines[to - 1u32]);
+
+        let inner = to - from - 1u32;
+        if inner <= most {
+            for level in from + 1u32 .. to {
+                result ~= self.cornersAt(slices, level, slices.levels[level]);
+            }
+        } else {
+            for i in 0u32 .. most {
+                let level = from + 1u32 + (i * (inner - 1u32)) / comparison::max(most - 1u32, 1u32);
+                result ~= self.cornersAt(slices, level, slices.levels[level]);
+            }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the corners of an outline at a level of slices (the lower face of the slice of the same index)
+     * */
+    fn cornersAt(self, slices: Slices, level: u32, outline: [(i64, i64)])-> [vec3] {
+        copy [self.cornerOn(slices.axis, slices.base + level, cast!u32(q._0), cast!u32(q._1)) for q in outline]
+    }
+
+    /**
+     * @returns: the slices of a piece across an axis: the outline of each (its 2D hull, the first and the last voxel of
+     * each of its lines enough), the outline of each level between two slices (the hull of the outlines of both), the
+     * outlines simplified by half a voxel at most, and the number of voxels of each slice
+     * */
+    fn slicesOf(self, piece: Piece, axis: u32)-> Slices {
+        let along = (axis + 1u32) % 3u32, across = (axis + 2u32) % 3u32;
+        let count = piece.high[axis] - piece.low[axis] + 1u32;
+        let width = piece.high[across] - piece.low[across] + 1u32;
+
+        // the first and the last voxel along `along` of each line of the slices
+        let dmut first = copy [NO_LINE; cast!usize(count * width)];
+        let dmut last = copy [0u32; cast!usize(count * width)];
+        let dmut voxels = copy [0u32; cast!usize(count)];
+        for v in piece.voxels {
+            let p = self.coordinatesOf(v);
+            let slice = p[axis] - piece.low[axis];
+            let line = slice * width + p[across] - piece.low[across];
+            first[line] = comparison::min(first[line], p[along]);
+            last[line] = comparison::max(last[line], p[along]);
+            voxels[slice] += 1u32;
+        }
+
+        let mut outlines: [[(i64, i64)]] = [];
+        for slice in 0u32 .. count {
+            let mut lines: [(i64, i64)] = [];
+            for l in 0u32 .. width if first[slice * width + l] != NO_LINE {
+                let c = cast!i64(piece.low[across] + l);
+                let b0 = cast!i64(first[slice * width + l]), b1 = cast!i64(last[slice * width + l] + 1u32);
+                lines ~= [(b0, c), (b1, c), (b0, c + 1i64), (b1, c + 1i64)];
+            }
+
+            outlines ~= [Decomposer::simplified(Decomposer::outlineOf(lines))];
+        }
+
+        // no level between two slices below the first one: the lower face of the first slice is its own outline
+        let mut levels: [[(i64, i64)]] = copy [outlines[0]];
+        for level in 1u32 .. count {
+            levels ~= [Decomposer::simplified(Decomposer::outlineOf(outlines[level - 1u32] ~ outlines[level]))];
+        }
+
+        Slices(axis-> axis, base-> piece.low[axis], outlines-> outlines, levels-> levels, voxels-> voxels)
+    }
+
+    /**
+     * @returns: the piece of connected voxels, the hull of their corners and the volume it holds outside them
+     * */
+    fn pieceOf(self, voxels: [u32])-> Piece
+        throws BalderError
+    {
+        let dmut low = [u32::max ; 3];
+        let dmut high = [0u32 ; 3];
+        for v in voxels {
+            let p = self.coordinatesOf(v);
+            for a in 0u32 .. 3u32 {
+                low[a] = comparison::min(low[a], p[a]);
+                high[a] = comparison::max(high[a], p[a]);
+            }
+        }
+
+        let mut piece = Piece(voxels-> voxels, low-> low, high-> high, splittable-> voxels.len > 1us);
+        let slices = self.slicesOf(piece, 0u32);
+        let hull = copy ConvexHull(self.cornersOf(slices, 0u32, cast!u32(slices.outlines.len), u32::max));
+        piece.points = hull.vertices;
+        piece.error = self.excessOf(hull, cast!u64(voxels.len));
+        piece
+    }
+
+    /**
+     * @returns: the connected pieces of voxels, connected by their faces
+     * */
+    fn componentsOf(mut self, voxels: [u32])-> [[u32]] {
+        self._label += 1u32;
+        let pending = self._label;
+        for v in voxels { self._labels[v] = pending; }
+
+        let mut result: [[u32]] = [];
+        for v in voxels {
+            if self._labels[v] != pending { continue; }
+
+            self._label += 1u32;
+            let label = self._label;
+            self._labels[v] = label;
+
+            let mut component: [u32] = copy [v];
+            let mut head = 0us;
+            while head < component.len {
+                let (x, y, z) = self._grid.coordinatesOf(component[head]);
+                head += 1us;
+
+                for side in 0u32 .. 6u32 {
+                    if let Ok(n) = self._grid.neighbourOf(x, y, z, side) && self._labels[n] == pending {
+                        self._labels[n] = label;
+                        component ~= [n];
+                    }
+                }
+            }
+
+            result ~= [component];
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          HULLS          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the hulls of the pieces, the two whose hull holds the least volume outside them merged as long as there
+     * are more than the hulls asked or that volume is under the tolerance
+     * */
+    fn merged(mut self, pieces: [Piece])-> [Part]
+        throws BalderError
+    {
+        let mut parts: [Part] = [];
+        for p in pieces {
+            self._label += 1u32;
+            parts ~= [Part(points-> p.points, voxels-> cast!u64(p.voxels.len), error-> p.error, id-> self._label)];
+        }
+
+        let maxHulls = cast!usize(comparison::max(self._settings.maxHulls, 1u32));
+        let dmut unions: [u64 => Part] = copy [];
+        while parts.len > 1us {
+            let mut best = Part();
+            let mut bestError = f32::max;
+            let mut first = 0us;
+            let mut second = 0us;
+            for i in 0us .. parts.len {
+                for j in i + 1us .. parts.len {
+                    let u = self.unionOf(parts[i], parts[j], alias unions);
+                    if u.error < bestError {
+                        bestError = u.error;
+                        best = u;
+                        first = i;
+                        second = j;
+                    }
+                }
+            }
+
+            if parts.len <= maxHulls && bestError > self._tolerance { break; }
+
+            self._label += 1u32;
+            best.id = self._label;
+
+            let mut kept: [Part] = [];
+            for i, p in parts if i != first && i != second {
+                kept ~= [p];
+            }
+
+            parts = kept ~ [best];
+        }
+
+        parts
+    }
+
+    /**
+     * @returns: the hull of two parts, kept in unions by the pair of their ids
+     * */
+    fn unionOf(self, a: Part, b: Part, dmut unions: [u64 => Part])-> Part
+        throws BalderError
+    {
+        let key = if a.id < b.id { (cast!u64(a.id) << 32u64) | cast!u64(b.id) } else { (cast!u64(b.id) << 32u64) | cast!u64(a.id) };
+        if let Ok(u) = unions[key] { return u; }
+
+        let hull = copy ConvexHull(a.points ~ b.points);
+        let u = Part(points-> hull.vertices, voxels-> a.voxels + b.voxels, error-> self.excessOf(hull, a.voxels + b.voxels));
+        unions[key] = u;
+        u
+    }
+
+    /**
+     * @returns: the hull of a part, its vertices kept in the box of the model and reduced to the number of vertices of
+     * the settings, those out of the box kept when the box flattens the hull
+     * */
+    fn finalHull(self, part: Part)-> &ConvexHull
+        throws BalderError
+    {
+        let b = self._bounds;
+        let kept = copy [makeVec3(comparison::min(comparison::max(p.x, b.min.x), b.max.x),
+                                  comparison::min(comparison::max(p.y, b.min.y), b.max.y),
+                                  comparison::min(comparison::max(p.z, b.min.z), b.max.z)) for p in part.points];
+
+        let points = {
+            self.reduced(kept)
+        } catch {
+            _: &BalderError => { self.reduced(part.points) }
+        };
+
+        copy ConvexHull(points)
+    }
+
+    /**
+     * @returns: the vertices of the hull of points reduced to the number of vertices of the settings: four vertices far
+     * apart, then the vertex farthest out of the hull of those taken until there are as many as asked
+     * */
+    fn reduced(self, points: [vec3])-> [vec3]
+        throws BalderError
+    {
+        let vertices = (copy ConvexHull(points)).vertices;
+        let most = cast!usize(comparison::max(self._settings.maxVertices, 4u32));
+        if vertices.len <= most { return vertices; }
+
+        let mut taken = Decomposer::simplexOf(vertices);
+        while taken.len < most {
+            let hull = copy ConvexHull(taken);
+            let mut far = 0.0f;
+            let mut next = vertices[0];
+            for v in vertices {
+                let mut out = -f32::max;
+                for f in hull.faces {
+                    out = comparison::max(out, f.normal.dot(v) - f.offset);
+                }
+
+                if out > far {
+                    far = out;
+                    next = v;
+                }
+            }
+
+            if far <= 0.0f { break; }
+            taken ~= [next];
+        }
+
+        taken
+    }
+
+    /**
+     * @returns: the volume a hull holds outside voxels, past the steps of the voxels along its faces, none being negative
+     * @info: the voxels a face crosses stick out of it, the hull of their corners lying past their steps: by
+     * |nx| + |ny| + |nz| - 1 of a voxel on average along a face of normal n, nothing along a face across an axis, half a
+     * voxel over a ball; a hull holding no more than STEP_MARGIN times those steps holds nothing outside the model
+     * */
+    fn excessOf(self, hull: &ConvexHull, voxels: u64)-> f32 {
+        let side = self._grid.voxelSize;
+        let mut steps = 0.0f;
+        let vertices = hull.vertices;
+        for f in hull.faces {
+            let area = (vertices[f.b] - vertices[f.a]).cross(vertices[f.c] - vertices[f.a]).length() / 2.0f;
+            let n = f.normal;
+            steps += area * (math::abs(n.x) + math::abs(n.y) + math::abs(n.z) - 1.0f);
+        }
+
+        let inside = cast!f32(voxels) * side * side * side;
+        comparison::max(hull.volume - inside - STEP_MARGIN * steps * side, 0.0f)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GRID          ========================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the coordinates of a voxel, by axis
+     * */
+    fn coordinatesOf(self, voxel: u32)-> [u32 ; 3] {
+        let (x, y, z) = self._grid.coordinatesOf(voxel);
+        [x, y, z]
+    }
+
+    /**
+     * @returns: the corner of the grid at a level across an axis, and at coordinates along the two axes after it
+     * */
+    fn cornerOn(self, axis: u32, level: u32, along: u32, across: u32)-> vec3 {
+        let dmut c = [0u32 ; 3];
+        c[axis] = level;
+        c[(axis + 1u32) % 3u32] = along;
+        c[(axis + 2u32) % 3u32] = across;
+        self._grid.cornerAt(c[0], c[1], c[2])
+    }
+
+}
+
+/**
+ * The statics of the decomposer
+ * */
+pub mod Decomposer {
+
+    /**
+     * @returns: the box of triangles
+     * */
+    pub fn boundsOf(triangles: [Triangle])-> Aabb {
+        let mut box = Aabb();
+        for t in triangles {
+            box = box.merged(t.aabb);
+        }
+
+        box
+    }
+
+    /**
+     * @returns: the corners of the 2D convex hull of points, counterclockwise, none on the edge between two others
+     * (Andrew's monotone chain)
+     * */
+    pub fn outlineOf(points: [(i64, i64)])-> [(i64, i64)] {
+        if points.len < 3us { return points; }
+
+        let dmut sorted = copy points;
+        sorting::sort(alias sorted, |p, q| => p._0 < q._0 || (p._0 == q._0 && p._1 < q._1));
+
+        let dmut chain = copy [(0i64, 0i64); 2us * sorted.len];
+        let mut k = 0us;
+        for p in sorted {
+            while k >= 2us && Decomposer::turn(chain[k - 2us], chain[k - 1us], p) <= 0i64 { k -= 1us; }
+            chain[k] = p;
+            k += 1us;
+        }
+
+        let lower = k + 1us;
+        for j in 0us .. sorted.len - 1us {
+            let p = sorted[sorted.len - 2us - j];
+            while k >= lower && Decomposer::turn(chain[k - 2us], chain[k - 1us], p) <= 0i64 { k -= 1us; }
+            chain[k] = p;
+            k += 1us;
+        }
+
+        chain[0us .. k - 1us]
+    }
+
+    /**
+     * @returns: a convex outline without the corners closer than SIMPLIFICATION to the edge joining their neighbours,
+     * the closest dropped first, three corners kept at least
+     * */
+    pub fn simplified(outline: [(i64, i64)])-> [(i64, i64)] {
+        let mut result = outline;
+        while result.len > 3us {
+            let mut closest = 0us;
+            let mut distance = f32::max;
+            for i in 0us .. result.len {
+                let prev = result[(i + result.len - 1us) % result.len], next = result[(i + 1us) % result.len];
+                let chord = math::sqrt(cast!f32((next._0 - prev._0) * (next._0 - prev._0) + (next._1 - prev._1) * (next._1 - prev._1)));
+                let d = cast!f32(math::abs(Decomposer::turn(prev, result[i], next))) / comparison::max(chord, 1.0f);
+                if d < distance { distance = d; closest = i; }
+            }
+
+            if distance >= SIMPLIFICATION { break; }
+            result = result[0us .. closest] ~ result[closest + 1us .. $];
+        }
+
+        result
+    }
+
+    /**
+     * @returns: twice the signed area of the triangle of three points, positive when they turn counterclockwise
+     * */
+    pub fn turn(o: (i64, i64), a: (i64, i64), b: (i64, i64))-> i64 {
+        (a._0 - o._0) * (b._1 - o._1) - (a._1 - o._1) * (b._0 - o._0)
+    }
+
+    /**
+     * @returns: four vertices far apart: the lowest along X, the farthest from it, the farthest from their line, the
+     * farthest from their plane
+     * */
+    pub fn simplexOf(vertices: [vec3])-> [vec3] {
+        let mut a = vertices[0];
+        for v in vertices if v.x < a.x { a = v; }
+
+        let mut b = a;
+        for v in vertices if (v - a).length() > (b - a).length() { b = v; }
+
+        let mut c = a;
+        let mut far = 0.0f;
+        for v in vertices {
+            let d = (b - a).cross(v - a).length();
+            if d > far { far = d; c = v; }
+        }
+
+        let normal = (b - a).cross(c - a);
+        let mut d = a;
+        let mut height = 0.0f;
+        for v in vertices {
+            let h = math::abs(normal.dot(v - a));
+            if h > height { height = h; d = v; }
+        }
+
+        copy [a, b, c, d]
+    }
+}

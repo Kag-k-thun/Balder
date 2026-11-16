@@ -1,0 +1,253 @@
+in voxel_grid;
+
+use balder::core::error;
+use balder::math::{bounds, vector};
+
+use std::math;
+use std::algorithm::comparison;
+
+/**
+ * What a voxel holds: nothing (outside the model), a triangle of the model, or the inside of the model
+ * */
+enum VoxelKind
+| OUTSIDE = 0u8
+| SURFACE = 1u8
+| INSIDE  = 2u8;
+
+/**
+ * The voxels of a model: a grid of cubes over the box of its triangles, each cube a triangle overlaps on its surface,
+ * each cube enclosed by its surface inside it
+ *
+ * @info: the grid has a voxel of margin around the box of the triangles and is shifted by half a voxel, the faces of the
+ * box crossing the voxels of its sides through their middle; the voxels outside are those a fill from a corner of the
+ * grid reaches without crossing the surface, so the inside of a surface that is not closed is outside, the surface
+ * alone being solid
+ *
+ * */
+@final
+pub class VoxelGrid {
+
+    // The corner of the first voxel, the lowest along each axis
+    let mut _origin: vec3 = vec3();
+
+    // The side of a voxel
+    let mut _size: f32 = 0.0f;
+
+    // The number of voxels along each axis
+    let mut _countX: u32 = 0u32;
+    let mut _countY: u32 = 0u32;
+    let mut _countZ: u32 = 0u32;
+
+    // The kind of each voxel, x first, then y, then z
+    let dmut _cells: [u8] = [];
+
+    /**
+     * The voxels of triangles
+     * @params:
+     *    - triangles: the triangles of the surface of the model
+     *    - resolution: the number of voxels along the longest side of the box of the triangles
+     * @throws: BalderError when there is no triangle, or when they are all on a point
+     * */
+    pub self (triangles: [Triangle], resolution: u32)
+        throws BalderError
+    {
+        let mut box = Aabb();
+        for t in triangles {
+            box = box.merged(t.aabb);
+        }
+
+        let side = box.max - box.min;
+        let longest = comparison::max(side.x, comparison::max(side.y, side.z));
+        if triangles.len == 0us || longest <= 0.0f {
+            throw copy BalderError("A voxel grid needs triangles spanning a length");
+        }
+
+        self._size = longest / cast!f32(comparison::max(resolution, 1u32));
+        self._origin = box.min - makeVec3(1.5f, 1.5f, 1.5f) * self._size;
+        self._countX = self.cellsAlong(side.x);
+        self._countY = self.cellsAlong(side.y);
+        self._countZ = self.cellsAlong(side.z);
+        self._cells = copy [cast!u8(VoxelKind::INSIDE); self.len];
+
+        for t in triangles {
+            self:.markSurface(t);
+        }
+
+        self:.fillOutside();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the corner of the first voxel, the lowest along each axis
+     * */
+    @field
+    pub fn origin(self)-> vec3 {
+        self._origin
+    }
+
+    /**
+     * @returns: the side of a voxel
+     * */
+    @field
+    pub fn voxelSize(self)-> f32 {
+        self._size
+    }
+
+    /**
+     * @returns: the number of voxels along each axis
+     * */
+    @field
+    pub fn counts(self)-> (u32, u32, u32) {
+        (self._countX, self._countY, self._countZ)
+    }
+
+    /**
+     * @returns: the number of voxels of the grid
+     * */
+    @field
+    pub fn len(self)-> usize {
+        cast!usize(self._countX) * cast!usize(self._countY) * cast!usize(self._countZ)
+    }
+
+    /**
+     * @returns: the index of the voxel at coordinates of the grid
+     * */
+    pub fn indexOf(self, x: u32, y: u32, z: u32)-> u32 {
+        x + self._countX * (y + self._countY * z)
+    }
+
+    /**
+     * @returns: the coordinates in the grid of the voxel at an index
+     * */
+    pub fn coordinatesOf(self, index: u32)-> (u32, u32, u32) {
+        let row = index / self._countX;
+        (index % self._countX, row % self._countY, row / self._countY)
+    }
+
+    /**
+     * @returns: the corner of the voxel at coordinates of the grid, the lowest along each axis, or a corner of the grid
+     * past its last voxel along an axis (its coordinate being the number of voxels along it)
+     * */
+    pub fn cornerAt(self, x: u32, y: u32, z: u32)-> vec3 {
+        self._origin + makeVec3(cast!f32(x), cast!f32(y), cast!f32(z)) * self._size
+    }
+
+    /**
+     * @returns: true iif the voxel at an index is on the surface of the model or inside it
+     * */
+    pub fn isSolid(self, index: u32)-> bool {
+        self._cells[index] != cast!u8(VoxelKind::OUTSIDE)
+    }
+
+    /**
+     * @returns: true iif a triangle of the model overlaps the voxel at an index
+     * */
+    pub fn isSurface(self, index: u32)-> bool {
+        self._cells[index] == cast!u8(VoxelKind::SURFACE)
+    }
+
+    /**
+     * @returns: the indices of the voxels on the surface of the model or inside it, in their order in the grid
+     * */
+    pub fn solidVoxels(self)-> [u32] {
+        let mut result: [u32] = [];
+        for i in 0u32 .. cast!u32(self.len) if self.isSolid(i) {
+            result ~= [i];
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the index of the neighbour of the voxel at coordinates of the grid across one of its six sides (-x, +x,
+     * -y, +y, -z, +z), none past the grid
+     * */
+    pub fn neighbourOf(self, x: u32, y: u32, z: u32, side: u32)-> (u32)? {
+        match side {
+            0u32 => { if x > 0u32 { return (self.indexOf(x - 1u32, y, z))?; } }
+            1u32 => { if x + 1u32 < self._countX { return (self.indexOf(x + 1u32, y, z))?; } }
+            2u32 => { if y > 0u32 { return (self.indexOf(x, y - 1u32, z))?; } }
+            3u32 => { if y + 1u32 < self._countY { return (self.indexOf(x, y + 1u32, z))?; } }
+            4u32 => { if z > 0u32 { return (self.indexOf(x, y, z - 1u32))?; } }
+            _ => { if z + 1u32 < self._countZ { return (self.indexOf(x, y, z + 1u32))?; } }
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the number of voxels along a side of the box of the triangles, a voxel and a half of margin on each side
+     * */
+    fn cellsAlong(self, side: f32)-> u32 {
+        cast!u32(math::ceil(side / self._size)) + 3u32
+    }
+
+    /**
+     * Mark the voxels a triangle overlaps as surface
+     * */
+    fn markSurface(mut self, t: Triangle) {
+        let box = t.aabb;
+        let (x0, y0, z0) = self.cellOf(box.min);
+        let (x1, y1, z1) = self.cellOf(box.max);
+        for z in z0 .. z1 + 1u32 {
+            for y in y0 .. y1 + 1u32 {
+                for x in x0 .. x1 + 1u32 {
+                    let corner = self.cornerAt(x, y, z);
+                    if t.overlaps(Aabb(corner, corner + makeVec3(self._size, self._size, self._size))) {
+                        self._cells[self.indexOf(x, y, z)] = cast!u8(VoxelKind::SURFACE);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: the coordinates of the voxel holding a point of the box of the triangles
+     * */
+    fn cellOf(self, p: vec3)-> (u32, u32, u32) {
+        let local = (p - self._origin) / self._size;
+        (comparison::min(cast!u32(math::floor(local.x)), self._countX - 1u32),
+         comparison::min(cast!u32(math::floor(local.y)), self._countY - 1u32),
+         comparison::min(cast!u32(math::floor(local.z)), self._countZ - 1u32))
+    }
+
+    /**
+     * Mark as outside the voxels reached from the first one without crossing the surface, the first voxel being in the
+     * margin of the grid
+     * */
+    fn fillOutside(mut self) {
+        let outside = cast!u8(VoxelKind::OUTSIDE), inside = cast!u8(VoxelKind::INSIDE);
+        let mut queue: [u32] = copy [0u32];
+        self._cells[0u32] = outside;
+
+        let mut head = 0us;
+        while head < queue.len {
+            let (x, y, z) = self.coordinatesOf(queue[head]);
+            head += 1us;
+
+            for side in 0u32 .. 6u32 {
+                if let Ok(n) = self.neighbourOf(x, y, z, side) && self._cells[n] == inside {
+                    self._cells[n] = outside;
+                    queue ~= [n];
+                }
+            }
+        }
+    }
+
+
+}
