@@ -4,7 +4,7 @@ use balder::math::_;
 use balder::core::{_, application::_};
 use balder::interface;
 use balder::interface::widget::layout::_;
-use balder::scene::node::{node3D::_, node3D::body, node3D::camera, node3D::visual::_, node3D::visual::material::_};
+use balder::scene::node::{node3D::_, node3D::body, node3D::camera, node3D::joint, node3D::visual::_, node3D::visual::material::_};
 use balder::scene::physics;
 use balder::utils::log;
 
@@ -35,6 +35,18 @@ def BALL_MASS = 2.0f;
 def THROW = 30.0f;
 
 /**
+ * The links of the chain hanging from its beam, and the length of a link, in metres
+ * */
+def LINKS = 8;
+def LINK = 0.5f;
+
+/**
+ * The torque closing the door on its hinge, in newton metres, and the speed it closes at, in radians a second
+ * */
+def DOOR_CLOSER = 40.0f;
+def DOOR_CLOSING = -1.0f;
+
+/**
  * The categories of the debug view of the physics drawn from the start (see Scene::physicsDebug), set by '--debug'
  * */
 pub lazy dmut __DEBUG__ = copy [0u32];
@@ -46,18 +58,20 @@ def CENTRE = makeVec3(0.0f, 2.5f, 0.0f);
 
 /**
  * The solver of the physics to look at: a stack of crates on the ground, two boxes on a slope, one sticking, the other
- * sliding, balls bouncing, and a ball thrown from the camera at each press of Space; the right button turns the camera,
- * the wheel zooms; 'S', 'C', 'B' and 'T' toggle the debug view of the colliders, of the contacts, of the boxes of the
- * colliders and of the tree of the broadphase
+ * sliding, balls bouncing, a chain swinging from a beam, a door closed by its hinge, a ragdoll tumbling down stairs, and
+ * a ball thrown from the camera at each press of Space; the right button turns the camera, the wheel zooms; 'S', 'C',
+ * 'B', 'T' and 'J' toggle the debug view of the colliders, of the contacts, of the boxes of the colliders, of the tree of
+ * the broadphase and of the joints
  * */
 pub class CratesActivity over Activity {
 
     let dmut _scene: (&Scene)? = none;
     let dmut _cam: (&PerspectiveCamera)? = none;
 
-    // The materials of the crates, of the boxes on the slope and of the balls
+    // The materials of the crates, of the boxes on the slope, of the balls and of the bodies held by joints
     let mut _crate: MaterialConfig = MaterialConfig();
     let mut _ball: MaterialConfig = MaterialConfig();
+    let mut _jointed: MaterialConfig = MaterialConfig();
 
     // The balls thrown, named after their count
     let mut _thrown: u32 = 0u32;
@@ -76,15 +90,19 @@ pub class CratesActivity over Activity {
         self._crate.roughness = 0.8f;
         self._ball.baseColor = makeVec3(0.85f, 0.15f, 0.1f);
         self._ball.roughness = 0.4f;
+        self._jointed.baseColor = makeVec3(0.25f, 0.45f, 0.75f);
+        self._jointed.roughness = 0.6f;
     }
 
     over onStart(mut self) {
         self.input:.quit():.connect(self.box, &self:.onQuit);
         self.input:.keyboard(KeyInfo(SDLK_SPACE, KeyEvent::DOWN)):.connect(self.box, &self:.onThrow);
+        self.input:.keyboard(KeyInfo(SDLK_R, KeyEvent::DOWN)):.connect(self.box, &self:.onThrowRagdoll);
         self.input:.keyboard(KeyInfo(SDLK_S, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleShapes);
         self.input:.keyboard(KeyInfo(SDLK_C, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleContacts);
         self.input:.keyboard(KeyInfo(SDLK_B, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleBoxes);
         self.input:.keyboard(KeyInfo(SDLK_T, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleTree);
+        self.input:.keyboard(KeyInfo(SDLK_J, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleJoints);
         self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::DOWN)):.connect(self.box, &self:.onTurnStart);
         self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::RELEASE)):.connect(self.box, &self:.onTurnEnd);
         self.input:.mouseMotion():.connect(self.box, &self:.onMouseMove);
@@ -115,6 +133,9 @@ pub class CratesActivity over Activity {
                 self:.createStack(alias s);
                 self:.createSlope(alias s);
                 self:.createBalls(alias s);
+                self:.createChain(alias s);
+                self:.createDoor(alias s);
+                self:.createRagdoll(alias s);
                 self:.createCamera(alias s);
             }
         } catch {
@@ -164,6 +185,27 @@ pub class CratesActivity over Activity {
         }
     }
 
+    pub fn onThrowRagdoll(mut self, _: KeyInfo) {
+        if let Ok(dmut s) = alias self._scene {
+            if let Ok(cam) = self._cam {
+                let look = (cam.target - cam.position).normalized();
+                self._thrown += 1u32;
+
+                self.window:.lockFrame();
+                {
+                    let dmut ball = self:.createRagdoll(alias s, at-> cam.position + look);
+                    ball:.applyImpulse(look * THROW);
+                } catch {
+                    err => {
+                        log::error #("Crates", "Failed to throw a ragdoll", err);
+                    }
+                }
+
+                self.window:.unlockFrame();
+            }
+        }
+    }
+
     pub fn onToggleShapes(mut self, _: KeyInfo) {
         self:.toggleDebug(PhysicsDebug::SHAPES);
     }
@@ -178,6 +220,10 @@ pub class CratesActivity over Activity {
 
     pub fn onToggleTree(mut self, _: KeyInfo) {
         self:.toggleDebug(PhysicsDebug::BROADPHASE);
+    }
+
+    pub fn onToggleJoints(mut self, _: KeyInfo) {
+        self:.toggleDebug(PhysicsDebug::JOINTS);
     }
 
     pub fn onTurnStart(mut self, x: i32, y: i32, _: MouseInfo) {
@@ -281,6 +327,147 @@ pub class CratesActivity over Activity {
             let at = makeVec3(5.0f + cast!f32(i) * 1.2f, 2.0f + cast!f32(i) * 1.5f, -2.0f);
             self:.createBall(alias scene, f"ball-${i}", at, 0.2f * cast!f32(i + 1));
         }
+    }
+
+    /**
+     * A chain of LINKS boxes held by ball joints, laid out along +x from a static beam, swinging down from there
+     * */
+    fn createChain(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        let beam = makeVec3(6.0f, 7.0f, 4.0f);
+        let dmut top = copy PhysicsBody3D("beam", alias scene:.getRootNode(), shape-> ColliderShape::box(makeVec3(0.3f, 0.3f, 0.3f)));
+        top.position = beam;
+        self:.drawBox(alias top, "beam-mesh", makeVec3(0.3f, 0.3f, 0.3f), self._crate);
+
+        let size = makeVec3(LINK, 0.12f, 0.12f);
+        let mut previous: &PhysicsBody3D = top;
+        for i in 0 .. LINKS {
+            let at = beam + makeVec3(LINK * (0.5f + cast!f32(i)), 0.0f, 0.0f);
+            let dmut link = self:.createJointed(alias scene, f"link-${i}", ColliderShape::box(size), at, 1.0f);
+            self:.drawBox(alias link, f"link-${i}-mesh", size, self._jointed);
+
+            let dmut j = copy Joint3D(f"link-${i}-joint", alias scene:.getRootNode(), previous, link);
+            j.position = beam + makeVec3(LINK * cast!f32(i), 0.0f, 0.0f);
+            previous = link;
+        }
+    }
+
+    /**
+     * A door on a hinge about +y at the edge of a static post, closed against its lower limit by a weak motor, the balls
+     * thrown pushing it open up to its upper limit
+     * */
+    fn createDoor(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        let hinge = makeVec3(-4.0f, 1.1f, 6.0f);
+        let dmut post = copy PhysicsBody3D("post", alias scene:.getRootNode(), shape-> ColliderShape::box(makeVec3(0.2f, 2.2f, 0.2f)));
+        post.position = hinge - makeVec3(0.1f, 0.0f, 0.0f);
+        self:.drawBox(alias post, "post-mesh", makeVec3(0.2f, 2.2f, 0.2f), self._crate);
+
+        let size = makeVec3(1.4f, 2.0f, 0.1f);
+        let dmut door = self:.createJointed(alias scene, "door", ColliderShape::box(size), hinge + makeVec3(0.72f, 0.0f, 0.0f), 15.0f);
+        self:.drawBox(alias door, "door-mesh", size, self._jointed);
+
+        let settings = JointSettings(kind-> JointKind::HINGE, limited-> true, lower-> 0.0f, upper-> 1.6f,
+                                     motor-> true, motorSpeed-> DOOR_CLOSING, maxMotorForce-> DOOR_CLOSER);
+        let dmut j = copy Joint3D("door-hinge", alias scene:.getRootNode(), post, door, settings-> settings);
+        j:.setTransform(hinge, Quaternion::fromAxisAngle(1.5707963f, makeVec3(0.0f, 0.0f, 1.0f)), makeVec3(1.0f, 1.0f, 1.0f));
+    }
+
+    /**
+     * Stairs of six steps, and a ragdoll of capsules over the top one, its shoulders and its hips balls, its elbows and
+     * its knees limited hinges, pushed off to tumble down
+     * */
+    fn createRagdoll(mut self, dmut scene: &Scene, at: vec3 = makeVec3(-6.0f, 0.0f, -4.0f))-> dmut &PhysicsBody3D
+        throws BalderError
+    {
+        let foot = at;
+
+        let base = foot + makeVec3(0.0f, 4.0f, -3.0f);
+        let dmut torso = self:.createLimb(alias scene, "torso", base, 0.15f, 0.7f, 10.0f);
+        let dmut head = self:.createJointed(alias scene, "head", ColliderShape::sphere(0.12f), base + makeVec3(0.0f, 0.5f, 0.0f), 3.0f);
+        self:.drawSphere(alias head, "head-mesh", 0.12f);
+        self:.join(alias scene, "neck", torso, head, base + makeVec3(0.0f, 0.38f, 0.0f), JointSettings());
+
+        let elbow = JointSettings(kind-> JointKind::HINGE, limited-> true, lower-> 0.0f, upper-> 2.5f);
+        let knee = JointSettings(kind-> JointKind::HINGE, limited-> true, lower-> -2.5f, upper-> 0.0f);
+        for side in [-1.0f, 1.0f] {
+            let name = if side < 0.0f { "left" } else { "right" };
+            let shoulder = base + makeVec3(side * 0.22f, 0.28f, 0.0f);
+            let arm = self:.createLimb(alias scene, name ~ "-arm", shoulder - makeVec3(0.0f, 0.15f, 0.0f), 0.05f, 0.3f, 2.0f);
+            let forearm = self:.createLimb(alias scene, name ~ "-forearm", shoulder - makeVec3(0.0f, 0.45f, 0.0f), 0.05f, 0.3f, 1.5f);
+            self:.join(alias scene, name ~ "-shoulder", torso, arm, shoulder, JointSettings());
+            self:.join(alias scene, name ~ "-elbow", arm, forearm, shoulder - makeVec3(0.0f, 0.3f, 0.0f), elbow);
+
+            let hip = base + makeVec3(side * 0.1f, -0.38f, 0.0f);
+            let thigh = self:.createLimb(alias scene, name ~ "-thigh", hip - makeVec3(0.0f, 0.225f, 0.0f), 0.07f, 0.45f, 4.0f);
+            let shin = self:.createLimb(alias scene, name ~ "-shin", hip - makeVec3(0.0f, 0.675f, 0.0f), 0.06f, 0.45f, 3.0f);
+            self:.join(alias scene, name ~ "-hip", torso, thigh, hip, JointSettings());
+            self:.join(alias scene, name ~ "-knee", thigh, shin, hip - makeVec3(0.0f, 0.45f, 0.0f), knee);
+        }
+
+        torso:.setVelocity(makeVec3(0.3f, 0.0f, -2.0f), angular-> makeVec3(-1.0f, 0.0f, 0.0f));
+        alias torso
+    }
+
+    /**
+     * @returns: a dynamic capsule of the ragdoll along y, drawn as a stretched sphere
+     * */
+    fn createLimb(mut self, dmut scene: &Scene, name: [c8], at: vec3, radius: f32, height: f32, mass: f32)-> dmut &PhysicsBody3D
+        throws BalderError
+    {
+        let dmut limb = self:.createJointed(alias scene, name, ColliderShape::capsule(radius, height), at, mass);
+        let (array, indices) = sphereMesh();
+        let dmut mesh = copy IndexedMesh3D(name ~ "-mesh", alias limb, LodChain(indices), array,
+                                           copy ConstantMaterial(self._jointed));
+        mesh.position = makeVec3(0.0f, -height / 2.0f, 0.0f);
+        mesh.scale = makeVec3(2.0f * radius, height, 2.0f * radius);
+
+        alias limb
+    }
+
+    /**
+     * @returns: a dynamic body of a shape and a mass at a point of the world, drawing nothing
+     * */
+    fn createJointed(mut self, dmut scene: &Scene, name: [c8], shape: ColliderShape, at: vec3, mass: f32)-> dmut &PhysicsBody3D {
+        let dmut body = copy PhysicsBody3D(name, alias scene:.getRootNode(), shape-> shape,
+                                           settings-> BodySettings(motion-> BodyMotion::DYNAMIC, mass-> mass));
+        body.position = at;
+        alias body
+    }
+
+    /**
+     * Join two bodies at an anchor of the world, the axis of a hinge along +x
+     * */
+    fn join(mut self, dmut scene: &Scene, name: [c8], a: &PhysicsBody3D, b: &PhysicsBody3D, anchor: vec3,
+            settings: JointSettings) {
+        let dmut j = copy Joint3D(name, alias scene:.getRootNode(), a, b, settings-> settings);
+        j.position = anchor;
+    }
+
+    /**
+     * Draw a body as a box of a size centred on it
+     * */
+    fn drawBox(mut self, dmut body: &PhysicsBody3D, name: [c8], size: vec3, material: MaterialConfig)
+        throws BalderError
+    {
+        let (array, indices) = cubeMesh();
+        let dmut mesh = copy IndexedMesh3D(name, alias body, LodChain(indices), array, copy ConstantMaterial(material));
+        mesh.position = makeVec3(0.0f, -size.y / 2.0f, 0.0f);
+        mesh.scale = size;
+    }
+
+    /**
+     * Draw a body as a sphere of a radius centred on it
+     * */
+    fn drawSphere(mut self, dmut body: &PhysicsBody3D, name: [c8], radius: f32)
+        throws BalderError
+    {
+        let (array, indices) = sphereMesh();
+        let dmut mesh = copy IndexedMesh3D(name, alias body, LodChain(indices), array, copy ConstantMaterial(self._jointed));
+        mesh.position = makeVec3(0.0f, -radius, 0.0f);
+        mesh.scale = makeVec3(2.0f * radius, 2.0f * radius, 2.0f * radius);
     }
 
     /**

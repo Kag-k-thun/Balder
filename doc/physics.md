@@ -229,8 +229,9 @@ times cheaper.
 ### Islands and sleep
 
 The islands are built again at each step, by union-find over the dynamic bodies: two of them share an island when
-their pair has a point of contact, even speculative. An `IslandSet` lays the bodies and the pairs of the islands out
-island after island; it and the buffers of the solver (the solver bodies, the constraints and their points) are kept
+their pair has a point of contact, even speculative, or a joint holds them (see Joints). An `IslandSet` lays the
+bodies, the pairs and the joints of the islands out island after island; it and the buffers of the solver (the solver
+bodies, the constraints, their points and the joints) are kept
 from step to step and only grow, so a step builds no map nor array for them. A static or a kinematic body joins no island, else the ground would
 make the whole level one. An awake body, or a moving kinematic body, wakes the sleeping bodies it is in contact with,
 their whole island with them: a stack wakes at once rather than a crate a step. An island whose bodies all stayed under
@@ -244,6 +245,77 @@ since the last tick gets the velocities of its move (`deriveKinematics`): the di
 between its two orientations. The steps do not move it, it is where the game put it, but the solver pushes and carries
 what it touches by its velocity, so a crate rides a platform. A kinematic body not moved has no velocity, unless the
 game set one (`setVelocity`), kept until it moves again: a conveyor belt.
+
+## Joints
+
+A joint holds two bodies by a frame: its origin is the anchor, its X axis the axis of a hinge or a slider. The world
+places the frame on each body as they are when the joint is made (`PhysicsWorld::addJoint (a, b, frame, settings)`, the
+frame in the space of the pose of each body), and keeps the second frame where the first is, but for the motion its kind
+leaves free (`JointSettings::kind`):
+
+| Kind     | Keeps                                                    | Rows                         |
+|----------|----------------------------------------------------------|------------------------------|
+| `FIXED`  | the anchor shared and the two turned alike: one body     | 3 linear, 3 angular          |
+| `BALL`   | the anchor shared, the bodies turning freely about it    | 3 linear                     |
+| `HINGE`  | the anchor shared, the bodies turning about X only       | 3 linear, 2 angular, 1 axial |
+| `SLIDER` | the bodies sliding along X without turning               | 2 linear, 3 angular, 1 axial |
+
+The position of a hinge is the angle it turned by about its axis since it was made, in [-pi, pi]; that of a slider the
+distance it slid along its axis (`jointPosition`). Both are 0 when the joint is made. The other `JointSettings`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `limited`, `lower`, `upper` | false, 0, 0 | the position of a hinge (radians) or a slider (metres) kept within [lower, upper] |
+| `motor`, `motorSpeed`, `maxMotorForce` | false, 0, 0 | the position driven at a speed, by a torque (N m) or a force (N) at most |
+| `breakForce`, `breakTorque` | 0, 0 | the force of the linear rows and the torque of the angular rows the joint holds at most before it breaks, 0 never breaking |
+| `collide` | false | whether the two bodies still touch each other; false leaves the limbs of a ragdoll free to overlap |
+
+```
+let hinge = world:.addJoint (post, door, RigidTransform (hinge, upright),
+                             settings-> JointSettings (kind-> JointKind::HINGE, limited-> true, lower-> 0.0f, upper-> 1.6f));
+```
+
+A joint is solved by the solver of the contacts, with other rows (`joint_solver`, after Box2D v3): prepared once a step
+(its arms from the centres of the masses to the anchors, the rotations of its frames in the world, `JointConstraint`),
+turned with its bodies through the sub steps, warm started then solved before the contacts at each pass, relaxed with
+them. The anchors are held by a block of three rows solved at once, the rotation of a fixed joint or a slider by a block
+of three, the axis of a hinge by two rows across it, a slider on its axis by two linear rows across it. An error is pulled
+back as by a spring of `joint-hertz` (60 Hz) damped by `joint-damping` (a ratio of 2), a soft joint (`Softness`). A limit
+not reached lets its position close in by what is left of the way to it in the sub step and no more, as a speculative
+contact does; a limit passed is pushed back by the spring. A motor drives the speed along the axis, its impulse bounded
+by its force over the sub step. The impulses are kept on the joint from step to step (`Joint`).
+
+The motor and the limits of a hinge are solved with its anchors kept on each other: each impulse along the axis comes
+with the impulse at the anchors that leaves them where they are, and its mass is that of the bodies turning about the
+anchor. A door hinged at its edge is five times heavier to turn about its hinge than about its centre: its limit solved
+alone stopped it about its centre, the point of the hinge then turned it on, and it bounced back off its limit by 13% of
+its speed whatever the passes. A slider keeps the plain row, its rotation being locked.
+
+Two dynamic bodies joined share an island: they wake and sleep together, and a moving kinematic body wakes what it is
+joined to. A joint to a static or a kinematic body is solved in the island of its dynamic body. Two bodies joined do not
+touch each other unless `collide` says so: the world counts the joints holding each pair apart, and the broadphase keeps
+no pair of them; the two find their pairs again once the last of their joints is removed or broken.
+
+Once the sub steps are run, a joint that held its bodies by more than its `breakForce` or its `breakTorque` (its impulses
+over the duration of a sub step, the motor and the limits counted along the axis) breaks: it holds nothing more, stays in
+the world until it is removed, and `takeBroken` gives it once. Making, changing, removing or breaking a joint wakes its
+bodies, their time still counted again, so a body held still until its joint broke falls. Removing a body removes its
+joints.
+
+### Joint3D
+
+A `Joint3D` is a `Node3D` naming its two bodies (two `PhysicsBody3D`), its origin the anchor and its X axis the axis. It
+is made in the world of its scene at the first tick it and its two bodies are in the scene, from where they are then, so
+a node placed in the tick it is built in is joined where it is placed; moving it afterwards does not move the joint. A
+body leaving the scene takes the joint out, made again at the first tick it is back. `settings` changes the joint at
+once (a motor driven at another speed), `jointPosition` and `isBroken` read it, and `broken` is emitted after the steps of
+the tick that broke it.
+
+```
+let dmut hinge = copy Joint3D ("door-hinge", alias root, post, door, settings-> JointSettings (kind-> JointKind::HINGE));
+hinge:.setTransform (at, Quaternion::fromAxisAngle (pi / 2, makeVec3 (0.0f, 0.0f, 1.0f)), makeVec3 (1.0f, 1.0f, 1.0f));
+hinge:.broken ():.connect (alias box, &self:.onDoorTorn);
+```
 
 ## Characters
 
@@ -291,12 +363,13 @@ being kinematic.
 | `CONTACTS` | the points of the manifolds, red crosses (pale when speculative), and their normals, yellow arrows |
 | `BOXES` | the boxes of the colliders in the world |
 | `BROADPHASE` | the hierarchy of the enlarged boxes (`Bvh::nodeBoxes`), the parents coloured by depth, the leaves cyan |
+| `JOINTS` | the joints holding, pink: the arm from the centre of each body to its anchor, a cross at each anchor, the axis of a hinge or a slider |
 
 The scene draws them at each tick after the steps (`ScenePhysics::drawDebug`, `debug_view::drawWorld`) in the
 `physics` layer of its debug lines (see the debug lines of `doc/render-graph.md`), and clears the layer once no
 category is drawn. `debug_view::drawCollider` draws a single collider in any `DebugLines`. In the `crates` example,
-`--debug` draws the shapes and the contacts from the start, and `S`, `C`, `B` and `T` toggle the shapes, the contacts,
-the boxes and the hierarchy.
+`--debug` draws the shapes, the contacts and the joints from the start, and `S`, `C`, `B`, `T` and `J` toggle the shapes,
+the contacts, the boxes, the hierarchy and the joints.
 
 ## Measuring a step
 
@@ -343,6 +416,8 @@ substeps = 4
 iterations = 2
 contact-hertz = 60.0
 contact-damping = 10.0
+joint-hertz = 60.0
+joint-damping = 2.0
 max-correction = 2.0
 bounce-threshold = 1.0
 sleep-linear = 0.05
@@ -350,8 +425,9 @@ sleep-angular = 0.05
 sleep-time = 0.5
 ```
 
-The `crates` example (`./crates`) shows a stack of crates, two boxes on a slope (one sticking, one sliding) and balls
-bouncing; Space throws a ball from the camera.
+The `crates` example (`./crates`) shows a stack of crates, two boxes on a slope (one sticking, one sliding), balls
+bouncing, a chain swinging from a beam, a door closed by a weak motor against the lower limit of its hinge, and a ragdoll
+tumbling down stairs; Space throws a ball from the camera.
 
 A body turns by its angular velocity through `Quaternion::integrated`, and is placed by a `RigidTransform` (a rotation
 then a translation). A `Node3D` holds its rotation as a quaternion: the Euler angles it is given are kept for the editor
@@ -359,7 +435,6 @@ and the scene files, and read from the quaternion once it is set as one (`orient
 
 ## Not done yet
 
-- joints (fixed, hinge, ball and socket, slider), the same solver with other rows (BAL-197);
-- the bodies in the scene files and in the editor (their panel, their wires);
+- the bodies and the joints in the scene files and in the editor (their panel, their wires, BAL-198);
 - an example walking a character through a level.
 

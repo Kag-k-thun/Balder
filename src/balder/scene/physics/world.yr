@@ -4,6 +4,7 @@ mod ::utils;
 
 use balder::core::config::physics;
 use balder::math::{bounds, matrix, quaternion, rigid_transform, vector};
+use balder::utils::log;
 
 use std::{math, time};
 use std::algorithm::{comparison, sorting};
@@ -57,6 +58,22 @@ def STILL_TURN = 1.0e-6f;
 def NOT_SOLVED = usize::max;
 
 /**
+ * A slot of the joints of a world, holding a joint or free
+ * */
+@data
+record WorldJoint {
+
+    // The joint
+    pub let mut joint: Joint = Joint();
+
+    // True when the slot holds a joint
+    pub let mut used: bool = false;
+
+    // The next free slot after a free one, NO_JOINT for the last
+    pub let mut next: u32 = NO_JOINT;
+}
+
+/**
  * A slot of the bodies of a world, holding a body or free
  * */
 @data
@@ -96,6 +113,10 @@ record WorldBody {
  * seen by the layers and the masks of the two, compared with those the last
  * report gave. Two meshes never touch, nor two static bodies that are not
  * triggers.
+ *
+ * A joint holds two bodies by a frame placed on both (see addJoint), solved with their contacts in their island: two
+ * dynamic bodies joined share an island, waking and sleeping together. Two bodies joined do not touch each other
+ * unless the settings of their joint say so. A joint breaks once it holds its bodies by more than its settings allow.
  * ====
  * */
 @final
@@ -171,6 +192,24 @@ pub class PhysicsWorld {
     // The index of each body in the solver bodies of the island being solved, NOT_SOLVED for a body in none, by handle
     let dmut _solverIndex: [usize] = [];
 
+    // The slots of the joints, by handle, the free ones included
+    let dmut _joints: [WorldJoint] = [];
+
+    // The first free slot of the joints, NO_JOINT when there is none
+    let mut _freeJoint: u32 = NO_JOINT;
+
+    // The number of joints in the world
+    let mut _jointLen: usize = 0us;
+
+    // The number of joints holding each pair of bodies apart, by the key of the pair (see pairKey)
+    let dmut _apart: [u64 => u32] = copy [];
+
+    // The joints broken since the last call of takeBroken
+    let mut _broken: [u32] = [];
+
+    // The joints of the island being solved, kept from island to island and from step to step, the first in use
+    let dmut _jointConstraints: [JointConstraint] = [];
+
     pub self () {}
 
     /*!
@@ -195,6 +234,14 @@ pub class PhysicsWorld {
     @field
     pub fn len(self)-> usize {
         self._len
+    }
+
+    /**
+     * @returns: the number of joints in the world, the broken ones included
+     * */
+    @field
+    pub fn jointCount(self)-> usize {
+        self._jointLen
     }
 
     /**
@@ -254,6 +301,8 @@ pub class PhysicsWorld {
                                       iterations-> config.iterations,
                                       contactHertz-> config.contactHertz,
                                       contactDamping-> config.contactDamping,
+                                      jointHertz-> config.jointHertz,
+                                      jointDamping-> config.jointDamping,
                                       maxCorrection-> config.maxCorrection,
                                       bounceThreshold-> config.bounceThreshold);
         self._sleep = SleepThresholds(linear-> config.sleepLinear,
@@ -393,7 +442,8 @@ pub class PhysicsWorld {
      * Remove a body from the world, its handle free for another body
      *
      * @info: the contacts of the body end at once, the next contact events not
-     * reporting them, as its handle may be given to another body by then
+     * reporting them, as its handle may be given to another body by then; its
+     * joints are removed with it
      *
      * @returns: the contacts of the body the last contact events reported,
      * ended; none when the world has no such body
@@ -424,6 +474,10 @@ pub class PhysicsWorld {
             if p.reported {
                 ended ~= [ContactEvent(a-> p.a, b-> p.b, phase-> ContactPhase::ENDED)];
             }
+        }
+
+        for j in self.jointsOf(handle) {
+            self:.removeJoint(j);
         }
 
         self:.unindex(handle, self._bodies[handle].collider.isPlane);
@@ -600,6 +654,152 @@ pub class PhysicsWorld {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * =====================================          JOINTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Join two bodies by a frame of the world, placed on both as they are: its origin the anchor, its X axis the axis of
+     * a hinge or a slider, waking them, their time still counted again from 0
+     *
+     * @params:
+     *    - a, b: the two bodies, the frame of a hinge or a slider turning with the first
+     *    - frame: the frame of the joint in the world
+     *    - settings: how the joint holds the two
+     *
+     * @returns: the handle of the joint, NO_JOINT when one of the bodies is not in the world or both are the same
+     *
+     * @info: the position of a hinge or a slider is 0 as the joint is made; a joint between two bodies that are not
+     * dynamic holds nothing
+     *
+     * */
+    pub fn addJoint(mut self, a: u32, b: u32, frame: RigidTransform, settings: JointSettings = JointSettings())-> u32 {
+        if !self.contains(a) || !self.contains(b) || a == b {
+            log::error #("PhysicsWorld", f"A joint needs two bodies of the world, not ${a} and ${b}");
+            return NO_JOINT;
+        }
+
+        let handle = if self._freeJoint != NO_JOINT {
+            let h = self._freeJoint;
+            self._freeJoint = self._joints[h].next;
+            h
+        } else {
+            self._joints = self._joints ~ copy [WorldJoint()];
+            cast!u32(self._joints.len - 1us)
+        };
+
+        let joint = Joint(a-> a, b-> b, settings-> settings,
+                          frameA-> self._states[a].pose.inversed() * frame,
+                          frameB-> self._states[b].pose.inversed() * frame);
+        self._joints[handle] = WorldJoint(joint-> joint, used-> true);
+        self._jointLen += 1us;
+        self:.holdApart(joint, true);
+
+        self:.wake(a);
+        self:.wake(b);
+        handle
+    }
+
+    /**
+     * Remove a joint from the world, its handle free for another joint, waking its bodies
+     * @info: does nothing when the world has no such joint
+     * */
+    pub fn removeJoint(mut self, handle: u32) {
+        if !self.containsJoint(handle) { return; }
+
+        let joint = self._joints[handle].joint;
+        if !joint.broken { self:.holdApart(joint, false); }
+
+        self._joints[handle] = WorldJoint(next-> self._freeJoint);
+        self._freeJoint = handle;
+        self._jointLen -= 1us;
+        self._broken = copy [j for j in self._broken if j != handle];
+
+        self:.wake(joint.a);
+        self:.wake(joint.b);
+    }
+
+    /**
+     * Change how a joint holds its bodies, waking them; the impulses it gathered kept
+     * @info: does nothing when the world has no such joint, or for a broken joint, which holds nothing
+     * */
+    pub fn setJointSettings(mut self, handle: u32, settings: JointSettings) {
+        if !self.containsJoint(handle) || self._joints[handle].joint.broken { return; }
+
+        let mut joint = self._joints[handle].joint;
+        self:.holdApart(joint, false);
+        joint.settings = settings;
+        if !settings.motor { joint.motorImpulse = 0.0f; }
+        if !settings.limited {
+            joint.lowerImpulse = 0.0f;
+            joint.upperImpulse = 0.0f;
+        }
+
+        self._joints[handle].joint = joint;
+        self:.holdApart(joint, true);
+
+        self:.wake(joint.a);
+        self:.wake(joint.b);
+    }
+
+    /**
+     * @returns: true iif a joint of the world has a handle
+     * */
+    pub fn containsJoint(self, handle: u32)-> bool {
+        cast!usize(handle) < self._joints.len && self._joints[handle].used
+    }
+
+    /**
+     * @returns: a joint: its bodies, its settings, its frames on them, whether it broke
+     * @warning: the joint is in the world (see containsJoint)
+     * */
+    pub fn getJoint(self, handle: u32)-> Joint {
+        self._joints[handle].joint
+    }
+
+    /**
+     * @returns: the frames of a joint in the world, on its first body and on its second, one on the other while the joint
+     * holds
+     * @warning: the joint is in the world (see containsJoint)
+     * */
+    pub fn jointFrames(self, handle: u32)-> (RigidTransform, RigidTransform) {
+        let joint = self._joints[handle].joint;
+        (self._states[joint.a].pose * joint.frameA, self._states[joint.b].pose * joint.frameB)
+    }
+
+    /**
+     * @returns: the position of a joint: the angle a hinge turned by about its axis since it was made, in radians within
+     * [-pi, pi], the distance a slider slid along its axis, in metres; 0 for another joint
+     * @warning: the joint is in the world (see containsJoint)
+     * */
+    pub fn jointPosition(self, handle: u32)-> f32 {
+        let (fa, fb) = self.jointFrames(handle);
+        joint_solver::positionOf(self._joints[handle].joint.settings.kind, fa.rotation, fb.rotation,
+                                 fb.position - fa.position)
+    }
+
+    /**
+     * @returns: the handles of the joints of the world, in their order
+     * */
+    pub yield jointHandles(self)-> u32 {
+        for i in 0us .. self._joints.len if self._joints[i].used {
+            yield cast!u32(i);
+        }
+    }
+
+    /**
+     * @returns: the joints broken since the last call, forgotten
+     * */
+    pub fn takeBroken(mut self)-> [u32] {
+        let broken = self._broken;
+        self._broken = [];
+        broken
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ====================================          QUERIES          =====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -763,7 +963,8 @@ pub class PhysicsWorld {
 
     /**
      * Advance the dynamic bodies by a step: the pairs and their manifolds updated, the bodies grouped in islands, each
-     * awake island solved and moved in sub steps (see solveIsland), the islands still for long enough put to sleep
+     * awake island solved and moved in sub steps with its joints (see solveIsland), the islands still for long enough put
+     * to sleep
      *
      * @params:
      *    - dt: the duration of the step, in seconds
@@ -791,7 +992,7 @@ pub class PhysicsWorld {
             let island = self._islands.bodiesOf(k);
             if !self._states[island[0]].awake { continue; }
 
-            timings.constraintCount += self:.solveIsland(island, self._islands.slotsOf(k), dt);
+            timings.constraintCount += self:.solveIsland(island, self._islands.slotsOf(k), self._islands.jointsOf(k), dt);
             timings.awakeCount += island.len;
         }
 
@@ -833,7 +1034,7 @@ pub class PhysicsWorld {
 
         for handle, _ in self._moved if self.contains(handle) {
             for j in self.candidatesOf(handle) if j != cast!usize(handle) {
-                if utils::canTouch(self._bodies[handle], self._bodies[j]) {
+                if utils::canTouch(self._bodies[handle], self._bodies[j]) && !(pairKey(handle, cast!u32(j)) in self._apart) {
                     self._pairs:.add(handle, cast!u32(j));
                 }
             }
@@ -880,7 +1081,8 @@ pub class PhysicsWorld {
 
     /**
      * @returns: true iif a pair stays: its bodies in the world, still able to
-     * touch, their enlarged boxes overlapping (a plane overlapping every box)
+     * touch, held apart by no joint, their enlarged boxes overlapping (a plane
+     * overlapping every box)
      *
      * */
     fn keeps(self, p: BroadPair)-> bool {
@@ -888,7 +1090,7 @@ pub class PhysicsWorld {
             return false;
         }
 
-        if !utils::canTouch(self._bodies[p.a], self._bodies[p.b]) {
+        if !utils::canTouch(self._bodies[p.a], self._bodies[p.b]) || pairKey(p.a, p.b) in self._apart {
             return false;
         }
 
@@ -954,13 +1156,19 @@ pub class PhysicsWorld {
     }
 
     /**
-     * Wake the dynamic bodies a body is in contact with, a body moved by the game not leaving them asleep in the air
+     * Wake the dynamic bodies a body is in contact with or joined to, a body moved by the game not leaving them asleep
+     * in the air
      * */
     pub fn wakeContactsOf(mut self, handle: u32) {
         for slot in 0us .. self._pairs.len {
             let p = self._pairs.get(slot);
             if p.a == handle { self:.wakeIfAsleep(p.b); }
             else if p.b == handle { self:.wakeIfAsleep(p.a); }
+        }
+
+        for j in self.jointsOf(handle) {
+            let joint = self._joints[j].joint;
+            self:.wakeIfAsleep(if joint.a == handle { joint.b } else { joint.a });
         }
     }
 
@@ -1114,6 +1322,7 @@ pub class PhysicsWorld {
      * @params:
      *    - island: the dynamic bodies of the island
      *    - slots: the slots of the pairs in contact of the island
+     *    - joints: the joints of the island holding, warm started and solved before the contacts at each sub step
      *
      * @returns: the number of points of contact solved
      *
@@ -1122,7 +1331,7 @@ pub class PhysicsWorld {
      * longer one leave it swaying
      *
      * */
-    fn solveIsland(mut self, island: [u32], slots: [usize], dt: f32)-> usize {
+    fn solveIsland(mut self, island: [u32], slots: [usize], joints: [u32], dt: f32)-> usize {
         while self._solverIndex.len < self._bodies.len { self._solverIndex ~= [NOT_SOLVED]; }
 
         let mut nbodies = 0us;
@@ -1162,25 +1371,47 @@ pub class PhysicsWorld {
             }
         }
 
+        let mut njoints = 0us;
+        for j in joints {
+            let joint = self._joints[j].joint;
+            nbodies = self:.addSolverBody(joint.a, nbodies);
+            nbodies = self:.addSolverBody(joint.b, nbodies);
+
+            let c = joint_solver::prepare(self._solverBodies[0us .. nbodies], self._solverIndex[joint.a],
+                                          self._solverIndex[joint.b], j, joint, self._states[joint.a],
+                                          self._states[joint.b]);
+            if njoints < self._jointConstraints.len {
+                self._jointConstraints[njoints] = c;
+            } else {
+                self._jointConstraints ~= [c];
+            }
+            njoints += 1us;
+        }
+
         let dmut bodies = alias self._solverBodies[0us .. nbodies];
         let constraints = self._constraints[0us .. nconstraints];
         let dmut points = alias self._points[0us .. npoints];
+        let dmut held = alias self._jointConstraints[0us .. njoints];
 
         let substeps = comparison::max(self._solver.substeps, 1u32);
         let h = dt / cast!f32(substeps);
         for _ in 0u32 .. substeps {
             solver::integrateVelocities(alias bodies, h);
+            joint_solver::warmStart(alias bodies, held);
             solver::warmStart(alias bodies, constraints, points);
             for _ in 0u32 .. self._solver.iterations {
+                joint_solver::solve(alias bodies, alias held, h, self._solver, true);
                 solver::solve(alias bodies, constraints, alias points, h, self._solver, true);
             }
 
             solver::integratePositions(alias bodies, h);
+            joint_solver::solve(alias bodies, alias held, h, self._solver, false);
             solver::solve(alias bodies, constraints, alias points, h, self._solver, false);
         }
 
         solver::applyRestitution(alias bodies, constraints, alias points);
         self:.storeImpulses(constraints, points);
+        self:.storeJoints(held, h);
 
         for sb in bodies if self.isDynamic(sb.handle) {
             let mut s = self._states[sb.handle];
@@ -1244,6 +1475,80 @@ pub class PhysicsWorld {
     }
 
     /**
+     * Write the impulses the joints gathered back to them for the next step, breaking those that held their bodies by
+     * more than their settings allow, their bodies woken
+     * @params:
+     *    - h: the duration of a sub step, the impulses gathered being those of a sub step
+     * */
+    fn storeJoints(mut self, joints: [JointConstraint], h: f32) {
+        for c in joints {
+            let mut joint = self._joints[c.joint].joint;
+            let (force, torque) = joint_solver::loadsOf(c, h);
+            let s = joint.settings;
+            if (s.breakForce > 0.0f && force > s.breakForce) || (s.breakTorque > 0.0f && torque > s.breakTorque) {
+                self:.holdApart(joint, false);
+                self._joints[c.joint].joint = Joint(a-> joint.a, b-> joint.b, settings-> s, frameA-> joint.frameA,
+                                                    frameB-> joint.frameB, broken-> true);
+                self._broken ~= [c.joint];
+
+                // held still by the joint up to now, the two are not left to sleep where nothing holds them
+                self:.wake(joint.a);
+                self:.wake(joint.b);
+                continue;
+            }
+
+            joint.linearImpulse = c.linearImpulse;
+            joint.angularImpulse = c.angularImpulse;
+            joint.motorImpulse = c.motorImpulse;
+            joint.lowerImpulse = c.lowerImpulse;
+            joint.upperImpulse = c.upperImpulse;
+            self._joints[c.joint].joint = joint;
+        }
+    }
+
+    /**
+     * Count a joint holding its two bodies apart, or no longer, unless its bodies touch each other; the two looking for
+     * their pairs again once they are no longer held apart
+     * @params:
+     *    - holds: true when the joint starts holding them, false when it stops
+     * */
+    fn holdApart(mut self, joint: Joint, holds: bool) {
+        if joint.settings.collide { return; }
+
+        let key = pairKey(joint.a, joint.b);
+        let count = if let Ok(n) = self._apart[key] { n } else { 0u32 };
+        if holds {
+            self._apart[key] = count + 1u32;
+        } else if count <= 1u32 {
+            self._apart:.remove(key);
+            self._moved[joint.a] = true;
+            self._moved[joint.b] = true;
+        } else {
+            self._apart[key] = count - 1u32;
+        }
+    }
+
+    /**
+     * @returns: the joints of a body, broken or not
+     * */
+    fn jointsOf(self, handle: u32)-> [u32] {
+        let mut result: [u32] = [];
+        for i in 0us .. self._joints.len if self._joints[i].used {
+            let joint = self._joints[i].joint;
+            if joint.a == handle || joint.b == handle { result ~= [cast!u32(i)]; }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: true iif a joint of the world holds its bodies, not broken
+     * */
+    fn holds(self, handle: u32)-> bool {
+        self._joints[handle].used && !self._joints[handle].joint.broken
+    }
+
+    /**
      * @returns: a body as the solver pushes and moves it, gravity and its forces accelerating a dynamic body, nothing
      * pushing nor moving a static or a kinematic body
      * */
@@ -1268,15 +1573,20 @@ pub class PhysicsWorld {
 
     /**
      * Group the dynamic bodies in islands, those in contact through their pairs (a point of a manifold, even
-     * speculative) put in one island, a static or a kinematic body joining none; a dynamic body in contact with no
-     * other an island of its own; the sleeping bodies in their islands too; the pairs in contact dealt to the islands
-     * of their dynamic bodies
+     * speculative) or held by a joint put in one island, a static or a kinematic body joining none; a dynamic body in
+     * contact with no other an island of its own; the sleeping bodies in their islands too; the pairs in contact and the
+     * joints holding dealt to the islands of their dynamic bodies
      *
      * */
     fn groupIslands(mut self) {
         self._islands:.reset(self._bodies.len);
         for p in self._pairs.pairs if utils::inContact(p) && self.isDynamic(p.a) && self.isDynamic(p.b) {
             self._islands:.join(p.a, p.b);
+        }
+
+        for i in 0us .. self._joints.len if self.holds(cast!u32(i)) {
+            let joint = self._joints[i].joint;
+            if self.isDynamic(joint.a) && self.isDynamic(joint.b) { self._islands:.join(joint.a, joint.b); }
         }
 
         for i in 0us .. self._bodies.len if self.isDynamic(cast!u32(i)) {
@@ -1289,17 +1599,29 @@ pub class PhysicsWorld {
             if utils::inContact(p) { self._islands:.addSlot(slot, p.a, p.b); }
         }
         self._islands:.sealSlots();
+
+        for i in 0us .. self._joints.len if self.holds(cast!u32(i)) {
+            let joint = self._joints[i].joint;
+            self._islands:.addJoint(cast!u32(i), joint.a, joint.b);
+        }
+        self._islands:.sealJoints();
     }
 
     /**
-     * Wake the sleeping dynamic bodies in contact with an awake dynamic body or a moving kinematic body, their whole
-     * island with them: a stack woken at once, not a body a step
+     * Wake the sleeping dynamic bodies in contact with, or joined to, an awake dynamic body or a moving kinematic body,
+     * their whole island with them: a stack woken at once, not a body a step
      *
      * */
     fn wakeTouched(mut self) {
         for p in self._pairs.pairs if utils::inContact(p) {
             if self.pushes(p.a) { self:.wakeIfAsleep(p.b); }
             if self.pushes(p.b) { self:.wakeIfAsleep(p.a); }
+        }
+
+        for i in 0us .. self._joints.len if self.holds(cast!u32(i)) {
+            let joint = self._joints[i].joint;
+            if self.pushes(joint.a) { self:.wakeIfAsleep(joint.b); }
+            if self.pushes(joint.b) { self:.wakeIfAsleep(joint.a); }
         }
 
         for k in 0us .. self._islands.len {
