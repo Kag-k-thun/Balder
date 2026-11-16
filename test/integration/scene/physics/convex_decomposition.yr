@@ -1,0 +1,312 @@
+in convex_decomposition;
+
+use balder::core::error;
+use balder::math::{bounds, vector};
+use balder::scene::node::node3D::solid;
+use balder::scene::physics;
+use balder::scene::physics::convex_decomposition;
+
+use integration::utils::{compare, root};
+
+use std::{fs, math};
+
+/**
+ * @returns: the twelve triangles of the surface of a box, turning counterclockwise from outside
+ * */
+fn boxTriangles(low: vec3, high: vec3)-> [Triangle] {
+    let c = copy [makeVec3(low.x, low.y, low.z), makeVec3(high.x, low.y, low.z),
+                  makeVec3(high.x, high.y, low.z), makeVec3(low.x, high.y, low.z),
+                  makeVec3(low.x, low.y, high.z), makeVec3(high.x, low.y, high.z),
+                  makeVec3(high.x, high.y, high.z), makeVec3(low.x, high.y, high.z)];
+
+    let quads = [(0us, 3us, 2us, 1us), (4us, 5us, 6us, 7us), (0us, 1us, 5us, 4us),
+                 (3us, 7us, 6us, 2us), (0us, 4us, 7us, 3us), (1us, 2us, 6us, 5us)];
+
+    let mut result: [Triangle] = [];
+    for q in quads {
+        result ~= [Triangle(c[q._0], c[q._1], c[q._2]), Triangle(c[q._0], c[q._2], c[q._3])];
+    }
+
+    result
+}
+
+/**
+ * @returns: the triangles of a U standing on the XZ plane, its two pillars rising from its base, two units apart
+ * */
+fn uTriangles()-> [Triangle] {
+    boxTriangles(makeVec3(0.0f, 0.0f, 0.0f), makeVec3(3.0f, 1.0f, 1.0f))
+        ~ boxTriangles(makeVec3(0.0f, 1.0f, 0.0f), makeVec3(0.5f, 3.0f, 1.0f))
+        ~ boxTriangles(makeVec3(2.5f, 1.0f, 0.0f), makeVec3(3.0f, 3.0f, 1.0f))
+}
+
+/**
+ * @returns: the triangles of a sphere of a radius about the origin, in rings and sectors
+ * */
+fn sphereTriangles(radius: f32, rings: u32, sectors: u32)-> [Triangle] {
+    let mut result: [Triangle] = [];
+    for i in 0u32 .. rings {
+        let t0 = math::PI * cast!f32(i) / cast!f32(rings), t1 = math::PI * cast!f32(i + 1u32) / cast!f32(rings);
+        for j in 0u32 .. sectors {
+            let p0 = 2.0f * math::PI * cast!f32(j) / cast!f32(sectors), p1 = 2.0f * math::PI * cast!f32(j + 1u32) / cast!f32(sectors);
+            let a = makeVec3(math::sin(t0) * math::cos(p0), math::cos(t0), math::sin(t0) * math::sin(p0)) * radius;
+            let b = makeVec3(math::sin(t1) * math::cos(p0), math::cos(t1), math::sin(t1) * math::sin(p0)) * radius;
+            let c = makeVec3(math::sin(t1) * math::cos(p1), math::cos(t1), math::sin(t1) * math::sin(p1)) * radius;
+            let d = makeVec3(math::sin(t0) * math::cos(p1), math::cos(t0), math::sin(t0) * math::sin(p1)) * radius;
+            result ~= [Triangle(a, b, c), Triangle(a, c, d)];
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: true iif a point is inside one of the hulls, or at a distance from it at most
+ * */
+fn covered(hulls: [&ConvexHull], p: vec3, margin: f32)-> bool {
+    for h in hulls {
+        let mut inside = true;
+        for f in h.faces if f.normal.dot(p) - f.offset > margin {
+            inside = false;
+            break;
+        }
+
+        if inside { return true; }
+    }
+
+    false
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          VOXELS          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test the_voxels_of_a_closed_box_are_its_surface_and_its_inside {
+    let grid = copy VoxelGrid(boxTriangles(vec3(), makeVec3(1.0f, 1.0f, 1.0f)), 8u32);
+    let (x, y, z) = grid.counts;
+    assert (near(grid.voxelSize, 0.125f));
+    assert (x == 11u32 && y == 11u32 && z == 11u32);
+
+    // the faces of the box cross the voxels of its sides through their middle: 9 voxels along each side
+    assert (grid.solidVoxels().len == 729us);
+    assert (grid.isSurface(grid.indexOf(1u32, 1u32, 1u32)) && grid.isSurface(grid.indexOf(9u32, 5u32, 5u32)));
+    assert (!grid.isSurface(grid.indexOf(5u32, 5u32, 5u32)) && grid.isSolid(grid.indexOf(5u32, 5u32, 5u32)));
+    assert (!grid.isSolid(grid.indexOf(0u32, 5u32, 5u32)) && !grid.isSolid(grid.indexOf(10u32, 5u32, 5u32)));
+}
+
+__test the_inside_of_an_open_surface_is_outside {
+    // a box without its top face: the fill reaches its inside from above
+    let open = boxTriangles(vec3(), makeVec3(1.0f, 1.0f, 1.0f));
+    let grid = copy VoxelGrid(open[0us .. 6us] ~ open[8us .. $], 8u32);
+    assert (!grid.isSolid(grid.indexOf(5u32, 5u32, 5u32)));
+    assert (grid.isSurface(grid.indexOf(5u32, 1u32, 5u32)));
+}
+
+__test the_neighbours_of_a_voxel_stop_at_the_sides_of_the_grid {
+    let grid = copy VoxelGrid(boxTriangles(vec3(), makeVec3(1.0f, 1.0f, 1.0f)), 8u32);
+    assert (!grid.neighbourOf(0u32, 3u32, 3u32, 0u32).hasValue);
+    assert (!grid.neighbourOf(3u32, 10u32, 3u32, 3u32).hasValue);
+    if let Ok(n) = grid.neighbourOf(3u32, 3u32, 3u32, 5u32) {
+        assert (grid.coordinatesOf(n) == (3u32, 3u32, 4u32));
+    } else {
+        assert (false);
+    }
+}
+
+__test no_triangle_makes_no_voxel {
+    let empty: [Triangle] = [];
+    let thrown = {
+        copy VoxelGrid(empty, 8u32);
+        false
+    } catch {
+        _: &BalderError => { true }
+    };
+
+    assert (thrown);
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =================================          DECOMPOSITION          ==================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test a_box_is_one_hull_of_its_eight_corners {
+    let d = copy ConvexDecomposition(boxTriangles(vec3(), makeVec3(2.0f, 1.0f, 1.0f)));
+    assert (d.hulls.len == 1us);
+
+    // the hull of the voxels is kept in the box of the triangles
+    let h = d.hulls[0];
+    assert (h.vertices.len == 8us);
+    assert (near(h.bounds.min, vec3(), tolerance-> 0.001f) && near(h.bounds.max, makeVec3(2.0f, 1.0f, 1.0f), tolerance-> 0.001f));
+    assert (math::abs(h.volume - 2.0f) < 0.001f);
+}
+
+__test a_sphere_is_one_hull_of_the_vertices_asked {
+    let d = copy ConvexDecomposition(sphereTriangles(1.0f, 12u32, 24u32), settings-> DecompositionSettings(maxVertices-> 24u32, resolution-> 32u32));
+    assert (d.hulls.len == 1us);
+    assert (d.hulls[0].vertices.len <= 24us);
+
+    // the vertices taken are the farthest apart: the hull keeps most of the volume of the ball
+    let ball = 4.0f / 3.0f * math::PI;
+    assert (d.hulls[0].volume > 0.75f * ball && d.hulls[0].volume < 1.1f * ball);
+}
+
+__test a_u_is_split_into_its_base_and_its_pillars {
+    let d = copy ConvexDecomposition(uTriangles(), settings-> DecompositionSettings(resolution-> 32u32));
+    assert (d.hulls.len >= 2us && d.hulls.len <= 4us);
+
+    // no hull spans the gap between the pillars, above the base
+    for h in d.hulls {
+        let gap = Aabb(makeVec3(0.75f, 1.25f, 0.25f), makeVec3(2.25f, 2.75f, 0.75f));
+        assert (!(h.bounds.min.x < gap.min.x && h.bounds.max.x > gap.max.x && h.bounds.max.y > gap.min.y));
+    }
+
+    let mut volume = 0.0f;
+    for h in d.hulls { volume += h.volume; }
+    assert (volume > 4.5f && volume < 6.0f);
+}
+
+__test the_hulls_cover_the_model {
+    let d = copy ConvexDecomposition(uTriangles(), settings-> DecompositionSettings(resolution-> 32u32));
+    let margin = 3.0f / 32.0f;
+    for p in [makeVec3(0.25f, 2.5f, 0.5f), makeVec3(2.75f, 2.5f, 0.5f), makeVec3(1.5f, 0.5f, 0.5f),
+              makeVec3(0.1f, 0.1f, 0.1f), makeVec3(2.9f, 2.9f, 0.9f)] {
+        assert (covered(d.hulls, p, margin));
+    }
+
+    assert (!covered(d.hulls, makeVec3(1.5f, 2.0f, 0.5f), 0.0f));
+}
+
+__test one_hull_asked_merges_every_piece {
+    let d = copy ConvexDecomposition(uTriangles(), settings-> DecompositionSettings(maxHulls-> 1u32, resolution-> 32u32));
+    assert (d.hulls.len == 1us);
+    assert (covered(d.hulls, makeVec3(1.5f, 2.0f, 0.5f), 0.0f));
+}
+
+__test separate_boxes_are_hulls_of_their_own {
+    let apart = boxTriangles(vec3(), makeVec3(1.0f, 1.0f, 1.0f)) ~ boxTriangles(makeVec3(3.0f, 0.0f, 0.0f), makeVec3(4.0f, 1.0f, 1.0f));
+    let d = copy ConvexDecomposition(apart, settings-> DecompositionSettings(resolution-> 32u32));
+    assert (d.hulls.len == 2us);
+}
+
+__test the_shape_of_a_decomposition_is_the_compound_of_its_hulls {
+    let d = copy ConvexDecomposition(uTriangles(), settings-> DecompositionSettings(resolution-> 32u32));
+    let shape = d.shape();
+    assert (shape.kind == ColliderKind::COMPOUND);
+    if let Ok(parts) = shape.parts {
+        assert (parts.parts.len == d.hulls.len);
+    } else {
+        assert (false);
+    }
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          FILES          =======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test the_file_of_a_decomposition_is_next_to_its_model {
+    assert (ConvexDecomposition::fileOf("res:/models/mug/mug.glb") == "res:/models/mug/mug.hulls");
+    assert (ConvexDecomposition::fileOf("models/v1.2/chair") == "models/v1.2/chair.hulls");
+}
+
+__test a_decomposition_saved_reads_back_its_hulls_and_its_settings {
+    let dir = tempDirectory(prefix-> "balder_hulls_");
+    let path = dir.push("u.hulls").toStr();
+    let settings = DecompositionSettings(concavity-> 0.02f, maxHulls-> 6u32, maxVertices-> 12u32, resolution-> 32u32);
+    let d = copy ConvexDecomposition(uTriangles(), settings-> settings, source-> 3735928559u32);
+    d.save(path);
+
+    let read = copy ConvexDecomposition::fromFile(path);
+    assert (read.source == 3735928559u32);
+    assert (near(read.settings.concavity, 0.02f) && read.settings.maxHulls == 6u32);
+    assert (read.settings.maxVertices == 12u32 && read.settings.resolution == 32u32);
+    assert (read.hulls.len == d.hulls.len && read.vertexCount == d.vertexCount);
+    for i, h in d.hulls {
+        assert (math::abs(read.hulls[i].volume - h.volume) < 0.0001f);
+    }
+
+    removeDir(dir, recursive-> true);
+}
+
+@parameters ((yield t for t in ["version = 2\nsource = 0\nconcavity = 0.01\nmax-hulls = 1\nmax-vertices = 8\nresolution = 8\n",
+                                "version = 1\nsource = 0\nconcavity = 0.01\nmax-hulls = 1\nmax-vertices = 8\nresolution = 8\n",
+                                "version = 1\nsource = 0\nconcavity = 0.01\nmax-hulls = 1\nmax-vertices = 8\nresolution = 8\n[[hull]]\npoints = [0.0, 1.0]\n",
+                                "version = 1\nsource = \"no\"\n",
+                                "version = 1\n[[hull\n"]))
+__test a_file_that_is_not_a_decomposition_is_refused (text: [c8]) {
+    let dir = tempDirectory(prefix-> "balder_hulls_");
+    let path = dir.push("broken.hulls");
+    writeFile(path, text);
+
+    let thrown = {
+        copy ConvexDecomposition::fromFile(path.toStr());
+        false
+    } catch {
+        _: &BalderError => { true }
+    };
+
+    removeDir(dir, recursive-> true);
+    assert (thrown);
+}
+
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          MODELS          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test the_triangles_of_a_model_are_those_of_its_meshes_in_its_unit_box {
+    let dmut root = copy Root();
+    let dmut cube = copy SolidObjectModel::fromFile("cube", alias root, "res:/models/cube/cube.obj", lods-> false);
+    let triangles = cube:.triangles();
+    assert (triangles.len == 12us);
+
+    let mut box = Aabb();
+    for t in triangles { box = box.merged(t.aabb); }
+    assert (near(box.min, makeVec3(-0.5f, 0.0f, -0.5f)) && near(box.max, makeVec3(0.5f, 1.0f, 0.5f)));
+}
+
+__test a_model_reads_the_decomposition_saved_next_to_its_file {
+    // a copy of the cube, the decomposition written next to it
+    let dir = tempDirectory(prefix-> "balder_hulls_");
+    copyDir(Path("res/models/cube"), dir.push("cube"), recursive-> true, create-> true);
+    let file = dir.push("cube/cube.obj").toStr();
+
+    let dmut root = copy Root();
+    let dmut cube = copy SolidObjectModel::fromFile("cube", alias root, file, lods-> false);
+    let saved = copy ConvexDecomposition(cube:.triangles(), source-> ConvexDecomposition::checksumOf(file));
+    saved.save(ConvexDecomposition::fileOf(file));
+
+    let read = cube.decomposition();
+    assert (read.source == saved.source && read.hulls.len == 1us);
+    assert (math::abs(read.hulls[0].volume - 1.0f) < 0.001f);
+    assert (read.shape().kind == ColliderKind::COMPOUND);
+
+    removeDir(dir, recursive-> true);
+}
+
+__test a_model_without_a_decomposition_has_no_hulls_to_read {
+    let dmut root = copy Root();
+    let cube = copy SolidObjectModel::fromFile("cube", alias root, "res:/models/cube/cube.obj", lods-> false);
+    let thrown = {
+        cube.decomposition();
+        false
+    } catch {
+        _: &BalderError => { true }
+    };
+
+    assert (thrown);
+}
