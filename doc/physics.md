@@ -51,7 +51,16 @@ A `ColliderShape` is centred on the origin of its body:
 | `HULL`     | `ColliderShape::hull (hull)`          | a shared `ConvexHull` of points (`copy ConvexHull (points)`) |
 | `COMPOUND` | `ColliderShape::compound (parts)`     | convex parts placed by rigid transforms (`CompoundShape`)    |
 
-`ColliderShape (volume)` gives the shape of a `VolumeShape`, the shape of a `Volume3D`. A mesh is only a surface: a
+`ColliderShape (volume)` gives the shape of a `VolumeShape`, the shape of a `Volume3D`.
+
+A body knows the shape it is described by in the scene files and in the editor (`described`, a `BodyShape`): a box, a
+sphere, a capsule, a cylinder or a plane of its sizes, the hulls or the triangles of a model by the path of its file, or
+the compound of the volumes under it. `reshape` builds its collider from one (`colliderOf`): the hulls of a model are
+its decomposition saved next to its file, or the hull of each of its meshes when it has none; the triangles of a model
+are a mesh shape; a compound takes the volumes under the body, each placed and scaled as it is under it, those under
+another body left out, and is refused without a volume. A collider set as a hull, a mesh or a compound (`shape`) is
+described by none, and a scene file cannot hold it. The scene files read and write the bodies and the characters (see
+the scene files of `doc/editor.md`). A mesh is only a surface: a
 ray hits its triangles from either side, a shape overlaps it only when it crosses a triangle, and two meshes never
 touch. A mesh shape can share the triangles a mesh instance keeps for its picking (`Scene::keepsTriangles`).
 
@@ -102,8 +111,8 @@ let dmut mug = copy SolidObjectModel::fromFile("mug", alias body, "res:/models/m
 body.shape = mug.decomposition().shape();
 ```
 
-The `decompose` tool (`tools/src/decompose`) decomposes a model at import, and the panel of the hulls of a model in the
-editor (see `doc/editor.md`) tunes the settings with the hulls drawn over the model:
+The `decompose` tool (`tools/src/decompose`) decomposes a model at import, the export of a project will (BAL-138); the
+panel of the hulls of a model in the editor (see `doc/editor.md`) draws the hulls saved over the model:
 
 ```
 cd tools && gyllir build decompose && cd ..
@@ -505,7 +514,9 @@ being kinematic.
 
 The scene draws them at each tick after the steps (`ScenePhysics::drawDebug`, `debug_view::drawWorld`) in the
 `physics` layer of its debug lines (see the debug lines of `doc/render-graph.md`), and clears the layer once no
-category is drawn. `debug_view::drawCollider` draws a single collider in any `DebugLines`. In the `crates` example,
+category is drawn. `debug_view::drawCollider` draws a single collider in any `DebugLines`, and `debug_view::colorOfSettings` gives the colour
+of a body by its settings out of a world (a dynamic body as an awake one): the editor draws the colliders of its scene
+with them, its scene never stepped. In the `crates` example,
 `--debug` draws the shapes, the contacts and the joints from the start, and `S`, `C`, `B`, `T` and `J` toggle the shapes,
 the contacts, the boxes, the hierarchy and the joints.
 
@@ -541,7 +552,9 @@ covers, the time left over carried to the next tick. A tick runs `catchUp` steps
 them is dropped, so a long stall slows the simulation down instead of piling up steps. `alpha`, the time left over over
 the duration of a step, places the display between the last two steps.
 
-The scene runs the steps in its tick (`ScenePhysics::advance`): the kinematic velocities derived, the steps run, the
+The scene runs the steps in its tick (`ScenePhysics::advance`), unless it does not simulate (`Scene::simulates`, false
+in an `EditableScene`): its bodies are then in its world, where their nodes are, hit by the queries, but no step moves
+them and no contact is reported. When it simulates: the kinematic velocities derived, the steps run, the
 forces dropped, then each awake dynamic body places its node between its pose before the last step and its pose after
 it, by `alpha` (`PhysicsBody3D::placeFromPhysics`, the pose of the world brought under the parent of the node, its scale
 kept). That move does not go back to the world as a teleport. A body that fell asleep is placed once more where it
@@ -578,6 +591,8 @@ and the scene files, and read from the quaternion once it is set as one (`orient
 
 ## Not done yet
 
-- the bodies and the joints in the scene files and in the editor (their panel, their wires, BAL-198);
+- the joints in the scene files and in the editor;
+- the convex decomposition of the models at the export of a project (BAL-138), the editor no longer decomposing them;
+- the play mode of the editor, simulating the scene edited (BAL-134).
 - an example walking a character through a level.
 
