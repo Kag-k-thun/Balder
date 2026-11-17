@@ -1,9 +1,10 @@
 in reader;
 
 use balder::math::{curve, utils, vector};
+use balder::scene::physics;
 use balder::scene::description::{kind, node_description};
 use balder::scene::node;
-use balder::scene::node::node3D::{light, marker, volume_shape};
+use balder::scene::node::node3D::{body_shape, light, marker, volume_shape};
 use balder::utils::syntax;
 
 use std::{conv, syntax, uuid};
@@ -140,7 +141,7 @@ pub record SceneReader {
 
         let kindTok = self._scanner:.next();
         let kind = if let Ok(k) = (if kindTok.kind == TokenKind::IDENT { kindNamed(kindTok.text) } else { none }) { k } else {
-            throw self._scanner.expected(kindTok, "the kind of the node, empty, model, cube, sphere, plane, light, marker, path, path-point or volume");
+            throw self._scanner.expected(kindTok, "the kind of the node, empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body or character");
         };
 
         let nameTok = self._scanner:.next();
@@ -177,6 +178,18 @@ pub record SceneReader {
 
         if kind == NodeKind::MODEL && node.asset.len == 0us {
             throw copy SyntaxError(f"model '${d.name}' without a file", at.line, at.col);
+        }
+
+        if kind == NodeKind::BODY {
+            let shape = node.description.shape.kind;
+            let ofModel = shape == BodyShapeKind::HULL || shape == BodyShapeKind::MESH;
+            if ofModel && node.asset.len == 0us {
+                throw copy SyntaxError(f"body '${d.name}' of a ${shapeName(shape)} shape without a model", at.line, at.col);
+            }
+
+            if !ofModel && node.asset.len != 0us {
+                throw copy SyntaxError(f"body '${d.name}' of a ${shapeName(shape)} shape given a model, which only a hull or a mesh reads", at.line, at.col);
+            }
         }
 
         node
@@ -242,6 +255,8 @@ pub record SceneReader {
             NodeKind::MARKER => { self.readMarkerEntry(ref node, key, values); }
             NodeKind::PATH   => { self.readPathEntry(ref node, key, values); }
             NodeKind::VOLUME => { self.readVolumeEntry(ref node, key, values); }
+            NodeKind::BODY   => { self.readBodyEntry(ref node, key, values); }
+            NodeKind::CHARACTER => { self.readCharacterEntry(ref node, key, values); }
             _ => { throw self.foreign(node, key); }
         }
     }
@@ -253,14 +268,7 @@ pub record SceneReader {
         throws SyntaxError
     {
         match key.text {
-            "file" => {
-                let tok = self.single(key, values);
-                if tok.kind != TokenKind::DIRECTIVE {
-                    throw copy SyntaxError("file must be an asset, @<key>", tok.line, tok.col);
-                }
-
-                node.asset = tok.text;
-            }
+            "file" => { node.asset = self.asset(key, values); }
             "lods" => { node.description.lods = self.boolean(key, values); }
             _ => { throw self.foreign(node, key); }
         }
@@ -342,6 +350,64 @@ pub record SceneReader {
     }
 
     /**
+     * Read an entry of a body: its shape (shape, size, radius, height, model), then its settings (motion, mass,
+     * friction, rolling-friction, spinning-friction, restitution, linear-damping, angular-damping, can-sleep, bullet,
+     * trigger, layer, mask)
+     * */
+    fn readBodyEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
+        throws SyntaxError
+    {
+        let b = node.description.shape;
+        match key.text {
+            "shape"  => { node.description.shape = b.withKind(self.bodyShapeKind(key, values)); }
+            "size"   => { node.description.shape = BodyShape(b.kind, self.vector(key, values), b.radius, b.height); }
+            "radius" => { node.description.shape = BodyShape(b.kind, b.size, self.number(key, values), b.height); }
+            "height" => { node.description.shape = BodyShape(b.kind, b.size, b.radius, self.number(key, values)); }
+            "model"  => { node.asset = self.asset(key, values); }
+            "motion" => { node.description.body.motion = self.motion(key, values); }
+            "mass"   => { node.description.body.mass = self.number(key, values); }
+            "friction"          => { node.description.body.friction = self.number(key, values); }
+            "rolling-friction"  => { node.description.body.rollingFriction = self.number(key, values); }
+            "spinning-friction" => { node.description.body.spinningFriction = self.number(key, values); }
+            "restitution"       => { node.description.body.restitution = self.number(key, values); }
+            "linear-damping"    => { node.description.body.linearDamping = self.number(key, values); }
+            "angular-damping"   => { node.description.body.angularDamping = self.number(key, values); }
+            "can-sleep" => { node.description.body.canSleep = self.boolean(key, values); }
+            "bullet"    => { node.description.body.bullet = self.boolean(key, values); }
+            "trigger"   => { node.description.body.trigger = self.boolean(key, values); }
+            "layer"     => { node.description.body.layer = self.layers(key, values); }
+            "mask"      => { node.description.body.mask = self.layers(key, values); }
+            _ => { throw self.foreign(node, key); }
+        }
+    }
+
+    /**
+     * Read an entry of a character: its capsule (radius, height), how it moves (up, slope-limit in degrees,
+     * step-offset, snap-distance, skin, coyote-time, push-mass, max-slides, depenetrations), its layer and its mask
+     * */
+    fn readCharacterEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
+        throws SyntaxError
+    {
+        let b = node.description.shape;
+        match key.text {
+            "radius"         => { node.description.shape = BodyShape(b.kind, b.size, self.number(key, values), b.height); }
+            "height"         => { node.description.shape = BodyShape(b.kind, b.size, b.radius, self.number(key, values)); }
+            "up"             => { node.description.character.up = self.vector(key, values); }
+            "slope-limit"    => { node.description.character.slopeLimit = radian(self.number(key, values)); }
+            "step-offset"    => { node.description.character.stepOffset = self.number(key, values); }
+            "snap-distance"  => { node.description.character.snapDistance = self.number(key, values); }
+            "skin"           => { node.description.character.skin = self.number(key, values); }
+            "coyote-time"    => { node.description.character.coyoteTime = self.number(key, values); }
+            "push-mass"      => { node.description.character.pushMass = self.number(key, values); }
+            "max-slides"     => { node.description.character.maxSlides = self.count(key, values); }
+            "depenetrations" => { node.description.character.depenetrations = self.count(key, values); }
+            "layer"          => { node.description.body.layer = self.layers(key, values); }
+            "mask"           => { node.description.body.mask = self.layers(key, values); }
+            _ => { throw self.foreign(node, key); }
+        }
+    }
+
+    /**
      * @returns: the error of an entry the kind of a node does not have
      * */
     fn foreign(self, node: FlatNode, key: Token)-> &SyntaxError {
@@ -391,6 +457,20 @@ pub record SceneReader {
     }
 
     /**
+     * @returns: the key of the asset of an entry, @<key>
+     * */
+    fn asset(self, key: Token, values: [Token])-> [c8]
+        throws SyntaxError
+    {
+        let tok = self.single(key, values);
+        if tok.kind != TokenKind::DIRECTIVE {
+            throw copy SyntaxError(f"${key.text} must be an asset, @<key>", tok.line, tok.col);
+        }
+
+        tok.text
+    }
+
+    /**
      * @returns: the number of a token
      * */
     fn toNumber(self, key: Token, tok: Token)-> f32
@@ -414,6 +494,45 @@ pub record SceneReader {
         throws SyntaxError
     {
         self.toNumber(key, self.single(key, values))
+    }
+
+    /**
+     * @returns: the value of an entry of one whole number, 0 or more
+     * */
+    fn count(self, key: Token, values: [Token])-> u32
+        throws SyntaxError
+    {
+        let tok = self.single(key, values);
+        let n = self.toNumber(key, tok);
+        if n < 0.0f || n != cast!f32(cast!u32(n)) {
+            throw copy SyntaxError(f"${key.text} must be a whole number, 0 or more", tok.line, tok.col);
+        }
+
+        cast!u32(n)
+    }
+
+    /**
+     * @returns: the bits of the layers of an entry, the numbers of the layers from 0 to 31, or none
+     * */
+    fn layers(self, key: Token, values: [Token])-> u32
+        throws SyntaxError
+    {
+        if values.len == 1us && values[0].kind == TokenKind::IDENT && values[0].text == "none" { return 0u32; }
+        if values.len == 0us {
+            throw copy SyntaxError(f"${key.text} must be the numbers of layers, 0 to 31, or none", key.line, key.col);
+        }
+
+        let mut bits = 0u32;
+        for tok in values {
+            let n = if tok.kind == TokenKind::NUMBER { self.toNumber(key, tok) } else { -1.0f };
+            if n < 0.0f || n > 31.0f || n != cast!f32(cast!u32(n)) {
+                throw copy SyntaxError(f"${key.text} must be the numbers of layers, 0 to 31, or none", tok.line, tok.col);
+            }
+
+            bits = bits | (1u32 << cast!u32(n));
+        }
+
+        bits
     }
 
     /**
@@ -519,6 +638,40 @@ pub record SceneReader {
     }
 
     /**
+     * @returns: the kind of shape of a body of an entry, box, sphere, capsule, cylinder, plane, hull, mesh or compound
+     * */
+    fn bodyShapeKind(self, key: Token, values: [Token])-> BodyShapeKind
+        throws SyntaxError
+    {
+        let tok = self.single(key, values);
+        if tok.kind == TokenKind::IDENT {
+            cte for k in BodyShapeKind::__members__ {
+                if shapeName(k) == tok.text { return k; }
+            }
+        }
+
+        throw copy SyntaxError(f"${key.text} must be box, sphere, capsule, cylinder, plane, hull, mesh or compound", tok.line, tok.col);
+    }
+
+    /**
+     * @returns: the motion of a body of an entry, static, kinematic or dynamic
+     * */
+    fn motion(self, key: Token, values: [Token])-> BodyMotion
+        throws SyntaxError
+    {
+        let tok = self.single(key, values);
+        if tok.kind == TokenKind::IDENT {
+            match tok.text {
+                "static"    => { return BodyMotion::STATIC; }
+                "kinematic" => { return BodyMotion::KINEMATIC; }
+                "dynamic"   => { return BodyMotion::DYNAMIC; }
+            }
+        }
+
+        throw copy SyntaxError(f"${key.text} must be static, kinematic or dynamic", tok.line, tok.col);
+    }
+
+    /**
      * @returns: the values of an entry of strings, none of them empty
      * */
     fn strings(self, key: Token, values: [Token])-> [[c8]]
@@ -549,7 +702,7 @@ record FlatNode {
     // The id of its parent, none for a node under the root
     pub let mut parent: (Uuid)?;
 
-    // The key of the asset of a model, empty for the other nodes
+    // The key of the asset of a model or of the model of a body, empty for the other nodes
     pub let mut asset: [c8];
 
     // The place of the block, quoted in the errors
@@ -604,12 +757,17 @@ mod SceneReader {
             if n.asset.len != 0us {
                 let mut found = false;
                 for a in assets if a.key == n.asset {
-                    r.description.file = a.path;
+                    if n.description.kind == NodeKind::BODY {
+                        r.description.shape = n.description.shape.withModel(a.path);
+                    } else {
+                        r.description.file = a.path;
+                    }
+
                     found = true;
                 }
 
                 if !found {
-                    throw copy SyntaxError(f"model '${n.description.name}' names the asset '${n.asset}', not declared", n.line, n.col);
+                    throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' names the asset '${n.asset}', not declared", n.line, n.col);
                 }
             }
 

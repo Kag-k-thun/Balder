@@ -206,6 +206,19 @@ the root of the interface when it is `""`, as if it were written there. The valu
 and `attributes` the block of the instance in the syntax of the `.gui` files. A path already taken, a parent that takes
 no more children and an instance refused are errors.
 
+#### Many changes at once
+
+A change that can move the widgets around it (a text, a class, a widget shown or hidden) lays the whole interface out
+again at once. Code writing many of them in a row, the fields of a panel refreshed each time a node moves, holds the
+layout around them so the interface is laid out once, when the outermost hold is released, and only when a change
+asked for it; a text set to the one it already has asks for nothing.
+
+```
+self.gui:.holdLayout ();
+self:.writeFields ();
+self.gui:.releaseLayout ();
+```
+
 ### Signals
 
 The code registers its handlers under names, the slots, and an `on-…` attribute says which slot a signal of the widget
@@ -264,6 +277,9 @@ Dropdown #THEME "Dark", "Light" { selected: 0; on-change: theme; }      // fn th
 ListView #FILES { multiple: true; on-select: picked; on-activate: open; }  // fn picked (mut self, rows: [usize])
 TreeView #FOLDERS { on-select: browsed; on-activate: reached; }         // fn browsed (mut self, nodes: [[usize]])
 TableView #SONGS { multiple: true; on-select: listed; on-activate: play; }  // fn play (mut self, row: usize)
+Collapsible #ADVANCED "Advanced" { expanded: false; on-toggle: folded;  // fn folded (mut self, expanded: bool)
+    CheckBox "Vertical sync";
+}
 Separator;
 Image "res:/images/logo.png";
 ```
@@ -279,7 +295,8 @@ Image "res:/images/logo.png";
   number of `step` from `min` (any value without one, 1 for a spin box), the value given by any attribute order. A
   slider drags its `::thumb` along its `::track`, the part under the value being its `::fill`; its style property
   `direction` lays it along a row (the lowest value on the left) or a column (the lowest value at the bottom). The wheel
-  moves a slider or a spin box by a step, a hundredth of the range without one. A spin box reads the text typed when it
+  moves a slider by a step, a hundredth of the range without one, and a spin box only while it has the focus, the
+  wheel over a spin box without it scrolling the layout around it. A spin box reads the text typed when it
   loses the focus, and writes the value again with its `decimals`; its arrows are `::up` and `::down`, in the states
   `:hover` and `:pressed`. `on-change` gives the value the user chose.
 - **A dropdown opens its list in its menu layout**, as a menu button its popup, so it works only inside a `MenuLayout`.
@@ -342,6 +359,15 @@ Image "res:/images/logo.png";
   Shift and the wheel, or a second `::scrollbar` in the bottom padding, as thick as its `height`. `on-select` gives the
   selected rows of the model in increasing order, whatever their order in the table, and `on-activate` the row of the
   model Enter is pressed on, or the row double clicked.
+- **A collapsible is a section folded under its header**: its `title` follows the marker, ▾ while it is expanded and
+  ▸ while it is collapsed, on a single line spanning its content box, the part `::header` (and `::marker`) in the states
+  `:hover` and `:pressed`; the collapsible is in the state `:expanded` while it is expanded (`expanded: true` by
+  default), so `Collapsible:expanded::header` styles an open section. Its children are laid out under the header in a
+  column, each as high as its content and an auto width stretched to it, and are out of the layout while it is
+  collapsed, a collapsible being as high as its header then. A click released on the header expands or collapses it, as
+  do Enter and Space while it has the focus, Right expanding it and Left collapsing it; `on-toggle` gives true iif the
+  user expanded it, not when `expanded:` or `setExpanded` does. Sections taller than their panel go in a linear layout
+  that scrolls (`overflow: scroll`), whose min-content is 0 so it never grows its ancestors.
 - **A separator is a rule** a pixel thick across its `direction`, a row (horizontal) by default, drawn with its
   background colour. An auto size stretches it along the layout it is in.
 - **An image shows a picture** as the background image of its inline style, so that `image-fill`, `image-keep-ratio`
@@ -525,9 +551,10 @@ picker.showsIcons = false;                       // hides them all, true shows t
 - **The icon comes from the class of the node**: `Node3D.editorIcon ()` gives a `NodeIcon`, the shapes of a glyph in
   the square from (-1, -1) to (1, 1), `none` for a node seen by its geometry. `Empty3D`, `Light` (a sun, a bulb or a
   lamp, by its type), `Camera`, `Marker3D` (a cross, a figure, a flag or a ring about a dot, by its purpose), `Path3D`,
-  `PathPoint3D` and `Volume3D` override it, and so does any class of nodes without geometry that wants one
-  (`NodeIcon::sun ()`, `bulb ()`, `spot ()`, `camera ()`, `empty ()`, `marker ()`, `spawnPoint ()`, `waypoint ()`,
-  `socket ()`, `path ()`, `pathPoint ()`, `volume ()`, or shapes of its own). `NodeIcon.size` scales the disc, the glyph
+  `PathPoint3D`, `Volume3D`, and `PhysicsBody3D` and `CharacterBody3D` without a visual instance under them override
+  it, and so does any class of nodes without geometry that wants one (`NodeIcon::sun ()`, `bulb ()`, `spot ()`,
+  `camera ()`, `empty ()`, `marker ()`, `spawnPoint ()`, `waypoint ()`, `socket ()`, `path ()`, `pathPoint ()`,
+  `volume ()`, `body ()`, `character ()`, or shapes of its own). `NodeIcon.size` scales the disc, the glyph
   and the distance the icon is picked within: the points of a path, many and close, are 0.55 of the others. The nodes
   of the tools (named `__…__`, and those under them) and the camera the scene is seen through have none.
 - **A click on an icon selects its node before the instances**: an icon covers what is behind it, so a left click within
@@ -543,6 +570,10 @@ picker.showsIcons = false;                       // hides them all, true shows t
   the guides whether the node is selected or not, light blue, orange once selected: the wireframe of a volume (the
   edges of a box, three circles of a sphere, the circles, the sides and the caps of a capsule), the curve of a path
   through its points with, for a Bézier one, the handles of its points fainter.
+- **The colliders of the bodies are drawn at all times**, in the layer `colliders` of the debug lines of the scene
+  (`debug_view::drawCollider`), in the colours of the debug view of the physics by their settings
+  (`debug_view::colorOfSettings`: grey static, blue kinematic, orange dynamic, yellow a trigger), fainter until their
+  body is selected; the layer is drawn again only once a body moved, changed or was selected, and cleared with the icons.
 - **The icons are drawn as the gizmo is**, by a `GizmoEffect` of their own (`icons`), placed before the gizmo in the
   chain so the gizmo is drawn over them. It draws 1024 shapes at most: past them the wires are left out first, then the
   guides, then the icons farthest from the eye.
@@ -582,12 +613,14 @@ if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
   grab is given to every node selected, those under another node selected moving with it: the same translation in the
   world, the same rotation and the same factors of scale about the origin of each. Ctrl (or Command) snaps it to the
   steps of `gizmo.snap`, 0.5 world units along each axis, 15° and a tenth of the scale by default.
-- **A volume selected alone shows the squares of its faces** (`TransformGizmo.faceAt`, `GizmoHandle::FACE`), picked
+- **A volume selected alone shows the squares of its faces**, and so does a body of a box, a sphere, a capsule or a
+  cylinder, on the faces of its collider (`TransformGizmo.faceAt`, `GizmoHandle::FACE`, `VolumeEdit::shapeOf`), picked
   before the handles of the gizmo, within 7 texels of their centre, the one closest to the eye winning. A face dragged
   follows the ray through the cursor projected on its normal (snapped to the step of the translation): a face of a box
-  or an end of a capsule moves on its own, the centre of the volume moving half as far so the opposite face stays where
-  it is; a face of a sphere or a side of a capsule changes its radius about its centre (`VolumeShape::movedFace`, in the
-  space of the volume, its scale counted). The change is a `VolumeEdit` (the shape and the transform before and after),
+  or an end of a capsule or a cylinder moves on its own, the centre of the volume moving half as far so the opposite
+  face stays where it is; a face of a sphere or a side of a capsule or a cylinder changes its radius about its centre
+  (`BodyShape::movedFace`, in the space of the volume, its scale counted). The change is a `VolumeEdit` (the shape, as a
+  `BodyShape`, and the transform before and after),
   kept in `gizmo.volumeEdit`, `reshaped` being emitted when the drag ends having changed the volume; Escape gives it
   back its shape.
 - **The gizmo stands on the node selected last**, at the same size on the image wherever it is: an axis spans `size`
@@ -831,6 +864,17 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-toggle` (bool)
 - **States:** `hover`, `focus`, `pressed`, `checked`
 - **Parts:** `label`, `box`, `mark`
+- **Properties:** none
+
+### `Collapsible`
+
+- **Attributes:** `tab-index`: an integer; `title`: a string; `expanded`: true or false
+- **Default attribute:** `title`
+- **Children:** any number
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-toggle` (bool)
+- **States:** `hover`, `focus`, `pressed`, `expanded`
+- **Parts:** `header` (states `hover`, `pressed`), `marker` (states `hover`, `pressed`)
 - **Properties:** none
 
 ### `Dropdown`

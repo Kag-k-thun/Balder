@@ -1,0 +1,245 @@
+in wrap;
+
+use main::naming;
+use main::command::{remove, utils};
+use balder::math::{bounds, matrix, vector};
+use balder::scene::editable;
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{body, body_shape, solid, transform, volume};
+use balder::scene::node::node3D::visual::_;
+use balder::scene::physics;
+
+/**
+ * The wrapping of nodes in physics bodies: each node goes under a new body, at the place it had, the body taking its
+ * transform and a shape fitted to it (see fitOf), the bodies being selected
+ * @info:
+ * =====
+ * A body is the parent of what it moves: the body stands where the node stood, at the centre of its shape, the node
+ * under it keeping its place in the world. A volume is turned into a body instead, a static trigger of its shape, of its
+ * name and of its transform, the nodes under the volume going under the body. The nodes under another node wrapped, the
+ * bodies, the characters and the meshes of a model are left as they are.
+ *
+ * The bodies built are kept: undone, the nodes go back to their parents, their places and their transforms, the bodies
+ * being detached (a volume attached again), and redone, the bodies are attached again around them.
+ * ====
+ * */
+pub class WrapCommand over EditCommand {
+
+    // The nodes selected, those wrapped among them
+    let dmut _nodes: [&Node3D];
+
+    // The nodes wrapped, the parents they were under, their places among the children of the parents and their
+    // transforms, when they were wrapped
+    let dmut _wrapped: [&Node3D] = [];
+    let dmut _parents: [&Node] = [];
+    let mut _places: [usize] = [];
+    let mut _placed: [NodeTransform] = [];
+
+    // The body of each node wrapped, built the first time the command is applied
+    let dmut _bodies: [&PhysicsBody3D] = [];
+
+    // The transform the body gives each node wrapped under it
+    let mut _under: [NodeTransform] = [];
+
+    // The nodes selected before the wrapping, selected again when it is undone
+    let dmut _selected: [&Node3D] = [];
+
+    pub self (dmut nodes: [&Node3D])
+        with _nodes = alias nodes
+    {}
+
+    pub over apply(mut self, dmut scene: &EditableScene)-> bool {
+        self._selected = alias selectedNodes(alias scene);
+        if self._bodies.len == 0us {
+            for dmut n in alias self._nodes if isWrapped(n, self._nodes) {
+                if let Ok(dmut p) = alias n:.getParent() {
+                    // the meshes of a model come from its file
+                    if let _: &SolidObjectModel = p { continue; }
+
+                    self._wrapped ~= [alias n];
+                    self._parents ~= [alias p];
+                    self._places ~= [n.index];
+                    self._placed ~= [NodeTransform(n)];
+                    self:.wrap(alias n, alias p);
+                }
+            }
+        } else {
+            for i in 0us .. self._bodies.len {
+                self:.rewrap(i);
+            }
+        }
+
+        if self._bodies.len == 0us { return false; }
+
+        let dmut selection = alias scene.selection;
+        selection:.clear();
+        for dmut b in alias self._bodies {
+            selection:.add(alias b);
+        }
+
+        true
+    }
+
+    pub over revert(mut self, dmut scene: &EditableScene) {
+        // the last node wrapped goes back first, each finding the children of its parent as it left them
+        for k in 0us .. self._bodies.len {
+            let i = self._bodies.len - 1us - k;
+            let dmut node = alias self._wrapped[i];
+            let dmut body = alias self._bodies[i];
+            if let dmut v: &Volume3D = alias node {
+                let dmut children = alias childrenOf(alias body);
+                for dmut c in alias children {
+                    c:.moveUnder(alias v, at-> LAST_PLACE);
+                }
+
+                body:.dispose();
+                v:.attach(alias self._parents[i], at-> self._places[i]);
+            } else {
+                body:.dispose();
+                node:.moveUnder(alias self._parents[i], at-> self._places[i]);
+                self._placed[i].applyTo(alias node);
+            }
+        }
+
+        reselect(alias scene, alias self._selected);
+    }
+
+    pub over describe(self)-> [c8] {
+        if self._bodies.len == 1us {
+            return "Wrapped " ~ self._wrapped[0].name.file() ~ " in a body";
+        }
+
+        f"Wrapped ${self._bodies.len} nodes in bodies"
+    }
+
+    pub over reshapes(self)-> bool {
+        true
+    }
+
+    /**
+     * Build the body of a node under its parent, at the place of the node, and put the node under it
+     * */
+    fn wrap(mut self, dmut node: &Node3D, dmut parent: &Node) {
+        let place = node.index;
+        let (shape, centre) = fitOf(alias node);
+
+        if let dmut v: &Volume3D = alias node {
+            // the volume turned into a trigger of its shape, of its name, the nodes under it going under the body
+            let name = v.name.file();
+            v:.dispose();
+
+            let dmut body = copy PhysicsBody3D(name, alias parent, settings-> BodySettings(trigger-> true));
+            if let Ok(c) = shape.collider() {
+                body:.setDescribedShape(c, shape?);
+            }
+            body:.moveUnder(alias parent, at-> place);
+            self._placed[$ - 1us].applyTo(alias body);
+            let dmut children = alias childrenOf(alias v);
+            for dmut c in alias children {
+                c:.moveUnder(alias body, at-> LAST_PLACE);
+            }
+
+            self._bodies ~= [alias body];
+            self._under ~= [NodeTransform(vec3(), vec3(), makeVec3(1.0f, 1.0f, 1.0f))];
+            return;
+        }
+
+        let local = node.parentTransformation.inversed() * node.transformation;
+        let dmut body = copy PhysicsBody3D(freeName(alias parent, node.name.file() ~ "_body"), alias parent);
+        if let Ok(c) = shape.collider() {
+            body:.setDescribedShape(c, shape?);
+        }
+
+        body:.moveUnder(alias parent, at-> place);
+        body:.setTransform((local * makeVec4(centre, 1.0f)).xyz, node.rotation, node.scale);
+
+        let under = NodeTransform(-centre, vec3(), makeVec3(1.0f, 1.0f, 1.0f));
+        node:.moveUnder(alias body, at-> LAST_PLACE);
+        under.applyTo(alias node);
+
+        self._bodies ~= [alias body];
+        self._under ~= [under];
+    }
+
+    /**
+     * Attach again the body of a node wrapped, around it, the command being redone
+     * */
+    fn rewrap(mut self, i: usize) {
+        let dmut node = alias self._wrapped[i];
+        let dmut body = alias self._bodies[i];
+        if let dmut v: &Volume3D = alias node {
+            v:.dispose();
+            body:.attach(alias self._parents[i], at-> self._places[i]);
+            let dmut children = alias childrenOf(alias v);
+            for dmut c in alias children {
+                c:.moveUnder(alias body, at-> LAST_PLACE);
+            }
+
+            return;
+        }
+
+        body:.attach(alias self._parents[i], at-> self._places[i]);
+        node:.moveUnder(alias body, at-> LAST_PLACE);
+        self._under[i].applyTo(alias node);
+    }
+
+}
+
+/**
+ * @returns: true iif a node selected may be wrapped in a body: neither a body nor a character, nor under another node
+ * selected
+ * */
+fn isWrapped(node: &Node3D, selected: [&Node3D])-> bool {
+    if let _: &PhysicsBody3D = node { return false; }
+    !isUnderOneOf(node, selected)
+}
+
+/**
+ * @returns: the shape fitted to a node, in the space of the node, and the centre of that shape there: the box of a cube
+ * or of a model (the box of its vertices), the sphere of a sphere, the plane of a plane, the shape of a volume, a unit
+ * box on the origin of the other nodes
+ * */
+pub fn fitOf(dmut node: &Node3D)-> (BodyShape, vec3) {
+    if let v: &Volume3D = node {
+        return (BodyShape(v.shape), vec3());
+    }
+
+    if let m: &IndexedMesh3D = node {
+        match m.primitive {
+            Primitive::CUBE   => { return (BodyShape(), makeVec3(0.0f, 0.5f, 0.0f)); }
+            Primitive::SPHERE => { return (BodyShape().withKind(BodyShapeKind::SPHERE), makeVec3(0.0f, 0.5f, 0.0f)); }
+            Primitive::PLANE  => { return (BodyShape().withKind(BodyShapeKind::PLANE), vec3()); }
+            _ => {}
+        }
+    }
+
+    let inverse = node.transformation.inversed();
+    let mut box = Aabb();
+    let dmut nodes: [&Node] = [];
+    node:.getAllNodes(ref nodes);
+    for dmut n in alias nodes if let dmut m: &IndexedMesh3D = alias n {
+        if let Ok(points) = m.mesh.positions {
+            let local = inverse * m.transformation;
+            for p in points {
+                let q = (local * makeVec4(p, 1.0f)).xyz;
+                box = box.merged(Aabb(q, q));
+            }
+        }
+    }
+
+    if box.isEmpty { return (BodyShape(), vec3()); }
+    (BodyShape(BodyShapeKind::BOX, box.max - box.min, 0.5f, 2.0f), (box.min + box.max) / 2.0f)
+}
+
+/**
+ * @returns: the children of a node in their order, in a list of their own, the node moving them elsewhere
+ * */
+fn childrenOf(dmut node: &Node)-> dmut [&Node] {
+    let dmut children: [&Node] = [];
+    for dmut c in alias node:.getChildrenInOrder() {
+        children ~= [alias c];
+    }
+
+    alias children
+}

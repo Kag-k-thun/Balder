@@ -1,8 +1,12 @@
 in body;
 
+mod ::utils;
+
+use balder::core::error;
 use balder::core::application::signal;
-use balder::math::{bounds, rigid_transform, utils, vector};
+use balder::math::{bounds, matrix, rigid_transform, utils, vector};
 use balder::scene::physics;
+use balder::scene::node::node3D::{body_shape, icon};
 
 /**
  * A body of the physics of a scene: a collider placed by the transformation of the node in the physics world of the
@@ -21,12 +25,19 @@ use balder::scene::physics;
  * other body when the two start touching, contactStayed at each tick they still touch, contactEnded when they no
  * longer do, or one of them leaves the scene. Two static bodies never touch; a trigger reports the bodies it overlaps,
  * stopping none of them.
+ *
+ * The body knows the shape it is described by (see BodyShape), the one the scene files and an editor give: a primitive
+ * of its sizes, the hulls or the triangles of a model, or the volumes under it (see reshape). A shape set by the game
+ * as a hull, a mesh or a compound is described by none, a scene file not telling where it comes from.
  * ====
  * */
 pub class PhysicsBody3D over Node3D {
 
     // The shape of the collider, in the space of the node
     let mut _shape: ColliderShape;
+
+    // The shape the collider is described by, none for a hull, a mesh or a compound set as a collider (see shape)
+    let mut _described: (BodyShape)?;
 
     // How the body takes part in the physics of its scene
     let mut _settings: BodySettings;
@@ -55,6 +66,7 @@ pub class PhysicsBody3D over Node3D {
     pub self (name: [c8], dmut parent: &Node, shape: ColliderShape = ColliderShape(), settings: BodySettings = BodySettings())
         with super(name, alias parent)
         , _shape = shape
+        , _described = BodyShape::describing(shape)
         , _settings = settings
     {
         self:.updateTransformation();
@@ -86,12 +98,93 @@ pub class PhysicsBody3D over Node3D {
 
     /**
      * Change the shape of the collider, the body in the world of the scene and the bounds of the node following
+     * @info: a box, a sphere, a capsule, a cylinder or a plane describes the body (see described), a hull, a mesh or a
+     * compound describes it by none
      * */
     @field
     pub fn shape(mut self, shape: ColliderShape) {
+        self:.setDescribedShape(shape, BodyShape::describing(shape));
+    }
+
+    /**
+     * @returns: the shape the collider of the body is described by in the scene files and in an editor, none for a
+     * hull, a mesh or a compound set as a collider
+     * */
+    @field
+    pub fn described(self)-> (BodyShape)? {
+        self._described
+    }
+
+    /**
+     * Change the shape of the collider to the one a description gives: a primitive of its sizes, the hulls or the
+     * triangles of its model, read from its file, or the volumes under the body as they are placed now (see colliderOf)
+     * @throws:
+     *    - &BalderError: if the model cannot be loaded, or a compound has no volume under the body, the body keeping its
+     *                    shape
+     * */
+    pub fn reshape(mut self, shape: BodyShape)
+        throws BalderError
+    {
+        let collider = self:.colliderOf(shape);
+        self:.setDescribedShape(collider, shape?);
+    }
+
+    /**
+     * Change the shape of the collider and the shape it is described by at once, the collider built from that
+     * description already (an editor undoing a change)
+     * */
+    pub fn setDescribedShape(mut self, shape: ColliderShape, described: (BodyShape)?) {
         self._shape = shape;
+        self._described = described;
         self:.invalidateBounds();
         self:.notifyChanged();
+    }
+
+    /**
+     * @returns: the collider a shape described gives the body: a primitive of its sizes; the hulls of a model, its
+     * convex decomposition saved next to its file (see ConvexDecomposition::fileOf) or else the hull of each of its
+     * meshes (see SolidObjectModel::hulls); the triangles of a model; both placed where the model stands under the body
+     * (see placeOfModel); the compound of the volumes under the body, those
+     * under another body left out, each placed and scaled as it is under the body
+     * @throws:
+     *    - &BalderError: if the model cannot be loaded, or a compound has no volume under the body
+     * */
+    pub fn colliderOf(mut self, shape: BodyShape)-> ColliderShape
+        throws BalderError
+    {
+        if let Ok(c) = shape.collider() { return c; }
+
+        match shape.kind {
+            BodyShapeKind::HULL => { utils::hullsOf(shape.model, place-> self:.placeOfModel(shape.model)) }
+            BodyShapeKind::MESH => { utils::trianglesOf(shape.model, place-> self:.placeOfModel(shape.model)) }
+            _ => {
+                let mut parts: [CompoundPart] = [];
+                let inverse = self.transformation.inversed();
+                for dmut c in alias self:.getChildrenInOrder() {
+                    utils::gatherVolumes(alias c, inverse, ref parts);
+                }
+
+                if parts.len == 0us {
+                    throw copy BalderError(f"${self.name.file()}: a compound shape without a volume under the body");
+                }
+
+                ColliderShape::compound(copy CompoundShape(parts))
+            }
+        }
+    }
+
+    /**
+     * @returns: the transformation of the model a hull or a mesh is read from in the space of the body, the first model
+     * of that file under the body (those under another body left out), the identity when there is none: the collider
+     * lies where the body moves the model, wherever the model stands under it (a model wrapped stands at the centre of
+     * its box, see the wrapping of the editor)
+     * */
+    pub fn placeOfModel(mut self, model: [c8])-> mat4 {
+        if let Ok(m) = utils::modelUnder(alias self, model) {
+            return self.transformation.inversed() * m;
+        }
+
+        mat4()
     }
 
     /**
@@ -284,6 +377,15 @@ pub class PhysicsBody3D over Node3D {
         if let Ok(dmut scene) = alias self:.getScene() {
             scene:.onBodyMoved(self);
         }
+    }
+
+    /**
+     * @returns: the glyph of a body without geometry under it, a ball on the ground, none for a body seen by the meshes
+     * it moves
+     * */
+    pub over editorIcon(self)-> (NodeIcon)? {
+        if utils::holdsGeometry(self) { return none; }
+        NodeIcon::body()?
     }
 
     /**

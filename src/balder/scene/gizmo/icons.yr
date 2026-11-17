@@ -2,13 +2,15 @@ in icons;
 
 mod ::utils;
 
-use balder::math::vector;
-use balder::scene::editable;
+use balder::math::{bounds, matrix, vector};
+use balder::scene::{debug, editable};
 use balder::scene::description::node_description;
 use balder::scene::gizmo::view;
 use balder::scene::node;
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::{guide, icon};
+use balder::scene::node::node3D::{body, guide, icon};
+use balder::scene::physics;
+use balder::scene::physics::debug_view;
 use balder::scene::utils::post::gizmo;
 use balder::scene::utils::post::gizmo::shape;
 use balder::utils::log;
@@ -35,6 +37,11 @@ def SELECTED_RING = 2.5f;
 def ICONS_EFFECT = "icons";
 
 /**
+ * The layer of the debug lines of the scene the colliders of the bodies are drawn in
+ * */
+def COLLIDERS_LAYER = "colliders";
+
+/**
  * The icons of the nodes without geometry of a scene (its lights, its cameras, its empties...), drawn over its image by an
  * editor at a size on the image wherever the nodes are, and picked by the cursor (see Node3D::editorIcon)
  * @info:
@@ -48,6 +55,12 @@ def ICONS_EFFECT = "icons";
  * cursor in white. Under the guides, the lines each node is drawn with at all times (see Node3D::editorWires: the
  * wireframe of a volume, the curve of a path) are drawn in blue, in orange for a node selected. The shapes past
  * MAX_GIZMO_SHAPES are not drawn, the wires first, then the guides, then the icons farthest from the eye.
+ *
+ * The colliders of the bodies under the parent of the icons are drawn in the layer COLLIDERS_LAYER of the debug lines
+ * of the scene (see debug_view::drawCollider), in the colours of the debug view of the physics (see
+ * debug_view::colorOfSettings: grey static, blue kinematic, orange dynamic, yellow triggers), fainter unless their
+ * body is selected; the layer is drawn again only when a body moved, changed or was selected, and cleared once the icons
+ * leave the scene.
  * ====
  * */
 pub class NodeIcons over Node {
@@ -60,6 +73,10 @@ pub class NodeIcons over Node {
 
     // The effect of the post-process chain drawing the icons, while they are in a scene
     let dmut _effect: (&GizmoEffect)? = none;
+
+    // What the colliders were drawn from last, by body: its uniq id, its transformation, its motion (the trigger bit
+    // above it), whether it was selected and the box of its shape, the layer drawn again once it changes
+    let mut _colliders: [(usize, mat4, u32, bool, Aabb)] = [];
 
     /**
      * Create the icons of the nodes under a node, put in a tree
@@ -122,6 +139,11 @@ pub class NodeIcons over Node {
             e:.setShapes([]);
         }
 
+        if self._colliders.len != 0us {
+            scene:.setDebugLines(COLLIDERS_LAYER, []);
+            self._colliders = [];
+        }
+
         self._effect = none;
         scene:.getPostChain():.enable(ICONS_EFFECT, false);
     }
@@ -144,9 +166,42 @@ pub class NodeIcons over Node {
                     e:.setShapes([]);
                 }
             }
+
+            self:.drawColliders(alias scene);
         }
 
         self.__super__:.onTick(delta);
+    }
+
+    /**
+     * Draw the colliders of the bodies in their layer of the debug lines of the scene, when they changed since they were
+     * drawn last
+     * */
+    fn drawColliders(mut self, dmut scene: &Scene) {
+        let dmut bodies: [&PhysicsBody3D] = [];
+        if let Ok(dmut parent) = alias self:.getParent() {
+            for _, dmut c in alias parent:.getChilds() {
+                gatherBodies(alias c, ref bodies);
+            }
+        }
+
+        let mut marks: [(usize, mat4, u32, bool, Aabb)] = [];
+        for b in bodies {
+            let settings = b.settings;
+            let motion = cast!u32(settings.motion) | (if settings.trigger { 4u32 } else { 0u32 });
+            marks ~= [(b.uid, b.transformation, motion, self.isSelected(b), b.shape.localBox())];
+        }
+
+        if utils::sameMarks(marks, self._colliders) { return; }
+        self._colliders = marks;
+
+        let dmut lines = copy DebugLines(depth-> DebugDepth::SEE_THROUGH);
+        for i, b in bodies {
+            debug_view::drawCollider(alias lines, Collider(b.shape, b.transformation),
+                                     utils::colliderColor(debug_view::colorOfSettings(b.settings), marks[i]._3));
+        }
+
+        scene:.setDebugLines(COLLIDERS_LAYER, lines.segments);
     }
 
     /*!
@@ -371,4 +426,19 @@ pub class NodeIcons over Node {
         }
     }
 
+}
+
+/**
+ * Add to a list the bodies of a node and of the nodes under it, but those of the tools (named __…__)
+ * */
+fn gatherBodies(dmut node: &Node, ref dmut found: [&PhysicsBody3D]) {
+    if isReservedName(node.name.file()) { return; }
+
+    if let dmut b: &PhysicsBody3D = alias node {
+        found ~= [alias b];
+    }
+
+    for _, dmut c in alias node:.getChilds() {
+        gatherBodies(alias c, ref found);
+    }
 }
