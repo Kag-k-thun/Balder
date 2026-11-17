@@ -1,0 +1,114 @@
+in utils;
+
+use balder::core::error;
+use balder::math::{bounds, matrix, rigid_transform, utils, vector};
+use balder::scene::node::node3D::{solid, volume};
+use balder::scene::physics;
+use balder::scene::physics::convex_decomposition;
+use balder::utils::path;
+
+use std::fs;
+
+/**
+ * @returns: the hulls of a model: its convex decomposition saved next to its file, or the hull of each of its meshes
+ * when it has none (see SolidObjectModel::hulls), placed in the space of the body by the transformation of the model
+ * there, its scale given to the hulls
+ * @params:
+ *    - place: the transformation of the model in the space of the body (see PhysicsBody3D::placeOfModel)
+ * @throws:
+ *    - &BalderError: if the model, or its decomposition, cannot be read
+ * */
+pub fn hullsOf(model: [c8], place: mat4 = mat4())-> ColliderShape
+    throws BalderError
+{
+    let saved = ConvexDecomposition::fileOf(model);
+    let hulls = if std::fs::isFile(projectPath(saved)) {
+        ConvexDecomposition::fromFile(saved).shape()
+    } else {
+        let dmut holder = copy ShapeHolder();
+        let dmut m = copy SolidObjectModel::fromFile("model", alias holder, model, lods-> false);
+        m:.hulls()
+    };
+
+    if place == mat4() { return hulls; }
+
+    // the parts of a compound part are placed under it (see CompoundShape)
+    ColliderShape::compound(copy CompoundShape(copy [CompoundPart(shape-> hulls.scaled(axesScale(place)),
+                                                                  place-> RigidTransform(place))]))
+}
+
+/**
+ * @returns: the triangles of the meshes of a model, placed in the space of the body by the transformation of the model
+ * there
+ * @params:
+ *    - place: the transformation of the model in the space of the body (see PhysicsBody3D::placeOfModel)
+ * @throws:
+ *    - &BalderError: if the model cannot be read, or has no triangle
+ * */
+pub fn trianglesOf(model: [c8], place: mat4 = mat4())-> ColliderShape
+    throws BalderError
+{
+    let dmut holder = copy ShapeHolder();
+    let dmut m = copy SolidObjectModel::fromFile("model", alias holder, model, lods-> false);
+    let triangles = m:.triangles();
+    if triangles.len == 0us {
+        throw copy BalderError(f"The model ${model} has no triangle");
+    }
+
+    let mut positions: [vec3] = [];
+    let mut indices: [u32] = [];
+    for i, t in triangles {
+        positions ~= [(place * makeVec4(t.a, 1.0f)).xyz, (place * makeVec4(t.b, 1.0f)).xyz, (place * makeVec4(t.c, 1.0f)).xyz];
+        let k = cast!u32(i) * 3u32;
+        indices ~= [k, k + 1u32, k + 2u32];
+    }
+
+    ColliderShape::mesh(copy TriangleBvh(positions, indices))
+}
+
+/**
+ * @returns: the transformation in the world of the first model of a file under a node, those under a body left out (the
+ * body of their own), none if there is none
+ * */
+pub fn modelUnder(dmut node: &Node, model: [c8])-> (mat4)? {
+    for dmut c in alias node:.getChildrenInOrder() {
+        if let _: &PhysicsBody3D = c { continue; }
+        if let m: &SolidObjectModel = c && m.file == model { return (m.transformation)?; }
+        if let Ok(t) = modelUnder(alias c, model) { return (t)?; }
+    }
+
+    none
+}
+
+/**
+ * Add to the parts of a compound the volumes of a node and of the nodes under it, those under a body left out (the body
+ * of their own), each placed by its transformation in the space of the compound, its scale given to its shape
+ * @params:
+ *    - inverse: the inverse of the transformation of the compound in the world
+ * */
+pub fn gatherVolumes(dmut node: &Node, inverse: mat4, ref mut parts: [CompoundPart]) {
+    if let _: &PhysicsBody3D = node { return; }
+
+    if let v: &Volume3D = node {
+        let local = inverse * v.transformation;
+        parts ~= [CompoundPart(shape-> ColliderShape(v.shape).scaled(axesScale(local)), place-> RigidTransform(local))];
+    }
+
+    for dmut c in alias node:.getChildrenInOrder() {
+        gatherVolumes(alias c, inverse, ref parts);
+    }
+}
+
+/**
+ * The root a model is loaded under for its shape only, out of any scene
+ * */
+class ShapeHolder over Node {
+
+    pub self ()
+        with super::root("__shape__")
+    {}
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+}
