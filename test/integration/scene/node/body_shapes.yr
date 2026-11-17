@@ -1,0 +1,252 @@
+in body_shapes;
+
+use balder::core::error;
+use balder::math::vector;
+use balder::scene::node::node3D::{body, body_shape, character, empty, solid, volume, volume_shape};
+use balder::scene::node::node3D::visual::{_, material::_};
+use balder::scene::physics;
+use balder::scene::physics::convex_decomposition;
+
+use integration::utils::{compare, root};
+
+use std::io;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          SHAPES          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test a_body_shape_keeps_its_sizes_above_the_smallest_a_capsule_as_high_as_wide {
+    let s = BodyShape(BodyShapeKind::CAPSULE, makeVec3(-1.0f, 0.0f, 2.0f), 0.0f, 0.0f);
+    assert (near(s.size, makeVec3(MIN_VOLUME_SIZE, MIN_VOLUME_SIZE, 2.0f)) && near(s.radius, MIN_VOLUME_SIZE));
+    assert (near(s.height, 2.0f * MIN_VOLUME_SIZE));
+
+    // a cylinder may be lower than wide, a box keeping the height it is given for the kinds it turns into
+    let disc = BodyShape(BodyShapeKind::CYLINDER, makeVec3(1.0f, 1.0f, 1.0f), 2.0f, 0.5f);
+    assert (near(disc.height, 0.5f));
+    assert (near(disc.withKind(BodyShapeKind::CAPSULE).height, 4.0f));
+}
+
+__test a_body_shape_of_its_sizes_gives_its_collider_the_others_none {
+    let s = BodyShape(BodyShapeKind::BOX, makeVec3(1.0f, 2.0f, 3.0f), 0.25f, 3.0f);
+    if let Ok(c) = s.collider() {
+        assert (c.kind == ColliderKind::BOX && near(c.size, makeVec3(1.0f, 2.0f, 3.0f)));
+    } else {
+        assert (false);
+    }
+
+    if let Ok(c) = s.withKind(BodyShapeKind::CYLINDER).collider() {
+        assert (c.kind == ColliderKind::CYLINDER && near(c.radius, 0.25f) && near(c.height, 3.0f));
+    } else {
+        assert (false);
+    }
+
+    if let Ok(c) = s.withKind(BodyShapeKind::PLANE).collider() {
+        assert (c.kind == ColliderKind::PLANE);
+    } else {
+        assert (false);
+    }
+
+    for k in [BodyShapeKind::HULL, BodyShapeKind::MESH, BodyShapeKind::COMPOUND] {
+        assert (!s.withKind(k).collider().hasValue && !s.withKind(k).isPrimitive);
+    }
+
+    assert (s.hasFaces && !s.withKind(BodyShapeKind::PLANE).hasFaces);
+}
+
+__test a_collider_of_its_sizes_describes_its_body_a_hull_or_a_compound_none {
+    if let Ok(d) = BodyShape::describing(ColliderShape::capsule(0.5f, 3.0f)) {
+        assert (d.kind == BodyShapeKind::CAPSULE && near(d.radius, 0.5f) && near(d.height, 3.0f));
+    } else {
+        assert (false);
+    }
+
+    if let Ok(d) = BodyShape::describing(ColliderShape::box(makeVec3(2.0f, 1.0f, 4.0f))) {
+        assert (d.kind == BodyShapeKind::BOX && near(d.size, makeVec3(2.0f, 1.0f, 4.0f)));
+    } else {
+        assert (false);
+    }
+
+    let parts = {
+        copy CompoundShape(copy [CompoundPart(shape-> ColliderShape::sphere(1.0f))])
+    } catch {
+        _ => panic;
+    };
+
+    assert (!BodyShape::describing(ColliderShape::compound(parts)).hasValue);
+}
+
+__test a_body_shape_of_a_volume_has_its_kind_and_its_sizes {
+    let v = VolumeShape(VolumeKind::SPHERE, makeVec3(1.0f, 1.0f, 1.0f), 0.75f, 2.0f);
+    let b = BodyShape(v);
+    assert (b.kind == BodyShapeKind::SPHERE && near(b.radius, 0.75f));
+    assert (b.toVolume() == v);
+}
+
+__test the_faces_of_a_cylinder_move_its_ends_on_their_own_and_its_sides_about_its_centre {
+    let c = BodyShape(BodyShapeKind::CYLINDER, makeVec3(1.0f, 1.0f, 1.0f), 0.5f, 2.0f);
+    assert (near(c.face(0us), makeVec3(0.5f, 0.0f, 0.0f)) && near(c.face(3us), makeVec3(0.0f, -1.0f, 0.0f)));
+
+    // the top raised, the bottom staying where it is
+    let (taller, shift) = c.movedFace(2us, 1.0f);
+    assert (near(taller.height, 3.0f) && near(shift, makeVec3(0.0f, 0.5f, 0.0f)));
+    assert (near(taller.face(3us) + shift, c.face(3us)));
+
+    // a side pushed, the radius growing about the centre
+    let (wider, still) = c.movedFace(5us, 0.25f);
+    assert (near(wider.radius, 0.75f) && near(still, vec3()) && wider.kind == BodyShapeKind::CYLINDER);
+
+    // the faces of a box move as those of a volume, the kind kept
+    let box = BodyShape();
+    let (moved, half) = box.movedFace(0us, 1.0f);
+    assert (moved.kind == BodyShapeKind::BOX && near(moved.size.x, 2.0f) && near(half, makeVec3(0.5f, 0.0f, 0.0f)));
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          BODIES          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+__test a_body_is_described_by_its_primitive_and_by_none_once_given_a_hull {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("b", alias root, shape-> ColliderShape::sphere(2.0f));
+    if let Ok(d) = b.described {
+        assert (d.kind == BodyShapeKind::SPHERE && near(d.radius, 2.0f));
+    } else {
+        assert (false);
+    }
+
+    b.shape = ColliderShape::hull(copy ConvexHull(copy [makeVec3(0.0f, 0.0f, 0.0f), makeVec3(1.0f, 0.0f, 0.0f),
+                                                        makeVec3(0.0f, 1.0f, 0.0f), makeVec3(0.0f, 0.0f, 1.0f)]));
+    assert (!b.described.hasValue);
+
+    let cylinder = BodyShape().withKind(BodyShapeKind::CYLINDER);
+    {
+        b:.reshape(cylinder);
+    } catch {
+        _ => { assert (false); }
+    }
+
+    assert (b.shape.kind == ColliderKind::CYLINDER && (b.described ?? BodyShape()) == cylinder);
+}
+
+__test a_compound_body_takes_the_volumes_under_it_placed_and_scaled_but_those_of_another_body {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("b", alias root);
+    b.position = makeVec3(10.0f, 0.0f, 0.0f);
+
+    let dmut seat = copy Volume3D("seat", alias b);
+    seat.position = makeVec3(1.0f, 0.0f, 0.0f);
+    seat.scale = makeVec3(2.0f, 1.0f, 1.0f);
+
+    let dmut group = copy Empty3D("legs", alias b);
+    group.position = vec3();
+    let dmut leg = copy Volume3D("leg", alias group, shape-> VolumeShape().withKind(VolumeKind::SPHERE));
+    leg.position = makeVec3(0.0f, -2.0f, 0.0f);
+
+    let dmut other = copy PhysicsBody3D("other", alias b);
+    copy Volume3D("apart", alias other);
+
+    {
+        b:.reshape(BodyShape().withKind(BodyShapeKind::COMPOUND));
+    } catch {
+        _ => { assert (false); }
+    }
+
+    assert (b.shape.kind == ColliderKind::COMPOUND);
+    if let Ok(parts) = b.shape.parts {
+        assert (parts.parts.len == 2us);
+        let box = parts.bounds;
+        // the seat a box of 2 by 1 by 1 about x = 1, the leg a sphere of radius 0.5 about y = -2
+        assert (near(box.min, makeVec3(-0.5f, -2.5f, -0.5f)) && near(box.max, makeVec3(2.0f, 0.5f, 0.5f)));
+    } else {
+        assert (false);
+    }
+}
+
+__test a_compound_body_without_a_volume_under_it_keeps_its_shape {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("b", alias root, shape-> ColliderShape::sphere(1.0f));
+    let failed = {
+        b:.reshape(BodyShape().withKind(BodyShapeKind::COMPOUND));
+        false
+    } catch {
+        _: &BalderError => { true }
+    };
+
+    assert (failed && b.shape.kind == ColliderKind::SPHERE);
+}
+
+__test a_body_of_the_hulls_of_a_model_takes_its_saved_decomposition {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("teapot", alias root);
+    let model = "res:/models/teapot/teapot.obj";
+    {
+        b:.reshape(BodyShape().withKind(BodyShapeKind::HULL).withModel(model));
+        let saved = copy ConvexDecomposition::fromFile(ConvexDecomposition::fileOf(model));
+        if let Ok(parts) = b.shape.parts {
+            assert (parts.parts.len == saved.hulls.len);
+        } else {
+            assert (false);
+        }
+
+        assert ((b.described ?? BodyShape()).model == model);
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
+
+__test a_body_of_the_mesh_of_a_model_takes_its_triangles {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("cube", alias root);
+    {
+        b:.reshape(BodyShape().withKind(BodyShapeKind::MESH).withModel("res:/models/cube/cube.obj"));
+        assert (b.shape.kind == ColliderKind::MESH && !b.shape.localBox().isEmpty);
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
+
+__test the_hulls_and_the_mesh_of_a_model_lie_where_the_model_stands_under_the_body {
+    // a model wrapped stands under its body at the centre of its box: in a unit box on the origin, y from 0 to 1, moved
+    // down by half its height, and scaled
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("cube_body", alias root);
+    b.position = makeVec3(5.0f, 0.0f, 0.0f);
+
+    let model = "res:/models/cube/cube.obj";
+    let dmut cube = copy SolidObjectModel::fromFile("cube", alias b, model, lods-> false);
+    cube.position = makeVec3(0.0f, -1.0f, 0.0f);
+    cube.scale = makeVec3(2.0f, 2.0f, 2.0f);
+
+    {
+        b:.reshape(BodyShape().withKind(BodyShapeKind::HULL).withModel(model));
+        let hulls = b.shape.localBox();
+        assert (near(hulls.min.y, -1.0f, tolerance-> 0.01f) && near(hulls.max.y, 1.0f, tolerance-> 0.01f));
+        assert (near((hulls.min.x + hulls.max.x) / 2.0f, 0.0f, tolerance-> 0.01f));
+
+        b:.reshape(BodyShape().withKind(BodyShapeKind::MESH).withModel(model));
+        let mesh = b.shape.localBox();
+        assert (near(mesh.min.y, -1.0f, tolerance-> 0.01f) && near(mesh.max.y, 1.0f, tolerance-> 0.01f));
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
+
+__test a_body_without_geometry_under_it_is_drawn_as_an_icon {
+    let dmut root = copy Root();
+    let dmut b = copy PhysicsBody3D("b", alias root);
+    let c = copy CharacterBody3D("c", alias root);
+    assert (b.editorIcon().hasValue && c.editorIcon().hasValue);
+
+    let dmut material = copy ConstantMaterial(MaterialConfig());
+    let cube = cubeMesh();
+    copy IndexedMesh3D("mesh", alias b, LodChain(cube._1), cube._0, alias material, primitive-> Primitive::CUBE);
+    assert (!b.editorIcon().hasValue);
+}
