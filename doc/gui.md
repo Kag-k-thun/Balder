@@ -1105,7 +1105,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([[usize]]), `on-activate` ([usize]), `on-drop` (balder::interface::widget::tree::drop::TreeDrop)
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `row` (states `hover`, `selected`, `current`, `drop`), `marker` (states `hover`, `selected`, `current`, `expanded`), `drop`, `scrollbar` (states `hover`, `pressed`)
+- **Parts:** `row` (states `hover`, `selected`, `current`, `drop`), `marker` (states `hover`, `selected`, `current`, `expanded`), `icon` (states `hover`, `selected`, `current`), `drop`, `scrollbar` (states `hover`, `pressed`)
 - **Properties:** none
 
 ## Style properties
