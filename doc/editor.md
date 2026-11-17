@@ -48,8 +48,9 @@ gyllir build editor
   sphere or a capsule standing along Y, the shape of a trigger or of a collider, its behaviour coming with the physics:
   selected alone, a white square on each face drags the face along its normal, the opposite face staying where it is (a
   sphere and the sides of a capsule growing about their centre).
-- **Outline**: the nodes of the scene in their order, a click selecting a node, Ctrl and Shift selecting several,
-  Enter or a double click looking at it. It follows the selection of the viewport. The rows selected are dragged: onto
+- **Outline**: the nodes of the scene in their order, each after the icon of its kind (`editor/ui/icons`, coloured by
+  family: the meshes blue, the lights yellow, the markers green, the paths cyan, the volumes purple, the bodies orange),
+  a click selecting a node, Ctrl and Shift selecting several, Enter or a double click looking at it. It follows the selection of the viewport. The rows selected are dragged: onto
   a row, their nodes go under its node, after its children; between two rows, to that place, under the parent of the
   line, which tells the level; below the rows, to the end of the first level. Each node keeps its place in the world,
   its transform computed again in the space of its new parent, or keeps its transform with Alt held at the drop. A node
@@ -75,7 +76,9 @@ gyllir build editor
 - **Menus**: *Scene* opens a new scene or a scene file and saves the scene (Ctrl+S) or saves it in another file
   (Ctrl+Shift+S), *Add* adds a cube, a sphere, a plane, a model read from a
   file, an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume or a light where the
-  centre of the viewport meets a surface (or at the point the camera looks at), or a point to the path selected,
+  centre of the viewport meets a surface (or at the point the camera looks at), or a point to the path selected, its
+  kinds grouped in submenus opening as they are hovered (*Mesh*, *Light*, *Marker*, *Path*, *Volume*), and Ctrl+E
+  opening it under the cursor,
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
   frames the selection, and *View* hides or shows the icons.
 - **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
