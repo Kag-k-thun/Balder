@@ -1,0 +1,647 @@
+in collapsible;
+
+use balder::core::dispose;
+use balder::core::application::signal;
+use balder::interface::style;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::text::label;
+use balder::math::vector;
+
+use ::sdl3::{keycode, mouse};
+
+use ::std::algorithm::comparison;
+
+// The text of the marker of a collapsible collapsed, and of one expanded
+def COLLAPSED_MARKER = "▸";
+def EXPANDED_MARKER = "▾";
+
+/**
+ * The header of a collapsible: a label on a single line drawing the background and the border of the part ::header,
+ * its text, the title, after the part ::marker, ▸ while the collapsible is collapsed and ▾ while it is expanded
+ * */
+class CollapsibleHeader over Label {
+
+    // The marker, before the title
+    let dmut _marker: &Label;
+
+    pub self (dmut manager: &WidgetManager)
+        with super(alias manager, "")
+        , _marker = copy Label(alias manager, "")
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("header");
+        self:.forceNoWrap(true);
+
+        self._marker:.setOwnerPart("marker");
+        self._marker:.forceNoWrap(true);
+        self._marker:.forceAlign(true);
+        self._marker:.setText(EXPANDED_MARKER);
+    }
+
+    /**
+     * Show the marker of a collapsible expanded, or of one collapsed
+     * */
+    pub fn setExpanded(mut self, expanded: bool) {
+        self._marker:.setText(if expanded { EXPANDED_MARKER } else { COLLAPSED_MARKER });
+    }
+
+    /**
+     * Give the marker the style of the part ::marker in the states of the header
+     * */
+    pub fn setMarkerStyle(mut self, style: &Style) {
+        self._marker:.setStyle(style);
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        max(self._depth, self._marker.getMaxDepth())
+    }
+
+    /**
+     * The title starts after the marker
+     * */
+    over onUpdateSize(mut self) {
+        self.__super__:.onUpdateSize();
+
+        let marker = self:.measureMarker();
+        if self._absoluteSize.x > 0.0f {
+            self._relTextPos = makeVec2(self._relTextPos.x + marker / self._absoluteSize.x, self._relTextPos.y);
+        }
+
+        self:.placeMarker(marker);
+    }
+
+    over onUpdateScissors(mut self) {
+        self._marker:.setScissors(self._scissorPos, self._scissorSize);
+    }
+
+    /**
+     * The content of the header is the marker followed by the title
+     * */
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        let marker = self:.measureMarker();
+        let (minWidth, maxWidth) = self.__super__:.measureContentWidths();
+        (marker + minWidth, marker + maxWidth)
+    }
+
+    prot over measureContentHeights(mut self, width: f32)-> (f32, f32) {
+        let marker = self:.measureMarker();
+        let (_, markerHeight) = self._marker:.measureIntrinsicHeights(marker);
+        let (minHeight, maxHeight) = self.__super__:.measureContentHeights(max(0.0f, width - marker));
+        (max(markerHeight, minHeight), max(markerHeight, maxHeight))
+    }
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self._marker:.onAttach((self)?);
+    }
+
+    over onHide(mut self) {
+        self._marker:.hide();
+    }
+
+    over onShow(mut self) {
+        self._marker:.show();
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self._marker:.dispose();
+            self.__super__:.dispose();
+        }
+    }
+
+    /**
+     * @returns: the width of the margin box of the marker, in pixels
+     * */
+    fn measureMarker(mut self)-> f32 {
+        self._marker:.measureIntrinsicWidths()._1
+    }
+
+    /**
+     * Place the marker at the start of the content box, as high as it
+     * */
+    fn placeMarker(mut self, width: f32) {
+        if !self._attached { return; }
+
+        self._marker:.setSize(self._absolutePosition, makeVec2(width, self._absoluteSize.y), self._depth, self._absoluteSize);
+        self._marker:.setScissors(self._scissorPos, self._scissorSize);
+    }
+}
+
+/**
+ * A section under a header the user expands or collapses, its children laid out under the header in a column while it
+ * is expanded, out of the layout while it is collapsed
+ * @info:
+ * =====
+ * The header is the part `::header`, a single line spanning the content box, in the states `:hover` under the cursor
+ * and `:pressed` while the left button holds it; its text, the title, follows the part `::marker`, ▾ while the
+ * collapsible is expanded and ▸ while it is collapsed, in the states of the header. The collapsible is in the state
+ * `:expanded` while it is expanded, so that `Collapsible:expanded::header` styles the header of an open section. A click
+ * released on the header expands or collapses it, Enter and Space as well while it has the focus, Right expands it and
+ * Left collapses it; `on-toggle` tells true iif the user expanded it, not when `expanded:` or the code sets it.
+ *
+ * The children are laid out in a column under the header, each as high as its content, an auto width stretched to the
+ * content box: a collapsible is as high as its header and its children, as a section of a panel that scrolls.
+ * ====
+ * */
+pub class Collapsible over Layout {
+
+    // The header, the title after the marker
+    let dmut _header: &CollapsibleHeader;
+
+    // The children, laid out under the header while the collapsible is expanded
+    let dmut _childs: [&Widget] = [];
+
+    // The position and the size of the margin box of the header, then of each child, relative to the content box
+    let dmut _relPos: [vec2] = [];
+    let dmut _relSize: [vec2] = [];
+
+    // True iif the children are shown
+    let mut _expanded: bool = true;
+
+    // True iif the cursor is over the header, and while the left button holds it
+    let mut _headerHover: bool = false;
+    let mut _headerPressed: bool = false;
+
+    prot { // signals
+        let dmut _toggled: (&Signal!{bool})? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "Collapsible")
+        , _header = copy CollapsibleHeader(alias manager)
+    {
+        self:.setState("expanded", true);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SET/GET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Set the title written in the header
+     * */
+    pub fn setTitle(mut self, title: [c8]) {
+        self._header:.setText(title);
+        self:.relayout();
+    }
+
+    /**
+     * Expand or collapse the collapsible, without emitting its signal
+     * @params:
+     *    - expanded: true to show the children, false to take them out of the layout
+     * */
+    pub fn setExpanded(mut self, expanded: bool) {
+        if expanded == self._expanded { return; }
+
+        self._expanded = expanded;
+        self._header:.setExpanded(expanded);
+        self:.setState("expanded", expanded);
+        if self._attached {
+            self:.showChildren();
+            self._manager:.updateWidgets();
+        }
+    }
+
+    /**
+     * @returns: true iif the children are shown
+     * */
+    pub fn isExpanded(self)-> bool {
+        self._expanded
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHILDREN          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Insert a child after the others
+     * @warning: the child is disposed when the collapsible is disposed
+     * */
+    pub fn insertChild(mut self, dmut ch: &Widget) {
+        self._childs ~= [alias ch];
+        if self._attached {
+            ch:.onAttach((self)?);
+            if !self._expanded || !self.isDrawn() { ch:.hide(); }
+        }
+
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * @returns: the header, then the children
+     * */
+    pub over getChildren(mut self)-> dmut [&Widget] {
+        let dmut res: [&Widget] = [];
+        res ~= [alias self._header];
+        for dmut c in alias self._childs {
+            res ~= [alias c];
+        }
+
+        alias res
+    }
+
+    /**
+     * The children of a collapsible collapsed are attached hidden
+     * */
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self:.styleHeader();
+        if !self._expanded {
+            for dmut c in alias self._childs { c:.hide(); }
+        }
+    }
+
+    over onShow(mut self) {
+        self._header:.show();
+        if self._expanded {
+            for dmut c in alias self._childs { c:.show(); }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          STYLE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    prot over onApplyStyle(mut self) {
+        self:.styleHeader();
+    }
+
+    prot over restyleChildren(mut self, deep: bool)-> bool {
+        let layout = self.__super__:.restyleChildren(deep);
+        self:.styleHeader();
+        layout
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The header on top, stretched across the content box, then the children of a collapsible expanded, each as high as
+     * its content
+     * */
+    over onUpdateSize(mut self) {
+        let container = self._absoluteSize;
+        let dmut children = self:.getChildren();
+        self._relPos = copy [vec2(); children.len];
+        self._relSize = copy [vec2(); children.len];
+
+        let mut y = 0.0f;
+        for i, dmut c in alias children {
+            if i != 0us && !self._expanded { break; }
+
+            let margins = c.getMarginSize(container);
+            let width = c:.measureWidth(container, stretch-> true);
+            let height = c:.measureHeight(width, container, stretch-> false);
+            let size = makeVec2(width, height) + margins;
+
+            let (relPos, relSize) = self:.placeChild(alias c, self._absolutePosition + makeVec2(0.0f, y), size, self._depth + 1);
+            self._relPos[i] = relPos;
+            self._relSize[i] = relSize;
+            y += size.y;
+        }
+    }
+
+    over onUpdateScissors(mut self) {
+        let dmut children = self:.getChildren();
+        for i, dmut c in alias children {
+            if i < self._relPos.len {
+                self:.clipChild(alias c, self._relPos[i], self._relSize[i]);
+            }
+        }
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        let mut depth = max(self._depth, self._header.getMaxDepth());
+        if self._expanded {
+            for c in self._childs { depth = max(depth, c.getMaxDepth()); }
+        }
+
+        depth
+    }
+
+    /**
+     * The content of a collapsible is its header, above its children while it is expanded
+     * */
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        let (headerMin, headerMax) = self._header:.measureIntrinsicWidths();
+        let mut minWidth = headerMin, mut maxWidth = headerMax;
+        if self._expanded {
+            for dmut c in alias self._childs {
+                let (minW, maxW) = c:.measureIntrinsicWidths();
+                minWidth = max(minWidth, minW);
+                maxWidth = max(maxWidth, maxW);
+            }
+        }
+
+        (minWidth, maxWidth)
+    }
+
+    prot over measureContentHeights(mut self, width: f32)-> (f32, f32) {
+        let container = makeVec2(width, INDEFINITE_SIZE);
+        let headerWidth = self._header:.measureWidth(container, stretch-> true);
+        let (headerMin, headerMax) = self._header:.measureIntrinsicHeights(headerWidth);
+        let mut minHeight = headerMin, mut maxHeight = headerMax;
+        if self._expanded {
+            for dmut c in alias self._childs {
+                let w = c:.measureWidth(container, stretch-> true);
+                let (minH, maxH) = c:.measureIntrinsicHeights(w);
+                minHeight += minH;
+                maxHeight += maxH;
+            }
+        }
+
+        (minHeight, maxHeight)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The header takes the cursor over it, the children elsewhere
+     * */
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        if self.isOnHeader(pos) {
+            if let Ok(dmut w) = alias self._lastHover {
+                w:.onLoseHoverFocus();
+                self._lastHover = none;
+            }
+
+            self:.setHeaderStates(true, self._headerPressed);
+            return (alias self)?;
+        }
+
+        self:.setHeaderStates(false, self._headerPressed);
+        self.__super__:.onHover(pos)
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        self:.setHeaderStates(false, self._headerPressed);
+        self.__super__:.onLoseHoverFocus();
+    }
+
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if self.isOnHeader(pos) {
+            if button == SDL_BUTTON_LEFT {
+                self:.setHeaderStates(self._headerHover, true);
+            }
+
+            return (alias self)?;
+        }
+
+        self.__super__:.onClick(pos, button)
+    }
+
+    pub over onDoubleClick(mut self, pos: vec2)-> dmut (&Widget)? {
+        if self.isOnHeader(pos) {
+            return (alias self)?;
+        }
+
+        self.__super__:.onDoubleClick(pos)
+    }
+
+    /**
+     * A click of the left button released over the header expands or collapses the collapsible
+     * */
+    pub over onClickEnd(mut self, button: u8)-> dmut (&Widget)? {
+        if button == SDL_BUTTON_LEFT && self._headerPressed {
+            self:.setHeaderStates(self._headerHover, false);
+            if self._headerHover {
+                self:.toggleByUser(!self._expanded);
+            }
+        }
+
+        (alias self)?
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          KEYBOARD EVENTS          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over isFocusableByKeyboard(self)-> bool {
+        true
+    }
+
+    /**
+     * Enter and Space expand or collapse the collapsible, Right expands it and Left collapses it, without Ctrl, Alt or
+     * the GUI key
+     * */
+    pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
+        if (mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI)) != 0u16 { return false; }
+        if key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE {
+            self:.toggleByUser(!self._expanded);
+            return true;
+        }
+
+        if key == SDLK_RIGHT || key == SDLK_LEFT {
+            self:.toggleByUser(key == SDLK_RIGHT);
+            return true;
+        }
+
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted when the user expands or collapses the collapsible, with true iif it is now expanded
+     * */
+    pub fn toggled(mut self)-> dmut &Signal!{bool} {
+        if let Ok(dmut s) = alias self._toggled {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{bool} ();
+        self._toggled = (alias s)?;
+
+        alias s
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self.__super__:.dispose();
+            self._childs = [];
+
+            if let Ok(dmut s) = alias self._toggled {
+                s:.clear();
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Expand or collapse the collapsible as the user asked, emitting its signal when it changed
+     * */
+    fn toggleByUser(mut self, expanded: bool) {
+        if expanded == self._expanded { return; }
+
+        self:.setExpanded(expanded);
+        if let Ok(dmut s) = alias self._toggled {
+            s:.emit(expanded);
+        }
+    }
+
+    /**
+     * Show the children of a collapsible expanded and drawn, hide them otherwise
+     * */
+    fn showChildren(mut self) {
+        let shown = self._expanded && self.isDrawn();
+        for dmut c in alias self._childs {
+            if shown { c:.show(); } else { c:.hide(); }
+        }
+    }
+
+    /**
+     * Set the states of the header, styling it again when they changed
+     * @params:
+     *    - hover: true iif the cursor is over the header
+     *    - pressed: true iif the left button holds it
+     * */
+    fn setHeaderStates(mut self, hover: bool, pressed: bool) {
+        if hover == self._headerHover && pressed == self._headerPressed { return; }
+
+        self._headerHover = hover;
+        self._headerPressed = pressed;
+        self:.styleHeader();
+    }
+
+    /**
+     * Give the header and its marker the styles of the parts ::header and ::marker in the states of the header
+     */
+    fn styleHeader(mut self) {
+        if !self._attached { return; }
+
+        let mut states: [[c8]] = [];
+        if self._headerHover { states ~= ["hover"]; }
+        if self._headerPressed { states ~= ["pressed"]; }
+
+        let (header, marker) = if states.len == 0us {
+            (self._currentStyle.getSubStyle("header"), self._currentStyle.getSubStyle("marker"))
+        } else {
+            let path = self.getStylePath();
+            (self._manager:.getStyleManager().computePart(path, self._currentStyle, "header", states-> states),
+             self._manager:.getStyleManager().computePart(path, self._currentStyle, "marker", states-> states))
+        };
+
+        self._header:.setStyle(header);
+        self._header:.setMarkerStyle(marker);
+    }
+
+    /**
+     * @returns: true iif the cursor is over the header
+     * @params:
+     *    - pos: the position of the cursor relative to the collapsible
+     * */
+    fn isOnHeader(self, pos: vec2)-> bool {
+        if self._relPos.len == 0us { return false; }
+        if let Ok(inner) = self.isInPadding(pos) {
+            return self.isInSquare(inner, self._relPos[0], self._relPos[0] + self._relSize[0]).hasValue;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the child of a collapsible expanded under the cursor, and the position of the cursor relative to it
+     */
+    prot over mouseToWidget(mut self, pos: vec2, ref mut canBeSelf: bool)-> dmut (&Widget, vec2)? {
+        canBeSelf = true;
+        if !self._expanded { return none; }
+
+        if let Ok(inner) = self.isInPadding(pos) {
+            for i, dmut c in alias self._childs {
+                if i + 1us >= self._relPos.len { break; }
+
+                let a = self._relPos[i + 1us];
+                if let Ok(relPos) = self.isInSquare(inner, a, a + self._relSize[i + 1us]) {
+                    if let Ok(_) = c.isInBorder(relPos) {
+                        return (alias c, relPos)?;
+                    }
+                }
+            }
+        }
+
+        none
+    }
+}
+
+/**
+ * The collapsibles in a .gui file
+ * */
+pub mod Collapsible {
+
+    /**
+     * @returns: the schema of the collapsibles, their title being their default attribute, taking any number of
+     * children
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("Collapsible",
+                          |dmut m, id|-> dmut &Widget => copy Collapsible(alias m, id),
+                          attributes-> copy [copy Setter!{&Collapsible, [c8]}("title", |dmut c, t| => { c:.setTitle(t); }),
+                                             copy Setter!{&Collapsible, bool}("expanded", |dmut c, e| => { c:.setExpanded(e); })],
+                          defaultAttribute-> "title",
+                          children-> (copy Inserter!{&Collapsible}(|dmut c, dmut ch, _| => {
+                              c:.insertChild(alias ch);
+                          }))?,
+                          signals-> copy [copy Emitter!{&Collapsible, bool}("on-toggle", |dmut c|-> dmut &Signal!{bool} => alias c:.toggled())],
+                          states-> copy ["hover", "focus", "pressed", "expanded"],
+                          parts-> copy ["header", "marker"],
+                          partStates-> copy ["header" => copy ["hover", "pressed"], "marker" => copy ["hover", "pressed"]])
+    }
+}
