@@ -1,0 +1,246 @@
+in project_template;
+
+use balder::core::error;
+use balder::scene::description;
+use balder::utils::path;
+
+use std::fs;
+
+/**
+ * A template a new project starts from: a directory of the editor (editor/templates/…) whose files are copied in the
+ * directory of the project, their names and their contents filled
+ * @info:
+ * =====
+ * {{name}} is replaced by the name of the project, {{package}} by the name of its package (see packageOf), in the
+ * paths and in the contents of the files; a file or a directory whose name starts with '_' starts with a dot instead
+ * (_gitignore giving .gitignore), the git of the editor leaving the template alone; the scenes (.scene) take ids of
+ * their own. The project gets a gyllir.toml.override linking Balder to the engine of the editor (ignored by git, the
+ * link being local), so that it is built against the engine it is edited with.
+ * ====
+ * */
+pub class ProjectTemplate {
+
+    // The absolute path of the directory of the template
+    let _directory: [c8];
+
+    /**
+     * @params:
+     *    - directory: the absolute path of the directory of the template
+     * */
+    pub self (directory: [c8])
+        with _directory = directory
+    {}
+
+    /**
+     * Create a project from the template, in a directory that does not exist yet, or is empty
+     * @returns: the project created
+     * @params:
+     *    - name: the name of the project
+     *    - directory: the absolute path of the directory of the project
+     * @throws:
+     *    - &BalderError: if the name is not a name of a project (see ProjectTemplate::checkName), if the directory holds
+     *                    files, or if a file cannot be written, the files written before it being removed (and the
+     *                    directory, when the creation made it)
+     * */
+    pub fn create(self, name: [c8], directory: [c8])-> &Project
+        throws BalderError
+    {
+        ProjectTemplate::checkName(name);
+        let root = Path(directory);
+        let source = Path(self._directory);
+        if !isDir(source) {
+            throw copy BalderError(f"No template in ${self._directory}");
+        }
+
+        let created = !exists(root);
+        if !created && !isEmptyDir(root) {
+            throw copy BalderError(f"${directory} is not an empty directory");
+        }
+
+        let values = copy [("name", name), ("package", ProjectTemplate::packageOf(name))];
+        {
+            makeDir(root);
+            for entry in walkDir(source) {
+                let target = root.push(filledPath(entry.path.removePrefix(source), values));
+                if entry.kind == FsEntryKind::DIR {
+                    makeDir(target);
+                } else if entry.path.extension() == "scene" {
+                    makeDir(target.parent());
+                    SceneDescription::fromFile(entry.path.toStr()).withoutIds().save(target.toStr());
+                } else {
+                    makeDir(target.parent());
+                    let dmut f = File::open(entry.path);
+                    let text = f:.readAll();
+                    f:.close();
+                    utils::writeFile(target.toStr(), filled(text, values));
+                }
+            }
+
+            utils::writeFile(root.push("gyllir.toml.override").toStr(), overrideOf(getEnginePath().toStr()));
+            return copy Project::open(directory);
+        } catch {
+            err: &FsError => {
+                discard(root, created);
+                throw copy BalderError(f"The project could not be created in ${directory}: ${err}");
+            }
+            err: &BalderError => {
+                discard(root, created);
+                throw copy BalderError(err.msg);
+            }
+        }
+    }
+
+}
+
+/**
+ * The names of the projects and of their packages
+ * */
+pub mod ProjectTemplate {
+
+    /**
+     * Refuse a name of a project that is blank, or holding a quote, a backslash or a control character (it is written
+     * as a string in the toml files of the project)
+     * @throws:
+     *    - &BalderError: telling why the name is refused
+     * */
+    pub fn checkName(name: [c8])
+        throws BalderError
+    {
+        let mut blank = true;
+        for c in name {
+            if c == '"' || c == '\\' || c < ' ' {
+                throw copy BalderError("The name of a project holds no quote, no backslash and no control character");
+            }
+
+            if c != ' ' { blank = false; }
+        }
+
+        if blank {
+            throw copy BalderError("A project needs a name");
+        }
+    }
+
+    /**
+     * @returns: the name of the package of a project, of the library of the game and of its root module: the letters
+     * and the digits of the name of the project in lower case, the other characters becoming '_' (My Game giving
+     * my_game), 'game' for a name of none, prefixed by 'game_' when it starts with a digit
+     * */
+    pub fn packageOf(name: [c8])-> [c8] {
+        let mut res: [c8] = "";
+        let mut gap = false;
+        for c in name {
+            let lower = if c >= 'A' && c <= 'Z' { cast!c8(cast!u8(c) + 32u8) } else { c };
+            if (lower >= 'a' && lower <= 'z') || (lower >= '0' && lower <= '9') {
+                if gap && res.len != 0us { res ~= "_"; }
+                res ~= [lower];
+                gap = false;
+            } else {
+                gap = true;
+            }
+        }
+
+        if res.len == 0us { return "game"; }
+        if res[0] >= '0' && res[0] <= '9' { return "game_" ~ res; }
+        res
+    }
+
+}
+
+/**
+ * @returns: the text of a file of a template, each {{key}} of the values replaced by its value
+ * */
+fn filled(text: [c8], values: [([c8], [c8])])-> [c8] {
+    let mut res: [c8] = "";
+    let mut i = 0us;
+    while i < text.len {
+        let mut matched = false;
+        for v in values {
+            let tag = "{{" ~ v._0 ~ "}}";
+            if i + tag.len <= text.len && text[i .. i + tag.len] == tag {
+                res ~= v._1;
+                i += tag.len;
+                matched = true;
+                break;
+            }
+        }
+
+        if !matched {
+            res ~= [text[i]];
+            i += 1us;
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the path in the project of a file of a template, relative to their directories: its parts filled, a part
+ * starting with '_' starting with a dot instead
+ * */
+fn filledPath(path: Path, values: [([c8], [c8])])-> Path {
+    let mut res = Path("");
+    for part in path.parts() {
+        let f = filled(part, values);
+        let name = if f.len != 0us && f[0] == '_' { "." ~ f[1us .. $] } else { f };
+        res = if res.isEmpty() { Path(name) } else { res.push(name) };
+    }
+
+    res
+}
+
+/**
+ * @returns: the content of the gyllir.toml.override of a project, linking Balder to the engine at a directory
+ * */
+fn overrideOf(engine: [c8])-> [c8] {
+    "# The engine the project is edited with, local to this machine: ignored by git\n"
+        ~ "[dependencies]\n"
+        ~ f"Balder = {version = \"*\", url = {local = ${utils::quoted(engine)}}}\n"
+}
+
+/**
+ * Create a directory and the directories above it, unless it exists
+ * @throws:
+ *    - &FsError: if it cannot be created
+ * */
+fn makeDir(dir: Path)
+    throws FsError
+{
+    if !isDir(dir) {
+        createDir(dir, recursive-> true);
+    }
+}
+
+/**
+ * Remove what a creation that failed wrote: the directory of the project when the creation made it, its entries
+ * otherwise (it was empty), what cannot be removed staying
+ * */
+fn discard(root: Path, created: bool) {
+    {
+        if created {
+            removeDir(root, recursive-> true);
+        } else {
+            for e in readDir(root) {
+                if e.kind == FsEntryKind::DIR { removeDir(e.path, recursive-> true); } else { removeFile(e.path); }
+            }
+        }
+    } catch {
+        _ => {}
+    }
+}
+
+/**
+ * @returns: true iif a path is a directory holding no entry, false when it is a file or cannot be read
+ * */
+fn isEmptyDir(dir: Path)-> bool {
+    if !isDir(dir) { return false; }
+
+    {
+        for _ in readDir(dir) {
+            return false;
+        }
+
+        true
+    } catch {
+        _ => { false }
+    }
+}

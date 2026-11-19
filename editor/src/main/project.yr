@@ -1,55 +1,214 @@
 in project;
 
-use balder::utils::path;
+pub mod ::recent;
+pub mod ::recent_project;
+pub mod ::project_template;
+mod ::utils;
 
-use std::{config, config::args, io};
+use balder::core::error;
+
+use std::algorithm::sorting;
 use std::fs;
 
 /**
- * The scene file the editor opens at the start, set by '--scene', empty for a new scene
+ * A game made with Balder: a directory holding project.toml, the gyllir.toml of the library of the game (its actors,
+ * later on) and res/, the files the paths res:/ name (its scenes, its models...)
+ * @info:
+ * =====
+ * project.toml names the project, its scenes by name (the game loading a scene by its name, the export knowing the
+ * scenes it ships) and the scene the game starts with:
+ * ```
+ * name = "My game"
+ * main-scene = "main"
+ *
+ * [scenes]
+ * main = "res:/scenes/main.scene"
+ * ```
+ * A scene of the project saved by the editor joins its scenes, named after its file; the first one is its main scene.
+ * The file is written the same for the same project, its scenes in the order of their names.
+ * ====
  * */
-lazy mut __SCENE__: [mut [c8]] = copy [""];
+pub class Project {
 
-/**
- * @returns: the path of a file of the editor, under the project directory
- * */
-pub fn editorFile(name: [c8])-> [c8] {
-    getProjectPath().push("editor").push(name).toStr()
-}
+    // The absolute path of the directory of the project
+    let _directory: [c8];
 
-/**
- * @returns: the scene file the editor opens at the start, empty for a new scene
- * */
-pub fn startScene()-> [c8] {
-    __SCENE__[0]
-}
+    // The name of the project
+    let mut _name: [c8];
 
-/**
- * Read the command line, '--work-dir' moving the project directory the 'res:/' and 'shaders:/' paths are resolved
- * against, '--scene' naming the scene file to open
- * @returns: false iif the application must not start
- * */
-pub fn readArguments(args: [[c8]])-> bool {
-    let parser = (copy ArgumentParser)
-        :.help("help", short-> "h", comments-> "print this help and exit")
-        :.option!{[c8]} ("work-dir", comments-> "the directory holding res/ and editor/ (the current directory by default)")
-        :.option!{[c8]} ("scene", comments-> "the scene file to open (a new scene by default)");
+    // The scenes of the project, their paths (res:/…) by name
+    let dmut _scenes: [[c8] => [c8]] = copy [];
 
+    // The name of the scene the game starts with, empty when the project has no scene
+    let mut _mainScene: [c8] = "";
+
+    /**
+     * A project of no scene yet
+     * @params:
+     *    - directory: the absolute path of its directory
+     *    - name: its name
+     * */
+    pub self (directory: [c8], name: [c8])
+        with _directory = directory
+        , _name = name
+    {}
+
+    /**
+     * Read the project of a directory, from its project.toml
+     * @params:
+     *    - directory: the absolute path of the directory of the project
+     * @throws:
+     *    - &BalderError: if the directory holds no project.toml, or one that cannot be read, its message telling why
+     * */
+    pub self open(directory: [c8])
+        with _directory = directory
+        , _name = ""
+        throws BalderError
     {
-        let cfg = parser.parse(args);
-        if let Ok(Str(value-> dir)) = cfg["work-dir"]? {
-            setProjectPath(Path(dir));
+        let file = Path(directory).push(Project::FILE).toStr();
+        let cfg = utils::readToml(file);
+
+        self._name = utils::stringOf(cfg, "name", file);
+        self._mainScene = utils::stringOf(cfg, "main-scene", file, optional-> true);
+        if let Ok(scenes) = cfg["scenes"]? {
+            for s in utils::stringsOf(scenes, "scenes", file) {
+                self._scenes[s._0] = dcopy s._1;
+            }
         }
 
-        if let Ok(Str(value-> scene)) = cfg["scene"]? {
-            __SCENE__[0] = scene;
-        }
-
-        true
-    } catch {
-        err: &std::config::args::CommandLineError => {
-            eprintln(parser.explain(err, usage-> "balder-editor"));
-            false
+        if self._mainScene.len != 0us && self._mainScene !in self._scenes {
+            throw copy BalderError(f"${file}: the main scene '${self._mainScene}' is not one of the [scenes]");
         }
     }
+
+    /**
+     * @returns: the absolute path of the directory of the project
+     * */
+    @field
+    pub fn directory(self)-> [c8] {
+        self._directory
+    }
+
+    /**
+     * @returns: the name of the project
+     * */
+    @field
+    pub fn name(self)-> [c8] {
+        self._name
+    }
+
+    /**
+     * @returns: the name of the scene the game starts with, empty when the project has no scene
+     * */
+    @field
+    pub fn mainScene(self)-> [c8] {
+        self._mainScene
+    }
+
+    /**
+     * @returns: the scenes of the project, their names and their paths (res:/…), in the order of their names
+     * */
+    @field
+    pub fn scenes(self)-> [([c8], [c8])] {
+        let dmut res: [([c8], [c8])] = [];
+        for name, path in self._scenes {
+            res ~= [(copy name, copy path)];
+        }
+
+        sort(alias res, |x, y| => { x._0 < y._0 });
+        res
+    }
+
+    /**
+     * @returns: the path (res:/…) of the scene the game starts with, none when the project has no scene
+     * */
+    pub fn mainScenePath(self)-> ([c8])? {
+        self._scenes[self._mainScene]
+    }
+
+    /**
+     * @returns: the name of a scene of the project, none when the path is not one of its scenes
+     * @params:
+     *    - path: the path of the scene, as the project names it (res:/…)
+     * */
+    pub fn sceneNamed(self, path: [c8])-> ([c8])? {
+        for name, p in self._scenes if p == path {
+            return name?;
+        }
+
+        none
+    }
+
+    /**
+     * Put a scene in the project, named after its file (a free name when another scene has it), the main scene when the
+     * project had none
+     * @returns: the name of the scene, the one it had when it is in the project already
+     * @params:
+     *    - path: the path of the scene, under the res/ directory of the project (res:/…)
+     * */
+    pub fn addScene(mut self, path: [c8])-> [c8] {
+        if let Ok(name) = self.sceneNamed(path) { return name; }
+
+        let base = Path(path).stripExtension().file();
+        let mut name = base;
+        let mut i = 2us;
+        while name in self._scenes {
+            name = f"${base}_${i}";
+            i += 1us;
+        }
+
+        self._scenes[name] = dcopy path;
+        if self._mainScene.len == 0us { self._mainScene = name; }
+
+        name
+    }
+
+    /**
+     * @returns: the content of the project.toml of the project, the same for the same project
+     * */
+    pub fn content(self)-> [c8] {
+        let mut text = "# The project of a game made with Balder: its name, its scenes by name and the scene the game starts with\n";
+        text ~= f"name = ${utils::quoted(self._name)}\n";
+        if self._mainScene.len != 0us {
+            text ~= f"main-scene = ${utils::quoted(self._mainScene)}\n";
+        }
+
+        text ~= "\n[scenes]\n";
+        for s in self.scenes {
+            text ~= f"${utils::key(s._0)} = ${utils::quoted(s._1)}\n";
+        }
+
+        text
+    }
+
+    /**
+     * Write the project.toml of the project, replacing the one there
+     * @throws:
+     *    - &BalderError: if the file cannot be written
+     * */
+    pub fn save(self)
+        throws BalderError
+    {
+        utils::writeFile(Path(self._directory).push(Project::FILE).toStr(), self.content());
+    }
+
+}
+
+/**
+ * The file describing a project
+ * */
+pub mod Project {
+
+    /**
+     * The name of the file describing a project, at the root of its directory
+     * */
+    pub def FILE = "project.toml";
+
+    /**
+     * @returns: true iif a directory holds a project, its project.toml
+     * */
+    pub fn isProject(directory: [c8])-> bool {
+        isFile(Path(directory).push(FILE))
+    }
+
 }

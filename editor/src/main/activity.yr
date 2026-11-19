@@ -1,7 +1,8 @@
 in activity;
 
-use main::{command, editor, hulls_panel, inspector_panel, naming, outline_panel, project, viewport};
+use main::{arguments, command, editor, hulls_panel, inspector_panel, manager, naming, outline_panel, project, viewport};
 use main::command::{add, duplicate, open, remove, transform, volume, wrap};
+use main::project::recent;
 use balder::core::{_, application::_};
 use balder::interface::dialog;
 use balder::interface::widget::{button::menu, button::push, layout::d3scene, text::label, tree::view};
@@ -12,15 +13,15 @@ use balder::scene::node;
 use balder::scene::node::node3D;
 use balder::scene::node::node3D::{light, marker, path, path_point, volume_shape};
 use balder::scene::node::node3D::camera::flight;
-use balder::utils::log;
+use balder::utils::{log, path};
 
 use std::io;
 use std::fs;
 
 use ::sdl3::_;
 
-// The scene a new scene starts from, under the directory of the editor
-def NEW_SCENE = "scenes/new.scene";
+// The configuration of the window of the project manager, under the directory of the editor
+def MANAGER_CONFIG = "manager.toml";
 
 // The extension of the scene files
 def SCENE_EXTENSION = "scene";
@@ -45,7 +46,8 @@ enum Pending : u8
 | NOTHING = 0u8
 | NEW     = 1u8
 | OPEN    = 2u8
-| QUIT    = 3u8;
+| QUIT    = 3u8
+| MANAGER = 4u8;
 
 
 /**
@@ -53,16 +55,27 @@ enum Pending : u8
  * selected on the right, under a menu bar opening, saving, adding, copying and removing nodes, above a status bar
  * @info:
  * =====
+ * The editor edits a project (see Project), the one of the project path (getProjectPath), opened by the project
+ * manager or by '--project': it starts on the scene of the project edited last, or on its main scene, or on a new
+ * scene. A scene saved under the res/ directory of the project joins its scenes, named after its file, and the path of
+ * a scene or a model under it is written res:/…, the project moving with its files. Scene → Back to the project
+ * manager closes the editor for the manager.
+ * ====
+ * @info:
+ * =====
  * Every change of the scene is a command run through the SceneEditor, which keeps their history; the viewport, focused
  * by a click, takes the keys W, E and R (the gizmo), Delete, Ctrl+D and F, the window Ctrl+Z (undo), Ctrl+Shift+Z and
  * Ctrl+Y (redo), Ctrl+S (save), Ctrl+Shift+S (save as) and Ctrl+E (the Add menu, under the cursor). The items Undo and Redo of the Edit menu name the change they
  * undo or redo.
  * The scene has unsaved changes while its history is not where it was at the last save (a change made, or undone),
- * shown in the title of the window and on the right of the status bar. A new scene, started from scenes/new.scene, has no file yet: its first save asks for one. New, Open
- * and Quit ask whether to save the changes first, or discard them, or do nothing.
+ * shown in the title of the window and on the right of the status bar. A new scene, blank, has no file yet: its first
+ * save asks for one. New, Open and Quit ask whether to save the changes first, or discard them, or do nothing.
  * ====
  * */
 pub class EditorActivity over Activity {
+
+    // The project edited, once read
+    let dmut _project: (&Project)? = none;
 
     // The editor of the scene, once the interface is loaded
     let dmut _editor: (&SceneEditor)? = none;
@@ -76,10 +89,13 @@ pub class EditorActivity over Activity {
     // The label telling the file of the scene and whether it has unsaved changes
     let dmut _document: (&Label)? = none;
 
-    // The directory of the file chosen last, the file dialogs starting from it
+    // The directory of the scene file chosen last, the dialogs of the scenes starting from it
     let mut _directory: [c8] = "";
 
-    // The file of the scene, where it is saved, empty for a new scene
+    // The directory of the model chosen last, the dialog adding a model starting from it, empty before the first one
+    let mut _modelDirectory: [c8] = "";
+
+    // The file of the scene, where it is saved, empty for a new scene; res:/… under the res/ directory of the project
     let mut _path: [c8] = "";
 
     // The speeds of the flights of the viewport in the scene files opened, by their path, each scene flown at its own
@@ -99,13 +115,14 @@ pub class EditorActivity over Activity {
     over onStart(mut self) {
         self.input:.quit():.connect(self.box, &self:.onQuit);
         self.input:.keyPressed():.connect(self.box, &self:.onKey);
-        self._directory = editorFile("scenes");
+        self._directory = projectDirectory("scenes");
 
         // the slots the 'on-…' attributes of editor.gui name: the menus, the outline and the inspector
         self:.slot("scene::new", &self:.onNewClicked);
         self:.slot("scene::open", &self:.onOpenClicked);
         self:.slot("scene::save", &self:.onSaveClicked);
         self:.slot("scene::save-as", &self:.onSaveAsClicked);
+        self:.slot("scene::manager", &self:.onManagerClicked);
         self:.slot("scene::quit", &self:.onQuitClicked);
         self:.slot("add::cube", &self:.onAddCube);
         self:.slot("add::sphere", &self:.onAddSphere);
@@ -185,11 +202,114 @@ pub class EditorActivity over Activity {
             return;
         }
 
-        let scene = startScene();
+        self:.openProject();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PROJECT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the project of the project path, put it first in the recent projects, and open its first scene: the one of
+     * the command line, or the scene edited last, or the main scene, or a new scene
+     * */
+    fn openProject(mut self) {
+        let directory = getProjectPath().toStr();
+        {
+            let dmut project = copy Project::open(directory);
+            self._project = (alias project)?;
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to read the project", err);
+                self:.setStatus(err.msg);
+            }
+        }
+
+        let dmut recent = copy RecentProjects();
+        recent:.opened(directory);
+        self:.saveRecent(recent);
+
+        let scene = self.firstScene(recent.sceneOf(directory));
         if scene.len == 0us {
-            self:.openScene(editorFile(NEW_SCENE), fromTemplate-> true);
+            self:.newScene();
         } else {
             self:.openScene(scene);
+        }
+    }
+
+    /**
+     * @returns: the scene the editor starts on, empty for a new scene: the one of the command line, or the scene of the
+     * project edited last, or its main scene, the first one whose file exists
+     * @params:
+     *    - edited: the scene of the project edited last, empty when none was
+     * */
+    fn firstScene(self, edited: [c8])-> [c8] {
+        let given = startScene();
+        if given.len != 0us { return given; }
+
+        let mut candidates: [[c8]] = copy [edited];
+        if let Ok(p) = self._project {
+            if let Ok(main) = p.mainScenePath() { candidates ~= [main]; }
+        }
+
+        for s in candidates if s.len != 0us && isFile(projectPath(s)) {
+            return s;
+        }
+
+        ""
+    }
+
+    /**
+     * Keep the scene of the project edited last, the one the editor starts on next time
+     * */
+    fn keepEdited(mut self, path: [c8]) {
+        if path.len == 0us { return; }
+
+        let dmut recent = copy RecentProjects();
+        recent:.edited(getProjectPath().toStr(), path);
+        self:.saveRecent(recent);
+    }
+
+    /**
+     * Put a scene saved in the scenes of the project, when it is under its res/ directory
+     * @returns: the name of the scene in the project, none when it is not under its res/ directory
+     * */
+    fn addToProject(mut self, path: [c8])-> ([c8])? {
+        if !CustomPathQualifiers::RESSOURCES.isPrefix(Path(path)) { return none; }
+
+        if let Ok(dmut p) = alias self._project {
+            if let Ok(name) = p.sceneNamed(path) { return name?; }
+
+            let name = p:.addScene(path);
+            {
+                p.save();
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "Failed to save the project", err);
+                    self:.setStatus(err.msg);
+                }
+            }
+
+            return name?;
+        }
+
+        none
+    }
+
+    /**
+     * Write the recent projects, logging why they cannot be
+     * */
+    fn saveRecent(mut self, recent: &RecentProjects) {
+        {
+            recent.save();
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to save the recent projects", err);
+            }
         }
     }
 
@@ -219,6 +339,10 @@ pub class EditorActivity over Activity {
 
     fn onQuitClicked(mut self, b: u8) {
         if b == SDL_BUTTON_LEFT { self:.ask(Pending::QUIT); }
+    }
+
+    fn onManagerClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.ask(Pending::MANAGER); }
     }
 
     /**
@@ -251,19 +375,27 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Replace the nodes of the scene by those of a scene file, the viewport looking at them
-     * @params:
-     *    - fromTemplate: true for the scene a new scene starts from, whose nodes take ids of their own and which is saved
-     *                    in a file of its own
+     * Replace the nodes of the scene by none, a new scene starting blank, saved in a file of its own
      * */
-    fn openScene(mut self, path: [c8], fromTemplate: bool = false) {
+    fn newScene(mut self) {
+        let nodes: [NodeDescription] = [];
+        if self:.run(copy OpenCommand(copy SceneDescription(nodes), "a new scene")) {
+            self:.keepFlightPace("");
+            self._path = "";
+        }
+    }
+
+    /**
+     * Replace the nodes of the scene by those of a scene file
+     * */
+    fn openScene(mut self, path: [c8]) {
         {
-            let file = copy SceneDescription::fromFile(path);
-            let description = if fromTemplate { file.withoutIds() } else { file };
-            if self:.run(copy OpenCommand(description, if fromTemplate { "a new scene" } else { Path(path).file() })) {
-                let opened = if fromTemplate { "" } else { path };
+            let description = copy SceneDescription::fromFile(path);
+            if self:.run(copy OpenCommand(description, Path(path).file())) {
+                let opened = qualifiedPath(path);
                 self:.keepFlightPace(opened);
                 self._path = opened;
+                self:.keepEdited(opened);
             }
         } catch {
             err: &BalderError => {
@@ -311,6 +443,7 @@ pub class EditorActivity over Activity {
         let question = match then {
             Pending::NEW  => { "before starting a new scene?" }
             Pending::OPEN => { "before opening another scene?" }
+            Pending::MANAGER => { "before going back to the project manager?" }
             _             => { "before quitting?" }
         };
 
@@ -341,11 +474,29 @@ pub class EditorActivity over Activity {
     fn proceed(mut self, then: Pending) {
         self._pending = Pending::NOTHING;
         match then {
-            Pending::NEW  => { self:.openScene(editorFile(NEW_SCENE), fromTemplate-> true); }
+            Pending::NEW  => { self:.newScene(); }
             Pending::OPEN => { self:.chooseScene(); }
             Pending::QUIT => { self.app:.close(alias self); }
+            Pending::MANAGER => { self:.openManager(); }
             _ => {}
         }
+    }
+
+    /**
+     * Open the project manager, the editor closing
+     * */
+    fn openManager(mut self) {
+        {
+            self.app:.open!{&ProjectManagerActivity}(copy BalderConfig(editorFile(MANAGER_CONFIG)));
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to open the project manager", err);
+                self:.setStatus(err.msg);
+                return;
+            }
+        }
+
+        self.app:.close(alias self);
     }
 
     /**
@@ -362,7 +513,7 @@ pub class EditorActivity over Activity {
         self._asking = false;
         if let Ok(p) = path {
             self._directory = Path(p).parent().toStr();
-            self:.openScene(p);
+            self:.openScene(qualifiedPath(p));
         }
     }
 
@@ -397,7 +548,7 @@ pub class EditorActivity over Activity {
         if let Ok(chosen) = path {
             let p = if Path(chosen).extension() == SCENE_EXTENSION { chosen } else { chosen ~ "." ~ SCENE_EXTENSION };
             self._directory = Path(p).parent().toStr();
-            if self:.write(p) {
+            if self:.write(qualifiedPath(p)) {
                 self:.proceed(self._pending);
             }
         } else {
@@ -426,8 +577,16 @@ pub class EditorActivity over Activity {
 
         self._path = path;
         e:.markSaved();
+        self:.keepEdited(path);
         self:.showDocument();
-        self:.setStatus("Saved " ~ Path(path).file());
+
+        let file = Path(path).file();
+        if let Ok(name) = self:.addToProject(path) {
+            self:.setStatus(f"Saved ${file}, the scene '${name}' of the project");
+        } else {
+            self:.setStatus(f"Saved ${file}, outside the res/ folder of the project: not one of its scenes");
+        }
+
         true
     }
 
@@ -439,7 +598,8 @@ pub class EditorActivity over Activity {
         let unsaved = self.unsaved();
         let name = self.documentName();
         let mark = if unsaved { "*" } else { "" };
-        self.window:.setName(f"${name}${mark} - Balder editor");
+        let project = if let Ok(p) = self._project { p.name } else { "no project" };
+        self.window:.setName(f"${name}${mark} - ${project} - Balder editor");
 
         if let Ok(dmut l) = alias self._document {
             let file = if self._path.len == 0us { "New scene, not saved yet" } else { self._path };
@@ -661,7 +821,8 @@ pub class EditorActivity over Activity {
     fn onAddModel(mut self, b: u8) {
         if b != SDL_BUTTON_LEFT { return; }
 
-        let dmut d = copy FileDialog(FileDialogMode::OPEN, directory-> self._directory, filters-> modelExtensions(),
+        let directory = if self._modelDirectory.len != 0us { self._modelDirectory } else { projectDirectory("models") };
+        let dmut d = copy FileDialog(FileDialogMode::OPEN, directory-> directory, filters-> modelExtensions(),
                                      title-> "Add a model");
         d:.answered():.connect(self.box, &self:.onModelChosen);
         self:.openDialog(alias d);
@@ -670,10 +831,10 @@ pub class EditorActivity over Activity {
     fn onModelChosen(mut self, path: ([c8])?) {
         self._asking = false;
         if let Ok(p) = path {
-            self._directory = Path(p).parent().toStr();
+            self._modelDirectory = Path(p).parent().toStr();
 
             let mut model = NodeDescription(Path(p).stripExtension().file(), NodeKind::MODEL);
-            model.file = p;
+            model.file = qualifiedPath(p);
             self:.add(model, lift-> 0.0f);
         }
     }
@@ -1023,6 +1184,14 @@ pub class EditorActivity over Activity {
  * */
 fn sceneExtensions()-> [[c8]] {
     copy [SCENE_EXTENSION]
+}
+
+/**
+ * @returns: the absolute path of a directory under the res/ directory of the project, res/ itself when it does not exist
+ * */
+fn projectDirectory(name: [c8])-> [c8] {
+    let dir = ressourcePath().push(name);
+    if isDir(dir) { dir.toStr() } else { ressourcePath().toStr() }
 }
 
 /**
