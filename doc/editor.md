@@ -1,21 +1,71 @@
 # The editor
 
-The editor of Balder lives in `editor/`, beside the library, as the start of a game engine editor: the outline of the
-scene on the left, its viewport in the middle, the inspector of the node selected on the right, under a menu bar and
-above a status bar.
+The editor of Balder lives in `editor/`, beside the library, as the start of a game engine editor. It edits a
+project: it opens on the project manager, then the editor window shows the outline of the scene on the left, its
+viewport in the middle and the inspector of the node selected on the right, under a menu bar and above a status bar.
 
 ```
 gyllir build editor
-./balder-editor                          # a new scene, editor/scenes/new.scene
-./balder-editor --scene path/to/a.scene  # a scene file
+target/bin/balder-editor                                       # the project manager
+target/bin/balder-editor --project path/to/game                # the editor, on a project
+target/bin/balder-editor --project path/to/game --scene res:/scenes/level.scene
+target/bin/balder-editor --engine-dir path/to/balder           # run from elsewhere than the engine's directory
 ```
 
 | Directory | Holds |
 |---|---|
 | `editor/src` | the sources, the target `editor` of `gyllir.toml` (built as `balder-editor`) |
 | `editor/ui` | the `.gui` and the `.style` files of its interface |
-| `editor/scenes` | `new.scene`, the scene a new scene starts from |
-| `editor/editor.toml` | the configuration of its window |
+| `editor/templates` | the templates a new project starts from (`empty`) |
+| `editor/editor.toml`, `editor/manager.toml` | the configurations of the window of the editor and of the project manager |
+
+## Projects
+
+A project is a game made with Balder, a directory as Godot or Unreal have one:
+
+```
+my_game/
+    project.toml             # its name, its scenes by name, the scene the game starts with
+    gyllir.toml              # the library of the game, depending on Balder
+    gyllir.toml.override     # the link of Balder to the engine of the editor, local, ignored by git
+    src/my_game.yr           # the root module of the library: the actor classes, later on (BAL-128)
+    res/scenes/main.scene    # its files, named res:/… (scenes, models, textures...)
+    .gitignore
+```
+
+```
+# The project of a game made with Balder: its name, its scenes by name and the scene the game starts with
+name = "My game"
+main-scene = "main"
+
+[scenes]
+main = "res:/scenes/main.scene"
+```
+
+The scenes are named, the game loading a scene by its name and the export knowing the scenes it ships. A project has
+no `main`: its library holds what the game adds to the engine, and the export (BAL-138) builds the executable around
+it, as Unreal's launcher module runs the module of a game.
+
+- **Paths.** `res:/` names the files of the project (`setProjectPath`), `engine:/` and `shaders:/` the files of the
+  engine (`setEnginePath`): its shaders, the files of its dialogs, its fonts, its images and its tables of colours. The
+  two are the same directory unless one moves, the examples and the tests running from the engine's directory; the
+  fonts of the project are registered before the engine's (`FontRegistry::ENGINE_FONT_DIR`). The editor moves the
+  project path to the project it opens, its own files staying under the engine's directory (`--engine-dir`). A scene or
+  a model chosen under the `res/` of the project is written `res:/…` (`qualifiedPath`), so that the project moves with
+  its files.
+- **The project manager** (`ProjectManagerActivity`) is the first window: the projects opened last, their names, their
+  folders and when they were opened, the one opened last first (a project whose `project.toml` is gone listed as
+  missing). A double click, Enter or *Open* opens one, the manager closing for the editor window; *New project…* asks
+  for a name and a location, and creates the project in a new folder of the location named after it (`My Game` in
+  `my_game`) from the template `editor/templates/empty` (`ProjectTemplate`: `{{name}}` and `{{package}}` filled in the
+  names and the contents of its files, a name starting with `_` starting with a dot, the scenes given ids of their
+  own); *Import…* opens the folder of a project; *Remove from the list* forgets one, its files staying. The list is kept
+  in `$XDG_CONFIG_HOME/balder/projects.toml` (`~/.config/balder/projects.toml`, `RecentProjects`), with the scene of
+  each project edited last and the location of the last project created.
+- **The editor** opens on the scene of the project edited last, or on its main scene, or on a new scene. A scene saved
+  under `res/` joins the scenes of the project, named after its file (`level_2` when `level` is taken), the first one
+  becoming its main scene; a scene saved elsewhere is not one of its scenes. The title tells the scene and the project.
+  *Scene → Back to the project manager* closes the editor for the manager, asking first about the unsaved changes.
 
 ## Using it
 
@@ -95,8 +145,8 @@ gyllir build editor
   layer of the debug lines of the scene (*Show the hulls* hides them). The editor does not decompose the models: the
   export of a project will (BAL-138), the `decompose` tool meanwhile; a model without hulls saved gives a body the hull
   of each of its meshes (`SolidObjectModel::hulls`) (`HullsPanel`).
-- **Menus**: *Scene* opens a new scene or a scene file and saves the scene (Ctrl+S) or saves it in another file
-  (Ctrl+Shift+S), *Add* adds a cube, a sphere, a plane, a model read from a
+- **Menus**: *Scene* opens a new scene or a scene file, saves the scene (Ctrl+S) or saves it in another file
+  (Ctrl+Shift+S), and goes back to the project manager, *Add* adds a cube, a sphere, a plane, a model read from a
   file, an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
   box), a character or a light where the centre of the viewport meets a surface (or at the point the camera looks at),
   a point to the path selected, or a body around each node selected, its kinds grouped in submenus opening as they are
@@ -109,9 +159,10 @@ gyllir build editor
 
 - **Saving**: a change marks the scene as unsaved, by a `*` in the title of the window and on the right of the status
   bar, which tells the file of the scene, until it is saved; undoing the changes made since the last save marks it
-  saved again. A new scene has no file yet: its first save asks for one,
-  given the extension `.scene` when it has none. New, Open and Quit (from the menu or by closing the window) ask
-  whether to save the changes first, to discard them, or to do nothing.
+  saved again. A new scene starts blank, and has no file yet: its first save asks for one, in the `res/scenes` of the
+  project, given the extension `.scene` when it has none. New, Open, Back to the project manager and Quit (from the menu or by
+  closing the window) ask whether to save the changes first, to discard them, or to do nothing. The file dialogs create
+  a folder (*New folder*) in the folder they show.
 
 The nodes named `__…__` belong to the editor (its camera, the gizmo, the icons): they are neither shown, nor removed with the
 scene, nor saved.
@@ -218,7 +269,8 @@ An asset is `asset <key> model "<path>";`, the path a `res:/…` or an absolute 
 the same nodes, so a scene diffs well under version control: the assets in the order of their paths, keyed by the name
 of their file; the nodes parents first, siblings in their order; the entries of a node in the order of
 the table, those holding their default left out (a body writes the entries of its shape only); each number the shortest decimal reading back the same float. A scene
-started from a template (`editor/scenes/new.scene`) gives its nodes ids of their own (`SceneDescription.withoutIds`).
+started from a template (the main scene of a new project, see `ProjectTemplate`) gives its nodes ids of their own
+(`SceneDescription.withoutIds`).
 
 The file is the source of a scene, the one edited and versioned; the game will load a binary file cooked from it
 (BAL-187).
