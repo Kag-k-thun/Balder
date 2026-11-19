@@ -69,6 +69,11 @@ it, as Unreal's launcher module runs the module of a game.
 
 ## Using it
 
+- **Grid**: a grid in metres lies on the ground (y = 0), a unit of the world being a metre: a line every step, every
+  tenth line stronger, the X axis red and the Z axis blue. The step follows the height of the eye, a power of ten
+  (10 cm, 1 m, 10 m...), told on the right of the status bar (`Grid: 1 m`); the grid is centred under the eye, fades
+  away from it, and is hidden by the nodes standing over it (`GroundGrid`, drawn in the debug lines of the scene).
+  *View → Hide the grid* hides it. Where nothing is drawn, a scene without an environment shows a grey.
 - **Viewport**: a click selects the node under the cursor (Ctrl toggles it), the middle button turns the camera around
   the point it looks at, Shift and the middle button slide it, the wheel brings it closer. Once clicked, the viewport
   takes the keys W, E and R (translate, rotate, scale, the key of the mode in use switching between the world and the
@@ -152,7 +157,7 @@ it, as Unreal's launcher module runs the module of a game.
   a point to the path selected, or a body around each node selected, its kinds grouped in submenus opening as they are
   hovered (*Mesh*, *Light*, *Marker*, *Path*, *Volume*, *Physics*), and Ctrl+E opening it under the cursor,
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
-  frames the selection, and *View* hides or shows the icons.
+  frames the selection, and *View* hides or shows the icons and the grid.
 - **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
   scene is undone, the nodes selected before it being selected again; the steps of one field of the inspector (its
   arrows clicked, its keys held, its wheel turned) are undone as one change. Opening a scene starts the history again.
