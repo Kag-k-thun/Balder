@@ -1,7 +1,7 @@
 in activity;
 
 use main::{arguments, command, editor, hulls_panel, inspector_panel, manager, naming, outline_panel, project, viewport};
-use main::command::{add, duplicate, open, remove, transform, volume, wrap};
+use main::command::{add, duplicate, open, projection, remove, transform, volume, wrap};
 use main::project::recent;
 use balder::core::{_, application::_};
 use balder::interface::dialog;
@@ -11,7 +11,7 @@ use balder::scene::{description::_, editable};
 use balder::scene::gizmo::mode;
 use balder::scene::node;
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::{light, marker, path, path_point, volume_shape};
+use balder::scene::node::node3D::{camera, light, marker, path, path_point, volume_shape};
 use balder::scene::node::node3D::camera::flight;
 use balder::utils::{log, path};
 
@@ -35,6 +35,9 @@ def ICONS_ITEM = "BAR/VIEW/ICONS";
 
 // The path of the item of the View menu showing and hiding the grid of the ground
 def GRID_ITEM = "BAR/VIEW/GRID";
+
+// The path of the item of the View menu looking through the camera selected, or through the camera of the editor again
+def THROUGH_ITEM = "BAR/VIEW/THROUGH";
 
 // The colour seen where nothing is drawn while the scene has no environment, a grey (linear, exposed and tone mapped
 // with the scene)
@@ -73,7 +76,8 @@ enum Pending : u8
  * Every change of the scene is a command run through the SceneEditor, which keeps their history; the viewport, focused
  * by a click, takes the keys W, E and R (the gizmo), Delete, Ctrl+D and F, the window Ctrl+Z (undo), Ctrl+Shift+Z and
  * Ctrl+Y (redo), Ctrl+S (save), Ctrl+Shift+S (save as) and Ctrl+E (the Add menu, under the cursor). The items Undo and Redo of the Edit menu name the change they
- * undo or redo.
+ * undo or redo. View → Look through the camera selected draws the viewport through a camera of the scene, its moves
+ * recorded as commands, until View → Look through the editor camera, or until the camera leaves the scene.
  * The scene has unsaved changes while its history is not where it was at the last save (a change made, or undone),
  * shown in the title of the window and on the right of the status bar. A new scene, blank, has no file yet: its first
  * save asks for one. New, Open and Quit ask whether to save the changes first, or discard them, or do nothing.
@@ -154,6 +158,8 @@ pub class EditorActivity over Activity {
         self:.slot("add::direction", &self:.onAddDirectionLight);
         self:.slot("add::point", &self:.onAddPointLight);
         self:.slot("add::spot", &self:.onAddSpotLight);
+        self:.slot("add::perspective", &self:.onAddPerspectiveCamera);
+        self:.slot("add::orthographic", &self:.onAddOrthographicCamera);
         self:.slot("edit::undo", &self:.onUndoClicked);
         self:.slot("edit::redo", &self:.onRedoClicked);
         self:.slot("edit::duplicate", &self:.onDuplicateClicked);
@@ -161,6 +167,7 @@ pub class EditorActivity over Activity {
         self:.slot("edit::frame", &self:.onFrameClicked);
         self:.slot("view::icons", &self:.onIconsClicked);
         self:.slot("view::grid", &self:.onGridClicked);
+        self:.slot("view::through", &self:.onThroughClicked);
         self:.slot("gizmo::translate", &self:.onTranslateClicked);
         self:.slot("gizmo::rotate", &self:.onRotateClicked);
         self:.slot("gizmo::scale", &self:.onScaleClicked);
@@ -202,6 +209,7 @@ pub class EditorActivity over Activity {
             v:.transformed():.connect(self.box, &self:.onGizmoTransformed);
             v:.reshaped():.connect(self.box, &self:.onGizmoReshaped);
             v:.gridStepped():.connect(self.box, &self:.onGridStepped);
+            v:.piloted():.connect(self.box, &self:.onPiloted);
             if let Ok(step) = v.gridStep { self:.onGridStepped(step); }
             self._viewport = (alias v)?;
         }
@@ -885,6 +893,37 @@ pub class EditorActivity over Activity {
         self:.add(spot, lift-> 4.0f);
     }
 
+    fn onAddPerspectiveCamera(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addCamera(CameraProjection::PERSPECTIVE); }
+    }
+
+    fn onAddOrthographicCamera(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.addCamera(CameraProjection::ORTHOGRAPHIC); }
+    }
+
+    /**
+     * Add a camera of a projection under the root of the scene, where the eye of the viewport stands, looking where it
+     * looks, an orthographic camera seeing at the point looked at what the viewport sees there
+     * */
+    fn addCamera(mut self, projection: CameraProjection) {
+        let orbit = if let Ok(v) = self._viewport { v.orbit } else { return; };
+        let eye = orbit.eye();
+        let back = eye - orbit.target;
+        if back.length() == 0.0f { return; }
+
+        let mut d = NodeDescription("camera", NodeKind::CAMERA);
+        d.projection = projection;
+        d.position = eye;
+        d.rotation = facing(back.normalized(), makeVec3(0.0f, 1.0f, 0.0f)).euler();
+        d.fov = 60.0f;
+        d.size = framedSize(d.fov, back.length());
+
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            self:.run(copy AddCommand(d, alias scene:.getRootNode()));
+        }
+    }
+
     /**
      * Add a cube, a sphere or a plane, a little grey and rough
      * */
@@ -1048,6 +1087,56 @@ pub class EditorActivity over Activity {
     }
 
     /**
+     * Look through the camera selected last, or through the camera of the editor again when the viewport looks through
+     * a camera of the scene
+     * */
+    fn onThroughClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut v = if let Ok(dmut v) = alias self._viewport { alias v } else { return; };
+        if v.lookedThrough.hasValue {
+            v:.lookThrough(none);
+            self:.setStatus("Looking through the editor camera");
+        } else {
+            let dmut nodes = alias self:.selectedNodes();
+            let dmut chosen: (&Camera)? = none;
+            if nodes.len != 0us {
+                if let dmut c: &Camera = alias nodes[$ - 1us] { chosen = (alias c)?; }
+            }
+
+            if let Ok(dmut c) = alias chosen {
+                v:.lookThrough((alias c)?);
+                self:.setStatus("Looking through " ~ c.name.file());
+            } else {
+                self:.setStatus("Select a camera to look through");
+            }
+        }
+
+        self:.showThrough();
+    }
+
+    /**
+     * Name in the item of the View menu the camera it looks through next
+     * */
+    fn showThrough(mut self) {
+        let through = if let Ok(v) = self._viewport { v.lookedThrough.hasValue } else { false };
+        if let Ok(dmut item: &PushButton) = self.gui:.find(THROUGH_ITEM) {
+            item:.setText(if through { "Look through the editor camera" } else { "Look through the camera selected" });
+        }
+    }
+
+    /**
+     * A move of the controls of the viewport moved the camera it looks through: the move is recorded as a command
+     * */
+    fn onPiloted(mut self) {
+        if let Ok(v) = self._viewport {
+            if let Ok(e) = v.pilotEdit {
+                self:.run(copy TransformCommand(copy [e], applied-> true));
+            }
+        }
+    }
+
+    /**
      * Tell the step of the grid of the ground in the status bar, in metres
      * */
     fn onGridStepped(mut self, step: f32) {
@@ -1162,6 +1251,11 @@ pub class EditorActivity over Activity {
     fn onEdited(mut self, _: &EditCommand) {
         if let Ok(e) = self._editor {
             self:.setStatus(e.change);
+        }
+
+        // the camera looked through removed, or replaced by a camera of the other projection
+        if let Ok(dmut v) = alias self._viewport {
+            if v:.checkLookedThrough() { self:.showThrough(); }
         }
 
         self:.showDocument();

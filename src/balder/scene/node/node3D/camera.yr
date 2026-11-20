@@ -3,6 +3,7 @@ in camera;
 mod ::persp;
 mod ::ortho;
 mod ::debug_view;
+mod ::projection;
 pub mod ::flight;
 
 use balder::math::_;
@@ -14,6 +15,7 @@ use balder::utils::log;
 pub def PerspectiveCamera: persp::PerspectiveCamera;
 pub def OrthoCamera: ortho::OrthoCamera;
 pub def DebugView: debug_view::DebugView;
+pub def CameraProjection: projection::CameraProjection;
 
 /**
  * The offset of the exposure in the uniform buffer of a camera, after its projection, its view, their product and its
@@ -38,15 +40,20 @@ pub def CAMERA_SIZE = DEBUG_VIEW_OFFSET + u32::size;
 
 /**
  * Ancestor class of all cameras
+ * @info: a camera looks along the -Z axis of its node, the +Y axis toward the top of its image, its view following the
+ * rotation of its node and the transforms of its parents (see transformation); target turns the node toward a point
  * */
 @abstract
 pub class Camera over Node3D {
 
-    // The target of the camera
-    let mut _target: vec3 = makeVec3(0.0f, 0.0f, 0.0f);
+    // The distance from the camera to the point it was turned toward last (see target), in the space of its parent
+    let mut _aim: f32 = 1.0f;
 
     // The up of the camera
     let mut _up: vec3 = makeVec3(0.0f, 1.0f, 0.0f);
+
+    // The position of the camera in world space, the eye its view looks from
+    let mut _eye: vec3 = vec3();
 
     let mut _near: f32 = 0.1f;
     let mut _far: f32  = 100.0f;
@@ -84,7 +91,10 @@ pub class Camera over Node3D {
     pub self (name: [c8], dmut parent: &Node)
         with super(name, alias parent)
     {
+        // looking at the origin, as target would turn it
         self._position = makeVec3(-10.0f, 10.0f, -10.0f);
+        self._aim = self._position.length();
+        self._orientation = facing(self._position.normalized(), self._up);
     }
 
     /*!
@@ -95,17 +105,34 @@ pub class Camera over Node3D {
      * ====================================================================================================
      */
 
+    /**
+     * @returns: the point the camera looks at, in the space of its parent: the point it was turned toward last, moved
+     * with it, and turned with it since (see target)
+     * */
     @field
     pub fn target(self)-> vec3 {
-        self._target
+        self._position + (self._orientation * makeVec3(0.0f, 0.0f, -1.0f)) * self._aim
     }
 
+    /**
+     * Turn the camera toward a point from where it stands, in the space of its parent, its top toward its up (see up)
+     * @info: the rotation of its node changes, the camera keeping it when it moves afterwards; a point where the camera
+     * stands changes nothing
+     * */
     @field
     pub fn target(mut self, v: vec3) {
-        self._target = v;
-        self:.updateTransformation();
+        let away = self._position - v;
+        let distance = away.length();
+        if distance == 0.0f { return; }
+
+        self._aim = distance;
+        self.orientation = facing(away / distance, self._up);
     }
 
+    /**
+     * @returns: the direction the top of the image of the camera goes toward when it is turned toward a point (see
+     * target), in the space of its parent
+     * */
     @field
     pub fn up(self)-> vec3 {
         self._up
@@ -116,6 +143,19 @@ pub class Camera over Node3D {
         self._up = v;
     }
 
+    /**
+     * @returns: the position of the camera in world space, the eye its view looks from
+     * */
+    @field
+    pub fn eye(self)-> vec3 {
+        self._eye
+    }
+
+    /**
+     * @returns: how the camera projects what it sees on its image, its class telling it
+     * */
+    pub fn projection(self)-> CameraProjection;
+
     @field
     pub fn near(self)-> f32 {
         self._near
@@ -124,7 +164,7 @@ pub class Camera over Node3D {
     @field
     pub fn near(mut self, near: f32) {
         self._near = near;
-        self:.updateTransformation();
+        self:.updateView();
     }
 
     @field
@@ -135,7 +175,7 @@ pub class Camera over Node3D {
     @field
     pub fn far(mut self, far: f32) {
         self._far = far;
-        self:.updateTransformation();
+        self:.updateView();
     }
 
     /**
@@ -254,7 +294,20 @@ pub class Camera over Node3D {
      * ====================================================================================================
      */
 
+    /**
+     * The transformation of the node computed, then the view and the projection of the camera, written in its uniform
+     * buffer
+     * */
     over updateTransformation(mut self) {
+        self.__super__:.updateTransformation();
+        self:.updateView();
+    }
+
+    /**
+     * Compute the view and the projection of the camera again, writing them in its uniform buffer
+     * @info: the setters of the projection (fov, near, far...) call it, the transformation of the node unchanged
+     * */
+    prot fn updateView(mut self) {
         atomic self {
             self:.computeView();
             self:.computeProj();
@@ -265,7 +318,7 @@ pub class Camera over Node3D {
                 u:.setData(0, jittered(self._proj, self._jitter));
                 u:.setData(mat4::size, self._view);
                 u:.setData(2 * mat4::size, self._viewProj);
-                u:.setData(3 * mat4::size, self._position);
+                u:.setData(3 * mat4::size, self._eye);
                 u:.setData(EXPOSURE_OFFSET, self._exposure);
 
                 let word: u32 = self._debugView;
@@ -275,10 +328,21 @@ pub class Camera over Node3D {
     }
 
     /**
-     * Compute the view matrix
+     * Compute the view matrix from the transformation of the node, its scale left out: the inverse of its rotation and
+     * its position, turned half a turn around Z, the image mirroring X and its rows going down (as lookAt gives it)
      * */
     fn computeView(mut self) {
-        self._view = lookAt!{f32} (self._position, self._target, self._up);
+        let w = self._transformation;
+        let x = makeVec3(w.a1, w.b1, w.c1).normalized();
+        let y = makeVec3(w.a2, w.b2, w.c2).normalized();
+        let z = makeVec3(w.a3, w.b3, w.c3).normalized();
+        let eye = makeVec3(w.a4, w.b4, w.c4);
+
+        self._eye = eye;
+        self._view = makeMat4(a1-> -x.x, a2-> -x.y, a3-> -x.z, a4-> x.dot(eye),
+                              b1-> -y.x, b2-> -y.y, b3-> -y.z, b4-> y.dot(eye),
+                              c1-> z.x, c2-> z.y, c3-> z.z, c4-> -z.dot(eye),
+                              d1-> 0.0f, d2-> 0.0f, d3-> 0.0f, d4-> 1.0f);
     }
 
     /**
@@ -390,6 +454,27 @@ pub class Camera over Node3D {
             }
         }
     }
+}
+
+/**
+ * @returns: the rotation of a camera looking along -back, its top toward up as far as it can, the camera rolled by
+ * nothing; looking straight along up, its top is toward -Z
+ * @params:
+ *    - back: the direction from the point looked at to the camera, of unit length
+ *    - up: the direction the top of the image goes toward
+ * */
+pub fn facing(back: vec3, up: vec3)-> Quaternion {
+    let mut right = up.cross(back);
+    if right.length() < 1.0e-6f {
+        right = makeVec3(0.0f, 0.0f, -1.0f).cross(back);
+        if right.length() < 1.0e-6f { right = makeVec3(1.0f, 0.0f, 0.0f); }
+    }
+
+    let x = right.normalized();
+    let y = back.cross(x);
+    Quaternion::fromRotation(mat4(a1-> x.x, b1-> x.y, c1-> x.z,
+                                  a2-> y.x, b2-> y.y, c2-> y.z,
+                                  a3-> back.x, b3-> back.y, c3-> back.z))
 }
 
 /**

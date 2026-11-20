@@ -6,7 +6,7 @@ use balder::scene::physics;
 use balder::scene::description::kind;
 use balder::scene::node;
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::{body, body_shape, character, empty, light, marker, path, path_point, solid, volume, volume_shape};
+use balder::scene::node::node3D::{body, body_shape, camera, character, empty, light, marker, path, path_point, solid, volume, volume_shape};
 use balder::scene::node::node3D::visual::{_, material::_};
 
 use std::uuid;
@@ -34,7 +34,8 @@ pub def CHARACTER_HEIGHT = 1.8f;
  *     metallic: 0;
  * }
  * ```
- * The kind is empty, model, cube, sphere, plane, light, marker, path, path-point or volume. Every node reads parent,
+ * The kind is empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body, character or camera.
+ * Every node reads parent,
  * position, rotation and scale; a model reads file (an asset of the file, @<key>, required) and lods (true or false);
  * a cube, a sphere and a plane read color, roughness and metallic; a light reads light (direction, point or spot),
  * color, intensity, direction, range, inner-angle, outer-angle (in degrees) and shadows; a marker reads purpose
@@ -45,8 +46,10 @@ pub def CHARACTER_HEIGHT = 1.8f;
  * required by them), motion (static, kinematic or dynamic), mass, friction, rolling-friction, spinning-friction,
  * restitution, linear-damping, angular-damping, can-sleep, bullet, trigger, layer and mask (the numbers of the layers,
  * 0 to 31, or none); a character reads radius, height, up, slope-limit (in degrees), step-offset, snap-distance, skin,
- * coyote-time, push-mass, max-slides, depenetrations, layer and mask. Every entry is optional, an entry absent keeping
- * the default of the description.
+ * coyote-time, push-mass, max-slides, depenetrations, layer and mask; a camera reads projection (perspective or
+ * orthographic), fov (in degrees, of a perspective camera), size (the height of the view of an orthographic camera),
+ * near, far and active (true for the camera the scene is drawn through, one camera of the file at most). Every entry is
+ * optional, an entry absent keeping the default of the description.
  * ====
  * */
 pub record NodeDescription {
@@ -126,6 +129,22 @@ pub record NodeDescription {
     // How a character moves
     pub let mut character: CharacterSettings = CharacterSettings();
 
+    // How a camera projects what it sees
+    pub let mut projection: CameraProjection = CameraProjection::PERSPECTIVE;
+
+    // The vertical field of view of a perspective camera, in degrees
+    pub let mut fov: f32 = 90.0f;
+
+    // The height of the view of an orthographic camera, in world units
+    pub let mut size: f32 = 10.0f;
+
+    // The distances from a camera to the planes it sees between
+    pub let mut near: f32 = 0.1f;
+    pub let mut far: f32 = 100.0f;
+
+    // True for the active camera of the scene, the one it is drawn through (see Scene::getActiveCamera)
+    pub let mut active: bool = false;
+
     // The nodes under the node, in order
     pub let mut children: [NodeDescription] = [];
 
@@ -148,7 +167,8 @@ pub record NodeDescription {
      * in
      * @params:
      *    - node: an empty, a model, a cube, a sphere or a plane (a mesh made of a primitive, see MeshGeometry.primitive),
-     *            a light, a marker, a path, a point of a path, a volume, a body or a character
+     *            a light, a marker, a path, a point of a path, a volume, a body, a character or a camera, active when it
+     *            is the active camera of its scene
      * @throws:
      *    - &BalderError: if the node, or a node under it, is of none of these kinds, or is a body of a shape no
      *                    description gives (see PhysicsBody3D::described)
@@ -214,6 +234,14 @@ pub record NodeDescription {
                 }
             }
             _: &Empty3D => {}
+            c: &Camera => {
+                self.kind = NodeKind::CAMERA;
+                self.projection = c.projection();
+                self.near = c.near;
+                self.far = c.far;
+                if let p: &PerspectiveCamera = c { self.fov = p.fov; }
+                if let o: &OrthoCamera = c { self.size = o.size; }
+            }
             _ => {
                 if let dmut mesh: &IndexedMesh3D = alias node {
                     self.kind = match mesh.mesh.primitive {
@@ -229,6 +257,12 @@ pub record NodeDescription {
                 } else {
                     throw copy BalderError(f"${node.name.toStr()}: a node of a kind no scene file describes");
                 }
+            }
+        }
+
+        if self.kind == NodeKind::CAMERA {
+            if let Ok(dmut scene) = alias node:.getScene() {
+                if let Ok(a) = scene:.getActiveCamera() { self.active = a is node; }
             }
         }
 
@@ -251,7 +285,7 @@ pub record NodeDescription {
      * Create the node under a parent, then the nodes under it, the node taking the id of the description unless it is nil
      * @returns: the node created
      * @info: a body of a hull or a mesh reads its model, a body of a compound takes the volumes under it once they are
-     * built (see PhysicsBody3D::reshape)
+     * built (see PhysicsBody3D::reshape); an active camera becomes the active camera of the scene of the parent
      * @throws:
      *    - &BalderError: if the file of a model cannot be loaded, or a compound has no volume under its body
      * */
@@ -271,6 +305,12 @@ pub record NodeDescription {
         if self.kind == NodeKind::BODY && !self.shape.isPrimitive {
             if let dmut b: &PhysicsBody3D = alias node {
                 b:.reshape(self.shape);
+            }
+        }
+
+        if self.active {
+            if let dmut c: &Camera = alias node {
+                if let Ok(dmut scene) = alias c:.getScene() { scene:.setActiveCamera(alias c); }
             }
         }
 
@@ -337,6 +377,10 @@ pub record NodeDescription {
                                         settings-> self.character, body-> self.body);
         }
 
+        if self.kind == NodeKind::CAMERA {
+            return alias self.createCamera(alias parent);
+        }
+
         let dmut l = copy Light(self.name, alias parent, castShadow-> self.shadows);
         l.type = self.light;
         l.color = self.color;
@@ -349,6 +393,25 @@ pub record NodeDescription {
     }
 
     /**
+     * @returns: a camera of the projection of the description, under a parent
+     * */
+    fn createCamera(self, dmut parent: &Node)-> dmut &Node3D {
+        let dmut cam: &Camera = if self.projection == CameraProjection::ORTHOGRAPHIC {
+            let dmut o = copy OrthoCamera(self.name, alias parent);
+            o.size = self.size;
+            alias o
+        } else {
+            let dmut p = copy PerspectiveCamera(self.name, alias parent);
+            p.fov = self.fov;
+            alias p
+        };
+
+        cam.near = self.near;
+        cam.far = self.far;
+        alias cam
+    }
+
+    /**
      * @returns: a mesh drawing a primitive with the material of the description, under a parent
      * */
     fn createMesh(self, dmut parent: &Node, primitive: Primitive, mesh: (MeshArray, [u32]))-> dmut &Node3D
@@ -358,12 +421,4 @@ pub record NodeDescription {
         copy IndexedMesh3D(self.name, alias parent, LodChain(mesh._1), mesh._0, alias material, primitive-> primitive)
     }
 
-}
-
-/**
- * @returns: true iif a name is of the form __…__, reserved for the nodes of the tools (the camera of the editor, its
- * gizmo...), which the scene files leave out
- * */
-pub fn isReservedName(name: [c8])-> bool {
-    name.len >= 4us && name[0us .. 2us] == "__" && name[$ - 2us .. $] == "__"
 }
