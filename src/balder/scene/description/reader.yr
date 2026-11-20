@@ -1,10 +1,9 @@
 in reader;
 
-use balder::math::{curve, utils, vector};
-use balder::scene::physics;
-use balder::scene::description::{kind, node_description};
+use balder::math::{utils, vector};
 use balder::scene::node;
-use balder::scene::node::node3D::{body_shape, camera, light, marker, volume_shape};
+use balder::scene::description::{kind, node_description};
+use balder::scene::property::{choice, kind, node_property, node_schema, value};
 use balder::utils::syntax;
 
 use std::{conv, syntax, uuid};
@@ -27,8 +26,10 @@ pub def SCENE_VERSION = 1u32;
  * ```
  * The blocks of the nodes are flat, each naming its parent by its id: they are put under their parents once every block
  * is read, in the order of the file among their siblings, so a block may come before the block of its parent. The
- * reader checks that the ids are distinct, that each parent and asset exists, that no node is under itself, and that
- * each entry belongs to the kind of its node, is given once and has values of its type.
+ * entries of a node are the properties of the schema of its kind (see schemaOf). The reader checks that the ids are
+ * distinct, that each parent and asset exists, that no node is under itself, that each entry is a property of the kind
+ * of its node, is given once and has values of its kind, that a node gives the properties it requires and no asset it
+ * does not read, and that one node at most has a unique property true (the active camera).
  * ====
  * */
 pub record SceneReader {
@@ -73,7 +74,7 @@ pub record SceneReader {
             }
         }
 
-        SceneReader::checkActive(nodes);
+        SceneReader::checkUnique(nodes);
         SceneReader::assemble(SceneReader::resolveAssets(nodes, assets))
     }
 
@@ -157,6 +158,7 @@ pub record SceneReader {
         let mut d = NodeDescription(nameTok.text, kind);
         d.id = id;
 
+        let schema = schemaOf(kind);
         let mut node = FlatNode(d, at.line, at.col);
         let mut given: [[c8]] = [];
         self._scanner:.expect("{");
@@ -174,25 +176,10 @@ pub record SceneReader {
             given = given ~ [tok.text];
             self._scanner:.expect(":");
             let values = self:.readValues();
-            self.readEntry(ref node, tok, values);
+            self.readEntry(ref node, schema, tok, values);
         }
 
-        if kind == NodeKind::MODEL && node.asset.len == 0us {
-            throw copy SyntaxError(f"model '${d.name}' without a file", at.line, at.col);
-        }
-
-        if kind == NodeKind::BODY {
-            let shape = node.description.shape.kind;
-            let ofModel = shape == BodyShapeKind::HULL || shape == BodyShapeKind::MESH;
-            if ofModel && node.asset.len == 0us {
-                throw copy SyntaxError(f"body '${d.name}' of a ${shapeName(shape)} shape without a model", at.line, at.col);
-            }
-
-            if !ofModel && node.asset.len != 0us {
-                throw copy SyntaxError(f"body '${d.name}' of a ${shapeName(shape)} shape given a model, which only a hull or a mesh reads", at.line, at.col);
-            }
-        }
-
+        SceneReader::checkGiven(node, schema, given);
         node
     }
 
@@ -225,206 +212,60 @@ pub record SceneReader {
      */
 
     /**
-     * Read an entry of a node, an entry of every node or one of its kind
+     * Read an entry of a node, its parent or a property of the schema of its kind
      * @params:
+     *    - schema: the schema of the kind of the node
      *    - key: the name of the entry
      *    - values: the tokens of its value
      * */
-    fn readEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
+    fn readEntry(self, ref mut node: FlatNode, schema: &NodeSchema, key: Token, values: [Token])
         throws SyntaxError
     {
-        match key.text {
-            "parent"   => {
-                node.parent = (self.readId(self.single(key, values), "the id of the parent, #<uuid>"))?;
-                return;
+        if key.text == "parent" {
+            node.parent = (self.readId(self.single(key, values), "the id of the parent, #<uuid>"))?;
+            return;
+        }
+
+        let p = if let Ok(p) = schema.property(key.text) { p } else { throw self.foreign(node, key); };
+        if p.kind == PropertyKind::ASSET {
+            node.assets ~= [(p.name, self.asset(key, values))];
+        } else {
+            node.description:.set(p.name, self.readValue(p, key, values));
+        }
+    }
+
+    /**
+     * @returns: the value of an entry of a property, of the kind of the property, the angles of a property in degrees
+     * read in radians
+     * */
+    fn readValue(self, p: &NodeProperty, key: Token, values: [Token])-> PropertyValue
+        throws SyntaxError
+    {
+        match p.kind {
+            PropertyKind::NUMBER => {
+                let n = self.number(key, values);
+                return PropertyValue::number(if p.degrees { radian(n) } else { n });
             }
-            "position" => { node.description.position = self.vector(key, values); return; }
-            "rotation" => {
-                let r = self.vector(key, values);
-                node.description.rotation = makeVec3(radian(r.x), radian(r.y), radian(r.z));
-                return;
-            }
-            "scale"    => { node.description.scale = self.vector(key, values); return; }
+            PropertyKind::VECTOR => { return PropertyValue::vector(self.angles(p, self.vector(key, values))); }
+            PropertyKind::COLOR  => { return PropertyValue::color(self.vector(key, values)); }
+            PropertyKind::BOOL   => { return PropertyValue::flag(self.boolean(key, values)); }
+            PropertyKind::CHOICE => { return PropertyValue::choice(self.choice(p, key, values)); }
+            PropertyKind::STRING => { return PropertyValue::text(self.string(key, values)); }
+            PropertyKind::TEXTS  => { return PropertyValue::texts(self.strings(key, values)); }
+            PropertyKind::NODE   => { return PropertyValue::node(self.readId(self.single(key, values), f"${key.text}, the id of a node, #<uuid>")); }
+            PropertyKind::COUNT  => { return PropertyValue::count(self.count(key, values)); }
+            PropertyKind::LAYERS => { return PropertyValue::layers(self.layers(key, values)); }
+            _ => {}
         }
 
-        match node.description.kind {
-            NodeKind::MODEL  => { self.readModelEntry(ref node, key, values); }
-            NodeKind::CUBE   => { self.readMaterialEntry(ref node, key, values); }
-            NodeKind::SPHERE => { self.readMaterialEntry(ref node, key, values); }
-            NodeKind::PLANE  => { self.readMaterialEntry(ref node, key, values); }
-            NodeKind::LIGHT  => { self.readLightEntry(ref node, key, values); }
-            NodeKind::MARKER => { self.readMarkerEntry(ref node, key, values); }
-            NodeKind::PATH   => { self.readPathEntry(ref node, key, values); }
-            NodeKind::VOLUME => { self.readVolumeEntry(ref node, key, values); }
-            NodeKind::BODY   => { self.readBodyEntry(ref node, key, values); }
-            NodeKind::CHARACTER => { self.readCharacterEntry(ref node, key, values); }
-            NodeKind::CAMERA => { self.readCameraEntry(ref node, key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
+        PropertyValue::asset(self.asset(key, values))
     }
 
     /**
-     * Read an entry of a model: file (@<asset>) and lods
+     * @returns: a vector, its components read in radians when the property holds angles in degrees
      * */
-    fn readModelEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        match key.text {
-            "file" => { node.asset = self.asset(key, values); }
-            "lods" => { node.description.lods = self.boolean(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a cube, a sphere or a plane: color, roughness and metallic
-     * */
-    fn readMaterialEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        match key.text {
-            "color"     => { node.description.material.baseColor = self.vector(key, values); }
-            "roughness" => { node.description.material.roughness = self.number(key, values); }
-            "metallic"  => { node.description.material.metallic = self.number(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a light: light, color, intensity, direction, range, inner-angle, outer-angle and shadows
-     * */
-    fn readLightEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        match key.text {
-            "light"       => { node.description.light = self.lightType(key, values); }
-            "color"       => { node.description.color = self.vector(key, values); }
-            "intensity"   => { node.description.intensity = self.number(key, values); }
-            "direction"   => { node.description.direction = self.vector(key, values); }
-            "range"       => { node.description.range = self.number(key, values); }
-            "inner-angle" => { node.description.innerAngle = self.number(key, values); }
-            "outer-angle" => { node.description.outerAngle = self.number(key, values); }
-            "shadows"     => { node.description.shadows = self.boolean(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a marker: purpose and tags
-     * */
-    fn readMarkerEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        match key.text {
-            "purpose" => { node.description.purpose = self.purpose(key, values); }
-            "tags"    => { node.description.tags = self.strings(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a path: curve and closed
-     * */
-    fn readPathEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        match key.text {
-            "curve"  => { node.description.curve = self.curveKind(key, values); }
-            "closed" => { node.description.closed = self.boolean(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a volume: shape, size, radius and height
-     * */
-    fn readVolumeEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        let v = node.description.volume;
-        match key.text {
-            "shape"  => { node.description.volume = v.withKind(self.volumeKind(key, values)); }
-            "size"   => { node.description.volume = VolumeShape(v.kind, self.vector(key, values), v.radius, v.height); }
-            "radius" => { node.description.volume = VolumeShape(v.kind, v.size, self.number(key, values), v.height); }
-            "height" => { node.description.volume = VolumeShape(v.kind, v.size, v.radius, self.number(key, values)); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a body: its shape (shape, size, radius, height, model), then its settings (motion, mass,
-     * friction, rolling-friction, spinning-friction, restitution, linear-damping, angular-damping, can-sleep, bullet,
-     * trigger, layer, mask)
-     * */
-    fn readBodyEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        let b = node.description.shape;
-        match key.text {
-            "shape"  => { node.description.shape = b.withKind(self.bodyShapeKind(key, values)); }
-            "size"   => { node.description.shape = BodyShape(b.kind, self.vector(key, values), b.radius, b.height); }
-            "radius" => { node.description.shape = BodyShape(b.kind, b.size, self.number(key, values), b.height); }
-            "height" => { node.description.shape = BodyShape(b.kind, b.size, b.radius, self.number(key, values)); }
-            "model"  => { node.asset = self.asset(key, values); }
-            "motion" => { node.description.body.motion = self.motion(key, values); }
-            "mass"   => { node.description.body.mass = self.number(key, values); }
-            "friction"          => { node.description.body.friction = self.number(key, values); }
-            "rolling-friction"  => { node.description.body.rollingFriction = self.number(key, values); }
-            "spinning-friction" => { node.description.body.spinningFriction = self.number(key, values); }
-            "restitution"       => { node.description.body.restitution = self.number(key, values); }
-            "linear-damping"    => { node.description.body.linearDamping = self.number(key, values); }
-            "angular-damping"   => { node.description.body.angularDamping = self.number(key, values); }
-            "can-sleep" => { node.description.body.canSleep = self.boolean(key, values); }
-            "bullet"    => { node.description.body.bullet = self.boolean(key, values); }
-            "trigger"   => { node.description.body.trigger = self.boolean(key, values); }
-            "layer"     => { node.description.body.layer = self.layers(key, values); }
-            "mask"      => { node.description.body.mask = self.layers(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a character: its capsule (radius, height), how it moves (up, slope-limit in degrees,
-     * step-offset, snap-distance, skin, coyote-time, push-mass, max-slides, depenetrations), its layer and its mask
-     * */
-    fn readCharacterEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        let b = node.description.shape;
-        match key.text {
-            "radius"         => { node.description.shape = BodyShape(b.kind, b.size, self.number(key, values), b.height); }
-            "height"         => { node.description.shape = BodyShape(b.kind, b.size, b.radius, self.number(key, values)); }
-            "up"             => { node.description.character.up = self.vector(key, values); }
-            "slope-limit"    => { node.description.character.slopeLimit = radian(self.number(key, values)); }
-            "step-offset"    => { node.description.character.stepOffset = self.number(key, values); }
-            "snap-distance"  => { node.description.character.snapDistance = self.number(key, values); }
-            "skin"           => { node.description.character.skin = self.number(key, values); }
-            "coyote-time"    => { node.description.character.coyoteTime = self.number(key, values); }
-            "push-mass"      => { node.description.character.pushMass = self.number(key, values); }
-            "max-slides"     => { node.description.character.maxSlides = self.count(key, values); }
-            "depenetrations" => { node.description.character.depenetrations = self.count(key, values); }
-            "layer"          => { node.description.body.layer = self.layers(key, values); }
-            "mask"           => { node.description.body.mask = self.layers(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
-    }
-
-    /**
-     * Read an entry of a camera: projection, fov (of a perspective camera, in degrees), size (of an orthographic camera),
-     * near, far and active
-     * */
-    fn readCameraEntry(self, ref mut node: FlatNode, key: Token, values: [Token])
-        throws SyntaxError
-    {
-        match key.text {
-            "projection" => { node.description.projection = self.projection(key, values); }
-            "fov"        => { node.description.fov = self.number(key, values); }
-            "size"       => { node.description.size = self.number(key, values); }
-            "near"       => { node.description.near = self.number(key, values); }
-            "far"        => { node.description.far = self.number(key, values); }
-            "active"     => { node.description.active = self.boolean(key, values); }
-            _ => { throw self.foreign(node, key); }
-        }
+    fn angles(self, p: &NodeProperty, v: vec3)-> vec3 {
+        if p.degrees { makeVec3(radian(v.x), radian(v.y), radian(v.z)) } else { v }
     }
 
     /**
@@ -586,126 +427,31 @@ pub record SceneReader {
     }
 
     /**
-     * @returns: the type of light of an entry, direction, point or spot
+     * @returns: the name of the choice of an entry, one of the choices of its property
      * */
-    fn lightType(self, key: Token, values: [Token])-> LightType
+    fn choice(self, p: &NodeProperty, key: Token, values: [Token])-> [c8]
         throws SyntaxError
     {
         let tok = self.single(key, values);
-        if tok.kind == TokenKind::IDENT {
-            match tok.text {
-                "direction" => { return LightType::DIRECTION; }
-                "point"     => { return LightType::POINT; }
-                "spot"      => { return LightType::SPOT; }
-            }
+        if tok.kind == TokenKind::IDENT && p.choiceIndex(tok.text).hasValue {
+            return tok.text;
         }
 
-        throw copy SyntaxError(f"${key.text} must be direction, point or spot", tok.line, tok.col);
+        throw copy SyntaxError(f"${key.text} must be ${SceneReader::alternatives(p.choices)}", tok.line, tok.col);
     }
 
     /**
-     * @returns: the purpose of a marker of an entry, generic, spawn, waypoint or socket
+     * @returns: the value of an entry of one string
      * */
-    fn purpose(self, key: Token, values: [Token])-> MarkerPurpose
+    fn string(self, key: Token, values: [Token])-> [c8]
         throws SyntaxError
     {
         let tok = self.single(key, values);
-        if tok.kind == TokenKind::IDENT {
-            match tok.text {
-                "generic"  => { return MarkerPurpose::GENERIC; }
-                "spawn"    => { return MarkerPurpose::SPAWN; }
-                "waypoint" => { return MarkerPurpose::WAYPOINT; }
-                "socket"   => { return MarkerPurpose::SOCKET; }
-            }
+        if tok.kind != TokenKind::STRING {
+            throw copy SyntaxError(f"${key.text} must be a string", tok.line, tok.col);
         }
 
-        throw copy SyntaxError(f"${key.text} must be generic, spawn, waypoint or socket", tok.line, tok.col);
-    }
-
-    /**
-     * @returns: the kind of curve of an entry, catmull-rom or bezier
-     * */
-    fn curveKind(self, key: Token, values: [Token])-> CurveKind
-        throws SyntaxError
-    {
-        let tok = self.single(key, values);
-        if tok.kind == TokenKind::IDENT {
-            match tok.text {
-                "catmull-rom" => { return CurveKind::CATMULL_ROM; }
-                "bezier"      => { return CurveKind::BEZIER; }
-            }
-        }
-
-        throw copy SyntaxError(f"${key.text} must be catmull-rom or bezier", tok.line, tok.col);
-    }
-
-    /**
-     * @returns: the kind of shape of a volume of an entry, box, sphere or capsule
-     * */
-    fn volumeKind(self, key: Token, values: [Token])-> VolumeKind
-        throws SyntaxError
-    {
-        let tok = self.single(key, values);
-        if tok.kind == TokenKind::IDENT {
-            match tok.text {
-                "box"     => { return VolumeKind::BOX; }
-                "sphere"  => { return VolumeKind::SPHERE; }
-                "capsule" => { return VolumeKind::CAPSULE; }
-            }
-        }
-
-        throw copy SyntaxError(f"${key.text} must be box, sphere or capsule", tok.line, tok.col);
-    }
-
-    /**
-     * @returns: the kind of shape of a body of an entry, box, sphere, capsule, cylinder, plane, hull, mesh or compound
-     * */
-    fn bodyShapeKind(self, key: Token, values: [Token])-> BodyShapeKind
-        throws SyntaxError
-    {
-        let tok = self.single(key, values);
-        if tok.kind == TokenKind::IDENT {
-            cte for k in BodyShapeKind::__members__ {
-                if shapeName(k) == tok.text { return k; }
-            }
-        }
-
-        throw copy SyntaxError(f"${key.text} must be box, sphere, capsule, cylinder, plane, hull, mesh or compound", tok.line, tok.col);
-    }
-
-    /**
-     * @returns: the motion of a body of an entry, static, kinematic or dynamic
-     * */
-    fn motion(self, key: Token, values: [Token])-> BodyMotion
-        throws SyntaxError
-    {
-        let tok = self.single(key, values);
-        if tok.kind == TokenKind::IDENT {
-            match tok.text {
-                "static"    => { return BodyMotion::STATIC; }
-                "kinematic" => { return BodyMotion::KINEMATIC; }
-                "dynamic"   => { return BodyMotion::DYNAMIC; }
-            }
-        }
-
-        throw copy SyntaxError(f"${key.text} must be static, kinematic or dynamic", tok.line, tok.col);
-    }
-
-    /**
-     * @returns: the projection of a camera of an entry, perspective or orthographic
-     * */
-    fn projection(self, key: Token, values: [Token])-> CameraProjection
-        throws SyntaxError
-    {
-        let tok = self.single(key, values);
-        if tok.kind == TokenKind::IDENT {
-            match tok.text {
-                "perspective"  => { return CameraProjection::PERSPECTIVE; }
-                "orthographic" => { return CameraProjection::ORTHOGRAPHIC; }
-            }
-        }
-
-        throw copy SyntaxError(f"${key.text} must be perspective or orthographic", tok.line, tok.col);
+        tok.text
     }
 
     /**
@@ -739,8 +485,8 @@ record FlatNode {
     // The id of its parent, none for a node under the root
     pub let mut parent: (Uuid)?;
 
-    // The key of the asset of a model or of the model of a body, empty for the other nodes
-    pub let mut asset: [c8];
+    // The properties of the kind ASSET the block gives, each with the key of the asset it names
+    pub let mut assets: [([c8], [c8])];
 
     // The place of the block, quoted in the errors
     pub let mut line: usize;
@@ -749,7 +495,7 @@ record FlatNode {
     pub self (description: NodeDescription, line: usize, col: usize)
         with description = description
         , parent = none
-        , asset = ""
+        , assets = []
         , line = line
         , col = col
     {}
@@ -781,9 +527,42 @@ record Asset {
 mod SceneReader {
 
     /**
-     * @returns: the nodes, each model given the path of the asset it names
+     * Check that a node gives the properties its kind requires while they apply, and no asset it does not read
+     * @params:
+     *    - schema: the schema of the kind of the node
+     *    - given: the names of the entries of its block
      * @throws:
-     *    - &SyntaxError: if a model names an asset not declared
+     *    - &SyntaxError: at the block, if it lacks a property its kind requires (the file of a model), or gives an asset
+     *                    it does not read (the model of a body of a box)
+     * */
+    pub fn checkGiven(node: FlatNode, schema: &NodeSchema, given: [[c8]])
+        throws SyntaxError
+    {
+        let d = node.description;
+        let what = f"${kindName(d.kind)} '${d.name}'";
+        for p in schema.properties {
+            let mut isGiven = false;
+            for g in given if g == p.name { isGiven = true; }
+
+            let applies = d.applies(p);
+            let shaped = if let Ok(c) = p.condition { f" of ${SceneReader::article(d.value(c.property).text)} ${c.property}" } else { "" };
+            if p.required && applies && !isGiven {
+                throw copy SyntaxError(f"${what}${shaped} without a ${p.name}", node.line, node.col);
+            }
+
+            if p.kind == PropertyKind::ASSET && isGiven && !applies {
+                if let Ok(c) = p.condition {
+                    throw copy SyntaxError(f"${what}${shaped} given a ${p.name}, which only ${SceneReader::either(c.choices)} reads",
+                                           node.line, node.col);
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: the nodes, each property of the kind ASSET given the path of the asset it names
+     * @throws:
+     *    - &SyntaxError: if a node names an asset not declared
      * */
     pub fn resolveAssets(nodes: [FlatNode], assets: [Asset])-> [FlatNode]
         throws SyntaxError
@@ -791,20 +570,15 @@ mod SceneReader {
         let mut resolved: [FlatNode] = [];
         for n in nodes {
             let mut r = n;
-            if n.asset.len != 0us {
+            for named in n.assets {
                 let mut found = false;
-                for a in assets if a.key == n.asset {
-                    if n.description.kind == NodeKind::BODY {
-                        r.description.shape = n.description.shape.withModel(a.path);
-                    } else {
-                        r.description.file = a.path;
-                    }
-
+                for a in assets if a.key == named._1 {
+                    r.description:.set(named._0, PropertyValue::asset(a.path));
                     found = true;
                 }
 
                 if !found {
-                    throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' names the asset '${n.asset}', not declared", n.line, n.col);
+                    throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' names the asset '${named._1}', not declared", n.line, n.col);
                 }
             }
 
@@ -815,20 +589,25 @@ mod SceneReader {
     }
 
     /**
-     * Check that one camera at most is the active camera of the scene
+     * Check that one node at most of each kind has each of its unique properties true: one active camera
      * @throws:
-     *    - &SyntaxError: at the second active camera
+     *    - &SyntaxError: at the second node having one
      * */
-    pub fn checkActive(nodes: [FlatNode])
+    pub fn checkUnique(nodes: [FlatNode])
         throws SyntaxError
     {
-        let mut first = "";
-        for n in nodes if n.description.kind == NodeKind::CAMERA && n.description.active {
-            if first.len != 0us {
-                throw copy SyntaxError(f"camera '${n.description.name}' is active, and so is camera '${first}': one camera of a scene at most is active", n.line, n.col);
-            }
+        let dmut first: [[c8] => [c8]] = copy [];
+        for n in nodes {
+            let kind = kindName(n.description.kind);
+            for p in schemaOf(n.description.kind).properties if p.unique && n.description.value(p.name).flag {
+                let key = f"${kind} ${p.name}";
+                if let Ok(other) = first[key] {
+                    throw copy SyntaxError(f"${kind} '${n.description.name}' is ${p.name}, and so is ${kind} '${other}': one ${kind} of a scene at most is ${p.name}",
+                                           n.line, n.col);
+                }
 
-            first = n.description.name;
+                first[key] = dcopy n.description.name;
+            }
         }
     }
 
@@ -917,5 +696,44 @@ mod SceneReader {
         }
 
         false
+    }
+
+    /**
+     * @returns: the names of choices, the last after an "or": `direction, point or spot`
+     * */
+    pub fn alternatives(choices: [Choice])-> [c8] {
+        let mut text = "";
+        for i, c in choices {
+            let sep = if i == 0us { "" } else if i + 1us == choices.len { " or " } else { ", " };
+            text = text ~ sep ~ c.name;
+        }
+
+        text
+    }
+
+    /**
+     * @returns: names after their article, the last after an "or": `a hull or a mesh`
+     * */
+    pub fn either(names: [[c8]])-> [c8] {
+        let mut text = "";
+        for i, n in names {
+            let sep = if i == 0us { "" } else if i + 1us == names.len { " or " } else { ", " };
+            text = text ~ sep ~ SceneReader::article(n);
+        }
+
+        text
+    }
+
+    /**
+     * @returns: a name after its article, `a box`, `an orthographic`
+     * */
+    pub fn article(name: [c8])-> [c8] {
+        if name.len != 0us {
+            match name[0] {
+                'a' | 'e' | 'i' | 'o' | 'u' => { return "an " ~ name; }
+            }
+        }
+
+        "a " ~ name
     }
 }
