@@ -7,6 +7,7 @@ use balder::core::application::signal;
 use balder::math::{bounds, matrix, rigid_transform, utils, vector};
 use balder::scene::physics;
 use balder::scene::node::node3D::{body_shape, icon};
+use balder::scene::property::{choice_property, condition, group, kind, node_property, node_schema, range, typed_property};
 
 /**
  * A body of the physics of a scene: a collider placed by the transformation of the node in the physics world of the
@@ -415,6 +416,134 @@ pub class PhysicsBody3D over Node3D {
         if let Ok(dmut scene) = alias self:.getScene() {
             scene:.onBodyChanged(self);
         }
+    }
+
+}
+
+/**
+ * The properties of the bodies
+ * */
+pub mod PhysicsBody3D {
+
+    /**
+     * The groups of the properties of a body, its sections of the inspector: its shape and how it moves, its material,
+     * the settings of a dynamic body, and its layers, folded at first
+     * */
+    pub def GROUP = "Physics body";
+    pub def MATERIAL_GROUP = "Physics material";
+    pub def DYNAMICS_GROUP = "Dynamics";
+    pub def LAYERS_GROUP = "Collision layers";
+
+    /**
+     * @returns: the groups of the properties of a body or a character, the layers folded at first
+     * */
+    pub fn groups()-> [PropertyGroup] {
+        copy [PropertyGroup(name-> GROUP), PropertyGroup(name-> MATERIAL_GROUP), PropertyGroup(name-> DYNAMICS_GROUP),
+              PropertyGroup(name-> LAYERS_GROUP, folded-> true)]
+    }
+
+    /**
+     * @returns: the layers a body or a character is in, and the layers it touches
+     * */
+    pub fn layers()-> [&NodeProperty] {
+        copy [copy Property!{&PhysicsBody3D, u32}("layer", BodySettings().layer, |dmut b| => b.layer,
+                                                 set-> (|dmut b, l| => { b.layer = l; })?,
+                                                 kind-> PropertyKind::LAYERS, label-> "Layers it is in", group-> LAYERS_GROUP),
+              copy Property!{&PhysicsBody3D, u32}("mask", BodySettings().mask, |dmut b| => b.mask,
+                                                 set-> (|dmut b, m| => { b.mask = m; })?,
+                                                 kind-> PropertyKind::LAYERS, label-> "Layers it touches", group-> LAYERS_GROUP)]
+    }
+
+    /**
+     * @returns: the schema of the bodies: their shape and its sizes, the model of a hull or a mesh, given at the creation
+     * of a body (see reshape), then how they take part in the physics of their scene (see BodySettings), the settings
+     * of a dynamic body applying to a dynamic body only
+     * */
+    pub fn schema()-> &NodeSchema {
+        let sizes = NumberRange(min-> 0.01f, max-> 10000.0f, step-> 0.05f, decimals-> 2u32);
+        let dynamic = (Condition(property-> "motion", choices-> copy ["dynamic"]))?;
+        let shape = BodyShape();
+        let settings = BodySettings();
+        copy NodeSchema("body", groups-> groups(), properties-> copy [
+            copy ChoiceProperty!{&PhysicsBody3D, BodyShapeKind}("shape", BodyShapeKind::BOX,
+                                                                copy [("box", "Box", BodyShapeKind::BOX),
+                                                                      ("sphere", "Sphere", BodyShapeKind::SPHERE),
+                                                                      ("capsule", "Capsule", BodyShapeKind::CAPSULE),
+                                                                      ("cylinder", "Cylinder", BodyShapeKind::CYLINDER),
+                                                                      ("plane", "Plane", BodyShapeKind::PLANE),
+                                                                      ("hull", "Hulls of the model", BodyShapeKind::HULL),
+                                                                      ("mesh", "Mesh of the model", BodyShapeKind::MESH),
+                                                                      ("compound", "Compound of the volumes", BodyShapeKind::COMPOUND)],
+                                                                |dmut b| => (b.described ?? BodyShape()).kind,
+                                                                label-> "Shape", group-> GROUP),
+            copy Property!{&PhysicsBody3D, vec3}("size", shape.size, |dmut b| => (b.described ?? BodyShape()).size,
+                                                 label-> "Size", group-> GROUP, range-> sizes,
+                                                 when-> (Condition(property-> "shape", choices-> copy ["box"]))?),
+            copy Property!{&PhysicsBody3D, f32}("radius", shape.radius, |dmut b| => (b.described ?? BodyShape()).radius,
+                                                label-> "Radius", group-> GROUP, range-> sizes,
+                                                when-> (Condition(property-> "shape", choices-> copy ["sphere", "capsule", "cylinder"]))?),
+            copy Property!{&PhysicsBody3D, f32}("height", shape.height, |dmut b| => (b.described ?? BodyShape()).height,
+                                                label-> "Height", group-> GROUP, range-> sizes,
+                                                when-> (Condition(property-> "shape", choices-> copy ["capsule", "cylinder"]))?),
+            copy Property!{&PhysicsBody3D, [c8]}("model", "", |dmut b| => (b.described ?? BodyShape()).model,
+                                                 kind-> PropertyKind::ASSET, label-> "Model", group-> GROUP, required-> true,
+                                                 when-> (Condition(property-> "shape", choices-> copy ["hull", "mesh"]))?),
+            copy ChoiceProperty!{&PhysicsBody3D, BodyMotion}("motion", BodyMotion::STATIC,
+                                                             copy [("static", "Static", BodyMotion::STATIC),
+                                                                   ("kinematic", "Kinematic", BodyMotion::KINEMATIC),
+                                                                   ("dynamic", "Dynamic", BodyMotion::DYNAMIC)],
+                                                             |dmut b| => b.settings.motion,
+                                                             set-> (|dmut b, m| => { let mut s = b.settings; s.motion = m; b.settings = s; })?,
+                                                             check-> (|b, m| => { neverDynamic(b, m) })?,
+                                                             label-> "Motion", group-> GROUP),
+            copy Property!{&PhysicsBody3D, f32}("mass", settings.mass, |dmut b| => b.settings.mass,
+                                                set-> (|dmut b, v| => { let mut s = b.settings; s.mass = v; b.settings = s; })?,
+                                                label-> "Mass (kg)", group-> DYNAMICS_GROUP, when-> dynamic,
+                                                range-> NumberRange(min-> 0.001f, max-> 1000000.0f, step-> 0.1f, decimals-> 3u32)),
+            copy Property!{&PhysicsBody3D, f32}("friction", settings.friction, |dmut b| => b.settings.friction,
+                                                set-> (|dmut b, v| => { let mut s = b.settings; s.friction = v; b.settings = s; })?,
+                                                label-> "Friction", group-> MATERIAL_GROUP,
+                                                range-> NumberRange(min-> 0.0f, max-> 10.0f, step-> 0.05f, decimals-> 2u32)),
+            copy Property!{&PhysicsBody3D, f32}("rolling-friction", settings.rollingFriction, |dmut b| => b.settings.rollingFriction,
+                                                set-> (|dmut b, v| => { let mut s = b.settings; s.rollingFriction = v; b.settings = s; })?,
+                                                label-> "Rolling friction", group-> DYNAMICS_GROUP, when-> dynamic,
+                                                range-> NumberRange(min-> 0.0f, max-> 10.0f, step-> 0.01f, decimals-> 2u32)),
+            copy Property!{&PhysicsBody3D, f32}("spinning-friction", settings.spinningFriction, |dmut b| => b.settings.spinningFriction,
+                                                set-> (|dmut b, v| => { let mut s = b.settings; s.spinningFriction = v; b.settings = s; })?,
+                                                label-> "Spinning friction", group-> DYNAMICS_GROUP, when-> dynamic,
+                                                range-> NumberRange(min-> 0.0f, max-> 10.0f, step-> 0.01f, decimals-> 2u32)),
+            copy Property!{&PhysicsBody3D, f32}("restitution", settings.restitution, |dmut b| => b.settings.restitution,
+                                                set-> (|dmut b, v| => { let mut s = b.settings; s.restitution = v; b.settings = s; })?,
+                                                label-> "Restitution", group-> MATERIAL_GROUP,
+                                                range-> NumberRange(min-> 0.0f, max-> 1.0f, step-> 0.05f, decimals-> 2u32)),
+            copy Property!{&PhysicsBody3D, f32}("linear-damping", settings.linearDamping, |dmut b| => b.settings.linearDamping,
+                                                set-> (|dmut b, v| => { let mut s = b.settings; s.linearDamping = v; b.settings = s; })?,
+                                                label-> "Linear damping", group-> DYNAMICS_GROUP, when-> dynamic,
+                                                range-> NumberRange(min-> 0.0f, max-> 100.0f, step-> 0.01f, decimals-> 2u32)),
+            copy Property!{&PhysicsBody3D, f32}("angular-damping", settings.angularDamping, |dmut b| => b.settings.angularDamping,
+                                                set-> (|dmut b, v| => { let mut s = b.settings; s.angularDamping = v; b.settings = s; })?,
+                                                label-> "Angular damping", group-> DYNAMICS_GROUP, when-> dynamic,
+                                                range-> NumberRange(min-> 0.0f, max-> 100.0f, step-> 0.01f, decimals-> 2u32)),
+            copy Property!{&PhysicsBody3D, bool}("can-sleep", settings.canSleep, |dmut b| => b.settings.canSleep,
+                                                 set-> (|dmut b, v| => { let mut s = b.settings; s.canSleep = v; b.settings = s; })?,
+                                                 label-> "Can sleep", group-> DYNAMICS_GROUP, when-> dynamic),
+            copy Property!{&PhysicsBody3D, bool}("bullet", settings.bullet, |dmut b| => b.settings.bullet,
+                                                 set-> (|dmut b, v| => { let mut s = b.settings; s.bullet = v; b.settings = s; })?,
+                                                 label-> "Bullet, advanced along its motion", group-> DYNAMICS_GROUP, when-> dynamic),
+            copy Property!{&PhysicsBody3D, bool}("trigger", settings.trigger, |dmut b| => b.settings.trigger,
+                                                 set-> (|dmut b, v| => { let mut s = b.settings; s.trigger = v; b.settings = s; })?,
+                                                 label-> "Trigger, stopping nothing", group-> GROUP)
+        ] ~ layers())
+    }
+
+    /**
+     * @returns: why a body refuses a motion, a plane or a mesh never being dynamic, empty when it takes it
+     * */
+    pub fn neverDynamic(body: &PhysicsBody3D, motion: BodyMotion)-> [c8] {
+        let kind = (body.described ?? BodyShape()).kind;
+        if motion != BodyMotion::DYNAMIC || (kind != BodyShapeKind::PLANE && kind != BodyShapeKind::MESH) { return ""; }
+
+        f"${body.name.file()}: a plane or a mesh is never dynamic"
     }
 
 }

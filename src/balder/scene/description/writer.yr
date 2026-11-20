@@ -1,9 +1,8 @@
 in writer;
 
-use balder::math::{curve, utils, vector};
-use balder::scene::physics;
+use balder::math::{utils, vector};
 use balder::scene::description::{kind, node_description, reader};
-use balder::scene::node::node3D::{body_shape, camera, light, marker, volume_shape};
+use balder::scene::property::{kind, node_property, value};
 
 use std::{conv, stream, uuid};
 use std::algorithm::sorting;
@@ -14,8 +13,9 @@ use std::algorithm::sorting;
  * =====
  * The file is the same each time the same nodes are written, so it diffs well under version control: the assets in the
  * order of their paths, each keyed by the name of its file; the nodes parents first, in the order of the descriptions
- * among their siblings; the entries of a node in a fixed order, those holding the default of the description left out;
- * each number the shortest decimal that reads back the same float (the angles, in degrees, the same radians).
+ * among their siblings; the entries of a node in the order of the schema of its kind, those that do not apply (see
+ * NodeProperty.condition) and those holding the default of the schema left out; each number the shortest decimal that
+ * reads back the same float (the angles, in degrees, the same radians).
  * ====
  * */
 pub record SceneWriter {
@@ -65,71 +65,24 @@ mod SceneWriter {
      * Write the block of a node, then the blocks of the nodes under it
      * @params:
      *    - parent: the id of its parent, none under the root
-     *    - assets: the keys of the files of the models (see assets)
+     *    - assets: the keys of the files of the assets (see assets)
      * */
     pub fn writeNode(dmut out: &StringStream, n: NodeDescription, parent: (Uuid)?, assets: [([c8], [c8])]) {
         let id = if n.id.isNil() { v4() } else { n.id };
-        let defaults = NodeDescription(n.name, n.kind);
 
         out:.write(f"\nnode #${id} ${kindName(n.kind)} ${SceneWriter::quoted(n.name)} {\n");
         if let Ok(p) = parent {
             SceneWriter::entry(alias out, "parent", f"#${p}");
         }
 
-        if n.position != defaults.position { SceneWriter::entry(alias out, "position", SceneWriter::vector(n.position)); }
-        if n.rotation != defaults.rotation {
-            let r = n.rotation;
-            SceneWriter::entry(alias out, "rotation", SceneWriter::angle(r.x) ~ " " ~ SceneWriter::angle(r.y) ~ " " ~ SceneWriter::angle(r.z));
-        }
-
-        if n.scale != defaults.scale { SceneWriter::entry(alias out, "scale", SceneWriter::vector(n.scale)); }
-
-        match n.kind {
-            NodeKind::MODEL => {
-                for a in assets if a._0 == n.file {
-                    SceneWriter::entry(alias out, "file", "@" ~ a._1);
+        for p in schemaOf(n.kind).properties if n.applies(p) {
+            let v = n.value(p.name);
+            if p.kind == PropertyKind::ASSET {
+                for a in assets if v.text.len != 0us && a._0 == v.text {
+                    SceneWriter::entry(alias out, p.name, "@" ~ a._1);
                 }
-
-                if n.lods != defaults.lods { SceneWriter::entry(alias out, "lods", SceneWriter::boolean(n.lods)); }
-            }
-            NodeKind::LIGHT => {
-                if n.light != defaults.light            { SceneWriter::entry(alias out, "light", SceneWriter::lightName(n.light)); }
-                if n.color != defaults.color            { SceneWriter::entry(alias out, "color", SceneWriter::vector(n.color)); }
-                if n.intensity != defaults.intensity    { SceneWriter::entry(alias out, "intensity", SceneWriter::number(n.intensity)); }
-                if n.direction != defaults.direction    { SceneWriter::entry(alias out, "direction", SceneWriter::vector(n.direction)); }
-                if n.range != defaults.range            { SceneWriter::entry(alias out, "range", SceneWriter::number(n.range)); }
-                if n.innerAngle != defaults.innerAngle  { SceneWriter::entry(alias out, "inner-angle", SceneWriter::number(n.innerAngle)); }
-                if n.outerAngle != defaults.outerAngle  { SceneWriter::entry(alias out, "outer-angle", SceneWriter::number(n.outerAngle)); }
-                if n.shadows != defaults.shadows        { SceneWriter::entry(alias out, "shadows", SceneWriter::boolean(n.shadows)); }
-            }
-            NodeKind::MARKER => {
-                if n.purpose != defaults.purpose { SceneWriter::entry(alias out, "purpose", SceneWriter::purposeName(n.purpose)); }
-                if n.tags.len != 0us             { SceneWriter::entry(alias out, "tags", SceneWriter::strings(n.tags)); }
-            }
-            NodeKind::PATH => {
-                if n.curve != defaults.curve   { SceneWriter::entry(alias out, "curve", SceneWriter::curveName(n.curve)); }
-                if n.closed != defaults.closed { SceneWriter::entry(alias out, "closed", SceneWriter::boolean(n.closed)); }
-            }
-            NodeKind::VOLUME => {
-                SceneWriter::writeVolume(alias out, n.volume, defaults.volume);
-            }
-            NodeKind::BODY => {
-                SceneWriter::writeBodyShape(alias out, n.shape, defaults.shape, assets);
-                SceneWriter::writeBodySettings(alias out, n.body, defaults.body);
-            }
-            NodeKind::CHARACTER => {
-                SceneWriter::writeCharacter(alias out, n, defaults);
-            }
-            NodeKind::CAMERA => {
-                SceneWriter::writeCamera(alias out, n, defaults);
-            }
-            NodeKind::EMPTY => {}
-            NodeKind::PATH_POINT => {}
-            _ => {
-                let m = n.material, d = defaults.material;
-                if m.baseColor != d.baseColor { SceneWriter::entry(alias out, "color", SceneWriter::vector(m.baseColor)); }
-                if m.roughness != d.roughness { SceneWriter::entry(alias out, "roughness", SceneWriter::number(m.roughness)); }
-                if m.metallic != d.metallic   { SceneWriter::entry(alias out, "metallic", SceneWriter::number(m.metallic)); }
+            } else if !(v == p.defaultValue) {
+                SceneWriter::entry(alias out, p.name, SceneWriter::valueOf(p, v));
             }
         }
 
@@ -140,111 +93,27 @@ mod SceneWriter {
     }
 
     /**
-     * Write the entries of the shape of a volume, those of its kind only: the size of a box, the radius of a sphere, the
-     * radius and the height of a capsule
-     * @params:
-     *    - defaults: the shape of a volume of the defaults of the description, the entries holding its values left out
+     * @returns: the text of the value of an entry of a property, the angles of a property in degrees written in degrees
      * */
-    pub fn writeVolume(dmut out: &StringStream, v: VolumeShape, defaults: VolumeShape) {
-        if v.kind != defaults.kind { SceneWriter::entry(alias out, "shape", SceneWriter::volumeName(v.kind)); }
-        match v.kind {
-            VolumeKind::BOX => {
-                if v.size != defaults.size { SceneWriter::entry(alias out, "size", SceneWriter::vector(v.size)); }
-            }
-            VolumeKind::SPHERE => {
-                if v.radius != defaults.radius { SceneWriter::entry(alias out, "radius", SceneWriter::number(v.radius)); }
-            }
-            _ => {
-                if v.radius != defaults.radius { SceneWriter::entry(alias out, "radius", SceneWriter::number(v.radius)); }
-                if v.height != defaults.height { SceneWriter::entry(alias out, "height", SceneWriter::number(v.height)); }
-            }
-        }
-    }
+    pub fn valueOf(p: &NodeProperty, v: PropertyValue)-> [c8] {
+        match p.kind {
+            PropertyKind::NUMBER => { return if p.degrees { SceneWriter::angle(v.number) } else { SceneWriter::number(v.number) }; }
+            PropertyKind::VECTOR | PropertyKind::COLOR => {
+                if !p.degrees { return SceneWriter::vector(v.vector); }
 
-    /**
-     * Write the entries of the shape of a body, those of its kind only: the size of a box, the radius of a sphere, the
-     * radius and the height of a capsule or a cylinder, the model of a hull or a mesh
-     * @params:
-     *    - defaults: the shape of a body of the defaults of the description, the entries holding its values left out
-     *    - assets: the keys of the files of the models (see assets)
-     * */
-    pub fn writeBodyShape(dmut out: &StringStream, b: BodyShape, defaults: BodyShape, assets: [([c8], [c8])]) {
-        if b.kind != defaults.kind { SceneWriter::entry(alias out, "shape", shapeName(b.kind)); }
-        match b.kind {
-            BodyShapeKind::BOX => {
-                if b.size != defaults.size { SceneWriter::entry(alias out, "size", SceneWriter::vector(b.size)); }
+                let r = v.vector;
+                return SceneWriter::angle(r.x) ~ " " ~ SceneWriter::angle(r.y) ~ " " ~ SceneWriter::angle(r.z);
             }
-            BodyShapeKind::SPHERE => {
-                if b.radius != defaults.radius { SceneWriter::entry(alias out, "radius", SceneWriter::number(b.radius)); }
-            }
-            BodyShapeKind::CAPSULE | BodyShapeKind::CYLINDER => {
-                if b.radius != defaults.radius { SceneWriter::entry(alias out, "radius", SceneWriter::number(b.radius)); }
-                if b.height != defaults.height { SceneWriter::entry(alias out, "height", SceneWriter::number(b.height)); }
-            }
-            BodyShapeKind::HULL | BodyShapeKind::MESH => {
-                for a in assets if a._0 == b.model {
-                    SceneWriter::entry(alias out, "model", "@" ~ a._1);
-                }
-            }
+            PropertyKind::BOOL   => { return SceneWriter::boolean(v.flag); }
+            PropertyKind::STRING => { return SceneWriter::quoted(v.text); }
+            PropertyKind::TEXTS  => { return SceneWriter::strings(v.texts); }
+            PropertyKind::NODE   => { return f"#${v.node}"; }
+            PropertyKind::COUNT  => { return f"${v.bits}"; }
+            PropertyKind::LAYERS => { return SceneWriter::layers(v.bits); }
             _ => {}
         }
-    }
 
-    /**
-     * Write the entries of the settings of a body, those holding the defaults of the description left out
-     * */
-    pub fn writeBodySettings(dmut out: &StringStream, s: BodySettings, d: BodySettings) {
-        if s.motion != d.motion                     { SceneWriter::entry(alias out, "motion", SceneWriter::motionName(s.motion)); }
-        if s.mass != d.mass                         { SceneWriter::entry(alias out, "mass", SceneWriter::number(s.mass)); }
-        if s.friction != d.friction                 { SceneWriter::entry(alias out, "friction", SceneWriter::number(s.friction)); }
-        if s.rollingFriction != d.rollingFriction   { SceneWriter::entry(alias out, "rolling-friction", SceneWriter::number(s.rollingFriction)); }
-        if s.spinningFriction != d.spinningFriction { SceneWriter::entry(alias out, "spinning-friction", SceneWriter::number(s.spinningFriction)); }
-        if s.restitution != d.restitution           { SceneWriter::entry(alias out, "restitution", SceneWriter::number(s.restitution)); }
-        if s.linearDamping != d.linearDamping       { SceneWriter::entry(alias out, "linear-damping", SceneWriter::number(s.linearDamping)); }
-        if s.angularDamping != d.angularDamping     { SceneWriter::entry(alias out, "angular-damping", SceneWriter::number(s.angularDamping)); }
-        if s.canSleep != d.canSleep                 { SceneWriter::entry(alias out, "can-sleep", SceneWriter::boolean(s.canSleep)); }
-        if s.bullet != d.bullet                     { SceneWriter::entry(alias out, "bullet", SceneWriter::boolean(s.bullet)); }
-        if s.trigger != d.trigger                   { SceneWriter::entry(alias out, "trigger", SceneWriter::boolean(s.trigger)); }
-        if s.layer != d.layer                       { SceneWriter::entry(alias out, "layer", SceneWriter::layers(s.layer)); }
-        if s.mask != d.mask                         { SceneWriter::entry(alias out, "mask", SceneWriter::layers(s.mask)); }
-    }
-
-    /**
-     * Write the entries of a character: its capsule, how it moves, its layer and its mask, those holding the defaults of
-     * the description left out
-     * */
-    pub fn writeCharacter(dmut out: &StringStream, n: NodeDescription, defaults: NodeDescription) {
-        let c = n.character, d = defaults.character;
-        if n.shape.radius != defaults.shape.radius { SceneWriter::entry(alias out, "radius", SceneWriter::number(n.shape.radius)); }
-        if n.shape.height != defaults.shape.height { SceneWriter::entry(alias out, "height", SceneWriter::number(n.shape.height)); }
-        if c.up != d.up                     { SceneWriter::entry(alias out, "up", SceneWriter::vector(c.up)); }
-        if c.slopeLimit != d.slopeLimit     { SceneWriter::entry(alias out, "slope-limit", SceneWriter::angle(c.slopeLimit)); }
-        if c.stepOffset != d.stepOffset     { SceneWriter::entry(alias out, "step-offset", SceneWriter::number(c.stepOffset)); }
-        if c.snapDistance != d.snapDistance { SceneWriter::entry(alias out, "snap-distance", SceneWriter::number(c.snapDistance)); }
-        if c.skin != d.skin                 { SceneWriter::entry(alias out, "skin", SceneWriter::number(c.skin)); }
-        if c.coyoteTime != d.coyoteTime     { SceneWriter::entry(alias out, "coyote-time", SceneWriter::number(c.coyoteTime)); }
-        if c.pushMass != d.pushMass         { SceneWriter::entry(alias out, "push-mass", SceneWriter::number(c.pushMass)); }
-        if c.maxSlides != d.maxSlides       { SceneWriter::entry(alias out, "max-slides", f"${c.maxSlides}"); }
-        if c.depenetrations != d.depenetrations { SceneWriter::entry(alias out, "depenetrations", f"${c.depenetrations}"); }
-        if n.body.layer != defaults.body.layer  { SceneWriter::entry(alias out, "layer", SceneWriter::layers(n.body.layer)); }
-        if n.body.mask != defaults.body.mask    { SceneWriter::entry(alias out, "mask", SceneWriter::layers(n.body.mask)); }
-    }
-
-    /**
-     * Write the entries of a camera: its projection, its field of view (perspective) or its size (orthographic), its near
-     * and far planes and whether it is active, those holding the defaults of the description left out
-     * */
-    pub fn writeCamera(dmut out: &StringStream, n: NodeDescription, defaults: NodeDescription) {
-        if n.projection != defaults.projection { SceneWriter::entry(alias out, "projection", SceneWriter::projectionName(n.projection)); }
-        if n.projection == CameraProjection::ORTHOGRAPHIC {
-            if n.size != defaults.size { SceneWriter::entry(alias out, "size", SceneWriter::number(n.size)); }
-        } else if n.fov != defaults.fov {
-            SceneWriter::entry(alias out, "fov", SceneWriter::number(n.fov));
-        }
-
-        if n.near != defaults.near { SceneWriter::entry(alias out, "near", SceneWriter::number(n.near)); }
-        if n.far != defaults.far   { SceneWriter::entry(alias out, "far", SceneWriter::number(n.far)); }
-        if n.active                { SceneWriter::entry(alias out, "active", SceneWriter::boolean(true)); }
+        v.text
     }
 
     /**
@@ -255,9 +124,9 @@ mod SceneWriter {
     }
 
     /**
-     * @returns: the files of the models of nodes and of the nodes under them (the models, the models of the hulls and
-     * of the meshes of the bodies), each once, in the order of their paths,
-     * with the key of each: the name of the file, without its directory and its extension, made a valid name, followed
+     * @returns: the files of the assets of nodes and of the nodes under them (their properties of the kind ASSET that
+     * apply: the file of a model, the model of a hull or a mesh), each once, in the order of their paths, with the key of
+     * each: the name of the file, without its directory and its extension, made a valid name, followed
      * by the first free number when another file before it took it
      * */
     pub fn assets(nodes: [NodeDescription])-> [([c8], [c8])] {
@@ -277,24 +146,18 @@ mod SceneWriter {
     }
 
     /**
-     * @returns: the files of the models of nodes and of the nodes under them (the models, the models of the hulls and
-     * of the meshes of the bodies), each once, added to those found already
+     * @returns: the files of the assets of nodes and of the nodes under them, each once, added to those found already
      * */
     pub fn modelFiles(nodes: [NodeDescription], found: [[c8]])-> [[c8]] {
         let mut files = found;
         for n in nodes {
-            let file = if n.kind == NodeKind::MODEL {
-                n.file
-            } else if n.kind == NodeKind::BODY && (n.shape.kind == BodyShapeKind::HULL || n.shape.kind == BodyShapeKind::MESH) {
-                n.shape.model
-            } else {
-                ""
-            };
-
-            if file.len != 0us {
-                let mut known = false;
-                for f in files if f == file { known = true; }
-                if !known { files = files ~ [file]; }
+            for p in schemaOf(n.kind).properties if p.kind == PropertyKind::ASSET && n.applies(p) {
+                let file = n.value(p.name).text;
+                if file.len != 0us {
+                    let mut known = false;
+                    for f in files if f == file { known = true; }
+                    if !known { files = files ~ [file]; }
+                }
             }
 
             files = SceneWriter::modelFiles(n.children, files);
@@ -447,36 +310,6 @@ mod SceneWriter {
     }
 
     /**
-     * @returns: the name of a purpose of a marker, as the entry purpose of a scene file writes it
-     * */
-    pub fn purposeName(p: MarkerPurpose)-> [c8] {
-        match p {
-            MarkerPurpose::SPAWN    => { "spawn" }
-            MarkerPurpose::WAYPOINT => { "waypoint" }
-            MarkerPurpose::SOCKET   => { "socket" }
-            _                       => { "generic" }
-        }
-    }
-
-    /**
-     * @returns: the name of a kind of curve, as the entry curve of a scene file writes it
-     * */
-    pub fn curveName(k: CurveKind)-> [c8] {
-        if k == CurveKind::BEZIER { "bezier" } else { "catmull-rom" }
-    }
-
-    /**
-     * @returns: the name of a kind of shape of a volume, as the entry shape of a scene file writes it
-     * */
-    pub fn volumeName(k: VolumeKind)-> [c8] {
-        match k {
-            VolumeKind::SPHERE  => { "sphere" }
-            VolumeKind::CAPSULE => { "capsule" }
-            _                   => { "box" }
-        }
-    }
-
-    /**
      * @returns: the numbers of the layers of bits, from the lowest, separated by spaces, or none
      * */
     pub fn layers(bits: u32)-> [c8] {
@@ -491,32 +324,4 @@ mod SceneWriter {
         s[]
     }
 
-    /**
-     * @returns: the name of a motion of a body, as the entry motion of a scene file writes it
-     * */
-    pub fn motionName(m: BodyMotion)-> [c8] {
-        match m {
-            BodyMotion::KINEMATIC => { "kinematic" }
-            BodyMotion::DYNAMIC   => { "dynamic" }
-            _                     => { "static" }
-        }
-    }
-
-    /**
-     * @returns: the name of a projection of a camera, as the entry projection of a scene file writes it
-     * */
-    pub fn projectionName(p: CameraProjection)-> [c8] {
-        if p == CameraProjection::ORTHOGRAPHIC { "orthographic" } else { "perspective" }
-    }
-
-    /**
-     * @returns: the name of a type of light, as the entry light of a scene file writes it
-     * */
-    pub fn lightName(t: LightType)-> [c8] {
-        match t {
-            LightType::POINT => { "point" }
-            LightType::SPOT  => { "spot" }
-            _                => { "direction" }
-        }
-    }
 }
