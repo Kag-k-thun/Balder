@@ -1,7 +1,7 @@
 in inspector_panel;
 
-use main::{command, editor, lighting, outline};
-use main::command::{body, light, marker, path, rename, transform, volume};
+use main::{command, editor, framing, lighting, outline};
+use main::command::{active_camera, body, camera, light, marker, path, projection, rename, transform, volume};
 use balder::core::application::signal;
 use balder::core::error;
 use balder::interface;
@@ -13,11 +13,11 @@ use balder::math::{_, utils};
 use balder::scene::edit;
 use balder::scene::edit::{body_edit, volume_edit};
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::{body, body_shape, character, light, marker, path, path_point, solid, transform, volume, volume_shape};
+use balder::scene::node::node3D::{body, body_shape, camera, character, light, marker, path, path_point, solid, transform, volume, volume_shape};
 use balder::scene::physics;
 
-// The path of the inspector in the interface of the editor, then of its panels, of an object, a light, a marker, a path
-// and a volume
+// The path of the inspector in the interface of the editor, then of its panels, of an object, a light, a marker, a path,
+// a volume, a body and a camera
 def INSPECTOR = "BODY/MAIN/INSPECTOR";
 def OBJECT = "BODY/MAIN/INSPECTOR/OBJECT";
 def LIGHT = "BODY/MAIN/INSPECTOR/LIGHT";
@@ -25,6 +25,7 @@ def MARKER = "BODY/MAIN/INSPECTOR/MARKER";
 def PATH = "BODY/MAIN/INSPECTOR/PATH";
 def VOLUME = "BODY/MAIN/INSPECTOR/VOLUME";
 def PHYSICS = "BODY/MAIN/INSPECTOR/BODY";
+def CAMERA = "BODY/MAIN/INSPECTOR/CAMERA";
 
 // The path of the panel of the convex hulls of a model, filled by the HullsPanel
 def HULLS = "BODY/MAIN/INSPECTOR/HULLS";
@@ -72,6 +73,12 @@ def NUMBER_ANGULAR = 4u32;
 def NUMBER_ROLLING = 5u32;
 def NUMBER_SPINNING = 6u32;
 
+// The settings of a camera a field of its panel changes, by the index the panel binds to its fields (see withFraming)
+def FRAME_FOV = 0u32;
+def FRAME_SIZE = 1u32;
+def FRAME_NEAR = 2u32;
+def FRAME_FAR = 3u32;
+
 // The switches of a body, by the index the panel binds to its boxes
 def SWITCH_SLEEPS = 0u32;
 def SWITCH_BULLET = 1u32;
@@ -79,7 +86,7 @@ def SWITCH_TRIGGER = 2u32;
 
 /**
  * The items of the dropdowns of the inspector, in their order in inspector.gui: the purposes of a marker, the curves of
- * a path, the shapes of a volume
+ * a path, the projections of a camera, the shapes of a volume
  * */
 enum Purposes
 | GENERIC  = (0us, MarkerPurpose::GENERIC)
@@ -90,6 +97,10 @@ enum Purposes
 enum Curves
 | CATMULL_ROM = (0us, CurveKind::CATMULL_ROM)
 | BEZIER      = (1us, CurveKind::BEZIER);
+
+enum Projections
+| PERSPECTIVE  = (0us, CameraProjection::PERSPECTIVE)
+| ORTHOGRAPHIC = (1us, CameraProjection::ORTHOGRAPHIC);
 
 enum Shapes
 | BOX     = (0us, VolumeKind::BOX)
@@ -122,10 +133,12 @@ enum BodyShapes
  * fields its type does not use being absent. Under the panel of an object, a marker has the panel of its purpose and
  * its tags, a path the panel of its curve and of whether it is closed, a volume the panel of its shape, the fields its
  * shape does not use being absent, a body or a character the panel of its physics (its motion, its shape, its
- * material, its layers), a model the panel of its convex hulls (filled by the HullsPanel)
+ * material, its layers), a camera the panel of its projection, its planes and whether it is the active camera of the
+ * scene, a model the panel of its convex hulls (filled by the HullsPanel)
  * @info: a name validated renames the node inspected; a field changed gives its value to every node selected of the
- * kind of the panel, each keeping its other settings; every change goes through the commands of the editor, the steps
- * of one field merging into one command
+ * kind of the panel, each keeping its other settings, but the projection and the activation of a camera, which change
+ * the camera inspected only; every change goes through the commands of the editor, the steps of one field merging into
+ * one command
  * */
 pub class InspectorPanel over Behavior {
 
@@ -183,6 +196,9 @@ pub class InspectorPanel over Behavior {
         self:.slot("switched", &self:.onSwitched);
         self:.slot("layered", &self:.onLayered);
         self:.slot("masked", &self:.onMasked);
+        self:.slot("projected", &self:.onProjected);
+        self:.slot("framed", &self:.onFramed);
+        self:.slot("activated", &self:.onActivated);
     }
 
     /**
@@ -276,6 +292,7 @@ pub class InspectorPanel over Behavior {
         self:.setPresent(PATH, if let Ok(_: &Path3D) = self._node { true } else { false });
         self:.setPresent(VOLUME, if let Ok(_: &Volume3D) = self._node { true } else { false });
         self:.setPresent(PHYSICS, if let Ok(_: &PhysicsBody3D) = self._node { true } else { false });
+        self:.setPresent(CAMERA, if let Ok(_: &Camera) = self._node { true } else { false });
         self:.setPresent(HULLS, if let Ok(_: &SolidObjectModel) = self._node { true } else { false });
 
         if let Ok(l: &Light) = self._node {
@@ -292,7 +309,36 @@ pub class InspectorPanel over Behavior {
             self:.refreshVolume(v);
         } else if let Ok(b: &PhysicsBody3D) = self._node {
             self:.refreshBody(b);
+        } else if let Ok(c: &Camera) = self._node {
+            self:.refreshCamera(c);
         }
+    }
+
+    /**
+     * Write the projection, the planes of a camera and whether it is the active camera of the scene in its panel, the
+     * field of view of a perspective camera and the height of the view of an orthographic one, the other absent
+     * */
+    fn refreshCamera(mut self, cam: &Camera) {
+        let projection = cam.projection();
+        cte for p in Projections::__members__ {
+            if p._1 == projection { self:.setChoice(CAMERA ~ "/PROJECTION", p._0); }
+        }
+
+        let settings = CameraSettings(cam);
+        self:.setPresent(CAMERA ~ "/FOV", projection == CameraProjection::PERSPECTIVE);
+        self:.setPresent(CAMERA ~ "/SIZE", projection == CameraProjection::ORTHOGRAPHIC);
+        self:.setNumber(CAMERA ~ "/FOV", settings.fov);
+        self:.setNumber(CAMERA ~ "/SIZE", settings.size);
+        self:.setNumber(CAMERA ~ "/NEAR", settings.near);
+        self:.setNumber(CAMERA ~ "/FAR", settings.far);
+
+        let mut active = false;
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            if let Ok(a) = scene:.getActiveCamera() { active = a is cam; }
+        }
+
+        self:.setChecked(CAMERA ~ "/ACTIVE", active);
     }
 
     /**
@@ -785,6 +831,65 @@ pub class InspectorPanel over Behavior {
     }
 
     /**
+     * An item of the projection of a camera was chosen: the camera inspected is replaced by a camera of that projection
+     * (see ProjectionCommand)
+     * */
+    fn onProjected(mut self, index: usize) {
+        cte for p in Projections::__members__ {
+            if p._0 == index {
+                if let Ok(dmut c: &Camera) = alias self._node {
+                    self:.run(copy ProjectionCommand(alias c, p._1));
+                }
+            }
+        }
+
+        self:.refresh();
+    }
+
+    /**
+     * A field of the panel of a camera changed: every camera selected takes the value, its other settings kept
+     * @params:
+     *    - setting: FRAME_FOV to FRAME_FAR
+     * */
+    fn onFramed(mut self, setting: u32, value: f32) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let dmut scene = alias e.scene;
+        let dmut selection = alias scene.selection;
+
+        let dmut cameras: [&Camera] = [];
+        let mut settings: [CameraSettings] = [];
+        for dmut n in alias selection.nodes {
+            if let dmut c: &Camera = alias n {
+                settings ~= [withFraming(CameraSettings(c), setting, value)];
+                cameras ~= [alias c];
+            }
+        }
+
+        if cameras.len != 0us {
+            self:.run(copy CameraCommand(alias cameras, settings, field-> f"camera ${setting}"));
+        }
+
+        // a value refused (a far plane before the near one...) is written back
+        self:.refresh();
+    }
+
+    /**
+     * The box of the active camera was checked: the camera inspected becomes the active camera of the scene; unchecked,
+     * the box is checked again, the scene keeping an active camera while it has one
+     * */
+    fn onActivated(mut self, on: bool) {
+        if on {
+            if let Ok(dmut c: &Camera) = alias self._node {
+                self:.run(copy ActiveCameraCommand(alias c));
+            }
+        } else {
+            self._status("The scene is seen through one of its cameras: make another one active instead");
+        }
+
+        self:.refresh();
+    }
+
+    /**
      * Give each light selected a value of a setting, through a command, the other settings of each one kept
      * @params:
      *    - setting: the setting changed, SET_DIRECTION to SET_SHADOWS
@@ -897,6 +1002,18 @@ fn withSetting(s: LightSettings, setting: u32, axis: u32, value: f32)-> LightSet
                   if setting == SET_INNER { value } else { s.innerAngle },
                   if setting == SET_OUTER { value } else { s.outerAngle },
                   if setting == SET_SHADOWS { value != 0.0f } else { s.castShadow })
+}
+
+/**
+ * @returns: the settings of a camera, one of them changed
+ * @params:
+ *    - setting: the setting changed, FRAME_FOV to FRAME_FAR
+ * */
+fn withFraming(s: CameraSettings, setting: u32, value: f32)-> CameraSettings {
+    CameraSettings(if setting == FRAME_FOV { value } else { s.fov },
+                   if setting == FRAME_SIZE { value } else { s.size },
+                   if setting == FRAME_NEAR { value } else { s.near },
+                   if setting == FRAME_FAR { value } else { s.far })
 }
 
 /**
