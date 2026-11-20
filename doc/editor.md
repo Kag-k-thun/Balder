@@ -95,6 +95,15 @@ it, as Unreal's launcher module runs the module of a game.
   a kinematic one or a character, orange a dynamic one, yellow a trigger, fainter until the body is selected; a body
   without a mesh under it, and a character, have an icon of their own. *View → Hide the icons* hides them all, the
   wireframes, the curves and the colliders with them, and shows them again.
+- **Cameras**: a scene holds any number of cameras (`PerspectiveCamera`, `OrthoCamera`), one of them active, the one
+  the game draws the scene through (`Scene::getActiveCamera`, `setActiveCamera`): the first camera entering the scene,
+  and when the active one leaves, the first of the others. The editor draws the viewport through its own camera
+  (`Scene::setViewCamera`), never saved, the active camera of the scene only ringed in green among the icons. A camera
+  looks along the -Z of its node, its top along Y, and follows its parents: a camera under a rig moves with it.
+  *View → Look through the camera selected* draws the viewport through a camera of the scene instead: the middle
+  button, the wheel, the flight and F then move that camera, each move recorded as a change of its transform, undone as
+  any other, until *View → Look through the editor camera*, or until the camera leaves the scene (removed, or replaced
+  by a camera of the other projection), the editor camera taking back the eye it had.
 - **Nodes without a mesh**: an *empty* (`Empty3D`) only places the nodes under it. A *marker* (`Marker3D`) is an empty
   with a purpose (a spawn point, a waypoint, a socket, or none given) and tags, the game looking it up by its name
   (`Marker3D::find`), its tags (`tagged`) or its purpose (`ofPurpose`) under a node. A *path* (`Path3D`) is a curve,
@@ -136,7 +145,9 @@ it, as Unreal's launcher module runs the module of a game.
   its sizes (the model of a hull or a mesh told under them), its friction and its restitution, the mass, the damping,
   the rolling and spinning frictions, the sleep and the bullet of a dynamic body, whether it is a trigger, then the
   layers it is in and the layers it touches as two fields of 32 boxes, a character its radius, its height and its
-  layers only; a light its position,
+  layers only; a camera its transform, then its projection (perspective or orthographic), its field of view (in degrees)
+  or the height of its view, its near and far planes, and whether it is the active camera of the scene, a box checked
+  to make it active (the scene keeping one active camera while it has one, unchecking it does nothing); a light its position,
   its direction, its colour, its intensity, its range, the angles of its cone and whether it casts shadows, the fields
   its type does not use left out (no position for a direction light, no direction for a point light, a cone for a spot
   light only). A name is applied when Enter is pressed; a field changed gives its value to every node selected of the
@@ -154,10 +165,11 @@ it, as Unreal's launcher module runs the module of a game.
   (Ctrl+Shift+S), and goes back to the project manager, *Add* adds a cube, a sphere, a plane, a model read from a
   file, an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
   box), a character or a light where the centre of the viewport meets a surface (or at the point the camera looks at),
-  a point to the path selected, or a body around each node selected, its kinds grouped in submenus opening as they are
-  hovered (*Mesh*, *Light*, *Marker*, *Path*, *Volume*, *Physics*), and Ctrl+E opening it under the cursor,
+  a camera where the eye of the viewport stands, looking where it looks, a point to the path selected, or a body around
+  each node selected, its kinds grouped in submenus opening as they are hovered (*Mesh*, *Light*, *Marker*, *Path*,
+  *Volume*, *Physics*, *Camera*), and Ctrl+E opening it under the cursor,
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
-  frames the selection, and *View* hides or shows the icons and the grid.
+  frames the selection, and *View* hides or shows the icons and the grid, and looks through the camera selected.
 - **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
   scene is undone, the nodes selected before it being selected again; the steps of one field of the inspector (its
   arrows clicked, its keys held, its wheel turned) are undone as one change. Opening a scene starts the history again.
@@ -204,6 +216,9 @@ executed after commands undone drops them; an open starts the history again (`st
 | `PathCommand` | the curve of paths or whether they are closed, chosen in the inspector | the curves and the closings before |
 | `VolumeCommand` | the shapes of volumes, typed in the inspector or dragged by a face with the gizmo, the centre following a face moved on its own; the faces of the collider of a body dragged | the shapes and the transforms before, merging the steps of one field |
 | `BodyCommand` | the settings and the shapes of bodies, typed in the inspector, the colliders built once (a model read, the volumes of a compound gathered) | the settings, the shapes and the colliders before, merging the steps of one field |
+| `CameraCommand` | the field of view, the height of the view or the planes of cameras, typed in the inspector, refused when a camera would see nothing | the settings before, merging the steps of one field |
+| `ProjectionCommand` | a camera replaced by a camera of the other projection, of its id, its name, its place, its transform, its planes and the nodes under it, seeing at the point it looks at what it saw there, active when it was, selected | the camera put back in place of its replacement |
+| `ActiveCameraCommand` | the active camera of the scene, checked in the inspector | the camera active before made active again |
 | `RenameCommand` | the name of a node, refused when a sibling has it | the name before |
 | `AddCommand` | a node built from its description, at a place among the children of its parent (a point inserted in a path), selected | detaching the node |
 | `RemoveCommand` | nodes and the nodes under them | attaching them again under their parents, at their places |
@@ -247,7 +262,7 @@ node #0c203f1a-b872-4e76-b3e0-0c7c95e00c74 model "table" {
 ```
 
 A node is `node #<id> <kind> "<name>" { … }`, the kind being `empty`, `model`, `cube`, `sphere`, `plane`, `light`,
-`marker`, `path`, `path-point`, `volume`, `body` or `character`, the points of a path being the `path-point` nodes
+`marker`, `path`, `path-point`, `volume`, `body`, `character` or `camera`, the points of a path being the `path-point` nodes
 under it, in their order, the parts of a compound body the `volume` nodes under it.
 Its id (`Node3D.guid`) is a uuid it keeps from one save to the next, and the nodes under another name it as their
 `parent`, so the file stays flat however deep the tree is: moving a node under another parent changes one line, and a
@@ -267,6 +282,7 @@ is the order of the nodes (`Node::getChildrenInOrder`), which the outline shows 
 | `shape`, `size`, `radius`, `height`, `model` | body | `box`, `sphere`, `capsule`, `cylinder`, `plane`, `hull`, `mesh` or `compound`; the sizes of its shape as a volume has them, the height of a cylinder too; the asset of the model of a hull or a mesh (`@<key>`, required by them, refused by the others) |
 | `motion`, `mass`, `friction`, `rolling-friction`, `spinning-friction`, `restitution`, `linear-damping`, `angular-damping`, `can-sleep`, `bullet`, `trigger` | body | `static`, `kinematic` or `dynamic`, then as `BodySettings` has them |
 | `layer`, `mask` | body, character | the numbers of the layers, 0 to 31 (`layer: 0 2;`), or `none` |
+| `projection`, `fov`, `size`, `near`, `far`, `active` | camera | `perspective` or `orthographic`; the vertical field of view of a perspective camera in degrees, the height of the view of an orthographic one; its planes; whether it is the active camera of the scene (`true`, one camera of the file at most) |
 | `radius`, `height`, `up`, `slope-limit`, `step-offset`, `snap-distance`, `skin`, `coyote-time`, `push-mass`, `max-slides`, `depenetrations` | character | its capsule (0.4 and 1.8 by default), then as `CharacterSettings` has them, the slope limit in degrees |
 
 An asset is `asset <key> model "<path>";`, the path a `res:/…` or an absolute one, named by the `file` of a model and the
