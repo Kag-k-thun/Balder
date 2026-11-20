@@ -137,24 +137,27 @@ it, as Unreal's launcher module runs the module of a game.
   its transform computed again in the space of its new parent, or keeps its transform with Alt held at the drop. A node
   goes neither under itself nor under a node under it, nor in or out of a model (its meshes come from its file), and a
   node named as a child of its new parent takes a free name (`cube_2`).
-- **Inspector**: the name of the node selected last, then the panel of its kind, refreshed as the gizmo moves it. An
-  object (a mesh, a model, an empty, a marker, a path, a point, a volume) shows its position, its rotation (in degrees)
-  and its scale, then a marker its purpose and its tags (separated by spaces, applied when Enter is pressed), a path
-  its curve and whether it is closed, a volume its shape and its size (the sides of a box, the radius of a sphere, the
-  radius and the height of a capsule, its caps included), a body its motion (static, kinematic, dynamic), its shape and
-  its sizes (the model of a hull or a mesh told under them), its friction and its restitution, the mass, the damping,
-  the rolling and spinning frictions, the sleep and the bullet of a dynamic body, whether it is a trigger, then the
-  layers it is in and the layers it touches as two fields of 32 boxes, a character its radius, its height and its
-  layers only; a camera its transform, then its projection (perspective or orthographic), its field of view (in degrees)
-  or the height of its view, its near and far planes, and whether it is the active camera of the scene, a box checked
-  to make it active (the scene keeping one active camera while it has one, unchecking it does nothing); a light its position,
-  its direction, its colour, its intensity, its range, the angles of its cone and whether it casts shadows, the fields
-  its type does not use left out (no position for a direction light, no direction for a point light, a cone for a spot
-  light only). A name is applied when Enter is pressed; a field changed gives its value to every node selected of the
-  kind of the panel, each keeping its other values. One direction light casts shadows at a time. Each panel is a
-  `Collapsible` the user folds by its header (a body in four: *Physics body*, *Material*, *Dynamics* and *Collision
-  layers*, the last one folded at first), and the inspector scrolls over the panels taller than the window instead of
-  growing the editor.
+- **Inspector**: the name of the node selected last, then a section for each group of the properties its class
+  declares (see the property schemas below), refreshed as the gizmo moves it: *Transform* for every node (its position,
+  its rotation in degrees, its scale), then *Model* (its file and its levels of detail, told), *Material* (the colour,
+  the roughness and the metalness of a cube, a sphere or a plane, told), *Light* (its type, its colour, its intensity,
+  its direction, its range for a point or a spot light, the angles of its cone for a spot light, its shadows),
+  *Marker* (its purpose, its tags separated by spaces, applied when Enter is pressed), *Path* (its curve, whether it is
+  closed), *Volume* (its shape and the sizes it uses: the sides of a box, the radius of a sphere, the radius and the
+  height of a capsule, its caps included), *Physics body* (its shape and the sizes it uses, the model of a hull or a
+  mesh told, its motion, whether it is a trigger; the radius and the height of a character), *Physics material* (its
+  friction and its restitution), *Dynamics* (the mass, the damping, the rolling and spinning frictions, the sleep and
+  the bullet of a dynamic body), *Character* (how a character moves, its slope limit in degrees), *Collision layers*
+  (the layers it is in and the layers it touches, 32 boxes each, folded at first) and *Camera* (its projection, its
+  field of view in degrees or the height of its view, its planes, and whether it is the active camera of the scene, a
+  box checked to make it active; the scene keeps one active camera while it has one, unchecking it does nothing). A
+  row is shown when every node selected has its property and the property applies to the node selected last, so that
+  several nodes of different classes show the properties they share; a field changed gives its value to every node
+  selected, a component of a vector or a layer changing that component or that layer of each, its others kept. The
+  properties a node takes at its creation only are told, not changed, but the projection of a camera (replacing it),
+  and the shape of a body and the capsule of a character (their colliders built). A name is applied when Enter is
+  pressed. One direction light casts shadows at a time. Each section is a `Collapsible` the user folds by its header,
+  and the inspector scrolls over the sections taller than the window instead of growing the editor.
 - **Convex hulls**: a model has a panel of the convex decomposition saved next to its file (`teapot.obj` giving
   `teapot.hulls`, see the convex decomposition of `doc/physics.md`), the shape of a body of the hulls of the model: the
   hulls and their vertices, the settings they were made with, drawn over the model, each in its colour, in the `hulls`
@@ -204,19 +207,16 @@ executed after commands undone drops them; an open starts the history again (`st
 - **The selection** a command found is selected again when it is reverted.
 - **Merging.** A command executed right after another one may merge into it (`merge`), the two being undone as one: the
   inspector names the field a change was typed in, and the changes of the same nodes in the same field merge
-  (`TransformEdit::extendedTo`). An undo, a redo or a save ends the merging.
+  (`PropertyEdit::extendedTo`). An undo, a redo or a save ends the merging.
 - **Unsaved changes.** The editor keeps the position of its history at the last save (`markSaved`): the scene has
   unsaved changes while the history is elsewhere, and for good once the commands undone past that save are dropped.
 
 | Command | Change | Reverted by |
 |---|---|---|
-| `TransformCommand` | the transforms of nodes, typed in the inspector or dragged with the gizmo | the transforms before, merging the steps of one field |
-| `LightCommand` | the settings of lights (colour, intensity, direction, range, cone, shadows), typed in the inspector | the settings before, merging the steps of one field |
-| `MarkerCommand` | the purpose or the tags of markers, chosen in the inspector | the purposes and the tags before |
-| `PathCommand` | the curve of paths or whether they are closed, chosen in the inspector | the curves and the closings before |
-| `VolumeCommand` | the shapes of volumes, typed in the inspector or dragged by a face with the gizmo, the centre following a face moved on its own; the faces of the collider of a body dragged | the shapes and the transforms before, merging the steps of one field |
-| `BodyCommand` | the settings and the shapes of bodies, typed in the inspector, the colliders built once (a model read, the volumes of a compound gathered) | the settings, the shapes and the colliders before, merging the steps of one field |
-| `CameraCommand` | the field of view, the height of the view or the planes of cameras, typed in the inspector, refused when a camera would see nothing | the settings before, merging the steps of one field |
+| `PropertyCommand` | a property of nodes (see the property schemas below), typed in the inspector, every node checked first, a value one of them refuses changing none (a light along a null direction, a far plane before the near one) | the values before, merging the steps of one field |
+| `TransformCommand` | the transforms of nodes dragged with the gizmo, or moved by the eye looking through a camera | the transforms before |
+| `VolumeCommand` | the shapes of volumes dragged by a face with the gizmo, the centre following a face moved on its own; the faces of the collider of a body dragged | the shapes and the transforms before |
+| `BodyCommand` | the shapes of bodies and the capsules of characters, typed in the inspector, the colliders built once (a model read, the volumes of a compound gathered) | the shapes and the colliders before, merging the steps of one field |
 | `ProjectionCommand` | a camera replaced by a camera of the other projection, of its id, its name, its place, its transform, its planes and the nodes under it, seeing at the point it looks at what it saw there, active when it was, selected | the camera put back in place of its replacement |
 | `ActiveCameraCommand` | the active camera of the scene, checked in the inspector | the camera active before made active again |
 | `RenameCommand` | the name of a node, refused when a sibling has it | the name before |
@@ -226,6 +226,34 @@ executed after commands undone drops them; an open starts the history again (`st
 | `WrapCommand` | nodes put under new bodies at their places, of shapes fitted to them, a volume turned into a trigger, the bodies selected | the nodes moved back to their parents, places and transforms, the bodies detached |
 | `DuplicateCommand` | copies of nodes beside them, sharing the geometry of their meshes, selected | detaching the copies |
 | `OpenCommand` | the nodes of the scene replaced by those of a scene file | attaching the nodes replaced again |
+
+## Property schemas
+
+Each node class declares its properties once, beside the class, in a `NodeSchema` (`balder::scene::property`), as
+the widgets declare their attributes in a `WidgetSchema`: `Light::schema()`, `Camera::schema()`... A property has the
+name of its entry in the scene files, a kind (a number, a vector, a colour, a boolean, a choice, a text, texts, an
+asset, a node, a count, the bits of the layers), a default, a getter and a setter (none for a property a node takes at
+its creation only: the file of a model, the projection of a camera, the shape of a body), a check telling why a node
+refuses a value, the label and the group of its row in the inspector, the range of its fields, and the condition under
+which it applies (the cone of a spot light, the sizes the shape of a volume uses). Every schema starts with the
+transform; `Property!{N, T}` declares a property of a class `N` holding a `T`, `ChoiceProperty!{N, E}` one holding a
+member of an enum, each named and labelled:
+
+```
+copy Property!{&Light, f32}("inner-angle", 20.0f, |dmut l| => l.innerAngle,
+                            set-> (|dmut l, a| => { l.innerAngle = a; })?,
+                            label-> "Inner angle (degrees)", group-> "Light",
+                            when-> (Condition(property-> "light", choices-> copy ["spot"]))?,
+                            range-> NumberRange(min-> 0.0f, max-> 90.0f, step-> 0.5f, decimals-> 1u32))
+```
+
+From the schemas, the scene files read and write the entries of a node (`NodeDescription` holds a value of each
+property of its kind, the default until it is given another one, `d.value("intensity")`, `d:.set("intensity",
+PropertyValue::number(2.0f))`), the inspector builds its rows, and `PropertyCommand` changes any property through a
+`PropertyEdit` (`balder::scene::edit`, the value before and after). A new node class declares its schema, and the
+scene files and the inspector take it with no other change but its kind (`description/kind.yr`). Two classes
+declaring a property of the same group and name share it (the radius of a body and of a character), the inspector
+showing it for nodes of both.
 
 ## Scene files
 
@@ -289,7 +317,9 @@ An asset is `asset <key> model "<path>";`, the path a `res:/…` or an absolute 
 `model` of a body. The writer writes the same file for
 the same nodes, so a scene diffs well under version control: the assets in the order of their paths, keyed by the name
 of their file; the nodes parents first, siblings in their order; the entries of a node in the order of
-the table, those holding their default left out (a body writes the entries of its shape only); each number the shortest decimal reading back the same float. A scene
+the schema of its kind, those that do not apply (the cone of a point light, the sizes another shape uses, the dynamics
+of a body that is not dynamic) and those holding their default left out; each number the shortest decimal reading back
+the same float. A scene
 started from a template (the main scene of a new project, see `ProjectTemplate`) gives its nodes ids of their own
 (`SceneDescription.withoutIds`).
 
