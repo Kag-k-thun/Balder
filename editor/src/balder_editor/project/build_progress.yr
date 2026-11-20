@@ -1,0 +1,175 @@
+in build_progress;
+
+use std::algorithm::searching;
+
+/**
+ * How far the build of the editor of a project is, read from the output of `gyllir build -v` as it is written (see
+ * ProjectEditor.progress): its steps, a target of the project or of a dependency each (`Compiling balder of Balder`,
+ * until `Produced …`), the modules the step compiles (`Compiling 3 modules in thread 1 …`, a line by thread) and those
+ * compiled (`Export module …`, a line by module, but `Export module dependencies`)
+ * @info: the number of steps of a build is the one of the build before it (gyllir announces a step as it starts it),
+ * the build of an editor going through the same targets each time; without it, one step more than those started is
+ * expected. The share done never reaches 1 before the build ends
+ * */
+pub class BuildProgress {
+
+    // The steps of the build before this one, 0 when they are not known
+    let _expected: u32;
+
+    // The steps started and the steps done
+    let mut _started: u32 = 0u32;
+    let mut _produced: u32 = 0u32;
+
+    // The modules the step running compiles, and those compiled
+    let mut _planned: u32 = 0u32;
+    let mut _compiled: u32 = 0u32;
+
+    // The step running, `Compiling balder of Balder`
+    let mut _step: [c8] = "Resolving the dependencies";
+
+    // True once the step running writes the object file of its modules, compiled
+    let mut _assembling: bool = false;
+
+    // The end of the output read last, a line not written whole yet
+    let mut _partial: [c8] = "";
+
+    /**
+     * @params:
+     *    - expected: the steps of the build before this one, 0 when they are not known
+     * */
+    pub self (expected: u32)
+        with _expected = expected
+    {}
+
+    /**
+     * Read the output of the build written since the last read
+     * */
+    pub fn read(mut self, text: [c8]) {
+        let all = self._partial ~ text;
+        let mut start = 0us;
+        for i in 0us .. all.len {
+            if all[i] == '\n' {
+                self:.readLine(all[start .. i]);
+                start = i + 1us;
+            }
+        }
+
+        self._partial = all[start .. $];
+    }
+
+    /**
+     * @returns: the steps started, the targets the build went through
+     * */
+    @field
+    pub fn steps(self)-> u32 {
+        self._started
+    }
+
+    /**
+     * @returns: the share of the build done, from 0 to 0.99, the steps done and the modules of the step running
+     * compiled
+     * */
+    @field
+    pub fn done(self)-> f32 {
+        let total = if self._expected > self._started { self._expected } else { self._started + 1u32 };
+        let mut current = 0.0f;
+        if self._started > self._produced && self._planned != 0u32 {
+            current = cast!f32(self._compiled) / cast!f32(self._planned);
+            if current > 1.0f { current = 1.0f; }
+        }
+
+        let res = (cast!f32(self._produced) + current) / cast!f32(total);
+        if res > 0.99f { 0.99f } else { res }
+    }
+
+    /**
+     * @returns: the step running, with the modules it compiled when it compiles some: `Compiling balder of Balder, 120
+     * modules of 530`, then `Compiling balder of Balder, writing its object file`
+     * */
+    @field
+    pub fn step(self)-> [c8] {
+        if self._started > self._produced && self._assembling {
+            return f"${self._step}, writing its object file";
+        }
+
+        if self._started > self._produced && self._planned != 0u32 {
+            return f"${self._step}, ${self._compiled} modules of ${self._planned}";
+        }
+
+        self._step
+    }
+
+    /**
+     * Read a line of the output, its colours left in: the modules compiled are counted on it as it is, the other
+     * markers read once it is plain
+     * */
+    fn readLine(mut self, line: [c8]) {
+        // the compiler writes the modules of several threads, sometimes on one line, and the dependencies of each
+        // thread after its modules (`Export module dependencies`)
+        self._compiled += utils::occurrences(line, "Export module ") - utils::occurrences(line, "Export module dependencies");
+        if !utils::contains(line, "Compiling") && !utils::contains(line, "Produced") && !utils::contains(line, "Resolving dependency") {
+            return;
+        }
+
+        let text = utils::trimmed(utils::plain(line));
+        if startsWith(text, "Produced ") {
+            if self._produced < self._started { self._produced += 1u32; }
+            self._planned = 0u32;
+            self._compiled = 0u32;
+            self._assembling = false;
+        } else if startsWith(text, "Resolving dependency ") {
+            self._step = "Resolving " ~ wordAt(text, 21us);
+        } else if startsWith(text, "Compiling ") {
+            let rest = text[10us .. $];
+            if rest.len != 0us && rest[0] >= '0' && rest[0] <= '9' {
+                self._planned += numberAt(rest);
+            } else if startsWith(rest, "object file") {
+                self._assembling = true;
+            } else if !startsWith(rest, "target ") && !startsWith(rest, "object file") && utils::contains(rest, " of ") {
+                self._started += 1u32;
+                self._planned = 0u32;
+                self._compiled = 0u32;
+                self._assembling = false;
+                self._step = "Compiling " ~ withoutVersion(rest);
+            }
+        }
+    }
+
+}
+
+/**
+ * @returns: the number a text starts with, its digits read
+ * */
+fn numberAt(text: [c8])-> u32 {
+    let mut res = 0u32;
+    for c in text {
+        if c < '0' || c > '9' { break; }
+        res = res * 10u32 + cast!u32(cast!u8(c) - cast!u8('0'));
+    }
+
+    res
+}
+
+/**
+ * @returns: the word of a text starting at an index, up to the next space
+ * */
+fn wordAt(text: [c8], at: usize)-> [c8] {
+    if at >= text.len { return ""; }
+
+    let mut end = at;
+    while end < text.len && text[end] != ' ' { end += 1us; }
+    text[at .. end]
+}
+
+/**
+ * @returns: a step of gyllir without the version of its package, `balder of Balder vBAL-128` giving `balder of Balder`
+ * */
+fn withoutVersion(step: [c8])-> [c8] {
+    let mut i = step.len;
+    while i > 1us {
+        i -= 1us;
+        if step[i] == 'v' && step[i - 1us] == ' ' { return step[0us .. i - 1us]; }
+    }
+
+    step
+}
