@@ -1032,10 +1032,80 @@ pub class Scene {
     }
 
     /**
-     * @returns: the camera of the scene if there is one camera set in the tree of nodes
+     * @returns: the camera the scene is drawn through: the view camera when there is one (see setViewCamera), the active
+     * camera otherwise, none when the scene has no camera
      * */
     pub fn getCamera (mut self)-> dmut (&Camera)? {
         alias self._tree.camera
+    }
+
+    /**
+     * @returns: the cameras of the scene, in the order they entered it
+     * */
+    pub fn getCameras (mut self)-> dmut [&Camera] {
+        atomic self {
+            alias self._tree.cameras
+        }
+    }
+
+    /**
+     * @returns: the active camera of the scene, the one a game draws it through, none when it has no camera
+     * @info: the first camera entering the scene becomes active, and when the active camera leaves, the first of the
+     * other cameras that entered; the cameras of the tools (named __…__, the camera of an editor) never become active on
+     * their own
+     * */
+    pub fn getActiveCamera (mut self)-> dmut (&Camera)? {
+        atomic self {
+            alias self._tree.active
+        }
+    }
+
+    /**
+     * Make a camera of the scene the active one, drawing the scene from the next frame unless a view camera draws it in
+     * its place (see setViewCamera): the gameplay camera, a cutscene, a screen of the scene
+     * @info: a camera not in the scene changes nothing; the passes reading the camera read the new one, the temporal
+     * anti-aliasing forgetting its history (a cut)
+     * */
+    pub fn setActiveCamera (mut self, dmut cam : &Camera) {
+        let drawn = atomic self {
+            self._tree:.setActive (alias cam)
+        };
+
+        if drawn { self:.drawThrough (alias cam); }
+    }
+
+    /**
+     * @returns: the camera drawing the scene in place of the active one, none when the active one draws it
+     * */
+    pub fn getViewCamera (mut self)-> dmut (&Camera)? {
+        atomic self {
+            alias self._tree.view
+        }
+    }
+
+    /**
+     * Draw the scene through a camera of the scene in place of its active camera, which stays active: the camera of an
+     * editor, or a camera of the scene an editor looks through
+     * @info: a camera not in the scene changes nothing; the view camera leaving the scene, the active one draws it again
+     * */
+    pub fn setViewCamera (mut self, dmut cam : &Camera) {
+        let changed = atomic self {
+            self._tree:.setView ((alias cam)?)
+        };
+
+        if changed { self:.drawThrough (alias cam); }
+    }
+
+    /**
+     * Draw the scene through its active camera again, a view camera no longer drawing it in its place
+     * */
+    pub fn clearViewCamera (mut self) {
+        let dmut drawn = atomic self {
+            let changed = self._tree:.setView (none);
+            if changed { alias self._tree.camera } else { none }
+        };
+
+        if let Ok (dmut cam) = alias drawn { self:.drawThrough (alias cam); }
     }
 
     /**
@@ -1245,11 +1315,11 @@ pub class Scene {
 
         node:.onEnter (alias self);
         if let dmut ca : &Camera = alias node {
-            let isCamera = atomic self {
-                self._tree:.setCamera (alias ca)
+            let drawn = atomic self {
+                self._tree:.addCamera (alias ca)
             };
 
-            if isCamera { self:.onCameraUpdate (alias ca); }
+            if drawn { self:.onCameraUpdate (alias ca); }
         }
 
         self._window:.redrawPipeline ();
@@ -1263,14 +1333,26 @@ pub class Scene {
         node:.getAllNodes (ref nodes);
 
         // the nodes exit outside the lock, as they enter (see registerNode)
+        let mut cameraChanged = false;
+        let dmut drawn : (&Camera)? = none;
         let dmut exiting = atomic self {
+            let before = if let Ok (c) = self._tree.camera { c.uid } else { 0us };
             let dmut exiting : [&Node] = [];
             for dmut n in alias nodes if self._tree:.remove (n) {
                 exiting ~= [alias n];
             }
 
+            let after = if let Ok (c) = self._tree.camera { c.uid } else { 0us };
+            cameraChanged = before != after;
+            drawn = alias self._tree.camera;
+
             alias exiting
         };
+
+        // another camera draws the scene before the one it replaces releases its buffer
+        if cameraChanged {
+            if let Ok (dmut cam) = alias drawn { self:.onCameraUpdate (alias cam); }
+        }
 
         for dmut n in alias exiting {
             n:.onExit (alias self);
@@ -1288,7 +1370,20 @@ pub class Scene {
     }
 
     /**
-     * Trigger when the camera is updated
+     * Draw the scene through a camera from the next frame, the passes reading it in place of the one before, the frames
+     * in flight finished first since they read the one before
+     * */
+    fn drawThrough (mut self, dmut cam : &Camera) {
+        self._window:.lockFrame ();
+        self._window:.getVulkanDevice ():.waitIdle ();
+        self:.onCameraUpdate (alias cam);
+        self._window:.unlockFrame ();
+
+        self._window:.redrawPipeline ();
+    }
+
+    /**
+     * Give the camera drawing the scene to the passes reading it
      * */
     pub fn onCameraUpdate (mut self, dmut cam : &Camera) {
         atomic self {

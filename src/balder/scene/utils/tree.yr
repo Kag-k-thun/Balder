@@ -25,8 +25,15 @@ pub record NodeTreeScene {
     // The nodes of the tree the scene ticks (see Node::ticked)
     let dmut _ticked : [usize => &Node] = copy [];
 
-    // The camera node of the tree
-    let dmut _camera : (&Camera)? = none;
+    // The cameras of the tree, in the order they entered it
+    let dmut _cameras : [&Camera] = [];
+
+    // The camera the scene is drawn through, unless a view camera draws it in its place
+    let dmut _active : (&Camera)? = none;
+
+    // The camera drawing the scene in place of the active one (the camera of an editor), none to draw through the
+    // active one
+    let dmut _view : (&Camera)? = none;
 
     /*!
      * ====================================================================================================
@@ -81,19 +88,45 @@ pub record NodeTreeScene {
     }
 
     /**
-     * @returns: the camera in the tree (if any)
+     * @returns: the camera the scene is drawn through, the view camera when there is one, the active camera otherwise
      * */
     @field
     pub fn camera (mut self)-> dmut (&Camera)? {
-        alias self._camera
+        if let Ok (dmut v) = alias self._view { return (alias v)?; }
+        alias self._active
     }
 
     /**
-     * @returns: the camera in the tree (if any)
+     * @returns: the camera the scene is drawn through, the view camera when there is one, the active camera otherwise
      * */
     @field
     pub fn camera (self)-> (&Camera)? {
-        self._camera
+        if let Ok (v) = self._view { return v?; }
+        self._active
+    }
+
+    /**
+     * @returns: the cameras of the tree, in the order they entered it
+     * */
+    @field
+    pub fn cameras (mut self)-> dmut [&Camera] {
+        alias self._cameras
+    }
+
+    /**
+     * @returns: the active camera of the scene, none when it has no camera
+     * */
+    @field
+    pub fn active (mut self)-> dmut (&Camera)? {
+        alias self._active
+    }
+
+    /**
+     * @returns: the camera drawing the scene in place of the active one, none when the active one draws it
+     * */
+    @field
+    pub fn view (mut self)-> dmut (&Camera)? {
+        alias self._view
     }
 
     
@@ -135,8 +168,8 @@ pub record NodeTreeScene {
 
     /**
      * Forget a node of the tree, without calling its hooks: the scene exits it once its lock is released (see
-     * Scene::removeNode)
-     * @returns: true iif the node is to exit, a node of the tree that is not a camera, or the camera of the scene
+     * Scene::removeNode); a camera is forgotten among the cameras too (see removeCamera)
+     * @returns: true iif the node is to exit, a node of the tree
      * */
     pub fn remove (mut self, node : &Node)-> bool {
         if node.uid !in self._nodes { return false; }
@@ -145,12 +178,7 @@ pub record NodeTreeScene {
         self._ticked:.remove (node.uid);
 
         if let ca : &Camera = node {
-            if let Ok (ica) = self._camera && ica is ca {
-                self._camera = none;
-                return true;
-            }
-
-            return false;
+            self:.removeCamera (ca);
         }
 
         true
@@ -165,30 +193,104 @@ pub record NodeTreeScene {
      */
 
     /**
-     * Make a camera entering the tree the camera of the scene, unless the scene has another one
-     * @returns: true iif the camera is the camera of the scene, the scene to give it to the passes drawing it
+     * Add a camera entering the tree to its cameras, the active camera when the scene has none, unless it is the camera
+     * of a tool (named __…__, see isReservedName), which draws the scene only when it is made the view camera or the
+     * active one
+     * @returns: true iif the camera draws the scene from now on, the scene to give it to the passes drawing it
      * */
-    pub fn setCamera (mut self, dmut cam : &Camera)-> bool {
-        if let Ok (ica) = self._camera && ica !is cam {
-            log::error #("Scene", "scene has multiple cameras");
-            return false;
+    pub fn addCamera (mut self, dmut cam : &Camera)-> bool {
+        for c in self._cameras if c is cam { return false; }
+
+        self._cameras ~= [alias cam];
+        if !self._active.hasValue && !isReservedName (cam.name.file ()) {
+            self._active = (alias cam)?;
+            return !self._view.hasValue;
         }
 
-        self._camera = (alias cam)?;
-        true
+        false
     }
 
     /**
-     * Remove the camera of the scene
+     * Forget a camera leaving the tree: when it was the view camera, the active camera draws again; when it was the
+     * active camera, the first of the other cameras that is not the camera of a tool becomes active, the scene having
+     * no active camera when there is none
+     * @returns: true iif another camera draws the scene, or none does anymore
      * */
-    fn onRemoveCamera (mut self) {
-        if let Ok (dmut scene) = alias self._scene {                    
-        
-            if let Ok (dmut cam) = alias self._camera {
+    pub fn removeCamera (mut self, cam : &Camera)-> bool {
+        let wasDrawn = if let Ok (c) = self.camera { c is cam } else { false };
+
+        let dmut kept : [&Camera] = [];
+        for dmut c in alias self._cameras if c !is cam {
+            kept ~= [alias c];
+        }
+
+        self._cameras = alias kept;
+        if let Ok (v) = self._view && v is cam {
+            self._view = none;
+        }
+
+        if let Ok (a) = self._active && a is cam {
+            self._active = none;
+            for dmut c in alias self._cameras if !isReservedName (c.name.file ()) {
+                self._active = (alias c)?;
+                break;
+            }
+        }
+
+        wasDrawn
+    }
+
+    /**
+     * Make a camera of the tree the active camera of the scene, a camera not in the tree changing nothing
+     * @returns: true iif the camera draws the scene from now on and did not before, no view camera drawing it instead
+     * */
+    pub fn setActive (mut self, dmut cam : &Camera)-> bool {
+        if !self:.holds (cam) { return false; }
+
+        let drawn = if let Ok (c) = self.camera { c is cam } else { false };
+        self._active = (alias cam)?;
+
+        !drawn && !self._view.hasValue
+    }
+
+    /**
+     * Draw the scene through a camera of the tree in place of the active one, or through the active one again (none), a
+     * camera not in the tree changing nothing
+     * @returns: true iif another camera draws the scene from now on
+     * */
+    pub fn setView (mut self, dmut cam : (&Camera)?)-> bool {
+        let before = if let Ok (c) = self.camera { c.uid } else { 0us };
+        if let Ok (c) = cam {
+            if !self:.holds (c) { return false; }
+        }
+
+        self._view = alias cam;
+        let after = if let Ok (c) = self.camera { c.uid } else { 0us };
+
+        before != after
+    }
+
+    /**
+     * @returns: true iif a camera is one of the cameras of the tree
+     * */
+    fn holds (mut self, cam : &Camera)-> bool {
+        for c in self._cameras if c is cam { return true; }
+        false
+    }
+
+    /**
+     * Exit the cameras of the tree, before the other nodes, the scene disposed
+     * */
+    fn onRemoveCameras (mut self) {
+        if let Ok (dmut scene) = alias self._scene {
+            let dmut cameras = alias self._cameras;
+            self._cameras = [];
+            self._active = none;
+            self._view = none;
+
+            for dmut cam in alias cameras {
                 self._nodes:.remove (cam.uid);
-                
-                self._camera = none;            
-                cam:.onExit (alias scene);            
+                cam:.onExit (alias scene);
             }
         }
     }
@@ -237,7 +339,7 @@ pub record NodeTreeScene {
 
     impl Disposable {
         pub over dispose (mut self) {
-            self:.onRemoveCamera ();
+            self:.onRemoveCameras ();
             for _, dmut n in alias self._nodes {
                 n:.onExit (alias self:.getScene ());
             }
