@@ -2,6 +2,7 @@ in node_description;
 
 use balder::core::error;
 use balder::scene::physics;
+use balder::scene::actors::{node_classes, node_connection, unknown_actor};
 use balder::scene::description::kind;
 use balder::scene::node;
 use balder::scene::node::node3D;
@@ -29,7 +30,9 @@ use std::uuid;
  *     metallic: 0;
  * }
  * ```
- * The kind is empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body, character or camera.
+ * The kind is empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body, character or camera, or
+ * the type of an actor class (see ActorClass), whose entries are its properties and the connections of its signals,
+ * `on-pressed: #<id> open;`.
  * Every node reads parent, then the properties of its schema: every one its transform (position, rotation, scale), a
  * model its file (required) and lods (Model::schema), a cube, a sphere and a plane their material (IndexedMesh3D::schema),
  * a light, a marker, a path, a volume, a body, a character and a camera theirs (Light::schema...). A description holds a
@@ -47,6 +50,16 @@ pub record NodeDescription {
 
     // What the node is
     pub let mut kind: NodeKind;
+
+    // The actor class of a node of the kind ACTOR, its type in the scene files, empty for the other kinds
+    pub let mut className: [c8] = "";
+
+    // The connections of the signals of an actor to the slots of other nodes (see NodeConnection)
+    pub let mut connections: [NodeConnection] = [];
+
+    // The entries of an actor of a class the program does not know, other than its transform and its connections, their
+    // names and the text of their values, written back as they are (see UnknownActor)
+    pub let mut entries: [([c8], [c8])] = [];
 
     // The value of each property of the schema of the kind, by its name, in the order of the schema
     let mut _values: [([c8], PropertyValue)] = [];
@@ -67,6 +80,22 @@ pub record NodeDescription {
     }
 
     /**
+     * A node of an actor class, at the origin of its parent, its properties holding the defaults of the schema of the
+     * class (see ActorClass), its transform only for a class the program does not know
+     * @params:
+     *    - className: the name of the class, the type of the node in the scene files
+     * */
+    pub self actor(name: [c8], className: [c8])
+        with name = name
+        , kind = NodeKind::ACTOR
+        , className = className
+    {
+        for p in schemaOfClass(NodeKind::ACTOR, className).properties {
+            self._values ~= [(p.name, p.defaultValue)];
+        }
+    }
+
+    /**
      * The description of a node of a scene, and of the nodes under it, as a scene file saves it, each property read
      * from the node (see NodeProperty::get)
      * @info: the nodes named __…__ are left out (see isReservedName), and so are the meshes of a model, which its file
@@ -82,7 +111,15 @@ pub record NodeDescription {
         throws BalderError
     {
         self.kind = kindOf(node);
-        for p in schemaOf(self.kind).properties {
+        if let u: &UnknownActor = node {
+            self.className = u.className;
+            self.entries = u.entries;
+        } else if let Ok(c) = actorClassOf(node) {
+            self.className = c.name;
+        }
+
+        self.connections = node.connections;
+        for p in self.schema().properties {
             self._values ~= [(p.name, p.get(alias node))];
         }
 
@@ -107,7 +144,14 @@ pub record NodeDescription {
      * @returns: the schema of the kind of the node
      * */
     pub fn schema(self)-> &NodeSchema {
-        schemaOf(self.kind)
+        schemaOfClass(self.kind, self.className)
+    }
+
+    /**
+     * @returns: the type of the node in the scene files, the name of its kind, or of its class for an actor
+     * */
+    pub fn typeName(self)-> [c8] {
+        typeName(self.kind, self.className)
     }
 
     /**
@@ -158,6 +202,7 @@ pub record NodeDescription {
      * */
     pub fn opEquals(self, other: NodeDescription)-> bool {
         if self.id.opCmp(other.id) != 0 || self.name != other.name || self.kind != other.kind { return false; }
+        if self.className != other.className || !sameConnections(self.connections, other.connections) || !sameEntries(self.entries, other.entries) { return false; }
         if self._values.len != other._values.len || self.children.len != other.children.len { return false; }
         for v in self._values {
             if !(other.value(v._0) == v._1) { return false; }
@@ -192,13 +237,15 @@ pub record NodeDescription {
         throws BalderError
     {
         let dmut node = alias self.create(alias parent);
-        for p in schemaOf(self.kind).properties if p.settable() {
+        for p in self.schema().properties if p.settable() {
             p.set(alias node, self.value(p.name));
         }
 
         if !self.id.isNil() {
             node.guid = self.id;
         }
+
+        node.connections = self.connections;
 
         for c in self.children {
             c.build(alias node);
@@ -248,6 +295,13 @@ pub record NodeDescription {
 
                 return copy PerspectiveCamera(self.name, alias parent);
             }
+            NodeKind::ACTOR => {
+                if let Ok(c) = actorClass(self.className) {
+                    return alias c.create(self.name, alias parent);
+                }
+
+                return copy UnknownActor(self.name, alias parent, self.className, self.entries);
+            }
             _ => {}
         }
 
@@ -293,4 +347,28 @@ pub record NodeDescription {
         copy IndexedMesh3D(self.name, alias parent, LodChain(mesh._1), mesh._0, alias material, primitive-> primitive)
     }
 
+}
+
+/**
+ * @returns: true iif two lists of connections are the same, in the same order
+ * */
+fn sameConnections(a: [NodeConnection], b: [NodeConnection])-> bool {
+    if a.len != b.len { return false; }
+    for i, c in a {
+        if c.signal != b[i].signal || c.slot != b[i].slot || c.target.opCmp(b[i].target) != 0 { return false; }
+    }
+
+    true
+}
+
+/**
+ * @returns: true iif two lists of entries kept as their text are the same, in the same order
+ * */
+fn sameEntries(a: [([c8], [c8])], b: [([c8], [c8])])-> bool {
+    if a.len != b.len { return false; }
+    for i, e in a {
+        if e._0 != b[i]._0 || e._1 != b[i]._1 { return false; }
+    }
+
+    true
 }

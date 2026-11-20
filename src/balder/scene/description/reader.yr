@@ -2,9 +2,10 @@ in reader;
 
 use balder::math::{utils, vector};
 use balder::scene::node;
+use balder::scene::actors::{node_classes, node_connection};
 use balder::scene::description::{kind, node_description};
 use balder::scene::property::{choice, kind, node_property, node_schema, value};
-use balder::utils::syntax;
+use balder::utils::{syntax, types};
 
 use std::{conv, syntax, uuid};
 
@@ -24,6 +25,10 @@ pub def SCENE_VERSION = 1u32;
  * entry = name ":" value { value } ";" ;
  * value = number | name | "#" uuid | "@" key ;
  * ```
+ * The kind of a node is a kind of Balder or the type of an actor class (see ActorClass), whose entries are its
+ * properties and the connections of its signals, `on-<signal>: #<id> <slot> { #<id> <slot> } ;`. A node of a type no
+ * class has is an actor of a class the program does not know (see UnknownActor): its transform is read, its other
+ * entries kept as their text.
  * The blocks of the nodes are flat, each naming its parent by its id: they are put under their parents once every block
  * is read, in the order of the file among their siblings, so a block may come before the block of its parent. The
  * entries of a node are the properties of the schema of its kind (see schemaOf). The reader checks that the ids are
@@ -75,6 +80,7 @@ pub record SceneReader {
         }
 
         SceneReader::checkUnique(nodes);
+        SceneReader::checkConnections(nodes);
         SceneReader::assemble(SceneReader::resolveAssets(nodes, assets))
     }
 
@@ -142,9 +148,9 @@ pub record SceneReader {
         let id = self.readId(self._scanner:.next(), "the id of the node, #<uuid>");
 
         let kindTok = self._scanner:.next();
-        let kind = if let Ok(k) = (if kindTok.kind == TokenKind::IDENT { kindNamed(kindTok.text) } else { none }) { k } else {
-            throw self._scanner.expected(kindTok, "the kind of the node, empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body, character or camera");
-        };
+        if kindTok.kind != TokenKind::IDENT {
+            throw self._scanner.expected(kindTok, "the kind of the node, empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body, character, camera, or the type of an actor class");
+        }
 
         let nameTok = self._scanner:.next();
         if nameTok.kind != TokenKind::STRING {
@@ -155,10 +161,12 @@ pub record SceneReader {
             throw copy SyntaxError(f"node name '${nameTok.text}', empty or holding a '/'", nameTok.line, nameTok.col);
         }
 
-        let mut d = NodeDescription(nameTok.text, kind);
+        let mut d = if let Ok(k) = kindNamed(kindTok.text) { NodeDescription(nameTok.text, k) } else {
+            NodeDescription::actor(nameTok.text, kindTok.text)
+        };
         d.id = id;
 
-        let schema = schemaOf(kind);
+        let schema = d.schema();
         let mut node = FlatNode(d, at.line, at.col);
         let mut given: [[c8]] = [];
         self._scanner:.expect("{");
@@ -226,11 +234,55 @@ pub record SceneReader {
             return;
         }
 
-        let p = if let Ok(p) = schema.property(key.text) { p } else { throw self.foreign(node, key); };
+        let d = node.description;
+        if d.kind == NodeKind::ACTOR && key.text.len > 3us && key.text[0us .. 3us] == "on-" {
+            self.readConnections(ref node, key, values);
+            return;
+        }
+
+        let p = if let Ok(p) = schema.property(key.text) { p } else {
+            if d.kind == NodeKind::ACTOR && !actorClass(d.className).hasValue && values.len != 0us {
+                node.description.entries ~= [(key.text, self._scanner.source(values[0].start, values[$ - 1us].end))];
+                return;
+            }
+
+            throw self.foreign(node, key);
+        };
         if p.kind == PropertyKind::ASSET {
             node.assets ~= [(p.name, self.asset(key, values))];
         } else {
             node.description:.set(p.name, self.readValue(p, key, values));
+        }
+    }
+
+    /**
+     * Read the connections of a signal of an actor, `on-pressed: #<id> open #<id> unlock;`, a signal its class has (any
+     * signal for a class the program does not know)
+     * */
+    fn readConnections(self, ref mut node: FlatNode, key: Token, values: [Token])
+        throws SyntaxError
+    {
+        let d = node.description;
+        let signal = key.text[3us .. $];
+        if let Ok(c) = actorClass(d.className) {
+            if !c.signal(signal).hasValue {
+                throw copy SyntaxError(f"${d.typeName()} '${d.name}' has no signal '${signal}'", key.line, key.col);
+            }
+        }
+
+        if values.len == 0us || values.len % 2us != 0us {
+            throw copy SyntaxError(f"${key.text} must be the nodes and the slots it is connected to, #<uuid> <slot>", key.line, key.col);
+        }
+
+        for i in 0us .. values.len / 2us {
+            let target = self.readId(values[2us * i], f"${key.text}, the id of a node, #<uuid>");
+            let slot = values[2us * i + 1us];
+            if slot.kind != TokenKind::IDENT {
+                throw self._scanner.expected(slot, f"the name of a slot of the node #${target}");
+            }
+
+            node.description.connections ~= [NodeConnection(signal-> signal, target-> target, slot-> slot.text)];
+            node.connectedAt ~= [(slot.line, slot.col)];
         }
     }
 
@@ -272,7 +324,7 @@ pub record SceneReader {
      * @returns: the error of an entry the kind of a node does not have
      * */
     fn foreign(self, node: FlatNode, key: Token)-> &SyntaxError {
-        copy SyntaxError(f"${kindName(node.description.kind)} '${node.description.name}' has no entry '${key.text}'",
+        copy SyntaxError(f"${node.description.typeName()} '${node.description.name}' has no entry '${key.text}'",
                          key.line, key.col)
     }
 
@@ -492,12 +544,16 @@ record FlatNode {
     pub let mut line: usize;
     pub let mut col: usize;
 
+    // The place of the slot of each connection of the description, quoted in the errors
+    pub let mut connectedAt: [(usize, usize)];
+
     pub self (description: NodeDescription, line: usize, col: usize)
         with description = description
         , parent = none
         , assets = []
         , line = line
         , col = col
+        , connectedAt = []
     {}
 
 }
@@ -539,7 +595,7 @@ mod SceneReader {
         throws SyntaxError
     {
         let d = node.description;
-        let what = f"${kindName(d.kind)} '${d.name}'";
+        let what = f"${d.typeName()} '${d.name}'";
         for p in schema.properties {
             let mut isGiven = false;
             for g in given if g == p.name { isGiven = true; }
@@ -578,7 +634,7 @@ mod SceneReader {
                 }
 
                 if !found {
-                    throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' names the asset '${named._1}', not declared", n.line, n.col);
+                    throw copy SyntaxError(f"${n.description.typeName()} '${n.description.name}' names the asset '${named._1}', not declared", n.line, n.col);
                 }
             }
 
@@ -598,8 +654,8 @@ mod SceneReader {
     {
         let dmut first: [[c8] => [c8]] = copy [];
         for n in nodes {
-            let kind = kindName(n.description.kind);
-            for p in schemaOf(n.description.kind).properties if p.unique && n.description.value(p.name).flag {
+            let kind = n.description.typeName();
+            for p in n.description.schema().properties if p.unique && n.description.value(p.name).flag {
                 let key = f"${kind} ${p.name}";
                 if let Ok(other) = first[key] {
                     throw copy SyntaxError(f"${kind} '${n.description.name}' is ${p.name}, and so is ${kind} '${other}': one ${kind} of a scene at most is ${p.name}",
@@ -607,6 +663,51 @@ mod SceneReader {
                 }
 
                 first[key] = dcopy n.description.name;
+            }
+        }
+    }
+
+    /**
+     * Check that the connections of the actors name nodes of the file, by slots they have taking the payloads of their
+     * signals; a node of a class the program does not know is taken to have every slot, and its signals every payload
+     * @throws:
+     *    - &SyntaxError: at the slot of the first connection naming a node not in the file, a slot its node does not
+     *                    have, or a slot not taking the payload of its signal
+     * */
+    pub fn checkConnections(nodes: [FlatNode])
+        throws SyntaxError
+    {
+        let dmut index: [Uuid => usize] = copy [];
+        for i, n in nodes { index[n.description.id] = i; }
+
+        for n in nodes {
+            let d = n.description;
+            for i, c in d.connections {
+                let at = n.connectedAt[i];
+                let what = f"${d.typeName()} '${d.name}'";
+                let t = if let Ok(j) = index[c.target] { nodes[j].description } else {
+                    throw copy SyntaxError(f"${what} connects ${c.signal} to #${c.target}, no node of the file", at._0, at._1);
+                };
+
+                let target = f"${t.typeName()} '${t.name}'";
+                if t.kind != NodeKind::ACTOR {
+                    throw copy SyntaxError(f"${what} connects ${c.signal} to ${target}, which has no slot", at._0, at._1);
+                }
+
+                if let Ok(tc) = actorClass(t.className) {
+                    let slot = if let Ok(s) = tc.slot(c.slot) { s } else {
+                        throw copy SyntaxError(f"${what} connects ${c.signal} to ${target}, which has no slot '${c.slot}'", at._0, at._1);
+                    };
+
+                    if let Ok(sc) = actorClass(d.className) {
+                        if let Ok(signal) = sc.signal(c.signal) {
+                            if !sameTypes(signal.payload, slot.params) {
+                                throw copy SyntaxError(f"${what} connects ${c.signal}, which gives ${signature(signal.payload)}, to the slot '${c.slot}' of ${target}, which takes ${signature(slot.params)}",
+                                                       at._0, at._1);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -637,7 +738,7 @@ mod SceneReader {
                 if let Ok(j) = index[p] {
                     children[j] = SceneReader::under(children, j) ~ [i];
                 } else {
-                    throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' is under #${p}, no node of the file", n.line, n.col);
+                    throw copy SyntaxError(f"${n.description.typeName()} '${n.description.name}' is under #${p}, no node of the file", n.line, n.col);
                 }
             } else {
                 roots = roots ~ [i];
@@ -652,7 +753,7 @@ mod SceneReader {
 
         if placed != nodes.len {
             for i, n in nodes if !SceneReader::isPlaced(children, roots, i) {
-                throw copy SyntaxError(f"${kindName(n.description.kind)} '${n.description.name}' is under itself", n.line, n.col);
+                throw copy SyntaxError(f"${n.description.typeName()} '${n.description.name}' is under itself", n.line, n.col);
             }
         }
 
