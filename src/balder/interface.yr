@@ -19,6 +19,7 @@ use balder::interface::style::conditions;
 use balder::interface::widget::focus;
 use balder::interface::widget::layout;
 use balder::interface::widget::layout::overlay;
+use balder::interface::widget::tooltip::layer;
 use balder::math::vector;
 use balder::scene::utils::post::registry;
 use balder::utils;
@@ -33,6 +34,10 @@ use ::sdl3::{keycode, mouse};
 // result of a condition its style reads
 def MAX_LAYOUT_PASSES = 4us;
 
+// The look of the tooltips, loaded at the origin of the components with the first tooltip, under the sheets of the
+// application
+def TOOLTIP_STYLE = "engine:/tooltip/tooltip.style";
+
 @final
 pub class WidgetManager {
 
@@ -41,6 +46,10 @@ pub class WidgetManager {
 
     // The overlays opened over the content, from the bottom one to the top one, which takes the mouse and the Tab key
     let dmut _overlays : [&Overlay] = [];
+
+    // The layer showing the tooltip of the widget under the cursor over the content and the overlays, created when the
+    // cursor first enters a widget that has a tooltip
+    let dmut _tooltips : (&TooltipLayer)? = none;
 
     // Emitted when Escape is pressed and nothing uses it: not the focused widget, no menu being open and no overlay
     let dmut _escaped : (&Signal!{()})? = none;
@@ -496,6 +505,7 @@ pub class WidgetManager {
         }
 
         self._contentSource = none;
+        self:.hoverTooltip (none, vec2 ());
         root:.onAttach (none);
         self._content = (alias root)?;
         self:.updateWidgets ();
@@ -518,6 +528,7 @@ pub class WidgetManager {
         self._wasHover = false;
         self:.setFocus (none);
         self._anchor = none;
+        self:.hoverTooltip (none, vec2 ());
 
         let dmut overlay = copy Overlay (alias self, "");
         overlay:.onAttach (none);
@@ -556,6 +567,7 @@ pub class WidgetManager {
         }
 
         self._overlays = alias rest;
+        self:.hoverTooltip (none, vec2 ());
         for dmut o in alias closed {
             o:.dispose ();
             self._wasHover = false;
@@ -570,6 +582,16 @@ pub class WidgetManager {
      * */
     pub fn getOverlayCount (self)-> usize {
         self._overlays.len
+    }
+
+    /**
+     * Take the change of the tooltip of a widget, the tooltip shown taking its new text, or being hidden when it has
+     * none (see Widget::setTooltip)
+     * */
+    pub fn updateTooltip (mut self, w : &Widget) {
+        if let Ok (dmut l) = alias self._tooltips {
+            l:.update (w);
+        }
     }
 
     /**
@@ -1007,6 +1029,11 @@ pub class WidgetManager {
             }
 
             self._overlays = [];
+            if let Ok (dmut l) = alias self._tooltips {
+                l:.dispose ();
+                self._tooltips = none;
+            }
+
             if let Ok (dmut w) = alias self._content {
                 w:.dispose ();
                 self._content = none;
@@ -1145,11 +1172,13 @@ pub class WidgetManager {
             let relPos = makeVec2 ((pos.x - wpos.x) / wsize.x, (pos.y - wpos.y) / wsize.y);
 
             if relPos.x >= 0.0f && relPos.x <= 1.0f && relPos.y >= 0.0f && relPos.y <= 1.0f {
-                w:.onHover (relPos);
+                let hovered = w:.onHover (relPos);
                 self._wasHover = true;
+                self:.hoverTooltip (hovered, pos);
             } else if self._wasHover {
                 w:.onLoseHoverFocus ();
                 self._wasHover = false;
+                self:.hoverTooltip (none, pos);
             }
         }
     }
@@ -1163,6 +1192,8 @@ pub class WidgetManager {
                 r:.onLoseHoverFocus ();
                 self._wasHover = false;
             }
+
+            self:.hoverTooltip (none, vec2 ());
         }
     }
 
@@ -1202,6 +1233,7 @@ pub class WidgetManager {
         let pos = self._drawer.toLayout (x, y);
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
+        self:.dismissTooltip ();
 
         // While a button slides, the wheel goes to the widget focused alone, when it captures it
         if self._clicked [0] || self._clicked [1] || self._clicked [2] {
@@ -1244,6 +1276,9 @@ pub class WidgetManager {
 
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
+        if info.type == KeyEvent::DOWN {
+            self:.dismissTooltip ();
+        }
 
         if let Ok (dmut w) = alias self:.getEventRoot () {
             if info.type == KeyEvent::DOWN {
@@ -1314,6 +1349,9 @@ pub class WidgetManager {
 
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
+        if info.type == KeyEvent::DOWN {
+            self:.dismissTooltip ();
+        }
 
         if let Ok (dmut w) = alias self:.getEventRoot () {
             if info.type == KeyEvent::DOWN {
@@ -1367,6 +1405,9 @@ pub class WidgetManager {
 
         let dim = self._window.getDimension ();
         self._mousePosition = makeVec2 (cast!f32 (x) / cast!f32 (dim._0), cast!f32 (y) / cast!f32 (dim._1));
+        if info.type == KeyEvent::DOWN {
+            self:.dismissTooltip ();
+        }
 
         if let Ok (dmut w) = alias self:.getEventRoot () {
             if info.type == KeyEvent::DOWN {
@@ -1444,6 +1485,65 @@ pub class WidgetManager {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ====================================          TOOLTIPS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Tell the layer of the tooltips the widget carrying the tooltip under the cursor, creating the layer when the
+     * cursor first enters a widget that has a tooltip
+     * @params:
+     *    - hovered: the widget under the cursor, none when it is over no widget
+     *    - cursor: the position of the cursor, in pixels
+     * */
+    fn hoverTooltip (mut self, hovered : (&Widget)?, cursor : vec2) {
+        let owner = TooltipLayer::ownerOf (hovered);
+        if !owner.hasValue && !self._tooltips.hasValue { return; }
+
+        let dmut layer = self:.tooltipLayer ();
+        layer:.hover (owner, cursor);
+    }
+
+    /**
+     * Hide the tooltip shown, a press of a button, the wheel or a key acting on the widget under the cursor, whose
+     * tooltip is not shown again until the cursor enters another widget
+     * */
+    fn dismissTooltip (mut self) {
+        if let Ok (dmut l) = alias self._tooltips {
+            l:.dismiss ();
+        }
+    }
+
+    /**
+     * @returns: the layer of the tooltips, created hidden over the overlays with the look of the tooltips the first
+     * time
+     * */
+    fn tooltipLayer (mut self)-> dmut &TooltipLayer {
+        if let Ok (dmut l) = alias self._tooltips {
+            return alias l;
+        }
+
+        {
+            self:.addStyle (self:.readStyle (TOOLTIP_STYLE, SheetOrigin::COMPONENT, false));
+        } catch {
+            e : &BalderError => {
+                log::error #("WidgetManager", "Failed to load", TOOLTIP_STYLE, e.msg);
+            }
+        }
+
+        let dmut layer = copy TooltipLayer (alias self, "");
+        layer:.onAttach (none);
+        layer:.hide ();
+        self._tooltips = (alias layer)?;
+        self:.updateWidgets ();
+
+        alias layer
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * =================================          KEYBOARD SLOTS          =================================
      * ====================================================================================================
      * ====================================================================================================
@@ -1455,6 +1555,7 @@ pub class WidgetManager {
      * overlay (onEscape)
      * */
     fn onKeyPressed (mut self, key : SDL_Keycode, mods : SDL_Keymod) {
+        self:.dismissTooltip ();
         if let Ok (dmut f) = alias self._focus && f.isAttached () {
             if f:.onKeyPressed (key, mods) { return; }
         }
@@ -1537,7 +1638,8 @@ pub class WidgetManager {
     }
 
     /**
-     * @returns: the root widgets of the interface, the content then the overlays, from the bottom one to the top one
+     * @returns: the root widgets of the interface, the content, the overlays from the bottom one to the top one, then
+     * the layer of the tooltips
      * */
     fn getRoots (mut self)-> dmut [&Widget] {
         let dmut res : [&Widget] = [];
@@ -1547,6 +1649,10 @@ pub class WidgetManager {
 
         for dmut o in alias self._overlays {
             res ~= [alias o];
+        }
+
+        if let Ok (dmut l) = alias self._tooltips {
+            res ~= [alias l];
         }
 
         alias res

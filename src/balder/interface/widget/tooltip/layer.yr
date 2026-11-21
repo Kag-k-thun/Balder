@@ -1,0 +1,276 @@
+in layer;
+
+use balder::core::dispose;
+use balder::interface::widget::layout;
+use balder::interface::widget::tooltip::{timer, tip};
+use balder::math::vector;
+
+use std::time;
+
+use ::std::algorithm::comparison;
+
+// The room left under the cursor, the top of a tooltip shown under it being this far below its tip, in pixels
+pub def TOOLTIP_CURSOR_HEIGHT = 20.0f;
+
+// The room left above the cursor, the bottom of a tooltip shown above it being this far above its tip, in pixels
+pub def TOOLTIP_CURSOR_GAP = 4.0f;
+
+/**
+ * The layer of the tooltips: a root of a widget manager filling the window over its content and its overlays, showing
+ * the tooltip of the widget the cursor rests on
+ * @info:
+ * =====
+ * The manager lays the layer out after the overlays, so that the tooltip is drawn over every widget, the popups of
+ * the menus, the dropdowns and the dialogs included, and never gives it the mouse or the keyboard. It tells the layer
+ * the widget carrying the tooltip under the cursor at each motion (hover), the presses of the buttons, the wheel and
+ * the keys (dismiss); the layer counts the delay of the style of its tooltip (see TooltipTimer) in the ticks, then
+ * shows it under the cursor where it was when the delay ended, above it when there is no room under it, and kept
+ * inside the window. A tooltip shown stays where it is until the cursor leaves its widget.
+ * ====
+ * */
+pub class TooltipLayer over Layout {
+
+    // The tooltip shown
+    let dmut _tip : &Tooltip;
+
+    // The widget carrying the tooltip under the cursor, none when the cursor is over no such widget
+    let mut _owner : (&Widget)? = none;
+
+    // The last position of the cursor, and the one the tooltip was shown at, in pixels
+    let mut _cursor : vec2 = vec2 ();
+    let mut _at : vec2 = vec2 ();
+
+    // The position and the size of the margin box of the tooltip, relative to the content box of the layer
+    let mut _tipPos : vec2 = vec2 ();
+    let mut _tipSize : vec2 = vec2 ();
+
+    // The timer of the delay
+    let mut _timer : TooltipTimer;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager : &WidgetManager, id : [c8])
+        with super (alias manager, id, "TooltipLayer")
+        , _tip = copy Tooltip (alias manager, "")
+        , _timer = TooltipTimer (Tooltip::defaultDelay (), TooltipTimer::defaultGrace ())
+    {
+        // the layer fills the window over the interface, only its tooltip is drawn
+        self._hasBackground = false;
+        self._hasBorder = false;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHILDREN          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over getChildren (mut self)-> dmut [&Widget] {
+        let dmut tip : &Widget = alias self._tip;
+        let dmut res : [&Widget] = [];
+        res ~= [alias tip];
+
+        alias res
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TOOLTIPS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Follow the cursor, the tooltip shown being hidden when it leaves its widget, and the delay of the tooltip of the
+     * widget it enters starting
+     * @params:
+     *    - owner: the widget carrying the tooltip under the cursor (see ownerOf), none when there is none
+     *    - cursor: the position of the cursor in the window, in pixels
+     * */
+    pub fn hover (mut self, owner : (&Widget)?, cursor : vec2) {
+        self._cursor = cursor;
+        let same = if let Ok (n) = owner {
+            if let Ok (o) = self._owner { n is o } else { false }
+        } else {
+            !self._owner.hasValue
+        };
+
+        if same { return; }
+
+        if self._timer.isShown () {
+            self:.hide ();
+        }
+
+        self._timer:.stop ();
+        self._owner = owner;
+        if owner.hasValue {
+            self._timer.delay = self._tip.getDelay ();
+            self._timer:.start ();
+        }
+    }
+
+    /**
+     * Hide the tooltip, and wait for the cursor to enter another widget before showing one: a press of a button, the
+     * wheel or a key acts on the widget under the cursor
+     * */
+    pub fn dismiss (mut self) {
+        if self._timer.isShown () {
+            self:.hide ();
+        }
+
+        self._timer:.cancel ();
+    }
+
+    /**
+     * Take the change of the tooltip of a widget: the tooltip shown takes its new text, or is hidden when it has none
+     * @params:
+     *    - w: the widget whose tooltip changed
+     * */
+    pub fn update (mut self, w : &Widget) {
+        let isOwner = if let Ok (o) = self._owner { o is w } else { false };
+        if !isOwner { return; }
+
+        if w.getTooltip () == "" {
+            self:.hover (none, self._cursor);
+        } else if self._timer.isShown () {
+            self:.showTooltip ();
+        }
+    }
+
+    /**
+     * Count the delay, showing the tooltip once it is over, and hide it when its widget is no longer drawn
+     * */
+    pub over onTick (mut self, delta : Duration) {
+        self.__super__:.onTick (delta);
+        if let Ok (o) = self._owner && (!o.isAttached () || !o.isDrawn ()) {
+            self:.hover (none, self._cursor);
+        }
+
+        if self._timer:.tick (delta) {
+            self._at = self._cursor;
+            self:.showTooltip ();
+        }
+    }
+
+    /**
+     * Show the tooltip of the owner at the position of the cursor the delay ended at
+     * */
+    fn showTooltip (mut self) {
+        if let Ok (o) = self._owner {
+            self._tip:.setText (o.getTooltip (), shortcut-> o.getTooltipShortcut ());
+            self:.computeSize ();
+            self:.onUpdateScissors ();
+            self:.show ();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The tooltip is sized to its content, fitted in the layer, and placed near the cursor (see place)
+     * */
+    over onUpdateSize (mut self) {
+        let container = self._absoluteSize;
+        let margins = self._tip.getMarginSize (container);
+        let width = self._tip:.measureWidth (container, stretch-> false);
+        let height = min (self._tip:.measureHeight (width, container, stretch-> false),
+                          max (0.0f, container.y - margins.y));
+        let size = makeVec2 (width, height) + margins;
+
+        let at = TooltipLayer::place (self._at - self._absolutePosition, size, container) + self._absolutePosition;
+        let (relPos, relSize) = self:.placeChild (alias self._tip, at, size, self._depth + 1);
+        self._tipPos = relPos;
+        self._tipSize = relSize;
+    }
+
+    over onUpdateScissors (mut self) {
+        self:.clipChild (alias self._tip, self._tipPos, self._tipSize);
+    }
+
+    pub over getMaxDepth (self)-> u32 {
+        max (self._depth, self._tip.getMaxDepth ())
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose (mut self) {
+            self.__super__:.dispose ();
+            self._owner = none;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The layer never takes the mouse, the manager giving it to the content or to the top overlay
+     * */
+    prot over mouseToWidget (mut self, _ : vec2, ref mut canBeSelf : bool)-> dmut (&Widget, vec2)? {
+        canBeSelf = false;
+        none
+    }
+}
+
+/**
+ * The placement of the tooltips, and the widget whose tooltip the cursor shows
+ * */
+pub mod TooltipLayer {
+
+    /**
+     * @returns: the position of the top left corner of a tooltip shown at the cursor: under it, above it when there is
+     * no room under it, moved back inside the window past its right side, its top left corner kept inside it
+     * @params:
+     *    - cursor: the position of the cursor
+     *    - size: the size of the tooltip
+     *    - window: the size of the window
+     * */
+    pub fn place (cursor : vec2, size : vec2, window : vec2)-> vec2 {
+        let below = cursor.y + TOOLTIP_CURSOR_HEIGHT;
+        let y = if below + size.y <= window.y { below } else { cursor.y - TOOLTIP_CURSOR_GAP - size.y };
+        let x = min (cursor.x, window.x - size.x);
+
+        makeVec2 (max (0.0f, x), max (0.0f, y))
+    }
+
+    /**
+     * @returns: the widget whose tooltip is shown when the cursor is over a widget: the widget when it has a tooltip,
+     * its nearest ancestor that has one otherwise, none when none has
+     * @params:
+     *    - w: the widget under the cursor, none when it is over no widget
+     * */
+    pub fn ownerOf (w : (&Widget)?)-> (&Widget)? {
+        if let Ok (c) = w {
+            if c.getTooltip () != "" { return (c)?; }
+            return TooltipLayer::ownerOf (c.getParent ());
+        }
+
+        none
+    }
+}
