@@ -1,6 +1,6 @@
 in editor;
 
-use balder_editor::command;
+use balder_editor::{command, history};
 use balder::core::application::signal;
 use balder::core::error;
 use balder::math::vector;
@@ -13,12 +13,13 @@ use balder::scene::node::node3D::{body, body_shape};
  * execute, which applies it and emits edited
  * @info:
  * =====
- * The editor keeps the history of the commands executed: undo reverts the last command applied, redo applies again the
- * last command undone, both emitting edited as execute does, so the outline, the inspector and the status bar follow
- * them as any change. A command executed after commands undone drops them; an open starts the history again (see
- * EditCommand::startsHistory). The steps of one field of the inspector merge into one command (see EditCommand::merge),
- * until an undo, a redo or a save. The position of the history when the scene was saved tells whether it has unsaved
- * changes. After each change, the bodies of a compound shape take again the volumes under them (see refitCompounds).
+ * The editor keeps the history of the commands executed (EditHistory): undo reverts the last command applied, redo
+ * applies again the last command undone, both emitting edited as execute does, so the outline, the inspector and the
+ * status bar follow them as any change. A command executed after commands undone drops them; an open starts the history
+ * again (see EditCommand::startsHistory). The steps of one field of the inspector merge into one command (see
+ * EditCommand::merge), until an undo, a redo or a save. The position of the history when the scene was saved tells
+ * whether it has unsaved changes. After each change, the bodies of a compound shape take again the volumes under them
+ * (see refitCompounds).
  * ====
  * */
 pub class SceneEditor {
@@ -29,22 +30,8 @@ pub class SceneEditor {
     // The signal emitted with each command that changed the scene, executed, undone or redone
     let dmut _edited: &Signal!{&EditCommand} = copy Signal!{&EditCommand} ();
 
-    // The commands executed, in order: those before the position are applied, those from it undone, to be redone
-    let dmut _history: [&EditCommand] = [];
-
-    // The number of commands of the history applied
-    let mut _position: usize = 0us;
-
-    // The position of the history when the scene was opened or saved last, none once the commands undone since were
-    // dropped, the scene saved being out of reach
-    let mut _saved: (usize)? = (0us)?;
-
-    // True when the last command applied takes in the next one executed (see EditCommand::merge), false after an
-    // undo, a redo or a save
-    let mut _merging: bool = false;
-
-    // The last change of the scene, in a few words
-    let mut _change: [c8] = "";
+    // The history of the changes of the scene
+    let dmut _history: &EditHistory = copy EditHistory();
 
     /**
      * @params:
@@ -82,25 +69,18 @@ pub class SceneEditor {
     {
         if command.startsHistory() {
             // the nodes the commands before name are replaced, even when the command fails half way
-            self._history = [];
-            self._position = 0us;
-            self._saved = none;
+            self._history:.clear();
         }
 
         if !command:.apply(alias self._scene) { return false; }
 
         if command.startsHistory() {
-            self._saved = (0us)?;
-            self._merging = false;
+            self._history:.restart();
         } else {
-            if !self:.mergeIntoLast(command) {
-                self:.push(alias command);
-            }
-
-            self._merging = true;
+            self._history:.push(alias command);
         }
 
-        self._change = command.describe();
+        self._history:.setChange(command.describe());
         self:.refitCompounds();
         self._edited:.emit(command);
         true
@@ -111,14 +91,10 @@ pub class SceneEditor {
      * @returns: true iif a command was undone, false when there is none to undo
      * */
     pub fn undo(mut self)-> bool {
-        if self._position == 0us { return false; }
-
-        self._position -= 1us;
-        self._merging = false;
-        let dmut command = alias self._history[self._position];
+        let dmut command = if let Ok(dmut c) = alias self._history:.back() { alias c } else { return false; };
         command:.revert(alias self._scene);
 
-        self._change = "Undone: " ~ command.describe();
+        self._history:.setChange("Undone: " ~ command.describe());
         self:.refitCompounds();
         self._edited:.emit(command);
         true
@@ -133,14 +109,11 @@ pub class SceneEditor {
     pub fn redo(mut self)-> bool
         throws BalderError
     {
-        if self._position == self._history.len { return false; }
-
-        let dmut command = alias self._history[self._position];
+        let dmut command = if let Ok(dmut c) = alias self._history:.next() { alias c } else { return false; };
         if !command:.apply(alias self._scene) { return false; }
 
-        self._position += 1us;
-        self._merging = false;
-        self._change = "Redone: " ~ command.describe();
+        self._history:.forward();
+        self._history:.setChange("Redone: " ~ command.describe());
         self:.refitCompounds();
         self._edited:.emit(command);
         true
@@ -150,8 +123,7 @@ pub class SceneEditor {
      * Mark the scene as saved as it stands, the unsaved changes being those made from now on
      * */
     pub fn markSaved(mut self) {
-        self._saved = (self._position)?;
-        self._merging = false;
+        self._history:.markSaved();
     }
 
     /**
@@ -159,8 +131,7 @@ pub class SceneEditor {
      * nodes holding unsaved changes (see EditorActivity's reload)
      * */
     pub fn markUnsaved(mut self) {
-        self._saved = none;
-        self._merging = false;
+        self._history:.markUnsaved();
     }
 
     /**
@@ -168,8 +139,7 @@ pub class SceneEditor {
      * */
     @field
     pub fn toUndo(self)-> (&EditCommand)? {
-        if self._position == 0us { return none; }
-        (self._history[self._position - 1us])?
+        self._history.toUndo
     }
 
     /**
@@ -177,8 +147,7 @@ pub class SceneEditor {
      * */
     @field
     pub fn toRedo(self)-> (&EditCommand)? {
-        if self._position == self._history.len { return none; }
-        (self._history[self._position])?
+        self._history.toRedo
     }
 
     /**
@@ -186,11 +155,7 @@ pub class SceneEditor {
      * */
     @field
     pub fn unsaved(self)-> bool {
-        if let Ok(s) = self._saved {
-            return s != self._position;
-        }
-
-        true
+        self._history.unsaved
     }
 
     /**
@@ -198,7 +163,7 @@ pub class SceneEditor {
      * */
     @field
     pub fn change(self)-> [c8] {
-        self._change
+        self._history.change
     }
 
     /**
@@ -251,33 +216,6 @@ pub class SceneEditor {
                 }
             }
         }
-    }
-
-    /**
-     * Merge a command applied into the last one executed, when it takes it in
-     * @returns: true iif the command is merged
-     * */
-    fn mergeIntoLast(mut self, command: &EditCommand)-> bool {
-        if !self._merging || self._position == 0us || self._position != self._history.len { return false; }
-
-        self._history[self._position - 1us]:.merge(command)
-    }
-
-    /**
-     * Put a command applied in the history, after the commands applied, the commands undone being dropped
-     * */
-    fn push(mut self, dmut command: &EditCommand) {
-        if let Ok(s) = self._saved {
-            if s > self._position { self._saved = none; }
-        }
-
-        let dmut kept: [&EditCommand] = [];
-        for i in 0us .. self._position {
-            kept ~= [alias self._history[i]];
-        }
-
-        self._history = alias kept ~ [alias command];
-        self._position += 1us;
     }
 
 }
