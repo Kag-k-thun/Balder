@@ -468,6 +468,39 @@ fn onClearClicked (mut self, button: u8) {
   (`.dialog`, `.dialog-question`, `.dialog-accept`, `.dialog-cancel`, `.dialog-entries`, …), so that the rules of the
   application select them by these names only, and `Overlay { background-color: … }` sets the backdrop.
 
+### Tooltips
+
+```
+PushButton #COMPILE "Compile" { on-click: compile; tooltip: "Build the library of the game"; tooltip-shortcut: "Ctrl+R"; }
+```
+
+```
+Tooltip { background-color: #202328; radius: 4; padding: 4 8; max-width: 320; text-wrap: wrap; delay: 500ms; }
+Tooltip::shortcut { text-color: #9aa3ab; margin-left: 16; }
+```
+
+- **Any widget can carry a tooltip**: the text of `tooltip`, and the shortcut of `tooltip-shortcut`, shown muted on its
+  right; `w:.setTooltip ("Build the library of the game", shortcut-> "Ctrl+R")` sets both from code, `""` removing it,
+  and the tooltip shown takes the change at once. A widget without one shows the tooltip of its nearest ancestor that
+  has one.
+- **It is shown once the cursor rests on the widget for the delay**, the property `delay` of the rules selecting
+  `Tooltip` (half a second when none sets it). Within half a second of a tooltip hidden by the cursor leaving its
+  widget, the tooltip of the next widget is shown at once, so that the cursor moving along a toolbar reads its buttons
+  one after the other. The delay is counted by the ticks of the interface, which only asks for a frame when the
+  tooltip appears: an idle interface stays idle while it waits.
+- **It is hidden** when the cursor leaves the widget, leaves the window, when a button of the mouse, the wheel or a
+  key is pressed, and when an overlay opens or closes. After a press, it is not shown again until the cursor enters
+  another widget.
+- **It is drawn over everything**: the manager shows it in a layer of its own laid out after the overlays, over the
+  content, the popups of the menus and the dropdowns, and the dialogs, and the layer never takes the mouse. The
+  tooltip is placed under the cursor, where it was when the delay ended, above it when there is no room under it,
+  moved back inside the window past its right side, and stays there until the cursor leaves the widget.
+- **Its look is the type `Tooltip`**, its text the part `::label` and its shortcut the part `::shortcut`, which is
+  never wrapped and is set apart from the text by its margin. `engine:/tooltip/tooltip.style`, loaded with the
+  first tooltip at the origin of the components, gives it a look every sheet of the application wins over. A
+  `Tooltip "Save" { shortcut: "Ctrl+S"; }` written in a .gui file is laid out by its parent as any widget, to show the
+  look in a gallery.
+
 ### Picking and selecting in a Scene3D
 
 ```
@@ -783,6 +816,7 @@ kind of value it expects.
 | length | a number, in `px` when it has no unit, or a percentage of the parent's content box | `12` `12px` `40%` |
 | size | a length, `auto`, `min-content` or `max-content` | `width: max-content` |
 | track | a length, a share of the free space in `fr`, or a size keyword | `columns: 1fr 2fr 120` |
+| duration | a number in `ms` or in `s`, the unit required | `delay: 500ms` `delay: 1.5s` |
 | colour | see below | `#388bfd` `steelblue / 40%` |
 | string | double quotes | `"Noto Sans"` |
 | keyword | an identifier from the property's own set | `row` `bold` `center` |
@@ -846,7 +880,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Box`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -857,7 +891,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `CheckBox`
 
-- **Attributes:** `tab-index`: an integer; `text`: a string; `checked`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `checked`: true or false
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -868,7 +902,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Collapsible`
 
-- **Attributes:** `tab-index`: an integer; `title`: a string; `expanded`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `title`: a string; `expanded`: true or false
 - **Default attribute:** `title`
 - **Children:** any number
 - **Attributes of the children:** none
@@ -879,7 +913,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Dropdown`
 
-- **Attributes:** `tab-index`: an integer; `items`: strings separated by commas; `selected`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `items`: strings separated by commas; `selected`: an integer of 0 or more
 - **Default attribute:** `items`
 - **Children:** none
 - **Attributes of the children:** none
@@ -890,7 +924,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `FloatingLayout`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** `capture-events`: true or false
@@ -901,7 +935,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `FrameGraph`
 
-- **Attributes:** `tab-index`: an integer; `frames`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `frames`: an integer of 0 or more
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -912,7 +946,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `GridLayout`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** `cell`: two integers of 0 or more
@@ -923,7 +957,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Image`
 
-- **Attributes:** `tab-index`: an integer; `src`: a string
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `src`: a string
 - **Default attribute:** `src`
 - **Children:** none
 - **Attributes of the children:** none
@@ -934,7 +968,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `InputText`
 
-- **Attributes:** `tab-index`: an integer; `text`: a string; `max-length`: an integer of 0 or more; `only-numbers`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `max-length`: an integer of 0 or more; `only-numbers`: true or false
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -945,7 +979,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Label`
 
-- **Attributes:** `tab-index`: an integer; `text`: a string
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -956,7 +990,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `LinearLayout`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** none
@@ -967,7 +1001,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `ListView`
 
-- **Attributes:** `tab-index`: an integer; `multiple`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `multiple`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -978,7 +1012,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `MenuButton`
 
-- **Attributes:** `tab-index`: an integer; `text`: a string; `open-on-hover`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `open-on-hover`: true or false
 - **Default attribute:** `text`
 - **Children:** its popup, optional
 - **Attributes of the children:** none
@@ -989,7 +1023,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `MenuLayout`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** its bar then its content
 - **Attributes of the children:** none
@@ -1000,7 +1034,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Overlay`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** its content
 - **Attributes of the children:** none
@@ -1011,7 +1045,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `ProgressBar`
 
-- **Attributes:** `tab-index`: an integer; `value`: a number; `min`: a number; `max`: a number
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `value`: a number; `min`: a number; `max`: a number
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
@@ -1022,7 +1056,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `PushButton`
 
-- **Attributes:** `tab-index`: an integer; `text`: a string
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -1033,7 +1067,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `RadioButton`
 
-- **Attributes:** `tab-index`: an integer; `text`: a string; `checked`: true or false; `group`: a string
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `checked`: true or false; `group`: a string
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
@@ -1044,7 +1078,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Scene3D`
 
-- **Attributes:** `tab-index`: an integer; `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`; `editable`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `resolution`: two integers of 0 or more; `post`: effects separated by commas, each a kind followed by its parameters, numbers and texts, `off` adding it disabled: `vignette(0.5), lut("res:/lut/neutral.png"), invert(off)`; `editable`: true or false
 - **Default attribute:** none
 - **Children:** its overlay, optional
 - **Attributes of the children:** none
@@ -1055,7 +1089,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `SceneGizmo`
 
-- **Attributes:** `tab-index`: an integer; `selectable`: true or false; `icons`: true or false; `size`: a number
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `selectable`: true or false; `icons`: true or false; `size`: a number
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -1066,7 +1100,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `ScenePicker`
 
-- **Attributes:** `tab-index`: an integer; `selectable`: true or false; `icons`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `selectable`: true or false; `icons`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -1077,7 +1111,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Separator`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -1088,7 +1122,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Slider`
 
-- **Attributes:** `tab-index`: an integer; `value`: a number; `min`: a number; `max`: a number; `step`: a number
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `value`: a number; `min`: a number; `max`: a number; `step`: a number
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
@@ -1099,7 +1133,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `SpinBox`
 
-- **Attributes:** `tab-index`: an integer; `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
@@ -1110,7 +1144,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `Splitter`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** any number
 - **Attributes of the children:** none
@@ -1121,7 +1155,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `TabLayout`
 
-- **Attributes:** `tab-index`: an integer
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
 - **Default attribute:** none
 - **Children:** at least 1
 - **Attributes of the children:** `tab`: a string, required
@@ -1132,7 +1166,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `TableView`
 
-- **Attributes:** `tab-index`: an integer; `multiple`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `multiple`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
@@ -1141,9 +1175,20 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Parts:** `header` (states `hover`, `ascending`, `descending`), `row` (states `hover`, `selected`, `current`), `cell` (states `hover`, `selected`, `current`), `scrollbar` (states `hover`, `pressed`)
 - **Properties:** none
 
+### `Tooltip`
+
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `shortcut`: a string
+- **Default attribute:** `text`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** `label`, `shortcut`
+- **Properties:** `delay`: a duration of 0 or more, in ms or s
+
 ### `TreeView`
 
-- **Attributes:** `tab-index`: an integer; `multiple`: true or false; `draggable`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `multiple`: true or false; `draggable`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
