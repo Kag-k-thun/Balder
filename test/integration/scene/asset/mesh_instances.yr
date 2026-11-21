@@ -1,0 +1,127 @@
+in mesh_instances;
+
+use balder::math::vector;
+use balder::scene::asset::{assets, material_asset, mesh_asset};
+use balder::scene::node;
+use balder::scene::node::node3D::{empty, mesh_instance, visual::_};
+use balder::scene::property::value;
+
+use integration::utils::{compare, root};
+
+use std::{fs, io, uuid};
+
+__test a_mesh_node_draws_each_part_through_a_mesh_under_it_sharing_its_geometry {
+    {
+        let dmut root = copy Root();
+        let dmut cube = copy MeshInstance3D("crate", alias root, alias Assets::mesh(MeshAsset::CUBE));
+        assert (cube.draws.len == 1us && cube.draws[0us].name.file() == "__draw_0__");
+        assert (isReservedName(cube.draws[0us].name.file()));
+        assert (cube.draws[0us].mesh is cube.mesh.subMeshes[0us].geometry);
+        assert (cube.castShadow && cube.draws[0us].castShadow());
+
+        // two nodes of one mesh share its geometry
+        let dmut other = copy MeshInstance3D("other", alias root, alias Assets::mesh(MeshAsset::CUBE));
+        assert (other.draws[0us].mesh is cube.draws[0us].mesh);
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
+
+__test the_meshes_drawing_the_parts_stand_where_their_node_stands {
+    {
+        let dmut root = copy Root();
+        let dmut holder = copy Empty3D("holder", alias root);
+        holder.position = makeVec3(4.0f, 0.0f, 0.0f);
+
+        let dmut cube = copy MeshInstance3D("crate", alias holder, alias Assets::mesh(MeshAsset::CUBE));
+        cube.position = makeVec3(0.0f, 1.0f, 0.0f);
+        assert (near(cube.draws[0us].transformation, cube.transformation));
+
+        // built again under a node already placed
+        cube:.setMaterials(copy [(Assets::material(MaterialAsset::DEFAULT))?]);
+        let origin = cube.draws[0us].transformation * makeVec4(0.0f, 0.0f, 0.0f, 1.0f);
+        assert (near(origin.xyz, makeVec3(4.0f, 1.0f, 0.0f)));
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
+
+__test a_material_slot_draws_its_part_with_another_material_the_node_staying_the_same {
+    {
+        let dmut root = copy Root();
+        let dmut cube = copy MeshInstance3D("crate", alias root, alias Assets::mesh(MeshAsset::CUBE));
+        let dmut _ = copy Empty3D("label", alias cube);
+        cube.position = makeVec3(1.0f, 2.0f, 3.0f);
+        let guid = cube.guid, uid = cube.uid;
+
+        let red = Assets::register(copy MaterialAsset::local(v4(), "red", values-> copy [("base-color", PropertyValue::color(makeVec3(1.0f, 0.0f, 0.0f)))]));
+        cube:.setMaterials(copy [(red)?]);
+        assert (cube.materialOf(0us) is red && near(cube.draws[0us].material.config.baseColor, makeVec3(1.0f, 0.0f, 0.0f)));
+        assert (cube.guid.opCmp(guid) == 0 && cube.uid == uid && near(cube.position, makeVec3(1.0f, 2.0f, 3.0f)));
+        assert (root:.find(Path("crate/label")).hasValue && cube.draws.len == 1us);
+
+        // the slots are written by the paths of their materials, the empty ones ending them dropped
+        assert (MeshInstance3D::pathsOf(cube.materials) == [red.path]);
+        assert (MeshInstance3D::pathsOf(copy [none, (red)?, none]) == ["", red.path]);
+
+        // an empty slot draws the part with its own
+        cube:.setMaterials(copy [none]);
+        assert (cube.materialOf(0us).path == MaterialAsset::DEFAULT);
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
+
+__test a_mesh_node_swaps_its_mesh_and_its_shadows_keeping_the_nodes_under_it {
+    {
+        let dmut root = copy Root();
+        let dmut node = copy MeshInstance3D("thing", alias root, alias Assets::mesh(MeshAsset::CUBE));
+        let dmut _ = copy Empty3D("label", alias node);
+
+        node:.setMesh(alias Assets::mesh(MeshAsset::SPHERE));
+        assert (node.mesh.primitive == Primitive::SPHERE && node.draws.len == 1us);
+        assert (node.draws[0us].mesh.primitive == Primitive::SPHERE && root:.find(Path("thing/label")).hasValue);
+
+        node:.setCastShadow(false);
+        assert (!node.castShadow && !node.draws[0us].castShadow());
+
+        // the old draws are gone, one mesh drawing the part
+        let mut draws = 0us;
+        for c in node.childrenInOrder() if isReservedName(c.name.file()) { draws += 1us; }
+        assert (draws == 1us);
+
+        // a copy draws the same mesh with the same materials and shadows
+        let dmut copied = copy MeshInstance3D::copyOf("copy", alias root, alias node);
+        assert (copied.mesh is node.mesh && !copied.castShadow && copied.draws[0us].mesh is node.draws[0us].mesh);
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
+
+__test the_properties_of_a_mesh_node_change_its_mesh_and_its_materials {
+    {
+        let dmut root = copy Root();
+        let dmut node = copy MeshInstance3D("thing", alias root, alias Assets::mesh(MeshAsset::CUBE));
+        let schema = MeshInstance3D::schema();
+        let mesh = if let Ok(p) = schema.property("mesh") { p } else { assert (false); };
+        let materials = if let Ok(p) = schema.property("materials") { p } else { assert (false); };
+        assert (mesh.settable() && mesh.required && mesh.asset == "mesh" && materials.asset == "material");
+
+        mesh.set(alias node, PropertyValue::asset(MeshAsset::PLANE));
+        assert (node.mesh.primitive == Primitive::PLANE);
+
+        let red = Assets::register(copy MaterialAsset::local(v4(), "red"));
+        assert (materials.check(node, PropertyValue::assets(copy [red.path])) == "");
+        assert (materials.check(node, PropertyValue::assets(copy ["res:/none.material"])) != "");
+        assert (mesh.check(node, PropertyValue::asset("")) != "");
+
+        materials.set(alias node, PropertyValue::assets(copy [red.path]));
+        assert (materials.get(alias node) == PropertyValue::assets(copy [red.path]));
+
+        // a material that cannot be loaded leaves the node as it was
+        materials.set(alias node, PropertyValue::assets(copy ["res:/none.material"]));
+        assert (materials.get(alias node) == PropertyValue::assets(copy [red.path]));
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}
