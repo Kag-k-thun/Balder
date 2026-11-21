@@ -69,15 +69,15 @@ scaled along other axes. A mesh is transformed as it is drawn. A sphere stays ro
 transformation. A capsule is scaled along its axis by the scale of Y (its cylinder), and its radius by the larger of the
 scales of X and Z.
 
-`SolidObjectModel::hulls` gives the compound of the hulls of the meshes of a model, one by material, before the model
-enters a scene that does not keep its triangles. A concave model (a chair, a mug, a teapot) is a compound of the hulls of
-its convex decomposition (see below), `SolidObjectModel::decomposition`. A plane has no box: the world keeps its planes
+`MeshAsset.hulls` (and `MeshInstance3D.hulls`) gives the compound of the hulls of the parts of a model, one by
+material, before the model enters a scene that does not keep its triangles. A concave model (a chair, a mug, a teapot) is a compound of the hulls of
+its convex decomposition (see below), `MeshAsset.decomposition`. A plane has no box: the world keeps its planes
 apart from its hierarchy and tests them in every query.
 
 ### Convex decomposition
 
 A triangle mesh is static only; a dynamic concave model is the compound of convex hulls approximating it. A
-`ConvexDecomposition` splits the triangles of a model (`SolidObjectModel::triangles`, in the space of the model) into
+`ConvexDecomposition` splits the triangles of a model (`MeshAsset.triangles`, in the space of the model) into
 hulls, by its `DecompositionSettings`:
 
 | Setting | Default | Meaning |
@@ -103,11 +103,11 @@ It is slow by nature (seconds to tens of seconds for a model of a few thousand t
 import or in the editor, never at load: the hulls are saved next to the model file (`ConvexDecomposition::fileOf`,
 `mug.glb` giving `mug.hulls`), a toml holding the version of the format, the settings, the CRC-32 of the model file
 they were made from (`checksumOf`) and a `[[hull]]` table of the coordinates of the vertices of each hull. The game reads
-it (`SolidObjectModel::decomposition`, `ConvexDecomposition::fromFile`), a warning telling when the model file changed
+it (`MeshAsset.decomposition`, `ConvexDecomposition::fromFile`), a warning telling when the model file changed
 since:
 
 ```
-let dmut mug = copy SolidObjectModel::fromFile("mug", alias body, "res:/models/mug/mug.glb");
+let dmut mug = copy MeshInstance3D::fromFile("mug", alias body, "res:/models/mug/mug.glb");
 body.shape = mug.decomposition().shape();
 ```
 

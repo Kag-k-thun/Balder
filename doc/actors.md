@@ -128,7 +128,7 @@ What a class needs:
   editor; their properties are then given the values of the file, so the constructor sets nothing a property holds.
 - **The tags** of `balder::scene::actors::tags` in scope (`use balder::scene::actors::tags;`).
 - **A type** (`"door"`) of lowercase letters, digits and `-`, starting with a letter, that no other class has (a
-  built-in kind, `cube`, `light`…, or another actor class): a class refused is logged at the start (`Actor class
+  built-in kind, `mesh`, `light`…, or another actor class): a class refused is logged at the start (`Actor class
   'door' refused: …`) and left out.
 
 ## 3. The tags

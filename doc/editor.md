@@ -163,12 +163,14 @@ module of a game.
   a row, their nodes go under its node, after its children; between two rows, to that place, under the parent of the
   line, which tells the level; below the rows, to the end of the first level. Each node keeps its place in the world,
   its transform computed again in the space of its new parent, or keeps its transform with Alt held at the drop. A node
-  goes neither under itself nor under a node under it, nor in or out of a model (its meshes come from its file), and a
+  goes neither under itself nor under a node under it (the meshes drawing the parts of a mesh node are its own, and
+  hidden: a node dropped on a mesh node goes under it as under any other), and a
   node named as a child of its new parent takes a free name (`cube_2`).
 - **Inspector**: the name of the node selected last, then a section for each group of the properties its class
   declares (see the property schemas below), refreshed as the gizmo moves it: *Transform* for every node (its position,
-  its rotation in degrees, its scale), then *Model* (its file and its levels of detail, told), *Material* (the colour,
-  the roughness and the metalness of a cube, a sphere or a plane, told), *Light* (its type, its colour, its intensity,
+  its rotation in degrees, its scale), then *Mesh* (the mesh drawn and the material of each part, told by their names,
+  `own` for a part drawn with the material of its mesh, whether the levels of detail of a model file are built, whether
+  it casts shadows), *Light* (its type, its colour, its intensity,
   its direction, its range for a point or a spot light, the angles of its cone for a spot light, its shadows),
   *Marker* (its purpose, its tags separated by spaces, applied when Enter is pressed), *Path* (its curve, whether it is
   closed), *Volume* (its shape and the sizes it uses: the sides of a box, the radius of a sphere, the radius and the
@@ -186,12 +188,12 @@ module of a game.
   and the shape of a body and the capsule of a character (their colliders built). A name is applied when Enter is
   pressed. One direction light casts shadows at a time. Each section is a `Collapsible` the user folds by its header,
   and the inspector scrolls over the sections taller than the window instead of growing the editor.
-- **Convex hulls**: a model has a panel of the convex decomposition saved next to its file (`teapot.obj` giving
+- **Convex hulls**: a mesh node of a model file has a panel of the convex decomposition saved next to its file (`teapot.obj` giving
   `teapot.hulls`, see the convex decomposition of `doc/physics.md`), the shape of a body of the hulls of the model: the
   hulls and their vertices, the settings they were made with, drawn over the model, each in its colour, in the `hulls`
   layer of the debug lines of the scene (*Show the hulls* hides them). The editor does not decompose the models: the
   export of a project will (BAL-138), the `decompose` tool meanwhile; a model without hulls saved gives a body the hull
-  of each of its meshes (`SolidObjectModel::hulls`) (`HullsPanel`).
+  of each of its parts (`MeshAsset.hulls`) (`HullsPanel`).
 - **Connections**: an actor has a panel of the connections of its signals to the slots of the actors of the scene
   (`ConnectionsPanel`, `Node3D.connections`), which the game makes as it builds the scene (`connectActors`), the editor
   only keeping them: a table of the connections (the signal, the actor receiving it, by its path, and its slot, an actor
@@ -199,8 +201,8 @@ module of a game.
   making the one chosen below it: a signal of the actor (its payload told), an actor of the scene having a slot taking
   that payload (the actor itself among them), and one of those slots. A connection made twice is refused.
 - **Menus**: *Scene* opens a new scene or a scene file, saves the scene (Ctrl+S) or saves it in another file
-  (Ctrl+Shift+S), and goes back to the project manager, *Add* adds a cube, a sphere, a plane, a model read from a
-  file, an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
+  (Ctrl+Shift+S), and goes back to the project manager, *Add* adds a cube, a sphere, a plane (mesh nodes of the
+  built-in meshes, drawn with the default material), a model read from a file (a mesh node of its mesh), an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
   box), a character or a light where the centre of the viewport meets a surface (or at the point the camera looks at),
   a camera where the eye of the viewport stands, looking where it looks, a point to the path selected, or a body around
   each node selected, its kinds grouped in submenus opening as they are hovered (*Mesh*, *Light*, *Marker*, *Path*,
@@ -298,13 +300,20 @@ showing it for nodes of both.
 A scene file (`.scene`) is read by `SceneDescription` (`balder::scene::description`), which also writes it:
 `SceneDescription::fromFile (path).build (root)` creates its nodes under a node, the root of a `Scene`, and
 `SceneDescription (root).save (path)` writes the nodes under it, the nodes named `__…__` left out. The file opens with
-the version of its format, declares the files its models use, then holds a flat block per node:
+the version of its format (`scene 2;`, a file of another version refused), declares the assets its nodes use (see
+`doc/assets.md`), holds a block per material local to the file, then a flat block per node:
 
 ```
 // a table and its light
-scene 1;
+scene 2;
 
-asset table model "res:/models/table.glb";
+asset cube mesh "engine:/meshes/cube";
+asset table mesh "res:/models/table.glb";
+
+material #5d1e0c2a-7b3f-4a9e-8c21-0f6e5d4c3b2a "red paint" {
+    base-color: 0.8 0.3 0.2;
+    roughness: 0.5;
+}
 
 node #87b7e0df-348c-4ee2-b5e4-a54c540e02bf light "sun" {
     direction: -0.3 -1 -0.2;
@@ -314,20 +323,20 @@ node #030e69b7-ba92-4e55-bd67-5381a2351926 empty "props" {
     position: 0 0 -2;
 }
 
-node #75e8622f-285e-414a-8e93-d82ecee1a614 cube "crate" {
+node #75e8622f-285e-414a-8e93-d82ecee1a614 mesh "crate" {
     parent: #030e69b7-ba92-4e55-bd67-5381a2351926;
     rotation: 0 30 0;
-    color: 0.8 0.3 0.2;
-    roughness: 0.5;
+    mesh: @cube;
+    materials: #5d1e0c2a-7b3f-4a9e-8c21-0f6e5d4c3b2a;
 }
 
-node #0c203f1a-b872-4e76-b3e0-0c7c95e00c74 model "table" {
+node #0c203f1a-b872-4e76-b3e0-0c7c95e00c74 mesh "table" {
     parent: #030e69b7-ba92-4e55-bd67-5381a2351926;
-    file: @table;
+    mesh: @table;
 }
 ```
 
-A node is `node #<id> <kind> "<name>" { … }`, the kind being `empty`, `model`, `cube`, `sphere`, `plane`, `light`,
+A node is `node #<id> <kind> "<name>" { … }`, the kind being `empty`, `mesh`, `light`,
 `marker`, `path`, `path-point`, `volume`, `body`, `character` or `camera`, the points of a path being the `path-point` nodes
 under it, in their order, the parts of a compound body the `volume` nodes under it, or the type of an actor class
 (see `doc/actors.md`): its entries are its transform, its properties (`#[export]`) and the connections of its signals,
@@ -351,8 +360,7 @@ is the order of the nodes (`Node::getChildrenInOrder`), which the outline shows 
 |---|---|---|
 | `parent` | every node | the id of the node it is under, `#<uuid>`, none under the root |
 | `position`, `rotation`, `scale` | every node | three numbers, in the space of the parent, the rotation in degrees |
-| `file`, `lods` | model | the asset of the model file (`@<key>`, required), whether its levels of detail are built (`true`) |
-| `color`, `roughness`, `metallic` | cube, sphere, plane | the base colour and the material |
+| `mesh`, `materials`, `lods`, `shadows` | mesh | the mesh asset drawn (`@<key>`, required); the material of each part, an asset of the file (`@<key>`), a material local to it (`#<uuid>`) or `none` for the part's own (`materials: none @brick;`); whether the levels of detail of a model file are built (`true`); whether it casts shadows (`true`) |
 | `light`, `color`, `intensity`, `direction`, `range`, `inner-angle`, `outer-angle`, `shadows` | light | `direction`, `point` or `spot`, then as `Light` has them |
 | `purpose`, `tags` | marker | `generic`, `spawn`, `waypoint` or `socket`; strings (`tags: "enemy" "boss";`) |
 | `curve`, `closed` | path | `catmull-rom` or `bezier`; whether the curve goes back to its first point (`false`) |
@@ -363,20 +371,27 @@ is the order of the nodes (`Node::getChildrenInOrder`), which the outline shows 
 | `projection`, `fov`, `size`, `near`, `far`, `active` | camera | `perspective` or `orthographic`; the vertical field of view of a perspective camera in degrees, the height of the view of an orthographic one; its planes; whether it is the active camera of the scene (`true`, one camera of the file at most) |
 | `radius`, `height`, `up`, `slope-limit`, `step-offset`, `snap-distance`, `skin`, `coyote-time`, `push-mass`, `max-slides`, `depenetrations` | character | its capsule (0.4 and 1.8 by default), then as `CharacterSettings` has them, the slope limit in degrees |
 
-An asset is `asset <key> model "<path>";`, the path a `res:/…` or an absolute one, named by the `file` of a model and the
-`model` of a body. The writer writes the same file for
+An asset is `asset <key> mesh "<path>";` or `asset <key> material "<path>";`, the path a `res:/…`, an absolute one, a
+built-in mesh (`engine:/meshes/cube`) or a material embedded in a model file (`res:/models/table.glb#0`), named by the
+`mesh` and the `materials` of a mesh node and the `model` of a body, each reading assets of its kind. A material block,
+`material #<uuid> "<name>" { … }`, is a material local to the file, of the entries of a `.material` file (see
+`doc/assets.md`), named by its id in the slots of the meshes; building the scene puts it in the cache of the assets. The
+kinds of the files of version 1, `model`, `cube`, `sphere` and `plane`, are refused, the error telling the mesh node
+replacing them. The writer writes the same file for
 the same nodes, so a scene diffs well under version control: the assets in the order of their paths, keyed by the name
-of their file; the nodes parents first, siblings in their order; the entries of a node in the order of
+of their file (`table_0` for the first material of `table.glb`); the materials local to the file in the order of their
+names, their entries holding their defaults left out; the nodes parents first, siblings in their order; the entries of a node in the order of
 the schema of its kind, those that do not apply (the cone of a point light, the sizes another shape uses, the dynamics
 of a body that is not dynamic) and those holding their default left out; each number the shortest decimal reading back
 the same float. A scene
-started from a template (the main scene of a new project, see `ProjectTemplate`) gives its nodes ids of their own
-(`SceneDescription.withoutIds`).
+started from a template (the main scene of a new project, see `ProjectTemplate`) gives its nodes and its local materials
+ids of their own (`SceneDescription.withoutIds`).
 
 The file is the source of a scene, the one edited and versioned; the game will load a binary file cooked from it
 (BAL-187).
 
-A cube, a sphere and a plane stand in the unit box of the models, as a model loaded from a file does: x and z in
-[-0.5, 0.5], y in [0, 1]. Their scale is their size, and their position the centre of their base. An entry its kind
-does not read, an entry given twice, a value of the wrong type, two nodes of one id, a parent or an asset the file does
-not declare, or a node under itself is an error telling the file, the line and the column, and why.
+The built-in cube, sphere and plane stand in the unit box of the models, as a model loaded from a file does: x and z in
+[-0.5, 0.5], y in [0, 1]. The scale of a mesh node drawing one is its size, and its position the centre of its base. An
+entry its kind does not read, an entry given twice, a value of the wrong type, two nodes of one id, a parent, an asset
+or a local material the file does not declare, an asset of another kind than its entry reads, or a node under itself is
+an error telling the file, the line and the column, and why.
