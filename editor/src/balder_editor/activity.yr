@@ -1,11 +1,11 @@
 in activity;
 
-use balder_editor::{arguments, command, connections_panel, editor, hulls_panel, inspector_panel, manager, naming, outline_panel, project, viewport};
+use balder_editor::{arguments, build_error_dialog, command, connections_panel, editor, hulls_panel, inspector_panel, manager, naming, outline_panel, project, viewport};
 use balder_editor::command::{add, duplicate, open, projection, remove, transform, volume, wrap};
-use balder_editor::project::recent;
+use balder_editor::project::{game_build, game_library, recent};
 use balder::core::{_, application::_};
 use balder::interface::dialog;
-use balder::interface::widget::{button::menu, button::push, layout::d3scene, text::label, tree::view};
+use balder::interface::widget::{button::menu, button::push, layout::d3scene, layout::linear, text::label, tree::view};
 use balder::math::vector;
 use balder::scene::{description::_, editable, property::value};
 use balder::scene::actors::node_classes;
@@ -18,6 +18,7 @@ use balder::utils::{log, path};
 
 use std::io;
 use std::fs;
+use std::time;
 
 use ::sdl3::_;
 
@@ -53,6 +54,15 @@ def ACTORS_GROUP = "BAR/ADD/ACTORS";
 // The class of an item of a menu with nothing to do, greyed (see editor.style)
 def IDLE = "idle";
 
+// The path of the button of the menu bar building the library of the game again and loading it
+def COMPILE_BUTTON = "BAR/COMPILE";
+
+// The dialog telling why the build of the library of the game failed, under the directory of the editor
+def BUILD_ERROR_DIALOG = "ui/build_error.gui";
+
+// How often the status bar tells how far the build of the library of the game is, in milliseconds
+def BUILD_REFRESH = 250u64;
+
 /**
  * What the editor does once the unsaved changes of the scene are saved or discarded
  * */
@@ -74,6 +84,21 @@ enum Pending : u8
  * scene. A scene saved under the res/ directory of the project joins its scenes, named after its file, and the path of
  * a scene or a model under it is written res:/…, the project moving with its files. Scene → Back to the project
  * manager closes the editor for the manager.
+ * ====
+ * @info:
+ * =====
+ * The library of the game of the project (the shared target of its gyllir.toml, see GameBuild) is loaded in the editor
+ * (see GameLibrary), the #[actor] tags of its classes registering them: the Add menu lists them, the inspector edits
+ * their nodes and the scene files build them. A library newer than its sources is loaded before the first scene is
+ * opened; otherwise it is built in the background, the status bar telling how far, then loaded, the scene rebuilt with
+ * its classes. Compile (the button on the right of the menu bar, or Ctrl+R) builds it again and reloads it, a change of
+ * the code of an actor taken without leaving the editor: the scene is described as its file would save it, its nodes
+ * dropped, the library closed (its classes unregistered) and opened again, then the scene is built again from its
+ * description with the classes of the new library, read leniently (an entry, a signal or a connection its class no
+ * longer declares dropped and logged, an actor of a class gone kept as an unknown one); its history starts again, its
+ * unsaved changes staying unsaved. A build that fails tells its first error in the status bar and in a dialog
+ * (BuildErrorDialog), the library loaded staying; a library that cannot be loaded leaves the actors unknown. Going
+ * back to the project manager closes the library.
  * ====
  * @info:
  * =====
@@ -126,6 +151,20 @@ pub class EditorActivity over Activity {
     // answer
     let mut _asking: bool = false;
 
+    // The build of the library of the game of the project, none for a project declaring no shared target
+    let dmut _build: (&GameBuild)? = none;
+
+    // Why the project has no library to build, told when it is asked to compile, empty for a project with one
+    let mut _noLibrary: [c8] = "";
+
+    // The time since the status bar told how far the build of the library is
+    let mut _sinceRefresh: u64 = 0u64;
+
+    // What the status bar tells once the changes the editor made itself are told (see notify), empty for nothing, and
+    // true until the update after the one it was given at
+    let mut _notice: [c8] = "";
+    let mut _noticeWaits: bool = false;
+
     pub self (uid: usize, dmut app: &Application, dmut window: &Window)
         with super(uid, alias app, alias window)
     {}
@@ -176,6 +215,7 @@ pub class EditorActivity over Activity {
         self:.slot("gizmo::translate", &self:.onTranslateClicked);
         self:.slot("gizmo::rotate", &self:.onRotateClicked);
         self:.slot("gizmo::scale", &self:.onScaleClicked);
+        self:.slot("game::compile", &self:.onCompileClicked);
 
         let dmut outline = copy OutlinePanel(&self:.setStatus);
         self:.behavior("outline", alias outline);
@@ -189,7 +229,6 @@ pub class EditorActivity over Activity {
         self.gui:.getRegistry():.register(EditorViewport::schema());
         println(self.gui:.loadStyleFile(editorFile("ui/editor.style"))?);
         println(self.gui:.loadGUIFile(editorFile("ui/editor.gui"))?);
-        self:.listActorClasses();
 
         if let Ok(dmut l: &Label) = self.gui:.find("BODY/FOOT/STATUS") {
             self._status = (alias l)?;
@@ -249,8 +288,9 @@ pub class EditorActivity over Activity {
      */
 
     /**
-     * Read the project of the project path, put it first in the recent projects, and open its first scene: the one of
-     * the command line, or the scene edited last, or the main scene, or a new scene
+     * Read the project of the project path, put it first in the recent projects, load the library of its game when it
+     * is newer than its sources, and open its first scene: the one of the command line, or the scene edited last, or
+     * the main scene, or a new scene; the library is built afterwards when it is not up to date
      * */
     fn openProject(mut self) {
         let directory = getProjectPath().toStr();
@@ -268,12 +308,17 @@ pub class EditorActivity over Activity {
         recent:.opened(directory);
         self:.saveRecent(recent);
 
+        let (notice, toBuild) = self:.findLibrary(directory);
         let scene = self.firstScene(recent.sceneOf(directory));
         if scene.len == 0us {
             self:.newScene();
         } else {
             self:.openScene(scene);
         }
+
+        if notice.len != 0us { self:.notify(notice); }
+        if toBuild { self:.compile(); }
+        self:.showCompile();
     }
 
     /**
@@ -351,6 +396,283 @@ pub class EditorActivity over Activity {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ====================================          LIBRARY          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the library of the game of the project, the library of another project closed: loaded right away when it is
+     * newer than its sources, so that the first scene is built with its classes
+     * @returns: what the status bar tells once the first scene is open, empty for nothing, and true iif the library is
+     * to be built
+     * */
+    fn findLibrary(mut self, directory: [c8])-> ([c8], bool) {
+        GameLibrary::unload();
+        self:.listActorClasses();
+        if !GameBuild::has(directory) {
+            if GameBuild::hasEditor(directory) {
+                // a project of the template of BAL-128, its editor target linking the library of its game
+                self._noLibrary = "The library of the project is not a shared one, its actors staying unknown: give its target type = \"shared\" and host-provided = [\"Balder\"], and remove its target 'editor' (see doc/actors.md)";
+                log::warn #("Editor", self._noLibrary);
+                return (self._noLibrary, false);
+            }
+
+            self._noLibrary = "The project has no library to compile: its gyllir.toml declares no target of type \"shared\"";
+            return ("", false);
+        }
+
+        {
+            let dmut b = copy GameBuild(directory);
+            self._build = (alias b)?;
+            if b.isUpToDate() {
+                return (self:.loadLibrary(b.library), false);
+            }
+
+            return ("", true);
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to read the library of the game", err);
+                self._noLibrary = err.msg;
+                return (err.msg, false);
+            }
+        }
+    }
+
+    /**
+     * Load the library of the game, in place of the one loaded, and list its actor classes in the Add menu
+     * @returns: what the status bar tells, the classes loaded or why the library could not be
+     * */
+    fn loadLibrary(mut self, path: [c8])-> [c8] {
+        let mut res = "";
+        {
+            let l = GameLibrary::load(path);
+            res = f"Loaded the library of ${self.projectName()}, ${l.classes.len} actor classes";
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to load the library of the game", err);
+                res = f"${err.msg}: its actors stay unknown";
+            }
+        }
+
+        self:.listActorClasses();
+        res
+    }
+
+    fn onCompileClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.compile(); }
+    }
+
+    /**
+     * Build the library of the game again, in the background, the status bar telling how far (see onUpdate), then load
+     * it (see reload)
+     * */
+    fn compile(mut self) {
+        let dmut b = if let Ok(dmut b) = alias self._build { alias b } else {
+            self:.setStatus(self._noLibrary);
+            return;
+        };
+
+        if b:.isRunning() {
+            self:.setStatus(f"The library of ${self.projectName()} is being built");
+            return;
+        }
+
+        {
+            b:.build();
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to build the library of the game", err);
+                self:.setStatus(err.msg);
+                return;
+            }
+        }
+
+        self._sinceRefresh = 0u64;
+        self:.setStatus(f"Building the library of ${self.projectName()}…");
+        self:.showCompile();
+    }
+
+    /**
+     * Tell how far the build of the library is in the status bar, then load the library once it is built
+     * */
+    over onUpdate(mut self, delta: Duration) {
+        if self._notice.len != 0us {
+            if self._noticeWaits {
+                self._noticeWaits = false;
+            } else {
+                self:.setStatus(self._notice);
+                self._notice = "";
+            }
+        }
+
+        let mut code: (i32)? = none;
+        let mut status = "";
+        if let Ok(dmut b) = alias self._build {
+            code = b:.finished();
+            self._sinceRefresh += delta.allMillis;
+            if !code.hasValue && self._sinceRefresh >= BUILD_REFRESH && b:.isRunning() {
+                self._sinceRefresh = 0u64;
+                let progress = b:.progress();
+                status = f"Building the library of ${self.projectName()}: ${cast!u32(progress.done * 100.0f)}% — ${progress.step}";
+            }
+        }
+
+        if status.len != 0us { self:.setStatus(status); }
+        if let Ok(c) = code { self:.onBuilt(c); }
+    }
+
+    /**
+     * The library of the game is built, or failed to: it is loaded, the scene rebuilt with its classes, or the status
+     * bar tells the first error of the build, and a dialog shows it as the compiler wrote it, the library loaded staying
+     * @params:
+     *    - code: the exit code of the build
+     * */
+    fn onBuilt(mut self, code: i32) {
+        self:.showCompile();
+        if code == 127 {
+            self:.setStatus(f"The library of ${self.projectName()} could not be built: gyllir is not found");
+        } else if code != 0 {
+            self:.onBuildFailed();
+        } else {
+            self:.reload();
+        }
+    }
+
+    /**
+     * The library of the game did not build: the status bar tells its first error, and a dialog shows it as the
+     * compiler wrote it, with the buttons opening the file of all the errors and the whole output of the build
+     * */
+    fn onBuildFailed(mut self) {
+        let b = if let Ok(b) = self._build { b } else { return; };
+        let name = self.projectName();
+        let errors = b.errors();
+        let first = if errors.len != 0us { errors[0] } else { "" };
+        let summary = GameBuild::summary(first);
+        log::error #("Editor", f"The library of ${name} did not build, see ${b.log}: ${summary}");
+        self:.setStatus(if summary.len != 0us { f"The library of ${name} did not build: ${summary}" }
+                        else { f"The library of ${name} did not build, see ${b.log}" });
+
+        let mut file = "";
+        {
+            file = b.writeErrors(errors);
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to write the errors of the build", err);
+            }
+        }
+
+        // it answers nothing: the editor is not asking while it is open, its overlay taking the clicks
+        {
+            let dmut d = copy BuildErrorDialog(editorFile(BUILD_ERROR_DIALOG), name, first, file, b.log);
+            d:.open(DialogMode::OVERLAY, alias self.gui);
+        } catch {
+            err => {
+                log::error #("Editor", "Failed to open the dialog of the errors of the build", err);
+            }
+        }
+    }
+
+    /**
+     * Load the library of the game built, in place of the one loaded, the scene rebuilt with its classes: described as
+     * its file would save it, its nodes dropped (with the history naming them) before the library loaded is closed,
+     * then built again from its description, read leniently, once the library is loaded; its unsaved changes stay
+     * unsaved, and so does a scene that lost what the classes no longer declare
+     * */
+    fn reload(mut self) {
+        let library = if let Ok(b) = self._build { b.library } else { return; };
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+
+        let mut content = "";
+        {
+            let dmut scene = alias e.scene;
+            content = copy SceneDescription(alias scene:.getRootNode()).content();
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to describe the scene to reload the library of the game", err);
+                self:.setStatus(f"The library was not reloaded: ${err.msg}");
+                return;
+            }
+        }
+
+        let unsaved = e.unsaved;
+        let name = self.documentName();
+        self:.dropNodes();
+        let mut status = self:.loadLibrary(library);
+        {
+            let description = copy SceneDescription(content, file-> name, lenient-> true);
+            for d in description.dropped {
+                log::warn #("Editor", f"Reloading the library of the game: ${d}, dropped");
+            }
+
+            self:.run(copy OpenCommand(description, name));
+            if unsaved || description.dropped.len != 0us { e:.markUnsaved(); }
+            if description.dropped.len != 0us {
+                status ~= f"; ${description.dropped.len} entries of the scene its classes no longer declare dropped (see the log)";
+            }
+        } catch {
+            err: &BalderError => {
+                // never the case of a scene this Balder wrote: kept where it can be read again
+                log::error #("Editor", "Failed to build the scene again with the library of the game", err);
+                let kept = self.keepContent(content);
+                e:.markUnsaved();
+                status = f"The scene could not be built again (${err.msg}), kept in ${kept}";
+            }
+        }
+
+        self:.showDocument();
+        self:.showHistory();
+        self:.notify(status);
+    }
+
+    /**
+     * Drop the nodes of the scene, the history naming them dropped with them, so that no node of a class of the library
+     * of the game outlives it
+     * */
+    fn dropNodes(mut self) {
+        let nodes: [NodeDescription] = [];
+        self:.run(copy OpenCommand(copy SceneDescription(nodes), self.documentName()));
+    }
+
+    /**
+     * Write the content of a scene in the build cache of the project, the scene a reload could not build again
+     * @returns: the path of the file, or why it could not be written
+     * */
+    fn keepContent(self, content: [c8])-> [c8] {
+        let file = getProjectPath().push(".target").push("reloaded.scene");
+        {
+            if !isDir(file.parent()) { createDir(file.parent(), recursive-> true); }
+            let dmut f = File::create(file, write-> true);
+            f:.write(content);
+            f:.close();
+            file.toStr()
+        } catch {
+            err: &FsError => { f"no file (${err})" }
+        }
+    }
+
+    /**
+     * Grey Compile while the library is being built, or when the project has none
+     * */
+    fn showCompile(mut self) {
+        let running = if let Ok(dmut b) = alias self._build { b:.isRunning() } else { false };
+        let idle = running || !self._build.hasValue;
+        if let Ok(dmut button: &PushButton) = self.gui:.find(COMPILE_BUTTON) {
+            button:.setClasses(if idle { copy ["compile", IDLE] } else { copy ["compile"] });
+            button:.setText(if running { "Compiling…" } else { "Compile (Ctrl+R)" });
+        }
+    }
+
+    /**
+     * @returns: the name of the project, for the status bar
+     * */
+    fn projectName(self)-> [c8] {
+        if let Ok(p) = self._project { p.name } else { "the project" }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * =====================================          SCENE          ======================================
      * ====================================================================================================
      * ====================================================================================================
@@ -389,7 +711,8 @@ pub class EditorActivity over Activity {
 
     /**
      * The keys of the window: Ctrl+Z undoes the last change, Ctrl+Shift+Z and Ctrl+Y redo it, Ctrl+S saves the scene,
-     * Ctrl+Shift+S saves it in another file, Ctrl+E opens the Add menu under the cursor
+     * Ctrl+Shift+S saves it in another file, Ctrl+E opens the Add menu under the cursor, Ctrl+R compiles the library of
+     * the game and loads it
      * */
     fn onKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
         let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
@@ -406,6 +729,8 @@ pub class EditorActivity over Activity {
             self:.save();
         } else if key == SDLK_E && !shift {
             self:.openAddMenu();
+        } else if key == SDLK_R && !shift {
+            self:.compile();
         }
     }
 
@@ -518,9 +843,17 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Open the project manager, the editor closing
+     * Open the project manager, the editor closing, its nodes dropped and the library of the game closed; not while the
+     * library is being built, the build going on
      * */
     fn openManager(mut self) {
+        if let Ok(dmut b) = alias self._build && b:.isRunning() {
+            self:.setStatus(f"The library of ${self.projectName()} is being built: back to the project manager once it is");
+            return;
+        }
+
+        self:.dropNodes();
+        GameLibrary::unload();
         {
             self.app:.open!{&ProjectManagerActivity}(copy BalderConfig(editorFile(MANAGER_CONFIG)));
         } catch {
@@ -675,9 +1008,9 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * List the actor classes the program registers in the Add menu, a submenu per category in the order of their first
-     * class, the classes of a category in the order of their registration; the Add menu has none of them when the
-     * program registers no actor class (the editor of Balder, the library of no game linked in)
+     * List the actor classes the program registers in the Add menu, in place of those listed: a submenu per category in
+     * the order of their first class, the classes of a category in the order of their registration; the Add menu has
+     * none of them when the program registers no actor class (no library of a game loaded)
      * */
     fn listActorClasses(mut self) {
         let classes = actorClasses();
@@ -688,10 +1021,13 @@ pub class EditorActivity over Activity {
             if !known { categories ~= [c.category]; }
         }
 
-        if categories.len == 0us { return; }
-
         self.gui:.holdLayout();
         {
+            if let Ok(dmut group: &LinearLayout) = alias self.gui:.find(ACTORS_GROUP) {
+                group:.removeChilds();
+                group:.setClasses(if categories.len == 0us { copy ["actors", "absent"] } else { copy ["actors"] });
+            }
+
             for i, category in categories {
                 let id = f"C${i}";
                 self.gui:.instantiate("ActorCategory", category ~ " ▸", parent-> ACTORS_GROUP, id-> id);
@@ -699,10 +1035,6 @@ pub class EditorActivity over Activity {
                     self.gui:.instantiate("ActorItem", c.label, parent-> ACTORS_GROUP ~ "/" ~ id ~ "/LIST", id-> f"A${j}",
                                           attributes-> f"on-click: add::actor(${WidgetManager::quoted(c.name)});");
                 }
-            }
-
-            if let Ok(dmut group) = alias self.gui:.find(ACTORS_GROUP) {
-                group:.setClasses(copy ["actors"]);
             }
         } catch {
             err: &BalderError => {
@@ -1368,6 +1700,15 @@ pub class EditorActivity over Activity {
                 self:.setStatus("The dialog could not be opened");
             }
         }
+    }
+
+    /**
+     * Tell something in the status bar after the changes of the scene made meanwhile, which the editor tells as they
+     * are delivered, at the start of the next update (the opens of a reload)
+     * */
+    fn notify(mut self, msg: [c8]) {
+        self._notice = msg;
+        self._noticeWaits = true;
     }
 
     fn setStatus(mut self, msg: [c8]) {
