@@ -35,6 +35,30 @@ layout (location = 5) out vec2 velocity;
 
 layout (set = 0, binding = 2) uniform sampler2D diffuse;
 
+// A metallic/roughness material (MaterialConfig), laid out as the composition reads it
+struct Material {
+    vec3 baseColor;
+    float metallic;
+    vec3 emissive;
+    float roughness;
+    float specular;
+    float occlusion;
+    float normalStrength;
+    float emissiveStrength;
+
+    // The tiling and the offset of the texture coordinates of the base colour
+    vec2 tiling;
+    vec2 offset;
+};
+
+// The materials of the scene, by the index the material word of an object holds
+layout (std430, set = 0, binding = 3) readonly buffer Materials {
+    Material materials [];
+};
+
+// The bit of the material word set when the object is outlined, the other bits holding its material
+const uint OUTLINED = 0x80000000u;
+
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -131,7 +155,8 @@ void main() {
     crossFade ();
 
     normals = octEncode (inNormals);
-    albedo = vec4 (texture (diffuse, inUV).xyz, 1);
+    Material mat = materials [inMaterial & ~OUTLINED];
+    albedo = vec4 (texture (diffuse, inUV * mat.tiling + mat.offset).xyz, 1);
 
     // the material has no map but its base colour, its factors used as they are
     surface = vec2 (1.0);
