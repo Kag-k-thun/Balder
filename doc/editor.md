@@ -3,6 +3,10 @@
 The editor of Balder lives in `editor/`, beside the library, as the start of a game engine editor. It edits a
 project: it opens on the project manager, then the editor window shows the outline of the scene on the left, its
 viewport in the middle and the inspector of the node selected on the right, under a menu bar and above a status bar.
+The window reads as one: no space between its panels but a seam of a pixel (`$edge`), the space inside the rows and
+never around them, bars and rows of 22 to 28 pixels (the menu bar 28, its items 24 with their shortcut right-aligned
+and muted, the rows of the outline 22, the headers of the sections of the inspector 24, the status bar 22), square
+panels and corners of 3 pixels for the fields and the buttons, 4 for the popups (`editor/ui/theme.style`).
 
 ```
 gyllir build editor
@@ -211,7 +215,8 @@ module of a game.
   default), listing its classes by their labels, each adding an actor of its properties' defaults where a cube goes
   (none in Balder's own editor),
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
-  frames the selection, and *View* hides or shows the icons and the grid, and looks through the camera selected.
+  frames the selection, and *View* hides or shows the icons and the grid, and looks through the camera selected; an
+  item writes its shortcut on its right (`shortcut:` of a `PushButton`).
 - **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
   scene is undone, the nodes selected before it being selected again; the steps of one field of the inspector (its
   arrows clicked, its keys held, its wheel turned) are undone as one change. Opening a scene starts the history again.
