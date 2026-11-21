@@ -1,0 +1,493 @@
+in mesh_instance;
+
+use balder::core::error;
+use balder::math::{bounds, matrix, vector};
+use balder::scene::animation::{clip, joint_pose, skeleton};
+use balder::scene::asset::{assets, material_asset, mesh_asset};
+use balder::scene::node::node3D::visual::{indexed_mesh, primitive};
+use balder::scene::physics;
+use balder::scene::physics::convex_decomposition;
+use balder::scene::property::{group, kind, node_schema, typed_property};
+use balder::utils::log;
+
+/**
+ * A node drawing a mesh asset, each of its parts with a material: the one a slot of the node gives, or the part's own
+ * (see SubMesh.material); the object of a game holding a mesh (a crate, a wall) is one, or has one under it
+ * @info: the node draws its parts through meshes under it named `__draw_<i>__` (see IndexedMesh3D::sharing), which the
+ * scene files and the editor leave out: the nodes drawing the same asset share its geometry, placed once in the geometry
+ * pool of each shader, and draw as instances of one command when their materials share their resources. Swapping the
+ * mesh, a material or the shadows of the node builds those draws again, the node keeping its id, its transform and the
+ * nodes under it
+ * @example:
+ * ```
+ * let dmut crate = copy MeshInstance3D::fromFile("crate", alias root, "res:/models/crate.glb");
+ * let dmut floor = copy MeshInstance3D("floor", alias root, Assets::mesh(MeshAsset::PLANE),
+ *                                      materials-> copy [(Assets::material("res:/materials/tiles.material"))?]);
+ * ```
+ * */
+pub class MeshInstance3D over Node3D {
+
+    // The mesh drawn
+    let dmut _mesh: &MeshAsset;
+
+    // The material of each part, by the index of the part, none to draw a part with its own
+    let mut _materials: [(&MaterialAsset)?];
+
+    // True when the parts cast shadows
+    let mut _castShadow: bool;
+
+    // The level of detail the parts are drawn at whatever the camera, none to select it from the camera
+    let mut _forcedLod: (usize)? = none;
+
+    // The meshes drawing the parts, by the index of the part
+    let dmut _draws: [&IndexedMesh3D] = [];
+
+    // The transformation of each joint of the skeleton in the mesh at the last pose, written again in place at each pose
+    let dmut _globals: [mat4] = [];
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - mesh: the mesh drawn
+     *    - materials: the material of each part, by the index of the part, none (or no slot) to draw a part with its own
+     *    - shadow: true when the parts cast shadows
+     * @throws: BalderError when the configuration of the shader of a material cannot be loaded
+     * */
+    pub self (name: [c8], dmut parent: &Node, dmut mesh: &MeshAsset, materials: [(&MaterialAsset)?] = [],
+              shadow: bool = true)
+        with super (name, alias parent)
+        , _mesh = alias mesh
+        , _materials = materials
+        , _castShadow = shadow
+        throws BalderError
+    {
+        self:.buildDraws();
+    }
+
+    /**
+     * A node drawing the mesh of a model file, its parts with the materials of the file (see Assets::mesh)
+     * @params:
+     *    - path: the project path of the model file
+     *    - lods: true to build the levels of detail of the parts
+     * @throws: BalderError when the model file cannot be read
+     * */
+    pub self fromFile(name: [c8], dmut parent: &Node, path: [c8], lods: bool = true)
+        with self(name, alias parent, alias Assets::mesh(path, lods-> lods))
+        throws BalderError
+    {}
+
+    /**
+     * A node drawing the mesh of another with its materials, its shadows and its level of detail, its geometry shared
+     * @info: the parts of a mesh uploaded before the copy released their vertices, the copy drawing the geometry they
+     * placed while they are in the scene; a mesh copied before entering the scene keeps them for its copies
+     * */
+    pub self copyOf(name: [c8], dmut parent: &Node, dmut other: &MeshInstance3D)
+        with self(name, alias parent, alias other._mesh, materials-> other._materials, shadow-> other._castShadow)
+        throws BalderError
+    {
+        self.forcedLod = other._forcedLod;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          BINDING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the mesh drawn
+     * */
+    @field
+    pub fn mesh(self)-> &MeshAsset {
+        self._mesh
+    }
+
+    /**
+     * Draw another mesh, the slots of the materials kept by the index of the parts
+     * @throws: BalderError when the configuration of the shader of a material cannot be loaded
+     * */
+    pub fn setMesh(mut self, dmut mesh: &MeshAsset)
+        throws BalderError
+    {
+        self._mesh = alias mesh;
+        self:.buildDraws();
+    }
+
+    /**
+     * @returns: the material of each part a slot gives, by the index of the part, none for a part drawn with its own
+     * */
+    @field
+    pub fn materials(self)-> [(&MaterialAsset)?] {
+        self._materials
+    }
+
+    /**
+     * Give the parts the materials of slots, by the index of the parts, none (or no slot) drawing a part with its own
+     * @throws: BalderError when the configuration of the shader of a material cannot be loaded
+     * */
+    pub fn setMaterials(mut self, materials: [(&MaterialAsset)?])
+        throws BalderError
+    {
+        self._materials = materials;
+        self:.buildDraws();
+    }
+
+    /**
+     * @returns: the material a part is drawn with, the one of its slot, or its own
+     * @params:
+     *    - part: the index of the part among the parts of the mesh
+     * */
+    pub fn materialOf(self, part: usize)-> &MaterialAsset {
+        if part < self._materials.len {
+            if let Ok(m) = self._materials[part] { return m; }
+        }
+
+        self._mesh.subMeshes[part].material
+    }
+
+    /**
+     * @returns: true iif the parts cast shadows
+     * */
+    @field
+    pub fn castShadow(self)-> bool {
+        self._castShadow
+    }
+
+    /**
+     * Make the parts cast shadows or not
+     * @throws: BalderError when the configuration of the shader of a material cannot be loaded
+     * */
+    pub fn setCastShadow(mut self, casts: bool)
+        throws BalderError
+    {
+        if casts == self._castShadow { return; }
+
+        self._castShadow = casts;
+        self:.buildDraws();
+    }
+
+    /**
+     * @returns: the level of detail the parts are drawn at whatever the camera, none when it is selected from the camera
+     * */
+    @field
+    pub fn forcedLod(self)-> (usize)? {
+        self._forcedLod
+    }
+
+    /**
+     * Draw the parts at a level of detail whatever the camera (the coarsest one past the end of the chain), or none to
+     * select it from the camera again
+     * */
+    @field
+    pub fn forcedLod(mut self, level: (usize)?) {
+        self._forcedLod = level;
+        for _, dmut d in alias self._draws {
+            d.forcedLod = level;
+        }
+    }
+
+    /**
+     * @returns: the meshes drawing the parts, by the index of the part
+     * */
+    @field
+    pub fn draws(mut self)-> dmut [&IndexedMesh3D] {
+        alias self._draws
+    }
+
+    /**
+     * @returns: the joints moving the parts of a skinned mesh (see MeshAsset.skeleton), none for a rigid one
+     * */
+    pub fn skeleton(self)-> (&Skeleton)? {
+        self._mesh.skeleton
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SKINNING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Move the skinned parts to a pose of the skeleton, from the next frame (see IndexedMesh3D.pose), nothing being done
+     * for a rigid mesh
+     * @params:
+     *    - poses: the pose of each joint of the skeleton relative to its parent (see AnimationClip.sample)
+     * */
+    pub fn pose(mut self, poses: [JointPose]) {
+        if let Ok(skeleton) = self._mesh.skeleton {
+            if self._globals.len != skeleton.len {
+                self._globals = copy [mat4() ; skeleton.len];
+            }
+
+            skeleton.globalMatricesInto(poses, alias self._globals);
+            for _, dmut d in alias self._draws {
+                d:.pose(self._globals);
+            }
+        }
+    }
+
+    /**
+     * Fit the boxes of the skinned parts to every pose of a clip, so they do not change while the mesh plays it (see
+     * AnimationClip.bounds), nothing being done for a rigid mesh
+     * */
+    pub fn fitClip(mut self, clip: &AnimationClip) {
+        if let Ok(skeleton) = self._mesh.skeleton {
+            for _, dmut d in alias self._draws {
+                if let Ok(skin) = d.skin {
+                    d.poseBounds = clip.bounds(skeleton, skin);
+                }
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PHYSICS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the shape of a collider made of the convex hulls of the parts, in the space of the node (see
+     * MeshAsset.hulls)
+     * @throws: BalderError when a part released its vertices, or the vertices of a part span no volume
+     * @example:
+     * ```
+     * let dmut crate = copy MeshInstance3D::fromFile("crate", alias level, "res:/models/crate.glb");
+     * let dmut body = copy PhysicsBody3D("crate-body", alias level, shape-> crate.hulls(),
+     *                                    settings-> BodySettings(motion-> BodyMotion::DYNAMIC, mass-> 20.0f));
+     * ```
+     * */
+    pub fn hulls(self)-> ColliderShape
+        throws BalderError
+    {
+        self._mesh.hulls()
+    }
+
+    /**
+     * @returns: the triangles of the parts, in the space of the node (see MeshAsset.triangles)
+     * @throws: BalderError when a part released its vertices
+     * */
+    pub fn triangles(self)-> [Triangle]
+        throws BalderError
+    {
+        self._mesh.triangles()
+    }
+
+    /**
+     * @returns: the convex decomposition saved next to the model file of the mesh (see MeshAsset.decomposition)
+     * @throws: BalderError when the model has no decomposition, or its file cannot be read
+     * */
+    pub fn decomposition(self)-> &ConvexDecomposition
+        throws BalderError
+    {
+        self._mesh.decomposition()
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          DRAWS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Replace the meshes drawing the parts by meshes of the mesh, the materials and the shadows of the node, sharing the
+     * geometry of the parts, at the place of the node
+     * */
+    fn buildDraws(mut self)
+        throws BalderError
+    {
+        for _, dmut d in alias self._draws {
+            d:.dispose();
+        }
+
+        self._draws = [];
+        for i in 0us .. self._mesh.subMeshes.len {
+            let material = self.materialOf(i);
+            let textured = self._mesh.subMeshes[i].textured;
+            let dmut draw = copy IndexedMesh3D::sharing(MeshInstance3D::drawName(i), alias self,
+                                                        alias self._mesh.subMeshes[i].geometry,
+                                                        material.instance(textured), shadow-> self._castShadow);
+
+            // a node built under a node already placed is placed once its transform is set
+            draw.position = vec3();
+            draw.forcedLod = self._forcedLod;
+            self._draws ~= [alias draw];
+        }
+    }
+
+}
+
+/**
+ * The names and the properties of the meshes drawn
+ * */
+pub mod MeshInstance3D {
+
+    /**
+     * The group of the properties of a mesh, its section of the inspector
+     * */
+    pub def GROUP = "Mesh";
+
+    /**
+     * @returns: the name of the mesh under the node drawing a part
+     * @params:
+     *    - part: the index of the part among the parts of the mesh
+     * */
+    pub fn drawName(part: usize)-> [c8] {
+        f"__draw_${part}__"
+    }
+
+    /**
+     * @returns: the paths of the materials of slots, by the index of the parts, empty for a part drawn with its own, the
+     * empty paths ending them dropped
+     * */
+    pub fn pathsOf(materials: [(&MaterialAsset)?])-> [[c8]] {
+        let mut paths = copy [if let Ok(m) = s { m.path } else { "" } for s in materials];
+        while paths.len != 0us && paths[$ - 1us] == "" {
+            paths = paths[0us .. $ - 1us];
+        }
+
+        paths
+    }
+
+    /**
+     * @returns: the materials of paths, by the index of the parts, none for an empty path (see Assets::material)
+     * @throws: BalderError when a material cannot be loaded
+     * */
+    pub fn materialsOf(paths: [[c8]])-> [(&MaterialAsset)?]
+        throws BalderError
+    {
+        let mut res: [(&MaterialAsset)?] = [];
+        for p in paths {
+            if p == "" {
+                res ~= [none];
+            } else {
+                let m = Assets::material(p);
+                res ~= [(m)?];
+            }
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the schema of the meshes: the mesh drawn (required), the materials of its parts, whether the levels of
+     * detail of a model file are built, and whether the parts cast shadows, all changed on a node created
+     * */
+    pub fn schema()-> &NodeSchema {
+        copy NodeSchema("mesh", groups-> copy [PropertyGroup(name-> GROUP)], properties-> copy [
+            copy Property!{&MeshInstance3D, [c8]}("mesh", "", |dmut m| => m.mesh.path,
+                                                  set-> (|dmut m, p| => MeshInstance3D::changeMesh(alias m, p, MeshInstance3D::lodsOf(m)))?,
+                                                  check-> (|_, p| => MeshInstance3D::meshError(p))?,
+                                                  kind-> PropertyKind::ASSET, asset-> "mesh", label-> "Mesh",
+                                                  group-> GROUP, required-> true),
+            copy Property!{&MeshInstance3D, [[c8]]}("materials", [], |dmut m| => MeshInstance3D::pathsOf(m.materials),
+                                                    set-> (|dmut m, p| => MeshInstance3D::changeMaterials(alias m, p))?,
+                                                    check-> (|_, p| => MeshInstance3D::materialsError(p))?,
+                                                    kind-> PropertyKind::ASSETS, asset-> "material",
+                                                    label-> "Materials", group-> GROUP),
+            copy Property!{&MeshInstance3D, bool}("lods", true, |dmut m| => MeshInstance3D::lodsOf(m),
+                                                  set-> (|dmut m, l| => MeshInstance3D::changeMesh(alias m, m.mesh.path, l))?,
+                                                  label-> "Levels of detail", group-> GROUP),
+            copy Property!{&MeshInstance3D, bool}("shadows", true, |dmut m| => m.castShadow,
+                                                  set-> (|dmut m, s| => MeshInstance3D::changeShadows(alias m, s))?,
+                                                  label-> "Casts shadows", group-> GROUP)
+        ])
+    }
+
+    /**
+     * @returns: true when the levels of detail of the mesh of a node are built, or when it is a built-in mesh, which has
+     * none to build
+     * */
+    pub fn lodsOf(m: &MeshInstance3D)-> bool {
+        m.mesh.lods || m.mesh.primitive != Primitive::NONE
+    }
+
+    /**
+     * Draw the mesh of a path (see Assets::mesh), the error told rather than thrown, the node keeping its mesh
+     * */
+    pub fn changeMesh(dmut m: &MeshInstance3D, path: [c8], lods: bool) {
+        if path == m.mesh.path && lods == MeshInstance3D::lodsOf(m) { return; }
+        {
+            m:.setMesh(alias Assets::mesh(path, lods-> lods));
+        } catch {
+            err => { log::error #("MeshInstance3D", f"${m.name.file()} keeps its mesh:", err); }
+        }
+    }
+
+    /**
+     * Give the parts the materials of paths, the error told rather than thrown, the node keeping its materials
+     * */
+    pub fn changeMaterials(dmut m: &MeshInstance3D, paths: [[c8]]) {
+        if paths == MeshInstance3D::pathsOf(m.materials) { return; }
+        {
+            m:.setMaterials(MeshInstance3D::materialsOf(paths));
+        } catch {
+            err => { log::error #("MeshInstance3D", f"${m.name.file()} keeps its materials:", err); }
+        }
+    }
+
+    /**
+     * Make the parts cast shadows or not, the error told rather than thrown
+     * */
+    pub fn changeShadows(dmut m: &MeshInstance3D, casts: bool) {
+        {
+            m:.setCastShadow(casts);
+        } catch {
+            err => { log::error #("MeshInstance3D", f"${m.name.file()} keeps its shadows:", err); }
+        }
+    }
+
+    /**
+     * @returns: why the mesh of a path cannot be drawn, empty when it can
+     * */
+    pub fn meshError(path: [c8])-> [c8] {
+        if path == "" { return "a mesh needs a mesh asset"; }
+        {
+            Assets::mesh(path);
+        } catch {
+            err: &BalderError => { return err.msg; }
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: why the materials of paths cannot be drawn, empty when they can
+     * */
+    pub fn materialsError(paths: [[c8]])-> [c8] {
+        {
+            MeshInstance3D::materialsOf(paths);
+        } catch {
+            err: &BalderError => { return err.msg; }
+        }
+
+        ""
+    }
+
+}

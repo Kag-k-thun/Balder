@@ -7,33 +7,51 @@ mod ::writer;
 
 use balder::core::error;
 use balder::scene::actors::wiring;
+use balder::scene::asset::{assets, material_asset};
 use balder::scene::description::{node_description, reader, writer};
 use balder::scene::node;
 use balder::scene::node::node3D;
+use balder::scene::node::node3D::mesh_instance;
+use balder::scene::property::{kind, value};
 use balder::utils::{log, path};
 
 use std::{fs, syntax, uuid};
 
 /**
- * A scene as a scene file describes it: the nodes under its root, each with the nodes under it
+ * A scene as a scene file describes it: the nodes under its root, each with the nodes under it, and the materials local
+ * to the file
  * @info:
  * =====
- * A scene file (.scene) opens with the version of its format, declares the files its nodes use, then holds a flat
- * block per node, each naming its parent by its id (see NodeDescription for the entries of a node):
+ * A scene file (.scene) opens with the version of its format, declares the assets its nodes use (meshes and
+ * materials, see MeshAsset and MaterialAsset), holds a block per material local to the file, then a flat block per
+ * node, each naming its parent by its id (see NodeDescription for the entries of a node):
  * ```
- * scene 1;
+ * scene 2;
  *
- * asset table model "res:/models/table.glb";
+ * asset cube mesh "engine:/meshes/cube";
+ * asset table mesh "res:/models/table.glb";
+ *
+ * material #5d1e0c2a-7b3f-4a9e-8c21-0f6e5d4c3b2a "red" {
+ *     base-color: 0.8 0.1 0.1;
+ *     roughness: 0.4;
+ * }
  *
  * node #9c41e2a0-51be-4c2d-9e3f-0a1b2c3d4e5f empty "props" {
  *     position: 0 0 -2;
  * }
  *
- * node #3f2a9c41-1b2c-4d3e-8f00-6a5b4c3d2e1f model "table" {
+ * node #3f2a9c41-1b2c-4d3e-8f00-6a5b4c3d2e1f mesh "table" {
  *     parent: #9c41e2a0-51be-4c2d-9e3f-0a1b2c3d4e5f;
- *     file: @table;
+ *     mesh: @table;
+ * }
+ *
+ * node #75e8622f-285e-414a-8e93-d82ecee1a614 mesh "crate" {
+ *     mesh: @cube;
+ *     materials: #5d1e0c2a-7b3f-4a9e-8c21-0f6e5d4c3b2a;
  * }
  * ```
+ * The materials local to the file are put in the cache of the assets as the description is built (see
+ * Assets::register), under their paths `local:<uuid>`.
  * A node keeps its id from one save to the next (see Node3D.guid): moving a node under another parent changes one line
  * of the file, and the other files name a node by its id. The comments are those of the .gui files. Built under a node,
  * the nodes are created under it, a scene being loaded by building its description under the root of a Scene.
@@ -43,6 +61,9 @@ pub class SceneDescription {
 
     // The nodes under the root, in order
     let mut _nodes: [NodeDescription];
+
+    // The materials local to the file, which its nodes name
+    let mut _materials: [&MaterialAsset] = [];
 
     // What the content read leniently held that the classes of its actors do not declare, dropped
     let mut _dropped: [[c8]] = [];
@@ -64,6 +85,7 @@ pub class SceneDescription {
         {
             let dmut r = SceneReader(content, lenient-> lenient);
             self._nodes = r:.read();
+            self._materials = r.materials;
             self._dropped = r.dropped;
         } catch {
             s: &SyntaxError => {
@@ -86,7 +108,8 @@ pub class SceneDescription {
     {}
 
     /**
-     * The description of the nodes under a node, the root of a scene, as a scene file saves them
+     * The description of the nodes under a node, the root of a scene, as a scene file saves them, with the materials
+     * local to a scene file their mesh nodes draw with
      * @info: the nodes named __…__ are left out (see isReservedName), the others in their order (see
      * Node::getChildrenInOrder)
      * @throws:
@@ -101,15 +124,19 @@ pub class SceneDescription {
                 self._nodes = self._nodes ~ [NodeDescription(alias n)];
             }
         }
+
+        self._materials = localMaterialsOf(root, []);
     }
 
     /**
      * A description of the nodes given
      * @params:
      *    - nodes: the nodes under the root, in order
+     *    - materials: the materials local to the file the nodes name
      * */
-    pub self (nodes: [NodeDescription])
+    pub self (nodes: [NodeDescription], materials: [&MaterialAsset] = [])
         with _nodes = nodes
+        , _materials = materials
     {}
 
     /**
@@ -118,6 +145,14 @@ pub class SceneDescription {
     @field
     pub fn nodes(self)-> [NodeDescription] {
         self._nodes
+    }
+
+    /**
+     * @returns: the materials local to the scene file, which its nodes name
+     * */
+    @field
+    pub fn materials(self)-> [&MaterialAsset] {
+        self._materials
     }
 
     /**
@@ -133,7 +168,7 @@ pub class SceneDescription {
      * @returns: the content of the scene file of the description (see SceneWriter), the same for the same nodes
      * */
     pub fn content(self)-> [c8] {
-        SceneWriter(self._nodes).write()
+        SceneWriter(self._nodes, materials-> self._materials).write()
     }
 
     /**
@@ -159,25 +194,38 @@ pub class SceneDescription {
     }
 
     /**
-     * @returns: the same nodes without their ids, the nodes built taking new ones: a scene started from a template has
-     * ids of its own
+     * @returns: the same nodes without their ids, the nodes built taking new ones, and the same materials local to the
+     * file under new ids, the nodes naming them by those: a scene started from a template has ids of its own
      * */
     pub fn withoutIds(self)-> &SceneDescription {
-        copy SceneDescription(nodesWithoutIds(self._nodes))
+        let mut renamed: [([c8], [c8])] = [];
+        let mut materials: [&MaterialAsset] = [];
+        for m in self._materials {
+            let fresh = copy MaterialAsset::local(v4(), m.name, values-> m.values());
+            renamed ~= [(m.path, fresh.path)];
+            materials ~= [fresh];
+        }
+
+        copy SceneDescription(nodesWithoutIds(self._nodes, renamed), materials-> materials)
     }
 
     /**
      * Create the nodes of the scene under a node, the root of a scene (see Scene::getRootNode), then connect the
      * signals of its actors to the slots their connections name, emitted by the scene (see connectActors)
      * @returns: the nodes created under it, in order
-     * @info: the nodes built under a node in no scene keep their connections without them being made; a connection
-     * that cannot be made (a class the program does not know) is logged
+     * @info: the materials local to the file are put in the cache of the assets first (see Assets::register), the mesh
+     * nodes naming them by their paths; the nodes built under a node in no scene keep their connections without them
+     * being made; a connection that cannot be made (a class the program does not know) is logged
      * @throws:
-     *    - &BalderError: if the file of a model cannot be loaded, the nodes before it being created
+     *    - &BalderError: if a mesh or a material cannot be loaded, the nodes before it being created
      * */
     pub fn build(self, dmut parent: &Node)-> dmut [&Node3D]
         throws BalderError
     {
+        for m in self._materials {
+            Assets::register(alias copy MaterialAsset(m.path, m.name, config-> m.config, maps-> m.maps));
+        }
+
         let dmut built: [&Node3D] = [];
         for n in self._nodes {
             built ~= [alias n.build(alias parent)];
@@ -195,18 +243,56 @@ pub class SceneDescription {
 }
 
 /**
- * @returns: nodes, and the nodes under them, of nil ids
+ * @returns: the materials local to a scene file the mesh nodes under a node draw with, each once, added to those found
+ * already, the nodes named __…__ left out
  * */
-fn nodesWithoutIds(nodes: [NodeDescription])-> [NodeDescription] {
+fn localMaterialsOf(node: &Node, found: [&MaterialAsset])-> [&MaterialAsset] {
+    let mut res = found;
+    for c in node.childrenInOrder() if !isReservedName(c.name.file()) {
+        if let m: &MeshInstance3D = c {
+            for slot in m.materials {
+                if let Ok(mat) = slot && mat.isLocal {
+                    let mut known = false;
+                    for f in res if f.path == mat.path { known = true; }
+                    if !known { res ~= [mat]; }
+                }
+            }
+        }
+
+        res = localMaterialsOf(c, res);
+    }
+
+    res
+}
+
+/**
+ * @returns: nodes, and the nodes under them, of nil ids, naming the materials local to the file by their new paths
+ * @params:
+ *    - renamed: the old path and the new path of each material local to the file
+ * */
+fn nodesWithoutIds(nodes: [NodeDescription], renamed: [([c8], [c8])])-> [NodeDescription] {
     let mut res: [NodeDescription] = [];
     for n in nodes {
         let mut d = n;
         d.id = Uuid::nil();
-        d.children = nodesWithoutIds(n.children);
+        for p in n.schema().properties if p.kind == PropertyKind::ASSETS {
+            let paths = copy [renamedPath(t, renamed) for t in n.value(p.name).texts];
+            d:.set(p.name, PropertyValue::assets(paths));
+        }
+
+        d.children = nodesWithoutIds(n.children, renamed);
         res = res ~ [d];
     }
 
     res
+}
+
+/**
+ * @returns: the new path of a renamed material, the path itself for another
+ * */
+fn renamedPath(path: [c8], renamed: [([c8], [c8])])-> [c8] {
+    for r in renamed if r._0 == path { return r._1; }
+    path
 }
 
 /**

@@ -187,7 +187,7 @@ flowchart LR
 
 ## Skinning
 
-A mesh whose vertices are moved by the joints of a skeleton (a `Skin`, read by `SolidObjectModel` from a glTF or an
+A mesh whose vertices are moved by the joints of a skeleton (a `Skin`, read by `MeshAsset::read` from a glTF or an
 FBX file) is skinned on the GPU, once per frame, before anything draws it:
 
 - **Shaders.** The raster shaders of the materials describe their skinned variant in a `[skin]` table of their file:
@@ -212,11 +212,11 @@ FBX file) is skinned on the GPU, once per frame, before anything draws it:
   a convex blend of its positions moved by each joint. A skinned instance has its own clusters, culled with the box of
   its poses and never by their cone. `IndexedMesh3D.pose` grows the box of the mesh when a pose leaves it, so the
   culling stays right at every frame; `AnimationClip.bounds` gives the box of the poses of a clip (sampled at its keys
-  and at least 30 times a second), which `SolidObjectModel.fitClip` sets up front so the box does not change while the
+  and at least 30 times a second), which `MeshInstance3D.fitClip` sets up front so the box does not change while the
   clip plays.
 
 ```
-let dmut fox = copy SolidObjectModel::fromFile ("fox", scene:.getRootNode (), "res:/models/fox/Fox.gltf");
+let dmut fox = copy MeshInstance3D::fromFile ("fox", scene:.getRootNode (), "res:/models/fox/Fox.gltf");
 let walk = library:.find ("res:/models/fox/Fox.gltf", "Walk");
 fox:.fitClip (walk);
 ...

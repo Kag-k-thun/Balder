@@ -1,0 +1,153 @@
+in material_assets;
+
+use balder::core::error;
+use balder::math::vector;
+use balder::scene::asset::material_asset;
+use balder::scene::node::node3D::visual::material::_;
+use balder::scene::property::{kind, value};
+
+use integration::utils::compare;
+
+use std::{fs, io, uuid};
+
+/**
+ * @returns: the message of the error reading a .material file of a content throws, empty when it reads it
+ * */
+fn readErrorOf(content: [c8])-> [c8] {
+    {
+        let dir = tempDirectory(prefix-> "balder_material_");
+        let path = dir.push("brick.material").toStr();
+        let msg = {
+            writeFile(Path(path), content);
+            MaterialAsset::read(path);
+            ""
+        } catch {
+            err: &BalderError => { err.msg }
+            _ => { "not written" }
+        };
+
+        removeDir(dir, recursive-> true);
+        return msg;
+    } catch {
+        _ => {}
+    }
+
+    "no directory"
+}
+
+/**
+ * @returns: true iif a text holds another one
+ * */
+fn holds(text: [c8], part: [c8])-> bool {
+    if part.len > text.len { return false; }
+    for i in 0us ... text.len - part.len {
+        if text[i .. i + part.len] == part { return true; }
+    }
+
+    false
+}
+
+__test a_material_file_saved_reads_back_its_factors_and_its_maps {
+    let dir = tempDirectory(prefix-> "balder_material_");
+    let path = dir.push("brick.material").toStr();
+    let values = copy [("base-color", PropertyValue::color(makeVec3(0.8f, 0.3f, 0.2f))),
+                       ("roughness", PropertyValue::number(0.6f)),
+                       ("emissive", PropertyValue::color(makeVec3(0.0f, 0.5f, 1.0f))),
+                       ("base-color-map", PropertyValue::asset("res:/textures/brick.png"))];
+    let written = copy MaterialAsset::fromValues(path, "brick", values);
+
+    let read = {
+        written.save(path);
+        MaterialAsset::read(path)
+    } catch {
+        err => { println(err); assert (false); }
+    };
+
+    assert (read.path == path && read.name == "brick" && !read.isLocal && !read.isEmbedded);
+    assert (near(read.config.baseColor, makeVec3(0.8f, 0.3f, 0.2f)) && near(read.config.roughness, 0.6f));
+    assert (near(read.config.emissive, makeVec3(0.0f, 0.5f, 1.0f)) && near(read.config.metallic, 0.0f));
+    assert (read.maps.baseColor == "res:/textures/brick.png" && read.maps.normal == "");
+    for v in written.values() {
+        assert (read.value(v._0) == v._1);
+    }
+
+    // the maps the material has not are left out of its file
+    let text = {
+        readFile(Path(path))
+    } catch {
+        _ => { assert (false); }
+    };
+
+    assert (holds(text, "base-color-map = \"res:/textures/brick.png\"") && !holds(text, "normal-map"));
+    assert (holds(text, "version = 1") && holds(text, "roughness = 0.6"));
+
+    {
+        removeDir(dir, recursive-> true);
+    } catch {
+        _ => {}
+    }
+}
+
+__test the_errors_of_a_material_file_tell_why {
+    assert (holds(readErrorOf("roughness = 0.5\n"), "has no version"));
+    assert (holds(readErrorOf("version = 2\n"), "of the version 2"));
+    assert (holds(readErrorOf("version = 1\ncolor = [1.0, 0.0, 0.0]\n"), "an entry 'color', which no material has"));
+    assert (holds(readErrorOf("version = 1\nbase-color = [1.0, 0.0]\n"), "base-color of the material"));
+    assert (holds(readErrorOf("version = 1\nroughness = \"rough\"\n"), "must be a number"));
+    assert (holds(readErrorOf("version = 1\nnormal-map = 3\n"), "must be the path of a file"));
+    assert (holds(readErrorOf("version = 1\n[maps\n"), "Failed to read the material"));
+    assert (readErrorOf("version = 1\nmetallic = 1\n") == "");
+}
+
+__test a_material_is_embedded_in_a_model_file_or_local_to_a_scene_file_by_its_path {
+    let path = MaterialAsset::embeddedPath("res:/models/crate.glb", 2us);
+    assert (path == "res:/models/crate.glb#2");
+    if let Ok(m) = MaterialAsset::modelOf(path) {
+        assert (m._0 == "res:/models/crate.glb" && m._1 == 2us);
+    } else {
+        assert (false);
+    }
+
+    assert (!MaterialAsset::modelOf("res:/materials/brick.material").hasValue);
+    assert (!MaterialAsset::modelOf("res:/models/crate.glb#").hasValue && !MaterialAsset::modelOf("res:/a#b").hasValue);
+
+    let id = v4();
+    let local = copy MaterialAsset::local(id, "red", values-> copy [("metallic", PropertyValue::number(1.0f))]);
+    assert (local.path == f"local:${id}" && local.isLocal && !local.isEmbedded && near(local.config.metallic, 1.0f));
+    assert (!MaterialAsset::modelOf(local.path).hasValue && MaterialAsset::isLocalPath(local.path));
+}
+
+__test the_entries_of_a_material_are_its_factors_then_its_maps {
+    let entries = MaterialAsset::entries();
+    assert (entries.len == 11us && entries[0us]._0 == "base-color" && entries[0us]._1 == PropertyKind::COLOR);
+    assert (entries[6us]._0 == "base-color-map" && entries[6us]._1 == PropertyKind::ASSET);
+    assert (MaterialAsset::entryKind("roughness").hasValue && !MaterialAsset::entryKind("color").hasValue);
+
+    // a material holds the defaults of a configuration
+    let plain = copy MaterialAsset("p", "plain");
+    assert (plain.value("roughness") == PropertyValue::number(MaterialConfig().roughness));
+    assert (plain.value("normal-map") == PropertyValue::asset(""));
+}
+
+__test a_material_draws_with_the_shader_its_maps_need {
+    let maps = MaterialMaps(baseColor-> "res:/a.png");
+    let pbr = MaterialMaps(baseColor-> "res:/a.png", normal-> "res:/n.png");
+    {
+        let plain = copy MaterialAsset("p", "plain");
+        if let _: &ConstantMaterial = plain.instance(true) {} else { assert (false); }
+
+        let textured = copy MaterialAsset("t", "textured", maps-> maps);
+        if let _: &DiffuseTextureMaterial = textured.instance(true) {} else { assert (false); }
+
+        // a mesh without texture coordinates has no use for the maps
+        if let _: &ConstantMaterial = textured.instance(false) {} else { assert (false); }
+
+        let full = copy MaterialAsset("f", "full", config-> MaterialConfig::phong(makeVec3(1.0f, 0.0f, 0.0f), vec3(), 10.0f, vec3()),
+                                      maps-> pbr);
+        let m = full.instance(true);
+        if let _: &MetallicRoughnessMaterial = m {} else { assert (false); }
+        assert (near(m.config.baseColor, makeVec3(1.0f, 0.0f, 0.0f)));
+    } catch {
+        err => { println(err); assert (false); }
+    }
+}

@@ -1,13 +1,10 @@
-in solid;
+in model_file;
 
 use balder::math::_;
 use balder::core::error;
-use balder::core::config::shader::entry;
-use balder::scene::animation::{clip, joint_pose, skeleton, skin, utils};
+use balder::scene::animation::{skeleton, skin, utils};
+use balder::scene::asset::{assets, material_asset, sub_mesh};
 use balder::scene::node::node3D::visual::{_, material::_};
-use balder::scene::physics;
-use balder::scene::physics::convex_decomposition;
-use balder::scene::property::{group, kind, node_schema, typed_property};
 use balder::utils::log;
 
 use ::assimp::_;
@@ -15,45 +12,59 @@ use ::assimp::_;
 use ::std::{conv, fs};
 
 /**
- * A solid object model is a 3D model containing multiple meshes
- * @info: the meshes of a skinned model keep the bones of their vertices, a skeleton giving the joints moving them
+ * @returns: the mesh asset of a model file (see MeshAsset::read)
  * */
-pub class SolidObjectModel over Node3D {
+pub fn read(path: [c8], lods: bool)-> dmut &MeshAsset
+    throws BalderError
+{
+    let dmut file = copy ModelFile(path, lods);
+    file:.load();
+    file:.asset()
+}
+
+/**
+ * The reading of a model file through assimp into the parts of a mesh asset and the materials embedded in it
+ * @info: the transformations of the nodes of a rigid model are applied to its meshes, merged by material; the meshes of
+ * a skinned model keep their bones, which pre-transforming them would drop, a skeleton giving the joints moving them;
+ * the whole model is scaled and moved into the unit box standing on its origin
+ * */
+class ModelFile {
+
+    // The project path of the file
+    let _path: [c8];
+
+    // True to build the levels of detail of the parts
+    let _lods: bool;
 
     // The joints of the model when its meshes are skinned, none for a rigid model
     let mut _skeleton: (&Skeleton)? = none;
 
-    // The transformation of each joint of the skeleton in the model at the last pose, written again in place at each pose
-    let dmut _globals: [mat4] = [];
+    // The materials of the file, in its order
+    let dmut _materials: [&MaterialAsset] = [];
 
-    // The project path of the file the model was loaded from
-    let _file: [c8];
+    // The parts read, in the order of the nodes of the file
+    let dmut _parts: [SubMesh] = [];
 
-    // True when the levels of detail of the meshes were built
-    let _lods: bool;
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ===============================          LOADING FROM FILE          ================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
+    pub self (path: [c8], lods: bool)
+        with _path = path
+        , _lods = lods
+    {}
 
     /**
-     * Load a 3D index mesh from a file
-     * @params:
-     *   - path: the project path of the file to load
-     *   - lods: true to build the levels of detail of the meshes of the model
-     * @returns: the mesh
+     * @returns: the asset of the parts and of the materials read
      * */
-    pub self fromFile(name: [c8], dmut parent: &Node, path: [c8], lods: bool = true)
-        with super (name, alias parent)
-        , _file = path
-        , _lods = lods
+    pub fn asset(mut self)-> dmut &MeshAsset {
+        copy MeshAsset(self._path, alias self._parts, lods-> self._lods, materials-> alias self._materials,
+                       skeleton-> self._skeleton)
+    }
+
+    /**
+     * Read the materials and the meshes of the file
+     * */
+    pub fn load(mut self)
         throws BalderError
     {
-        let filePath = balder::utils::path::projectPath(path);
+        let filePath = balder::utils::path::projectPath(self._path);
 
         unsafe {
             let mut sceneAI = importFile(filePath.toStr(),
@@ -65,8 +76,6 @@ pub class SolidObjectModel over Node3D {
             }
 
             {
-                // the transformations of the nodes of a rigid model are applied to their meshes, merged by material;
-                // the meshes of a skinned model keep their bones, which pre-transforming them would drop
                 let skinned = self.hasBones(sceneAI);
                 if !skinned {
                     sceneAI = aiApplyPostProcessing(sceneAI, aiPostProcessSteps::PreTransformVertices);
@@ -91,211 +100,16 @@ pub class SolidObjectModel over Node3D {
                     self._skeleton = (copy Skeleton(sceneAI, loadTransform))?;
                 }
 
-                let root = sceneAI.rootNode();
-                self:.processSolidNode(root, sceneAI, dir, loadTransform, mat4(), lods);
+                for i in 0u32 .. sceneAI.numMaterials() {
+                    self._materials ~= [self.readMaterial(sceneAI.materials() [i], cast!usize(i), dir)];
+                }
 
+                self:.processSolidNode(sceneAI.rootNode(), sceneAI, loadTransform, mat4());
             } exit {
                 aiReleaseImport(sceneAI);
             }
         }
     }
-
-    /**
-     * Create a model drawing the meshes of another, sharing their geometry: placed once in the geometry pool of each
-     * shader, the meshes of the models sharing it are drawn by one instanced command
-     * @info: the meshes of a model uploaded before the copy released their vertices, the copy drawing the geometry they
-     * placed while they are in the scene; a model copied before entering the scene keeps them for its copies
-     * @params:
-     *    - model: the model to draw again, its meshes drawn with copies of their materials, its skeleton shared
-     * */
-    pub self copyOf(name: [c8], dmut parent: &Node, dmut model: &SolidObjectModel)
-        with super (name, alias parent)
-        , _skeleton = model._skeleton
-        , _file = model._file
-        , _lods = model._lods
-    {
-        for _, dmut c in alias model._childs if let dmut mesh: &IndexedMesh3D = alias c {
-            let chName = "mesh_" ~ std::conv::to!{[c8]} (self._childs.len);
-            let dmut copied = copy IndexedMesh3D::sharing(chName,
-                                                          alias self,
-                                                          alias mesh.mesh,
-                                                          mesh.material.clone(),
-                                                          shadow-> mesh.castShadow());
-
-            copied.position = mesh.position;
-            copied.rotation = mesh.rotation;
-            copied.scale = mesh.scale;
-            copied.forcedLod = mesh.forcedLod;
-        }
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ====================================          BINDING          =====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    pub over onEnter(mut self, dmut _: &Scene) {}
-    pub over onExit(mut self, dmut _: &Scene) {}
-
-    /**
-     * @returns: the project path of the file the model was loaded from (the one of the model copied by copyOf)
-     * */
-    @field
-    pub fn file(self)-> [c8] {
-        self._file
-    }
-
-    /**
-     * @returns: true when the levels of detail of the meshes of the model were built
-     * */
-    @field
-    pub fn lods(self)-> bool {
-        self._lods
-    }
-
-    /**
-     * @returns: the joints of the model when its meshes are skinned (see MeshGeometry.skin), none for a rigid model
-     * */
-    pub fn skeleton(self)-> (&Skeleton)? {
-        self._skeleton
-    }
-
-    /**
-     * Draw every mesh of the model at a level of detail whatever the camera, or none to select it from the camera
-     * */
-    pub fn forceLod(mut self, level: (usize)?) {
-        for _, dmut c in alias self._childs if let dmut mesh: &IndexedMesh3D = alias c {
-            mesh.forcedLod = level;
-        }
-    }
-
-    /**
-     * Move the skinned meshes of the model to a pose of its skeleton, from the next frame (see IndexedMesh3D.pose),
-     * nothing being done for a rigid model
-     * @params:
-     *    - poses: the pose of each joint of the skeleton relative to its parent (see AnimationClip.sample)
-     * */
-    pub fn pose(mut self, poses: [JointPose]) {
-        if let Ok(skeleton) = self._skeleton {
-            if self._globals.len != skeleton.len {
-                self._globals = copy [mat4() ; skeleton.len];
-            }
-
-            skeleton.globalMatricesInto(poses, alias self._globals);
-            for _, dmut c in alias self._childs if let dmut mesh: &IndexedMesh3D = alias c {
-                mesh:.pose(self._globals);
-            }
-        }
-    }
-
-    /**
-     * Fit the boxes of the skinned meshes of the model to every pose of a clip, so they do not change while the model
-     * plays it (see AnimationClip.bounds), nothing being done for a rigid model
-     * */
-    pub fn fitClip(mut self, clip: &AnimationClip) {
-        if let Ok(skeleton) = self._skeleton {
-            for _, dmut c in alias self._childs if let dmut mesh: &IndexedMesh3D = alias c {
-                if let Ok(skin) = mesh.skin {
-                    mesh.poseBounds = clip.bounds(skeleton, skin);
-                }
-            }
-        }
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ====================================          PHYSICS          =====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-
-    /**
-     * @returns: the shape of a collider made of the convex hulls of the meshes
-     * of the model, in the space of the model (one hull by mesh: see
-     * decomposition for a concave model)
-     *
-     * @throws: BalderError when a mesh released its vertices (uploaded in a
-     * scene not keeping its triangles, see Scene.keepsTriangles), or the
-     * vertices of a mesh span no volume
-     *
-     * @example:
-     * ```
-     * let dmut crate = copy SolidObjectModel::fromFile("crate", alias level, "res/models/crate.glb");
-     * let dmut body = copy PhysicsBody3D("crate-body", alias level, shape-> crate:.hulls(),
-     *                                    settings-> BodySettings(motion-> BodyMotion::DYNAMIC, mass-> 20.0f));
-     * ```
-     * */
-    pub fn hulls(mut self)-> ColliderShape
-        throws BalderError
-    {
-        let mut parts: [CompoundPart] = [];
-        for name, dmut c in alias self._childs if let dmut mesh: &IndexedMesh3D = alias c {
-            if let Ok(points) = mesh.mesh.positions {
-                parts ~= [CompoundPart(shape-> ColliderShape::hull(copy ConvexHull(points)))];
-            } else {
-                throw copy BalderError(f"The mesh ${name} of the model ${self._file} released its vertices");
-            }
-        }
-
-        ColliderShape::compound(copy CompoundShape(parts))
-    }
-
-    /**
-     * @returns: the triangles of the meshes of the model, in the space of the model, the surface a convex decomposition
-     * splits (see ConvexDecomposition)
-     *
-     * @throws: BalderError when a mesh released its vertices (uploaded in a scene not keeping its triangles, see
-     * Scene.keepsTriangles)
-     * */
-    pub fn triangles(mut self)-> [Triangle]
-        throws BalderError
-    {
-        let mut result: [Triangle] = [];
-        for name, dmut c in alias self._childs if let dmut mesh: &IndexedMesh3D = alias c {
-            if let Ok(t) = mesh.mesh.triangles {
-                for i in 0us .. t.len {
-                    result ~= [t.getTriangle(i)];
-                }
-            } else {
-                throw copy BalderError(f"The mesh ${name} of the model ${self._file} released its vertices");
-            }
-        }
-
-        result
-    }
-
-    /**
-     * @returns: the convex decomposition of the model saved next to its file (see ConvexDecomposition::fileOf), its
-     * hulls in the space of the model, the shape of a dynamic body of a concave model (see ConvexDecomposition::shape)
-     *
-     * @info: the decomposition is read, never computed: it runs offline, at import or in the editor; a warning tells
-     * when the file of the model changed since it was decomposed
-     *
-     * @throws: BalderError when the model has no decomposition, or its file cannot be read
-     *
-     * @example:
-     * ```
-     * let dmut mug = copy SolidObjectModel::fromFile("mug", alias level, "res:/models/mug/mug.glb");
-     * let dmut body = copy PhysicsBody3D("mug-body", alias level, shape-> mug.decomposition().shape(),
-     *                                    settings-> BodySettings(motion-> BodyMotion::DYNAMIC, mass-> 0.3f));
-     * ```
-     * */
-    pub fn decomposition(self)-> &ConvexDecomposition
-        throws BalderError
-    {
-        let decomposition = copy ConvexDecomposition::fromFile(ConvexDecomposition::fileOf(self._file));
-        if decomposition.source != 0u32 && decomposition.source != ConvexDecomposition::checksumOf(self._file) {
-            log::warn #("SolidObjectModel", f"The model ${self._file} changed since it was decomposed, its hulls may no longer fit it");
-        }
-
-        decomposition
-    }
-
 
     /*!
      * ====================================================================================================
@@ -398,48 +212,46 @@ pub class SolidObjectModel over Node3D {
      */
 
     /**
-     * Read all the meshes and material inside a node and its childs, and register the meshes inside the solid object
-     * @info: the window resource manager is used to load Managed resources (e.g. textures)
+     * Read the meshes of a node and of its children into parts
      * @params:
      *    - loadTransform: the transformation placing the scene in the unit box of the model
      *    - parent: the transformation of the parent of the node in the scene
      * */
     @unsafe
-    fn processSolidNode(mut self, node: *aiNode, scene: *aiScene, dir: Path, loadTransform: mat4, parent: mat4, lods: bool)
+    fn processSolidNode(mut self, node: *aiNode, scene: *aiScene, loadTransform: mat4, parent: mat4)
         throws BalderError
     {
         let nodeTransform = parent * toMat4(node.transformation());
         for i in 0 .. node.numMeshes() {
             // a node gives the indices of its meshes in the meshes of the scene
             let mesh = scene.meshes()[node.meshes()[i]];
-            self:.processSolidMesh(mesh, scene, dir, loadTransform, nodeTransform, lods);
+            self:.processSolidMesh(mesh, loadTransform, nodeTransform);
         }
 
         for i in 0 .. (*node).mNumChildren {
             let child = node.children()[i];
-            self:.processSolidNode(child, scene, dir, loadTransform, nodeTransform, lods);
+            self:.processSolidNode(child, scene, loadTransform, nodeTransform);
         }
     }
 
     /**
-     * Read a mesh and its associated material, and build its levels of detail
+     * Read a mesh into a part, drawn by default with the material of the file it names, and build its levels of detail
      * @params:
      *    - loadTransform: the transformation placing the scene in the unit box of the model
      *    - nodeTransform: the transformation of the node of the mesh in the scene
      * */
     @unsafe
-    fn processSolidMesh(mut self, mesh: *aiMesh, scene: *aiScene, dir: Path, loadTransform: mat4, nodeTransform: mat4, lods: bool)
+    fn processSolidMesh(mut self, mesh: *aiMesh, loadTransform: mat4, nodeTransform: mat4)
         throws BalderError
     {
-        let dmut material = if scene.numMaterials() > mesh.materialIndex() {
-            let innerMat = scene.materials() [mesh.materialIndex()];
-            self:.processMaterial(mesh, innerMat, dir)
+        let material = if cast!usize(mesh.materialIndex()) < self._materials.len {
+            self._materials[mesh.materialIndex()]
         } else {
-            let dmut mt = copy ConstantMaterial(MaterialConfig());
-            alias mt
+            copy MaterialAsset(MaterialAsset::DEFAULT, "default")
         };
 
-        let array = self:.loadSolidMeshVertices(mesh, material, loadTransform, nodeTransform);
+        let textured = mesh.numUVComponents(0) != 0;
+        let array = self.loadSolidMeshVertices(mesh, loadTransform, nodeTransform);
         let mut skin: (Skin)? = none;
         if let Ok(skeleton) = self._skeleton {
             if mesh.numBones() > 0u32 {
@@ -457,20 +269,19 @@ pub class SolidObjectModel over Node3D {
             }
         }
 
-        let chName = "mesh_" ~ std::conv::to!{[c8]} (self._childs.len);
-        let chain = if lods {
-            let vertices = array.compactVertices(material.shaderConfig, forShadow-> false);
+        let aiName = mesh.name();
+        let name = if aiName.len != 0u32 { copy aiName.data[0 .. aiName.len] } else { f"mesh_${self._parts.len}" };
+
+        // the vertices welded as the shader of the material of the part reads them
+        let chain = if self._lods {
+            let vertices = array.compactVertices(material.instance(textured).shaderConfig, forShadow-> false);
             let welded = weldVertices(indices, vertices, vertices.len / array.positions.len);
             buildLodChain(array.positions, welded)
         } else { LodChain(indices) };
-        log::debug #("SolidObjectModel", chName, "has", chain.levels.len, "levels of detail");
+        log::debug #("MeshAsset", self._path, name, "has", chain.levels.len, "levels of detail");
 
-        let dmut _ = copy IndexedMesh3D(chName,
-                                        alias self,
-                                        chain,
-                                        array,
-                                        alias material,
-                                        skin-> skin);
+        self._parts ~= [SubMesh(name-> name, geometry-> copy MeshGeometry(array, chain, skin-> skin), material-> material,
+                                textured-> textured)];
     }
 
     /*!
@@ -482,17 +293,17 @@ pub class SolidObjectModel over Node3D {
      */
 
     /**
-     * Load a material from a material assump description: a metallic/roughness material when it has maps other than its
-     * base colour, a material of its base colour texture when it has only this one, a constant material otherwise
+     * @returns: the material asset of a material of the file, embedded in the mesh asset: its factors and the paths of
+     * its maps; the material the cache holds under its path when the file was read before (with or without its levels
+     * of detail), the material read put in the cache otherwise, so that one material stands for it
+     * @params:
+     *    - index: the index of the material among those of the file
+     *    - dir: the directory of the file, the paths of the maps relative to it
      * */
     @unsafe
-    fn processMaterial(mut self, mesh: *aiMesh, mat: *aiMaterial, dir: Path)-> dmut &Material
-        throws BalderError
-    {
-        let config = self.readConfig(mat);
-        if mesh.numUVComponents(0) == 0 {
-            return copy ConstantMaterial(config);
-        }
+    fn readMaterial(self, mat: *aiMaterial, index: usize, dir: Path)-> dmut &MaterialAsset {
+        let path = MaterialAsset::embeddedPath(self._path, index);
+        if let Ok(dmut cached) = alias Assets::cachedMaterial(path) { return alias cached; }
 
         // the slots of the maps, by preference: assimp gives the occlusion of glTF as a lightmap
         let baseColor = copy [aiTextureType::BASE_COLOR, aiTextureType::DIFFUSE];
@@ -505,15 +316,11 @@ pub class SolidObjectModel over Node3D {
                                 occlusion-> self.texturePath(mat, dir, occlusion),
                                 emissive-> self.texturePath(mat, dir, emissive));
 
-        if maps.metallicRoughness != "" || maps.normal != "" || maps.occlusion != "" || maps.emissive != "" {
-            return copy MetallicRoughnessMaterial(maps, config);
-        }
-
-        if maps.baseColor != "" {
-            return copy DiffuseTextureMaterial(maps.baseColor, config);
-        }
-
-        return copy ConstantMaterial(config);
+        let aiName = mat.name();
+        let name = if aiName.len != 0u32 { copy aiName.data[0 .. aiName.len] } else { f"material ${index}" };
+        let dmut read = copy MaterialAsset(path, name, config-> self.readConfig(mat), maps-> maps);
+        Assets::register(alias read);
+        alias read
     }
 
     /**
@@ -550,7 +357,7 @@ pub class SolidObjectModel over Node3D {
             let ainame = mat.texture(slot, 0);
             let name = copy ainame.data[0 .. ainame.len];
             if name.len != 0 && name[0] == '*' {
-                log::warn #("SolidObjectModel", "The embedded texture", name, "is not read");
+                log::warn #("MeshAsset", "The embedded texture", name, "is not read");
                 return "";
             }
 
@@ -602,14 +409,15 @@ pub class SolidObjectModel over Node3D {
      */
 
     /**
-     * Process a solid mesh whose material is a simple color material
+     * @returns: the vertices of a mesh, every attribute the file gives kept, whatever the material drawing it: the shader
+     * of a material reads the attributes it needs (see MeshArray::compactVertices)
      * @params:
      *    - loadTransform: the transformation placing the scene in the unit box of the model, a uniform scale and a
      *                     translation
      *    - nodeTransform: the transformation of the node of the mesh in the scene, the identity once pre-transformed
      * */
     @unsafe
-    fn loadSolidMeshVertices(mut self, mesh: *aiMesh, material: &Material, loadTransform: mat4, nodeTransform: mat4)-> MeshArray {
+    fn loadSolidMeshVertices(self, mesh: *aiMesh, loadTransform: mat4, nodeTransform: mat4)-> MeshArray {
         let placement = loadTransform * nodeTransform;
 
         // the normals and the tangents turn with the node, the uniform scale of the load leaving their directions
@@ -619,26 +427,25 @@ pub class SolidObjectModel over Node3D {
 
         let mut array = MeshArray();
         array.positions = copy [vec3() ; mesh.numVertices()];
-        if mesh.normals() != null && VertexEntry::NORMALS in material.shaderConfig.entries {
+        if mesh.normals() != null {
             array.normals = copy [vec3() ; mesh.numVertices()];
         }
 
         let mut handedness: [f32] = [];
-        if mesh.tangents() != null && mesh.normals() != null && mesh.textureCoords(0) != null
-            && VertexEntry::TANGENTS in material.shaderConfig.entries {
-                array.tangents = copy [vec4() ; mesh.numVertices()];
-                handedness = self.tangentHandedness(mesh);
-            }
+        if mesh.tangents() != null && mesh.normals() != null && mesh.textureCoords(0) != null {
+            array.tangents = copy [vec4() ; mesh.numVertices()];
+            handedness = self.tangentHandedness(mesh);
+        }
 
-        if mesh.textureCoords(0) != null && VertexEntry::TEX_UV in material.shaderConfig.entries {
+        if mesh.textureCoords(0) != null {
             array.textureUVs = copy [vec2() ; mesh.numVertices()];
         }
 
-        if mesh.textureCoords(1) != null && VertexEntry::TEX_UV2 in material.shaderConfig.entries {
+        if mesh.textureCoords(1) != null {
             array.textureUVs2 = copy [vec2() ; mesh.numVertices()];
         }
 
-        if mesh.colors(0) != null && VertexEntry::COLORS in material.shaderConfig.entries {
+        if mesh.colors(0) != null {
             array.colors = copy [vec3() ; mesh.numVertices()];
         }
 
@@ -727,31 +534,6 @@ pub class SolidObjectModel over Node3D {
         }
 
         result
-    }
-
-}
-
-/**
- * The properties of the models
- * */
-pub mod SolidObjectModel {
-
-    /**
-     * The group of the properties of a model, its section of the inspector
-     * */
-    pub def GROUP = "Model";
-
-    /**
-     * @returns: the schema of the models: the file they are read from (required) and whether the levels of detail of
-     * their meshes are built, both given at the creation of a model (see fromFile)
-     * */
-    pub fn schema()-> &NodeSchema {
-        copy NodeSchema("model", groups-> copy [PropertyGroup(name-> GROUP)], properties-> copy [
-            copy Property!{&SolidObjectModel, [c8]}("file", "", |dmut m| => m.file, kind-> PropertyKind::ASSET,
-                                                    label-> "File", group-> GROUP, required-> true),
-            copy Property!{&SolidObjectModel, bool}("lods", true, |dmut m| => m.lods, label-> "Levels of detail",
-                                                    group-> GROUP)
-        ])
     }
 
 }

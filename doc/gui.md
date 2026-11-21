@@ -500,12 +500,12 @@ if let Ok (dmut scene : &EditableScene) = alias scene3D:.getScene () {
 - **Only an editable scene selects**: `editable: true` makes the `Scene3D` render an `EditableScene`, the `Scene` that
   owns a selection; a plain `Scene` (the default, a game, a preview) renders what it is given and selects nothing.
 - **`selectable: true` makes a left click select**: the instance clicked alone, Ctrl (or Command) toggling it, and a
-  click on no instance clearing the selection (a Ctrl click on none leaving it). A click on a mesh of a
-  `SolidObjectModel` selects the model, the node placing and scaling its meshes (`selectedOnClick`); `picked` and
+  click on no instance clearing the selection (a Ctrl click on none leaving it). A click on a mesh drawing a part of a
+  `MeshInstance3D` selects the mesh node, the node placing and scaling its parts (`selectedOnClick`); `picked` and
   `hovered` still give the mesh. The selection is the `Selection` of the editable scene, `scene.selection`, holding
   `Node3D`s in the order they were selected; the code selects through it too (`select`, `add`, `toggle`, `remove`,
   `clear`). Its `changed` signal is emitted at each change, and a node removed from the scene leaves it.
-- **The selected instances are outlined**, with the visual instances under the selected nodes (the meshes of a model):
+- **The selected instances are outlined**, with the visual instances under the selected nodes (the meshes drawing the parts of a mesh node):
   the editable scene gives them to `Scene.outline (instances)`, and the composition draws `scene.outlineColor` around
   their pixels, `scene.outlineWidth` pixels of the render resolution
   wide (3 by default, up to 6, 0 for none). The outline is an edge detect on a bit of the material word of the
