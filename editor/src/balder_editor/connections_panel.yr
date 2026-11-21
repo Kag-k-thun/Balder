@@ -1,0 +1,375 @@
+in connections_panel;
+
+use balder_editor::{command, editor};
+use balder_editor::command::connections;
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface;
+use balder::interface::widget;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget::button::dropdown;
+use balder::interface::widget::table::{texts, view};
+use balder::scene::actors::{node_classes, node_connection, signal_info, slot_info};
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::utils::types;
+
+use std::uuid;
+
+use ::sdl3::mouse;
+
+// The path of the panel of the connections in the interface of the editor
+def CONNECTIONS = "BODY/MAIN/INSPECTOR/CONNECTIONS";
+
+// The class of the panel while the node inspected is not an actor, displayed none (see inspector.style)
+def ABSENT = "absent";
+
+/**
+ * The panel of the connections of the actor selected last, under its properties, mounted under the behavior
+ * 'connections': the connections of its signals to the slots of the actors of the scene (see Node3D.connections), in a
+ * table, one picked there being removed by Remove, and the choice of a new one, a signal of the actor, an actor of the
+ * scene and one of its slots taking the payload of the signal, made by Connect
+ * @info: the game makes the connections when it builds the scene, not the editor; each change goes through a
+ * ConnectionsCommand, undone as the other changes of the scene. A connection to a node no longer in the scene is kept,
+ * told missing in the table
+ * */
+pub class ConnectionsPanel over Behavior {
+
+    // The interface holding the fields
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the slots of the selection and of the editor are emitted in
+    let dmut _box: &SlotEmitter;
+
+    // Shows a message in the status bar
+    let _status: dg ([c8])-> void;
+
+    // The editor of the scene, once bound
+    let dmut _editor: (&SceneEditor)? = none;
+
+    // The actor inspected, the node selected last when it is of an actor class
+    let dmut _node: (&Node3D)? = none;
+
+    // The rows of the table of the connections
+    let dmut _model: &TextTableModel = copy TextTableModel(headers-> copy ["Signal", "Actor", "Slot"]);
+
+    // The row of the table picked, none when no row is
+    let mut _picked: (usize)? = none;
+
+    // The signals of the actor inspected, the actors of the scene taking the signal chosen, and the slots of the actor
+    // chosen taking it, in the order of their dropdowns
+    let mut _signals: [SignalInfo] = [];
+    let dmut _targets: [&Node3D] = [];
+    let mut _slotChoices: [SlotInfo] = [];
+
+    /**
+     * @params:
+     *    - gui: the interface holding the fields
+     *    - box: the mailbox the slots of the selection and of the editor are emitted in
+     *    - status: shows a message in the status bar
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, status: dg ([c8])-> void)
+        with _gui = alias gui
+        , _box = alias box
+        , _status = status
+    {
+        // the slots the 'on-…' attributes of inspector.gui name
+        self:.slot("picked", &self:.onPicked);
+        self:.slot("remove", &self:.onRemoveClicked);
+        self:.slot("signal", &self:.onSignalChosen);
+        self:.slot("target", &self:.onTargetChosen);
+        self:.slot("connect", &self:.onConnectClicked);
+    }
+
+    /**
+     * Follow the actor selected last in the scene of an editor, and the changes of the scene, once the interface is
+     * loaded
+     * */
+    pub fn bind(mut self, dmut editor: &SceneEditor) {
+        let dmut scene = alias editor.scene;
+        let dmut selection = alias scene.selection;
+        selection:.changed():.connect(alias self._box, &self:.onSelectionChanged);
+        editor:.edited():.connect(alias self._box, &self:.onEdited);
+        self._editor = (alias editor)?;
+
+        if let Ok(dmut t: &TableView) = self._gui:.find(CONNECTIONS ~ "/TABLE") {
+            t:.setModel(alias self._model);
+        }
+
+        self:.onSelectionChanged();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSPECTING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Inspect the node selected last when it is of an actor class, the panel taking no room otherwise
+     * */
+    fn onSelectionChanged(mut self) {
+        let dmut node: (&Node3D)? = none;
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            let dmut nodes = alias selection.nodes;
+            if nodes.len != 0us && actorClassOf(nodes[$ - 1us]).hasValue {
+                node = (alias nodes[$ - 1us])?;
+            }
+        }
+
+        self._node = alias node;
+        self._picked = none;
+        if let Ok(dmut w) = alias self._gui:.find(CONNECTIONS) {
+            let mut classes: [[c8]] = [];
+            for c in w.getClasses() if c != ABSENT { classes ~= [c]; }
+            if !node.hasValue { classes ~= [ABSENT]; }
+            w:.setClasses(classes);
+        }
+
+        self:.refresh();
+    }
+
+    /**
+     * A change of the scene, the connections of the actor inspected among them (undone or redone), or the actors of the
+     * scene
+     * */
+    fn onEdited(mut self, _: &EditCommand) {
+        self:.refresh();
+    }
+
+    /**
+     * Write the connections of the actor inspected in the table, its signals in their dropdown, then the actors and the
+     * slots taking the signal chosen
+     * */
+    fn refresh(mut self) {
+        let mut rows: [[[c8]]] = [];
+        let mut signals: [SignalInfo] = [];
+        if let Ok(dmut n) = alias self._node {
+            for c in n.connections {
+                rows ~= [copy [c.signal, self:.nameOf(c.target), c.slot]];
+            }
+
+            if let Ok(cls) = actorClassOf(n) { signals = cls.signals(); }
+        }
+
+        self._model:.setRows(rows);
+        if let Ok(dmut t: &TableView) = self._gui:.find(CONNECTIONS ~ "/TABLE") {
+            t:.clearSelection();
+        }
+
+        self._picked = none;
+        self._signals = signals;
+        self:.fill("SIGNAL", copy [s.name ~ (if s.payload.len == 0us { "" } else { " " ~ signature(s.payload) }) for s in signals]);
+        self:.fillTargets();
+    }
+
+    /**
+     * Fill the dropdown of the actors with the actors of the scene having a slot taking the signal chosen
+     * */
+    fn fillTargets(mut self) {
+        let dmut targets: [&Node3D] = [];
+        if let Ok(signal) = self:.chosenSignal() {
+            if let Ok(dmut e) = alias self._editor {
+                let dmut scene = alias e.scene;
+                let dmut all: [&Node] = [];
+                for dmut n in alias scene:.getRootNode():.getAllNodes(ref all) {
+                    if let dmut d: &Node3D = alias n {
+                        if slotsTaking(d, signal).len != 0us { targets ~= [alias d]; }
+                    }
+                }
+            }
+        }
+
+        self._targets = alias targets;
+        self:.fill("TARGET", copy [shownName(t) for t in targets]);
+        self:.fillSlots();
+    }
+
+    /**
+     * Fill the dropdown of the slots with the slots of the actor chosen taking the signal chosen
+     * */
+    fn fillSlots(mut self) {
+        let mut slots: [SlotInfo] = [];
+        if let Ok(signal) = self:.chosenSignal() {
+            if let Ok(t) = self:.chosenTarget() { slots = slotsTaking(t, signal); }
+        }
+
+        self._slotChoices = slots;
+        self:.fill("SLOT", copy [s.name for s in slots]);
+    }
+
+    /**
+     * Give a dropdown of the panel its items, without emitting its signal
+     * */
+    fn fill(mut self, id: [c8], items: [[c8]]) {
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(CONNECTIONS ~ "/" ~ id) {
+            d:.setItems(items);
+        }
+    }
+
+    /**
+     * @returns: the name of the node of an id in the scene, its path under the root, `#<id> (missing)` when the scene
+     * has none
+     * */
+    fn nameOf(mut self, id: Uuid)-> [c8] {
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut all: [&Node] = [];
+            for dmut n in alias scene:.getRootNode():.getAllNodes(ref all) {
+                if let d: &Node3D = n && d.guid == id { return shownName(d); }
+            }
+        }
+
+        f"#${id} (missing)"
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          EDITING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onPicked(mut self, rows: [usize]) {
+        self._picked = if rows.len == 1us { (rows[0])? } else { none };
+    }
+
+    fn onSignalChosen(mut self, _: usize) {
+        self:.fillTargets();
+    }
+
+    fn onTargetChosen(mut self, _: usize) {
+        self:.fillSlots();
+    }
+
+    /**
+     * Remove the connection picked in the table
+     * */
+    fn onRemoveClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut node = if let Ok(dmut n) = alias self._node { alias n } else { return; };
+        let row = if let Ok(r) = self._picked { r } else {
+            self._status("Pick the connection to remove in the table");
+            return;
+        };
+
+        let old = node.connections;
+        if row >= old.len { return; }
+
+        let c = old[row];
+        let kept = old[0us .. row] ~ old[row + 1us .. $];
+        self:.run(copy ConnectionsCommand(alias node, kept, f"Removed the connection of ${c.signal} to ${c.slot}"));
+    }
+
+    /**
+     * Connect the signal chosen to the slot chosen of the actor chosen
+     * */
+    fn onConnectClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut node = if let Ok(dmut n) = alias self._node { alias n } else { return; };
+        let signal = if let Ok(s) = self:.chosenSignal() { s } else {
+            self._status(f"${node.name.file()} has no signal to connect");
+            return;
+        };
+
+        let target = if let Ok(t) = self:.chosenTarget() { t } else {
+            self._status(f"No actor of the scene has a slot taking ${signal.name}");
+            return;
+        };
+
+        let slot = if let Ok(s) = self:.chosenSlot() { s } else { return; };
+        let c = NodeConnection(signal-> signal.name, target-> target.guid, slot-> slot.name);
+        for o in node.connections if o.signal == c.signal && o.target == c.target && o.slot == c.slot {
+            self._status(f"${c.signal} is connected to ${c.slot} of ${shownName(target)} already");
+            return;
+        }
+
+        self:.run(copy ConnectionsCommand(alias node, node.connections ~ [c],
+                                          f"Connected ${c.signal} to ${c.slot} of ${shownName(target)}"));
+    }
+
+    /**
+     * @returns: the signal chosen in its dropdown, none when the actor has none
+     * */
+    fn chosenSignal(mut self)-> (SignalInfo)? {
+        if let Ok(i) = self:.chosen("SIGNAL") && i < self._signals.len { return self._signals[i]?; }
+        none
+    }
+
+    /**
+     * @returns: the actor chosen in its dropdown, none when no actor takes the signal chosen
+     * */
+    fn chosenTarget(mut self)-> (&Node3D)? {
+        if let Ok(i) = self:.chosen("TARGET") && i < self._targets.len { return self._targets[i]?; }
+        none
+    }
+
+    /**
+     * @returns: the slot chosen in its dropdown, none when no slot takes the signal chosen
+     * */
+    fn chosenSlot(mut self)-> (SlotInfo)? {
+        if let Ok(i) = self:.chosen("SLOT") && i < self._slotChoices.len { return self._slotChoices[i]?; }
+        none
+    }
+
+    /**
+     * @returns: the item selected in a dropdown of the panel, none when it has none
+     * */
+    fn chosen(mut self, id: [c8])-> (usize)? {
+        if let Ok(d: &Dropdown) = self._gui:.find(CONNECTIONS ~ "/" ~ id) {
+            return d.getSelected();
+        }
+
+        none
+    }
+
+    /**
+     * Run a command, the status bar telling why it is refused
+     * */
+    fn run(mut self, dmut command: &EditCommand) {
+        if let Ok(dmut e) = alias self._editor {
+            {
+                e:.execute(alias command);
+            } catch {
+                err: &BalderError => {
+                    self._status(err.msg);
+                }
+            }
+        }
+    }
+
+}
+
+/**
+ * @returns: the slots of a node taking the payload of a signal, none for a node of no actor class
+ * */
+fn slotsTaking(node: &Node3D, signal: SignalInfo)-> [SlotInfo] {
+    let mut res: [SlotInfo] = [];
+    if let Ok(cls) = actorClassOf(node) {
+        for s in cls.slots() if sameTypes(s.params, signal.payload) { res ~= [s]; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the name of a node in the panel, its path under the root of the scene
+ * */
+fn shownName(node: &Node3D)-> [c8] {
+    let parts = node.name.parts();
+    if parts.len <= 1us { return node.name.file(); }
+
+    let mut res: [c8] = "";
+    for i, p in parts[1us .. $] {
+        res ~= (if i == 0us { "" } else { "/" }) ~ p;
+    }
+
+    res
+}

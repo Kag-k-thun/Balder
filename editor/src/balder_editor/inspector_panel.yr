@@ -1,0 +1,924 @@
+in inspector_panel;
+
+use balder_editor::{command, editor};
+use balder_editor::command::{active_camera, body, projection, property, rename};
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface;
+use balder::interface::widget;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget::button::{check, dropdown};
+use balder::interface::widget::text::_;
+use balder::math::{_, utils};
+use balder::scene::description::kind;
+use balder::scene::edit::{body_edit, property_edit};
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{body, body_shape, camera, character, solid};
+use balder::scene::physics;
+use balder::scene::property::{kind, node_property, node_schema, value};
+
+use std::{char, conv, stream};
+
+// The path of the inspector in the interface of the editor, of the sections of the properties in it, and of the panel
+// of the convex hulls of a model, filled by the HullsPanel
+def INSPECTOR = "BODY/MAIN/INSPECTOR";
+def PROPERTIES = "BODY/MAIN/INSPECTOR/PROPERTIES";
+def HULLS = "BODY/MAIN/INSPECTOR/HULLS";
+
+// The fields of the axes of a vector row
+def AXES = ["X", "Y", "Z"];
+
+// The class of a section or of a row the nodes inspected do not use, displayed none (see inspector.style)
+def ABSENT = "absent";
+
+// The keys of the properties the editor changes through commands of their own: the projection of a camera replaces it
+// (see ProjectionCommand), the active camera is one of the scene (see ActiveCameraCommand), the shape of a body and its
+// sizes, and the capsule of a character, build a collider (see BodyCommand)
+def PROJECTION = "Camera/projection";
+def ACTIVE = "Camera/active";
+def BODY_SHAPE = "Physics body/shape";
+def BODY_SIZE = "Physics body/size";
+def BODY_RADIUS = "Physics body/radius";
+def BODY_HEIGHT = "Physics body/height";
+
+// What a change typed in a row gives a node (see RowChange): a number, a component of a vector, a box toggled, a
+// choice, a text, a layer set or cleared
+def CHANGE_NUMBER = 0u32;
+def CHANGE_AXIS = 1u32;
+def CHANGE_FLAG = 2u32;
+def CHANGE_CHOICE = 3u32;
+def CHANGE_TEXT = 4u32;
+def CHANGE_BIT = 5u32;
+
+// The changes of the shape of a body (see editOf): its kind, a side of its box, its radius, its height
+def SHAPE_KIND = 0u32;
+def SHAPE_SIZE = 1u32;
+def SHAPE_RADIUS = 2u32;
+def SHAPE_HEIGHT = 3u32;
+
+/**
+ * A row of the inspector, the fields of the property of a key, shared by the classes declaring that key (see
+ * NodeProperty::key)
+ * */
+record PropertyRow {
+
+    // The key of the property
+    pub let key: [c8];
+
+    // The first declaration of the key, giving the row its kind, its label and its range
+    pub let property: &NodeProperty;
+
+    // The path of the section holding the row, and of the row
+    pub let section: [c8];
+    pub let path: [c8];
+
+    // True when the row changes the property, false when it only tells its value
+    pub let editable: bool;
+
+    pub self (key: [c8], property: &NodeProperty, section: [c8], path: [c8], editable: bool)
+        with key = key
+        , property = property
+        , section = section
+        , path = path
+        , editable = editable
+    {}
+
+}
+
+/**
+ * A change typed in a row, given to the property of each node selected (see changedValue)
+ * */
+@data
+record RowChange {
+
+    // What the change is, CHANGE_NUMBER to CHANGE_BIT
+    pub let how: u32 = CHANGE_NUMBER;
+
+    // The number typed, of a number or of a component of a vector, in degrees for the angles
+    pub let number: f32 = 0.0f;
+
+    // The component of a vector, the choice, the layer changed
+    pub let index: u32 = 0u32;
+
+    // The box toggled on, the layer set
+    pub let on: bool = false;
+
+    // The text validated
+    pub let text: [c8] = "";
+}
+
+/**
+ * The inspector of the nodes selected, on the right of the editor, mounted under the behavior 'inspector': the name of
+ * the node selected last, then a section for each group of the properties the schemas of the node classes declare (see
+ * NodeSchema), holding a row for each property, its fields refreshed when the node moves
+ * @info:
+ * =====
+ * The rows are built once, from the schemas of every class a scene file describes (see schemas): a property of a key
+ * has one row, shared by the classes declaring that key. A row is shown when every node selected has its property and
+ * the property applies to the node selected last (the cone of a spot light, see NodeProperty.condition), its fields
+ * holding the values of that node; a section is shown while one of its rows is. A property given to a node only at its
+ * creation is told, not changed, but those the editor changes its own way: the projection and the activation of a
+ * camera (the camera inspected only), the shape of a body and its sizes, the capsule of a character.
+ *
+ * A field changed gives each node selected the value through a PropertyCommand, a component of a vector or a layer
+ * changing that component or that layer of each node, its others kept; the steps of one field merge into one command.
+ * ====
+ * */
+pub class InspectorPanel over Behavior {
+
+    // The interface holding the fields
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the slots of the selection and of the node inspected are emitted in
+    let dmut _box: &SlotEmitter;
+
+    // Shows a message in the status bar
+    let _status: dg ([c8])-> void;
+
+    // The editor of the scene, once bound
+    let dmut _editor: (&SceneEditor)? = none;
+
+    // The node inspected, the one selected last, none when none is
+    let dmut _node: (&Node3D)? = none;
+
+    // The nodes selected, and the schema of the class of each
+    let dmut _selection: [&Node3D] = [];
+    let mut _schemas: [&NodeSchema] = [];
+
+    // The rows of the properties, in the order of the inspector
+    let mut _rows: [PropertyRow] = [];
+
+    // The sections of the groups, by name, with their paths
+    let mut _sections: [([c8], [c8])] = [];
+
+    /**
+     * @params:
+     *    - gui: the interface holding the fields
+     *    - box: the mailbox the slots of the selection and of the node inspected are emitted in
+     *    - status: shows a message in the status bar
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, status: dg ([c8])-> void)
+        with _gui = alias gui
+        , _box = alias box
+        , _status = status
+    {
+        self:.slot("renamed", &self:.onRenamed);
+        self:.slot("number", &self:.onNumber);
+        self:.slot("axis", &self:.onAxis);
+        self:.slot("flag", &self:.onFlag);
+        self:.slot("choice", &self:.onChoice);
+        self:.slot("text", &self:.onText);
+        self:.slot("bit", &self:.onBit);
+    }
+
+    /**
+     * Build the rows of the properties, then inspect the nodes selected in the scene of an editor, once the interface
+     * is loaded
+     * */
+    pub fn bind(mut self, dmut editor: &SceneEditor) {
+        self:.buildRows();
+
+        let dmut scene = alias editor.scene;
+        let dmut selection = alias scene.selection;
+        selection:.changed():.connect(alias self._box, &self:.onSelectionChanged);
+        editor:.edited():.connect(alias self._box, &self:.onEdited);
+        self._editor = (alias editor)?;
+
+        self:.onSelectionChanged();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          ROWS          ========================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create the section of each group and the row of each property of the schemas, in the order of the schemas, the
+     * interface laid out once they are all created
+     * */
+    fn buildRows(mut self) {
+        self._gui:.holdLayout();
+        for schema in schemas() {
+            for g in schema.groups {
+                self:.sectionOf(g.name, folded-> g.folded);
+            }
+
+            for p in schema.properties {
+                let mut known = false;
+                for r in self._rows if r.key == p.key() { known = true; }
+                if !known { self:.addRow(p); }
+            }
+        }
+
+        self._gui:.releaseLayout();
+    }
+
+    /**
+     * @returns: the path of the section of a group, created after the others the first time
+     * @params:
+     *    - folded: true for a section folded at first
+     * */
+    fn sectionOf(mut self, group: [c8], folded: bool = false)-> [c8] {
+        for s in self._sections if s._0 == group { return s._1; }
+
+        let id = idOf(group);
+        let path = PROPERTIES ~ "/" ~ id;
+        {
+            self._gui:.instantiate("PropertySection", group, parent-> PROPERTIES, id-> id,
+                                   attributes-> if folded { "expanded: false;" } else { "" });
+        } catch {
+            err: &BalderError => { self._status(err.msg); }
+        }
+
+        self._sections ~= [(group, path)];
+        path
+    }
+
+    /**
+     * Create the row of a property in the section of its group, of the kind of the property, or telling its value when
+     * the editor does not change it
+     * */
+    fn addRow(mut self, p: &NodeProperty) {
+        let key = p.key();
+        let section = self:.sectionOf(p.group);
+        let id = idOf(p.name);
+        let path = section ~ "/" ~ id;
+        let editable = p.settable() || isOwnEdit(key);
+        let label = if p.label.len != 0us { p.label } else { p.name };
+        let r = p.range;
+        let bounds = f"min: ${decimal(r.min)}; max: ${decimal(r.max)}; step: ${decimal(r.step)}; ";
+        let slot = quoted(key);
+
+        {
+            if !editable {
+                self._gui:.instantiate("NoteRow", label, parent-> section, id-> id);
+            } else {
+                match p.kind {
+                    PropertyKind::NUMBER => {
+                        self._gui:.instantiate("NumberRow", label, parent-> section, id-> id,
+                                               attributes-> bounds ~ f"decimals: ${r.decimals}; on-change: inspector::number(${slot});");
+                    }
+                    PropertyKind::COUNT => {
+                        self._gui:.instantiate("NumberRow", label, parent-> section, id-> id,
+                                               attributes-> bounds ~ f"decimals: 0; on-change: inspector::number(${slot});");
+                    }
+                    PropertyKind::VECTOR | PropertyKind::COLOR => {
+                        self._gui:.instantiate("VectorRow", label, parent-> section, id-> id,
+                                               attributes-> bounds ~ f"decimals: ${r.decimals}; "
+                                               ~ f"on-x: inspector::axis(${slot}, 0); on-y: inspector::axis(${slot}, 1); on-z: inspector::axis(${slot}, 2);");
+                    }
+                    PropertyKind::BOOL => {
+                        self._gui:.instantiate("CheckRow", label, parent-> section, id-> id,
+                                               attributes-> f"on-toggle: inspector::flag(${slot});");
+                    }
+                    PropertyKind::CHOICE => {
+                        let mut items = "";
+                        for i, c in p.choices {
+                            items = items ~ (if i == 0us { "" } else { ", " }) ~ quoted(c.label);
+                        }
+
+                        self._gui:.instantiate("ChoiceRow", label, parent-> section, id-> id,
+                                               attributes-> f"items: ${items}; on-change: inspector::choice(${slot});");
+                    }
+                    PropertyKind::STRING | PropertyKind::TEXTS => {
+                        self._gui:.instantiate("TextRow", label, parent-> section, id-> id,
+                                               attributes-> f"on-validate: inspector::text(${slot});");
+                    }
+                    PropertyKind::LAYERS => {
+                        self._gui:.instantiate("LayersRow", label, parent-> section, id-> id);
+                        self:.addBits(path, slot);
+                    }
+                    _ => {
+                        self._gui:.instantiate("NoteRow", label, parent-> section, id-> id);
+                    }
+                }
+            }
+        } catch {
+            err: &BalderError => { self._status(err.msg); }
+        }
+
+        self._rows ~= [PropertyRow(key, p, section, path, editable && p.kind != PropertyKind::ASSET && p.kind != PropertyKind::NODE)];
+    }
+
+    /**
+     * Create the 32 boxes of the layers of a row, in four rows of eight, each toggled to the slot 'bit' of its layer
+     * @params:
+     *    - slot: the key of the property, quoted
+     * */
+    fn addBits(mut self, row: [c8], slot: [c8])
+        throws BalderError
+    {
+        for r in 0u32 .. 4u32 {
+            let line = f"R${r}";
+            self._gui:.instantiate("BitRow", parent-> row, id-> line);
+            for b in r * 8u32 .. r * 8u32 + 8u32 {
+                self._gui:.instantiate("BitBox", f"${b}", parent-> row ~ "/" ~ line, id-> f"B${b}",
+                                       attributes-> f"on-toggle: inspector::bit(${slot}, ${b});");
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSPECTING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Inspect the nodes selected, the one selected last giving the values of the rows
+     * */
+    fn onSelectionChanged(mut self) {
+        let dmut nodes: [&Node3D] = [];
+        let mut found: [&NodeSchema] = [];
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            for dmut n in alias selection.nodes {
+                nodes ~= [alias n];
+                found ~= [schemaOfNode(n)];
+            }
+        }
+
+        self._selection = alias nodes;
+        self._schemas = found;
+
+        let dmut last: (&Node3D)? = none;
+        if self._selection.len != 0us {
+            last = (alias self._selection[$ - 1us])?;
+        }
+
+        self:.inspect(alias last);
+    }
+
+    /**
+     * Refresh the fields after a command, a renaming changing the name shown
+     * */
+    fn onEdited(mut self, _: &EditCommand) {
+        self:.refresh();
+    }
+
+    /**
+     * Inspect a node, its fields refreshed each time it moves
+     * */
+    fn inspect(mut self, dmut node: (&Node3D)?) {
+        if let Ok(dmut old) = alias self._node {
+            old:.transformationChanged():.disconnect(&self:.refresh);
+        }
+
+        if let Ok(dmut n) = alias node {
+            n:.transformationChanged():.connect(alias self._box, &self:.refresh);
+        }
+
+        self._node = alias node;
+        self:.refresh();
+    }
+
+    /**
+     * Write the name and the properties of the node inspected in the fields, without emitting their signals, the rows
+     * and the sections the nodes selected use present and the others absent, the inspector laid out once all of them
+     * are written
+     * */
+    fn refresh(mut self) {
+        self._gui:.holdLayout();
+        self:.writeFields();
+        self._gui:.releaseLayout();
+    }
+
+    /**
+     * Write the name and the properties of the node inspected in the fields (see refresh)
+     * */
+    fn writeFields(mut self) {
+        let (kind, name) = if let Ok(n) = self._node { (balder_editor::outline::kindOf(n), n.name.file()) } else { ("Nothing selected", "") };
+        if let Ok(dmut l: &Label) = self._gui:.find(INSPECTOR ~ "/KIND") {
+            l:.setText(kind);
+        }
+
+        if let Ok(dmut input: &InputText) = self._gui:.find(INSPECTOR ~ "/NAME") {
+            input:.setText(name);
+        }
+
+        let mut shownSections: [[c8]] = [];
+        for row in self._rows {
+            let shown = self:.writeRow(row);
+            self:.setPresent(row.path, shown);
+            if shown { shownSections ~= [row.section]; }
+        }
+
+        for s in self._sections {
+            let mut shown = false;
+            for p in shownSections if p == s._1 { shown = true; }
+            self:.setPresent(s._1, shown);
+        }
+
+        self:.setPresent(HULLS, if let Ok(_: &SolidObjectModel) = self._node { true } else { false });
+    }
+
+    /**
+     * Write the value of the property of a row of the node inspected in its fields
+     * @returns: true iif the row is shown: every node selected has the property, and it applies to the node inspected
+     * */
+    fn writeRow(mut self, row: PropertyRow)-> bool {
+        if self._selection.len == 0us { return false; }
+        for s in self._schemas {
+            if !s.propertyOfKey(row.key).hasValue { return false; }
+        }
+
+        let schema = self._schemas[$ - 1us];
+        let dmut node = alias self._selection[$ - 1us];
+        let p = if let Ok(p) = schema.propertyOfKey(row.key) { p } else { return false; };
+        if !schema.applies(p, alias node) { return false; }
+
+        let v = p.get(alias node);
+        if !row.editable {
+            if let Ok(dmut l: &Label) = self._gui:.find(row.path ~ "/VALUE") {
+                l:.setText(f"${row.property.label}: ${display(p, v)}");
+            }
+
+            return true;
+        }
+
+        match p.kind {
+            PropertyKind::NUMBER => { self:.setNumber(row.path, if p.degrees { degree(v.number) } else { v.number }); }
+            PropertyKind::COUNT => { self:.setNumber(row.path, cast!f32(v.bits)); }
+            PropertyKind::VECTOR | PropertyKind::COLOR => {
+                let x = v.vector;
+                self:.setAxes(row.path, if p.degrees { makeVec3(degree(x.x), degree(x.y), degree(x.z)) } else { x });
+            }
+            PropertyKind::BOOL => { self:.setChecked(row.path, v.flag); }
+            PropertyKind::CHOICE => {
+                if let Ok(i) = p.choiceIndex(v.text) {
+                    if let Ok(dmut d: &Dropdown) = self._gui:.find(row.path ~ "/VALUE") { d:.setSelected(i); }
+                }
+            }
+            PropertyKind::STRING | PropertyKind::TEXTS => {
+                if let Ok(dmut input: &InputText) = self._gui:.find(row.path ~ "/VALUE") {
+                    input:.setText(if p.kind == PropertyKind::TEXTS { joined(v.texts) } else { v.text });
+                }
+            }
+            PropertyKind::LAYERS => {
+                for i in 0u32 .. 32u32 {
+                    self:.setChecked(row.path ~ f"/R${i / 8u32}/B${i}", (v.bits & (1u32 << i)) != 0u32);
+                }
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    /**
+     * Check a box, or uncheck it, without emitting its signal
+     * */
+    fn setChecked(mut self, path: [c8], checked: bool) {
+        if let Ok(dmut c: &CheckBox) = self._gui:.find(path) {
+            c:.setChecked(checked);
+        }
+    }
+
+    /**
+     * Write a vector in a row of three spin boxes (see VectorRow)
+     * */
+    fn setAxes(mut self, row: [c8], value: vec3) {
+        for j, axis in AXES {
+            if let Ok(dmut s: &SpinBox) = self._gui:.find(row ~ "/" ~ axis) {
+                s:.setValue(component(value, j));
+            }
+        }
+    }
+
+    /**
+     * Write a number in the spin box of a row (see NumberRow)
+     * */
+    fn setNumber(mut self, row: [c8], value: f32) {
+        if let Ok(dmut s: &SpinBox) = self._gui:.find(row ~ "/VALUE") {
+            s:.setValue(value);
+        }
+    }
+
+    /**
+     * Make a section or a row present, or absent, taking no room
+     * */
+    fn setPresent(mut self, path: [c8], present: bool) {
+        if let Ok(dmut w) = alias self._gui:.find(path) {
+            let mut classes: [[c8]] = [];
+            for c in w.getClasses() if c != ABSENT {
+                classes ~= [c];
+            }
+
+            if !present { classes ~= [ABSENT]; }
+            w:.setClasses(classes);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          EDITING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The name was validated: the node inspected is renamed
+     * */
+    fn onRenamed(mut self, name: [c8]) {
+        if let Ok(dmut n) = alias self._node {
+            self:.run(copy RenameCommand(alias n, name));
+        }
+
+        // a name refused is written back
+        self:.refresh();
+    }
+
+    /**
+     * The number of a row changed, in degrees for an angle: every node selected takes it, the radius and the height of a
+     * body reshaping it
+     * */
+    fn onNumber(mut self, key: [c8], value: f32) {
+        if key == BODY_RADIUS { self:.editBodies(SHAPE_RADIUS, 0u32, value, BodyShapeKind::BOX); return; }
+        if key == BODY_HEIGHT { self:.editBodies(SHAPE_HEIGHT, 0u32, value, BodyShapeKind::BOX); return; }
+
+        self:.edit(key, key, RowChange(how-> CHANGE_NUMBER, number-> value));
+    }
+
+    /**
+     * A field of a vector row changed: every node selected takes the value along its axis, the size of a body reshaping
+     * it
+     * @params:
+     *    - axis: 0 for X, 1 for Y, 2 for Z
+     * */
+    fn onAxis(mut self, key: [c8], axis: u32, value: f32) {
+        if key == BODY_SIZE { self:.editBodies(SHAPE_SIZE, axis, value, BodyShapeKind::BOX); return; }
+
+        self:.edit(key, f"${key} ${axis}", RowChange(how-> CHANGE_AXIS, number-> value, index-> axis));
+    }
+
+    /**
+     * A box was toggled: every node selected takes it; the box of the active camera, checked, makes the camera inspected
+     * the active camera of the scene, and unchecked is checked again, the scene keeping an active camera while it has one
+     * */
+    fn onFlag(mut self, key: [c8], on: bool) {
+        if key == ACTIVE {
+            if !on {
+                self._status("The scene is seen through one of its cameras: make another one active instead");
+            } else if let Ok(dmut c: &Camera) = alias self._node {
+                self:.run(copy ActiveCameraCommand(alias c));
+            }
+
+            self:.refresh();
+            return;
+        }
+
+        self:.edit(key, key, RowChange(how-> CHANGE_FLAG, on-> on));
+    }
+
+    /**
+     * A choice was picked: every node selected takes it; the projection of a camera replaces the camera inspected by a
+     * camera of that projection (see ProjectionCommand), the shape of a body reshapes every body selected
+     * */
+    fn onChoice(mut self, key: [c8], index: usize) {
+        let row = if let Ok(r) = self.rowOf(key) { r } else { return; };
+        if index >= row.property.choices.len { return; }
+        let name = row.property.choices[index].name;
+
+        if key == PROJECTION {
+            if let Ok(dmut c: &Camera) = alias self._node {
+                let projection = if name == "orthographic" { CameraProjection::ORTHOGRAPHIC } else { CameraProjection::PERSPECTIVE };
+                self:.run(copy ProjectionCommand(alias c, projection));
+            }
+
+            self:.refresh();
+            return;
+        }
+
+        if key == BODY_SHAPE { self:.editBodies(SHAPE_KIND, 0u32, 0.0f, shapeNamed(name)); return; }
+
+        self:.edit(key, key, RowChange(how-> CHANGE_CHOICE, index-> cast!u32(index)));
+    }
+
+    /**
+     * A text was validated: every node selected takes it, the words of the text for texts (the tags of a marker)
+     * */
+    fn onText(mut self, key: [c8], text: [c8]) {
+        self:.edit(key, key, RowChange(how-> CHANGE_TEXT, text-> text));
+    }
+
+    /**
+     * A layer was toggled: every node selected is put in it or taken out of it, its other layers kept
+     * */
+    fn onBit(mut self, key: [c8], bit: u32, on: bool) {
+        self:.edit(key, f"${key} ${bit}", RowChange(how-> CHANGE_BIT, index-> bit, on-> on));
+    }
+
+    /**
+     * Give the property of a key of each node selected the value a change makes of its own, through a command
+     * @params:
+     *    - field: the field the change was typed in, the steps of one field merging into one command
+     * */
+    fn edit(mut self, key: [c8], field: [c8], change: RowChange) {
+        let mut edits: [PropertyEdit] = [];
+        for i, dmut n in alias self._selection {
+            if let Ok(p) = self._schemas[i].propertyOfKey(key) {
+                if !p.settable() { continue; }
+
+                let before = p.get(alias n);
+                let after = changedValue(p, before, change);
+                if !(after == before) { edits ~= [PropertyEdit(alias n, p, before, after)]; }
+            }
+        }
+
+        if edits.len != 0us {
+            self:.run(copy PropertyCommand(edits, field-> field));
+        }
+
+        // a value refused (a null direction, a far plane before the near one...) is written back
+        self:.refresh();
+    }
+
+    /**
+     * Give each body selected its shape changed, through a command, its settings kept
+     * @params:
+     *    - change: what is changed, SHAPE_KIND to SHAPE_HEIGHT
+     *    - axis: the side of a box changed
+     *    - value: the value of a side, a radius or a height
+     *    - kind: the kind of shape, for SHAPE_KIND
+     * */
+    fn editBodies(mut self, change: u32, axis: u32, value: f32, kind: BodyShapeKind) {
+        {
+            let mut edits: [BodyEdit] = [];
+            for dmut n in alias self._selection {
+                if let dmut b: &PhysicsBody3D = alias n {
+                    edits ~= [editOf(alias b, change, axis, value, kind)];
+                }
+            }
+
+            if edits.len != 0us {
+                self:.run(copy BodyCommand(edits, field-> f"body ${change} ${axis}"));
+            }
+        } catch {
+            err: &BalderError => { self._status(err.msg); }
+        }
+
+        // a value refused (a dynamic plane, a hull without a model...) is written back
+        self:.refresh();
+    }
+
+    /**
+     * @returns: the row of a key, none when no schema declares it
+     * */
+    fn rowOf(self, key: [c8])-> (PropertyRow)? {
+        for r in self._rows if r.key == key { return r?; }
+        none
+    }
+
+    /**
+     * Change the scene through the editor, telling in the status bar why the change failed
+     * */
+    fn run(mut self, dmut command: &EditCommand) {
+        if let Ok(dmut e) = alias self._editor {
+            {
+                e:.execute(alias command);
+            } catch {
+                err: &BalderError => {
+                    self._status(err.msg);
+                }
+            }
+        }
+    }
+
+}
+
+/**
+ * @returns: true iif the editor changes the property of a key through a command of its own, the property having no
+ * setter
+ * */
+fn isOwnEdit(key: [c8])-> bool {
+    key == PROJECTION || key == ACTIVE || key == BODY_SHAPE || key == BODY_SIZE || key == BODY_RADIUS || key == BODY_HEIGHT
+}
+
+/**
+ * @returns: the value a change typed in a row makes of the value of a property of a node, the angles typed in degrees
+ * */
+fn changedValue(p: &NodeProperty, before: PropertyValue, c: RowChange)-> PropertyValue {
+    let typed = if p.degrees { radian(c.number) } else { c.number };
+    if c.how == CHANGE_NUMBER {
+        if p.kind == PropertyKind::COUNT { return PropertyValue::count(cast!u32((if c.number < 0.0f { 0.0f } else { c.number }) + 0.5f)); }
+        return PropertyValue::number(typed);
+    }
+
+    if c.how == CHANGE_AXIS {
+        let v = withComponent(before.vector, c.index, typed);
+        return if p.kind == PropertyKind::COLOR { PropertyValue::color(v) } else { PropertyValue::vector(v) };
+    }
+
+    if c.how == CHANGE_FLAG { return PropertyValue::flag(c.on); }
+    if c.how == CHANGE_CHOICE {
+        if cast!usize(c.index) < p.choices.len { return PropertyValue::choice(p.choices[c.index].name); }
+        return before;
+    }
+
+    if c.how == CHANGE_TEXT {
+        return if p.kind == PropertyKind::TEXTS { PropertyValue::texts(wordsOf(c.text)) } else { PropertyValue::text(c.text) };
+    }
+
+    if c.how == CHANGE_BIT { return PropertyValue::layers(withBit(before.bits, c.index, c.on)); }
+
+    before
+}
+
+/**
+ * @returns: the value of a property in words, for a row telling it: a number, a vector, yes or no, the label of a
+ * choice, a path or none
+ * */
+fn display(p: &NodeProperty, v: PropertyValue)-> [c8] {
+    match p.kind {
+        PropertyKind::NUMBER => { return decimal(if p.degrees { degree(v.number) } else { v.number }); }
+        PropertyKind::VECTOR | PropertyKind::COLOR => {
+            return f"${decimal(v.vector.x)} ${decimal(v.vector.y)} ${decimal(v.vector.z)}";
+        }
+        PropertyKind::BOOL => { return if v.flag { "yes" } else { "no" }; }
+        PropertyKind::CHOICE => {
+            if let Ok(i) = p.choiceIndex(v.text) { return p.choices[i].label; }
+            return v.text;
+        }
+        PropertyKind::TEXTS => { return joined(v.texts); }
+        PropertyKind::COUNT | PropertyKind::LAYERS => { return f"${v.bits}"; }
+        PropertyKind::NODE => { return f"#${v.node}"; }
+        _ => {}
+    }
+
+    if v.text.len != 0us { v.text } else { "none" }
+}
+
+/**
+ * @returns: the id of the widget of a group or a property, its letters in upper case, the others '_': `INNER_ANGLE`
+ * */
+fn idOf(name: [c8])-> [c8] {
+    let dmut s = copy StringStream();
+    for c in name {
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+            s:.write(toUpper(c));
+        } else {
+            s:.write('_');
+        }
+    }
+
+    s[]
+}
+
+/**
+ * @returns: a text between double quotes, as the .gui files write it, its quotes and backslashes escaped
+ * */
+fn quoted(text: [c8])-> [c8] {
+    let dmut s = copy StringStream();
+    s:.write('"');
+    for c in text {
+        if c == '"' || c == '\\' { s:.write('\\'); }
+        s:.write(c);
+    }
+
+    s:.write('"');
+    s[]
+}
+
+/**
+ * @returns: a number in decimals, without the zeros ending its fractional part
+ * */
+fn decimal(f: f32)-> [c8] {
+    let text = std::conv::to!{[c8]} (f, prec-> 4u32);
+    let mut dot = false;
+    for c in text if c == '.' { dot = true; }
+    if !dot { return text; }
+
+    let mut end = text.len;
+    while end > 0us && text[end - 1us] == '0' { end -= 1us; }
+    if end > 0us && text[end - 1us] == '.' { end -= 1us; }
+
+    let t = text[0us .. end];
+    if t == "-0" { "0" } else { t }
+}
+
+/**
+ * @returns: texts separated by spaces
+ * */
+fn joined(texts: [[c8]])-> [c8] {
+    let mut text = "";
+    for i, t in texts {
+        text = if i == 0us { t } else { text ~ " " ~ t };
+    }
+
+    text
+}
+
+/**
+ * @returns: a component of a vector, 0 for x, 1 for y, 2 for z
+ * */
+fn component(v: vec3, axis: usize)-> f32 {
+    if axis == 0us { v.x } else if axis == 1us { v.y } else { v.z }
+}
+
+/**
+ * @returns: a vector whose component along an axis is replaced
+ * @params:
+ *    - axis: 0 for x, 1 for y, 2 for z
+ * */
+fn withComponent(v: vec3, axis: u32, value: f32)-> vec3 {
+    if axis == 0u32 {
+        makeVec3(value, v.y, v.z)
+    } else if axis == 1u32 {
+        makeVec3(v.x, value, v.z)
+    } else {
+        makeVec3(v.x, v.y, value)
+    }
+}
+
+/**
+ * @returns: the words of a text, separated by spaces, tabs or commas, the tags of a marker
+ * */
+fn wordsOf(text: [c8])-> [[c8]] {
+    let mut words: [[c8]] = [];
+    let mut start = 0us;
+    for i in 0us .. text.len + 1us {
+        let end = i == text.len || text[i] == ' ' || text[i] == '\t' || text[i] == ',';
+        if end {
+            if i > start { words ~= [text[start .. i]]; }
+            start = i + 1us;
+        }
+    }
+
+    words
+}
+
+/**
+ * @returns: the edit of a body taking its shape changed, its collider built; a character keeps its capsule, only sized
+ * @params:
+ *    - change: SHAPE_KIND to SHAPE_HEIGHT
+ *    - axis: the side of a box changed
+ *    - value: the value of a side, a radius or a height
+ *    - kind: the kind of shape, for SHAPE_KIND, a hull or a mesh taking the model under the body
+ * @throws:
+ *    - &BalderError: if the body would be a dynamic plane or mesh, a hull or a mesh without a model under it, a compound
+ *                    without a volume under it, or its model cannot be read
+ * */
+fn editOf(dmut body: &PhysicsBody3D, change: u32, axis: u32, value: f32, kind: BodyShapeKind)-> BodyEdit
+    throws BalderError
+{
+    let isCharacter = if let _: &CharacterBody3D = body { true } else { false };
+    let settings = body.settings;
+    let before = body.described ?? BodyShape();
+    let mut shape = before;
+
+    if change == SHAPE_KIND && !isCharacter {
+        shape = before.withKind(kind);
+        if shape.kind == BodyShapeKind::HULL || shape.kind == BodyShapeKind::MESH {
+            shape = shape.withModel(modelUnder(alias body, body.name.file()));
+        }
+    } else if change == SHAPE_SIZE {
+        shape = BodyShape(before.kind, withComponent(before.size, axis, value), before.radius, before.height, model-> before.model);
+    } else if change == SHAPE_RADIUS {
+        shape = BodyShape(before.kind, before.size, value, before.height, model-> before.model);
+    } else if change == SHAPE_HEIGHT {
+        shape = BodyShape(before.kind, before.size, before.radius, value, model-> before.model);
+    }
+
+    let flat = shape.kind == BodyShapeKind::PLANE || shape.kind == BodyShapeKind::MESH;
+    if flat && settings.motion == BodyMotion::DYNAMIC {
+        throw copy BalderError(f"${body.name.file()}: a plane or a mesh is never dynamic");
+    }
+
+    BodyEdit(alias body, settings, shape?, body:.colliderOf(shape))
+}
+
+/**
+ * @returns: the project path of the file of the first model under a body, those under another body left out
+ * @throws:
+ *    - &BalderError: if there is none, a hull or a mesh taking the model the body moves
+ * */
+fn modelUnder(dmut node: &Node, name: [c8])-> [c8]
+    throws BalderError
+{
+    for dmut c in alias node:.getChildrenInOrder() {
+        if let m: &SolidObjectModel = c { return m.file; }
+        if let _: &PhysicsBody3D = c { continue; }
+
+        {
+            return modelUnder(alias c, name);
+        } catch {
+            _ => {}
+        }
+    }
+
+    throw copy BalderError(f"${name}: no model under the body to take its hulls or its mesh from");
+}
+
+/**
+ * @returns: bits, one of them set or cleared
+ * */
+fn withBit(bits: u32, bit: u32, on: bool)-> u32 {
+    if on { bits | (1u32 << bit) } else { bits & (u32::max ^ (1u32 << bit)) }
+}

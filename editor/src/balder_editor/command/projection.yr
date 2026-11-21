@@ -1,0 +1,160 @@
+in projection;
+
+use balder_editor::command::utils;
+use balder::math::utils;
+use balder::scene::editable;
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::camera;
+
+use std::math;
+
+/**
+ * The change of the projection of a camera, made in the inspector: the camera is replaced by a camera of the other
+ * projection, of its name, its id, its place among its siblings, its transform, its planes and the nodes under it, which
+ * sees what the camera saw at the distance of the point it looks at (see framedSize, framedFov), and becomes the active
+ * camera in its place; the new camera is selected
+ * @info: the camera replaced and its replacement are kept, the change undone putting the camera back, and redone its
+ * replacement again
+ * */
+pub class ProjectionCommand over EditCommand {
+
+    // The camera replaced
+    let dmut _camera: &Camera;
+
+    // The projection of the replacement
+    let _projection: CameraProjection;
+
+    // The camera in place of the replaced one, built the first time the command is applied
+    let dmut _replacement: (&Camera)? = none;
+
+    // The parent of the camera and its place among the children of the parent
+    let dmut _parent: (&Node)? = none;
+    let mut _place: usize = 0us;
+
+    // The nodes selected before the change, selected again when it is undone
+    let dmut _selected: [&Node3D] = [];
+
+    pub self (dmut cam: &Camera, projection: CameraProjection)
+        with _camera = alias cam
+        , _projection = projection
+    {}
+
+    pub over apply(mut self, dmut scene: &EditableScene)-> bool {
+        if self._camera.projection() == self._projection && !self._replacement.hasValue { return false; }
+
+        self._selected = alias selectedNodes(alias scene);
+        if !self._parent.hasValue {
+            self._parent = alias self._camera:.getParent();
+            self._place = self._camera.index;
+        }
+
+        let dmut parent = if let Ok(dmut p) = alias self._parent { alias p } else { return false; };
+        let dmut replacement = if let Ok(dmut r) = alias self._replacement {
+            alias r
+        } else {
+            let dmut r = alias self:.build(alias parent);
+            self._replacement = (alias r)?;
+            alias r
+        };
+
+        swap(alias scene, alias self._camera, alias replacement, alias parent, self._place);
+
+        let dmut chosen: [&Node3D] = [];
+        chosen ~= [alias replacement];
+        reselect(alias scene, alias chosen);
+        true
+    }
+
+    pub over revert(mut self, dmut scene: &EditableScene) {
+        if let Ok(dmut r) = alias self._replacement {
+            if let Ok(dmut parent) = alias self._parent {
+                swap(alias scene, alias r, alias self._camera, alias parent, self._place);
+            }
+        }
+
+        reselect(alias scene, alias self._selected);
+    }
+
+    pub over describe(self)-> [c8] {
+        let kind = if self._projection == CameraProjection::ORTHOGRAPHIC { "orthographic" } else { "perspective" };
+        f"Made ${self._camera.name.file()} ${kind}"
+    }
+
+    pub over reshapes(self)-> bool {
+        true
+    }
+
+    /**
+     * @returns: the camera of the other projection replacing the camera, detached, of its settings
+     * */
+    fn build(mut self, dmut parent: &Node)-> dmut &Camera {
+        let old = self._camera;
+        let distance = (old.target - old.position).length();
+
+        // built under the parent under another name, the camera keeping its own until it is detached
+        let name = old.name.file();
+        let dmut cam: &Camera = if self._projection == CameraProjection::ORTHOGRAPHIC {
+            let dmut o = copy OrthoCamera(name ~ "__projection", alias parent);
+            o.size = if let p: &PerspectiveCamera = old { framedSize(p.fov, distance) } else { 10.0f };
+            alias o
+        } else {
+            let dmut p = copy PerspectiveCamera(name ~ "__projection", alias parent);
+            p.fov = if let o: &OrthoCamera = old { framedFov(o.size, distance) } else { 60.0f };
+            alias p
+        };
+
+        cam.guid = old.guid;
+        cam.near = old.near;
+        cam.far = old.far;
+        cam.up = old.up;
+        cam:.setTransform(old.position, old.orientation, old.scale);
+        cam:.dispose();
+        cam:.rename(name);
+
+        alias cam
+    }
+
+}
+
+/**
+ * Put a camera in the place of another one under a parent, the nodes under the other going under it, the camera made
+ * active when the other was
+ * */
+fn swap(dmut scene: &EditableScene, dmut out: &Camera, dmut into: &Camera, dmut parent: &Node, place: usize) {
+    let wasActive = if let Ok(a) = scene:.getActiveCamera() { a is out } else { false };
+
+    let dmut children: [&Node] = [];
+    for dmut c in alias out:.getChildrenInOrder() {
+        children ~= [alias c];
+    }
+
+    out:.dispose();
+    into:.attach(alias parent, at-> place);
+    for dmut c in alias children {
+        c:.moveUnder(alias into, at-> LAST_PLACE);
+    }
+
+    if wasActive { scene:.setActiveCamera(alias into); }
+}
+
+/**
+ * @returns: the height of the view of an orthographic camera seeing at a distance what a perspective camera of a field
+ * of view sees there
+ * @params:
+ *    - fov: the field of view, in degrees
+ *    - distance: the distance, a camera looking at nothing framing 10 units
+ * */
+pub fn framedSize(fov: f32, distance: f32)-> f32 {
+    if distance <= 0.0f { return 10.0f; }
+    2.0f * distance * math::tan(radian(fov) / 2.0f)
+}
+
+/**
+ * @returns: the field of view of a perspective camera seeing at a distance what an orthographic camera of a height of
+ * view sees, in degrees
+ * */
+pub fn framedFov(size: f32, distance: f32)-> f32 {
+    if distance <= 0.0f || size <= 0.0f { return 60.0f; }
+    degree(2.0f * math::atan(size / (2.0f * distance)))
+}

@@ -1,0 +1,458 @@
+in manager;
+
+pub mod ::build_dialog;
+pub mod ::build_error_dialog;
+pub mod ::new_project;
+mod ::utils;
+
+use balder_editor::{activity, arguments, project};
+use balder_editor::manager::{build_dialog, build_error_dialog, new_project};
+use balder_editor::project::{project_editor, project_template, recent, recent_project};
+use balder::core::{_, application::_};
+use balder::interface::dialog;
+use balder::interface::widget::{button::push, table::texts, table::view, text::label};
+use balder::utils::{log, path};
+
+use std::{fs, io, time};
+
+use ::sdl3::mouse;
+
+// The template of a new project, under the directory of the editor
+def TEMPLATE = "templates/empty";
+
+// The configuration of the window of the editor, under the directory of the editor
+def EDITOR_CONFIG = "editor.toml";
+
+// The dialog showing the build of the editor of a project, under the directory of the editor
+def BUILD_DIALOG = "ui/build.gui";
+
+// The dialog telling why the build of the editor of a project failed, under the directory of the editor
+def BUILD_ERROR_DIALOG = "ui/build_error.gui";
+
+// How often the dialog of a build reads how far it is, in milliseconds
+def BUILD_REFRESH = 100u64;
+
+// The paths of the table of the projects and of the actions working on the project selected
+def PROJECTS = "BODY/PROJECTS";
+def OPEN_ACTION = "BODY/OPEN";
+def REMOVE_ACTION = "BODY/REMOVE";
+
+// The class of an action with nothing to do, greyed (see manager.style)
+def IDLE = "idle";
+
+/**
+ * The project manager of the editor of Balder, its first window, as the one of Godot or the project browser of Unreal:
+ * the projects opened last (see RecentProjects), their names, their directories and when they were opened, the one
+ * opened last first, and the actions opening one (a double click, Enter or Open), creating one from a template (New
+ * project…, see NewProjectDialog), importing one from its directory (Import…), and forgetting one (Remove from the
+ * list, its files staying where they are)
+ * @info: opening a project whose gyllir.toml declares an editor (see ProjectEditor) builds it, a dialog over the
+ * manager showing how far the build is (BuildDialog), runs it on the project and closes the manager, the actor classes of the game being linked in that editor;
+ * the project of the editor running, or one declaring no editor, is opened in this editor: its directory becomes the
+ * one the res:/ paths name (setProjectPath), the editor window opens on it and the manager closes. A project whose
+ * directory holds no project.toml any more is listed as missing
+ * */
+pub class ProjectManagerActivity over Activity {
+
+    // The rows of the table of the projects
+    let dmut _model: &TextTableModel = copy TextTableModel(headers-> copy ["Name", "Folder", "Last opened"]);
+
+    // The directories of the projects of the rows, in order
+    let mut _directories: [[c8]] = [];
+
+    // The row selected, none when no project is
+    let mut _selected: (usize)? = none;
+
+    // The status bar
+    let dmut _status: (&Label)? = none;
+
+    // True while a dialog of the manager asks something
+    let mut _asking: bool = false;
+
+    // The editor of a project being built, run once it is, none when no editor is being built
+    let dmut _building: (&ProjectEditor)? = none;
+
+    // The name of the project whose editor is being built
+    let mut _buildingName: [c8] = "";
+
+    // The dialog showing the build over the manager, and the time since it read how far the build is
+    let dmut _buildDialog: (&BuildDialog)? = none;
+    let mut _sinceRefresh: u64 = 0u64;
+
+    pub self (uid: usize, dmut app: &Application, dmut window: &Window)
+        with super(uid, alias app, alias window)
+    {}
+
+    over onStart(mut self) {
+        self.input:.quit():.connect(self.box, &self:.onQuit);
+
+        // the slots the 'on-…' attributes of manager.gui name
+        self:.slot("projects::picked", &self:.onPicked);
+        self:.slot("projects::reached", &self:.onReached);
+        self:.slot("projects::open", &self:.onOpenClicked);
+        self:.slot("projects::new", &self:.onNewClicked);
+        self:.slot("projects::import", &self:.onImportClicked);
+        self:.slot("projects::remove", &self:.onRemoveClicked);
+        self:.slot("projects::quit", &self:.onQuitClicked);
+
+        println(self.gui:.loadStyleFile(editorFile("ui/manager.style"))?);
+        println(self.gui:.loadGUIFile(editorFile("ui/manager.gui"))?);
+
+        if let Ok(dmut l: &Label) = self.gui:.find("STATUS") {
+            self._status = (alias l)?;
+        }
+
+        if let Ok(dmut t: &TableView) = self.gui:.find(PROJECTS) {
+            t:.setModel(alias self._model);
+        }
+
+        self:.refresh();
+        self.gui:.setFocus(alias self.gui:.find(PROJECTS));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PROJECTS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onPicked(mut self, rows: [usize]) {
+        self._selected = if rows.len == 1us { (rows[0])? } else { none };
+        self:.showActions();
+    }
+
+    fn onReached(mut self, row: usize) {
+        if row < self._directories.len {
+            self:.openProject(self._directories[row]);
+        }
+    }
+
+    fn onOpenClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        if let Ok(row) = self._selected {
+            self:.openProject(self._directories[row]);
+        } else {
+            self:.setStatus("Select a project to open");
+        }
+    }
+
+    fn onRemoveClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        if let Ok(row) = self._selected {
+            let directory = self._directories[row];
+            let dmut recent = copy RecentProjects();
+            recent:.remove(directory);
+            self:.saveRecent(recent);
+            self:.refresh();
+            self:.setStatus(f"Removed ${directory} from the list, its files staying where they are");
+        } else {
+            self:.setStatus("Select a project to remove from the list");
+        }
+    }
+
+    fn onQuitClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.onQuit(); }
+    }
+
+    fn onQuit(mut self) {
+        if !self._asking { self.app:.close(alias self); }
+    }
+
+    /**
+     * Run the editor being built once its build is finished, the status bar telling the error when it failed
+     * */
+    over onUpdate(mut self, delta: Duration) {
+        let mut code: (i32)? = none;
+        if let Ok(dmut e) = alias self._building {
+            code = e:.finished();
+            self._sinceRefresh += delta.allMillis;
+            if !code.hasValue && self._sinceRefresh >= BUILD_REFRESH {
+                self._sinceRefresh = 0u64;
+                let progress = e:.progress();
+                if let Ok(dmut d) = alias self._buildDialog {
+                    d:.setProgress(progress.done, progress.step);
+                }
+            }
+        }
+
+        if let Ok(c) = code {
+            self:.onEditorBuilt(c);
+        }
+    }
+
+    /**
+     * Fill the table with the recent projects, the one opened last first, none selected
+     * */
+    fn refresh(mut self) {
+        let recent = copy RecentProjects();
+        let mut rows: [[[c8]]] = [];
+        let mut dirs: [[c8]] = [];
+        for p in recent.projects {
+            rows ~= [copy [utils::nameOf(p.directory), utils::shownDirectory(p.directory), utils::openedText(p.opened)]];
+            dirs ~= [p.directory];
+        }
+
+        self._directories = dirs;
+        self._selected = none;
+        self._model:.setRows(rows);
+        if let Ok(dmut t: &TableView) = self.gui:.find(PROJECTS) {
+            t:.clearSelection();
+        }
+
+        self:.showActions();
+        if dirs.len == 0us {
+            self:.setStatus("No project yet: create one, or import the folder of one");
+        }
+    }
+
+    /**
+     * Grey the actions working on the project selected while none is
+     */
+    fn showActions(mut self) {
+        let classes = if self._selected.hasValue { copy ["action"] } else { copy ["action", IDLE] };
+        if let Ok(dmut b: &PushButton) = self.gui:.find(OPEN_ACTION) {
+            b:.setClasses(classes ~ ["primary"]);
+        }
+
+        if let Ok(dmut b: &PushButton) = self.gui:.find(REMOVE_ACTION) {
+            b:.setClasses(classes);
+        }
+    }
+
+    /**
+     * Open the editor on the project of a directory, the manager closing: the editor of the project, built first, when
+     * it declares one, this editor otherwise; the status bar tells why it cannot be opened
+     * */
+    fn openProject(mut self, directory: [c8]) {
+        if self._building.hasValue {
+            self:.setStatus(f"The editor of ${self._buildingName} is being built");
+            return;
+        }
+
+        if !Project::isProject(directory) {
+            self:.setStatus(f"No project in ${directory}: its ${Project::FILE} is missing");
+            return;
+        }
+
+        if directory != linkedProject() && ProjectEditor::has(directory) {
+            self:.buildEditor(directory);
+        } else {
+            self:.openHere(directory);
+        }
+    }
+
+    /**
+     * Build the editor of a project, in the background, the manager running it once it is built (see onUpdate), or run
+     * it right away when it is newer than its sources
+     * */
+    fn buildEditor(mut self, directory: [c8]) {
+        {
+            let name = Project::open(directory).name;
+            let dmut e = copy ProjectEditor(directory);
+            self._building = (alias e)?;
+            self._buildingName = name;
+            if e.isUpToDate() {
+                self:.onEditorBuilt(0);
+                return;
+            }
+
+            e:.build();
+            self:.setStatus(f"Building the editor of ${name}…");
+
+            // the manager takes no click while the dialog is open
+            let dmut d = copy BuildDialog(editorFile(BUILD_DIALOG), name);
+            d:.open(DialogMode::OVERLAY, alias self.gui);
+            self._buildDialog = (alias d)?;
+            self._sinceRefresh = 0u64;
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to build the editor of the project", err);
+                self:.setStatus(err.msg);
+            }
+        }
+    }
+
+    /**
+     * The editor of a project is built, or failed to: it runs on the project, the manager closing, or the status bar
+     * tells the first error of the build
+     * @params:
+     *    - code: the exit code of the build
+     * */
+    fn onEditorBuilt(mut self, code: i32) {
+        let name = self._buildingName;
+        if let Ok(dmut d) = alias self._buildDialog {
+            d:.close();
+        }
+
+        self._buildDialog = none;
+        if let Ok(e) = self._building {
+            self._building = none;
+            if code == 127 {
+                self:.setStatus(f"The editor of ${name} could not be built: gyllir is not found");
+                return;
+            }
+
+            if code != 0 {
+                self:.onEditorFailed(e, name);
+                return;
+            }
+
+            {
+                e.run();
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "Failed to run the editor of the project", err);
+                    self:.setStatus(err.msg);
+                    return;
+                }
+            }
+
+            self.app:.close(alias self);
+        }
+    }
+
+    /**
+     * The editor of a project did not build: the status bar tells its first error, and a dialog shows it as the compiler
+     * wrote it, with the buttons opening the file of all the errors and the whole output of the build
+     * */
+    fn onEditorFailed(mut self, e: &ProjectEditor, name: [c8]) {
+        let errors = e.errors();
+        let first = if errors.len != 0us { errors[0] } else { "" };
+        let summary = ProjectEditor::summary(first);
+        log::error #("Editor", f"The editor of ${name} did not build, see ${e.log}: ${summary}");
+        self:.setStatus(if summary.len != 0us { f"The editor of ${name} did not build: ${summary}" }
+                        else { f"The editor of ${name} did not build, see ${e.log}" });
+
+        let mut file = "";
+        {
+            file = e.writeErrors(errors);
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to write the errors of the build", err);
+            }
+        }
+
+        // it answers nothing: the manager is not asking while it is open, its overlay taking the clicks
+        {
+            let dmut d = copy BuildErrorDialog(editorFile(BUILD_ERROR_DIALOG), name, first, file, e.log);
+            d:.open(DialogMode::OVERLAY, alias self.gui);
+        } catch {
+            err => {
+                log::error #("Editor", "Failed to open the dialog of the errors of the build", err);
+            }
+        }
+    }
+
+    /**
+     * Open this editor on the project of a directory, the manager closing
+     * */
+    fn openHere(mut self, directory: [c8]) {
+        {
+            Project::open(directory);
+            setProjectPath(Path(directory));
+            self.app:.open!{&EditorActivity}(copy BalderConfig(editorFile(EDITOR_CONFIG)));
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to open the project", err);
+                self:.setStatus(err.msg);
+                return;
+            }
+        }
+
+        self.app:.close(alias self);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DIALOGS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Ask for the name and the location of a new project, proposing the location of the last one created
+     */
+    fn onNewClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let recent = copy RecentProjects();
+        let location = if recent.location.len != 0us { recent.location } else { utils::homeDirectory() };
+        let origin = copy ProjectTemplate(editorFile(TEMPLATE));
+        let dmut d = copy NewProjectDialog(editorFile("ui/new_project.gui"), origin, location);
+        d:.answered():.connect(self.box, &self:.onProjectCreated);
+        self:.openDialog(alias d);
+    }
+
+    /**
+     * A project is created: its location is proposed for the next one, and it is opened
+     * */
+    fn onProjectCreated(mut self, directory: ([c8])?) {
+        self._asking = false;
+        if let Ok(dir) = directory {
+            let dmut recent = copy RecentProjects();
+            recent:.setLocation(Path(dir).parent().toStr());
+            self:.saveRecent(recent);
+            self:.openProject(dir);
+        }
+    }
+
+    /**
+     * Ask for the directory of a project to open, the manager listing it from now on
+     */
+    fn onImportClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let recent = copy RecentProjects();
+        let location = if recent.location.len != 0us { recent.location } else { utils::homeDirectory() };
+        let dmut d = copy FileDialog(FileDialogMode::DIRECTORY, directory-> location, title-> "Import a project");
+        d:.answered():.connect(self.box, &self:.onImportChosen);
+        self:.openDialog(alias d);
+    }
+
+    fn onImportChosen(mut self, directory: ([c8])?) {
+        self._asking = false;
+        if let Ok(dir) = directory {
+            self:.openProject(dir);
+        }
+    }
+
+    /**
+     * Open a dialog over the manager, the manager asking something until its answer
+     * */
+    fn openDialog(mut self, dmut d: &Dialog) {
+        {
+            d:.open(DialogMode::OVERLAY, alias self.gui);
+            self._asking = true;
+        } catch {
+            err => {
+                log::error #("Editor", "Failed to open the dialog", err);
+                self:.setStatus("The dialog could not be opened");
+            }
+        }
+    }
+
+    /**
+     * Write the recent projects, the status bar telling when they cannot be
+     * */
+    fn saveRecent(mut self, recent: &RecentProjects) {
+        {
+            recent.save();
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to save the recent projects", err);
+                self:.setStatus(err.msg);
+            }
+        }
+    }
+
+    fn setStatus(mut self, msg: [c8]) {
+        if let Ok(dmut status) = alias self._status {
+            status:.setText(msg);
+        }
+    }
+}

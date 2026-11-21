@@ -14,7 +14,8 @@ target/bin/balder-editor --engine-dir path/to/balder           # run from elsewh
 
 | Directory | Holds |
 |---|---|
-| `editor/src` | the sources, the target `editor` of `gyllir.toml` (built as `balder-editor`) |
+| `editor/src` | the sources, the library `balder_editor` (the target `balder-editor` of `gyllir.toml`, built as `libBalderEditor.a`), its entry `runEditor` |
+| `editor/bin` | the `main` of Balder's own editor, the target `editor` (built as `balder-editor`) |
 | `editor/ui` | the `.gui` and the `.style` files of its interface |
 | `editor/templates` | the templates a new project starts from (`empty`) |
 | `editor/editor.toml`, `editor/manager.toml` | the configurations of the window of the editor and of the project manager |
@@ -26,9 +27,10 @@ A project is a game made with Balder, a directory as Godot or Unreal have one:
 ```
 my_game/
     project.toml             # its name, its scenes by name, the scene the game starts with
-    gyllir.toml              # the library of the game, depending on Balder
+    gyllir.toml              # the library of the game, and the editor of the project, depending on Balder
     gyllir.toml.override     # the link of Balder to the engine of the editor, local, ignored by git
-    src/my_game.yr           # the root module of the library: the actor classes, later on (BAL-128)
+    src/my_game.yr           # the root module of the library: its actor classes
+    editor/main.yr           # the main of the editor of the project, the library of the game linked in
     res/scenes/main.scene    # its files, named res:/… (scenes, models, textures...)
     .gitignore
 ```
@@ -46,6 +48,15 @@ The scenes are named, the game loading a scene by its name and the export knowin
 no `main`: its library holds what the game adds to the engine, and the export (BAL-138) builds the executable around
 it, as Unreal's launcher module runs the module of a game.
 
+- **The editor of a project.** The `gyllir.toml` of a project declares two targets: the library of the game
+  (`my_game`, in `target/lib`), its actor classes (see `doc/actors.md`), and `editor` (`my_game-editor`, in
+  `target/bin`), an executable linking the library of the editor (`balder_editor`) and the library of the game, whose
+  main runs the editor (`runEditor (args, ".", ".deps/Balder")`): the project its own, the engine the one it was built
+  against. The library of a game is linked whole (gyllir builds a library as one object), so the `#[actor]` tags of its
+  classes register them at the start of the program without the main naming them; that is how the editor knows the
+  actor classes of the game, gyllir having no shared library to load them. Balder's own editor (`target/bin/balder-editor`)
+  has none: it opens a project in its window when the project declares no editor, the actors of its scenes kept as
+  unknown ones.
 - **Paths.** `res:/` names the files of the project (`setProjectPath`), `engine:/` and `shaders:/` the files of the
   engine (`setEnginePath`): its shaders, the files of its dialogs, its fonts, its images and its tables of colours. The
   two are the same directory unless one moves, the examples and the tests running from the engine's directory; the
@@ -55,7 +66,19 @@ it, as Unreal's launcher module runs the module of a game.
   its files.
 - **The project manager** (`ProjectManagerActivity`) is the first window: the projects opened last, their names, their
   folders and when they were opened, the one opened last first (a project whose `project.toml` is gone listed as
-  missing). A double click, Enter or *Open* opens one, the manager closing for the editor window; *New project…* asks
+  missing). A double click, Enter or *Open* opens one: a project declaring an editor has it built in the background
+  (`gyllir build editor -v` in its folder, its output in `.target/editor-build.log`, `ProjectEditor`), unless the
+  editor is newer than every source it is built from, then run on the project, the manager closing its window and
+  waiting for the editor, so that the terminal it was started from stays with it. While the build runs, a dialog over
+  the manager, which takes no click meanwhile, fills a bar as far as the build is and tells its step, the target
+  compiled and its modules (`BuildDialog`, `BuildProgress`: the steps of the last build, in
+  `.target/editor-build.steps`, tell how many to expect); the build is not cancelled, Escape leaving the dialog open. A
+  build that fails closes the dialog and leaves the manager open, the status bar telling the first error of the
+  compiler and where it is, and a dialog showing that error as the compiler wrote it, its place and its code
+  (`BuildErrorDialog`), with buttons opening, in the application of the desktop (`xdg-open`), the file of all the
+  errors of the build, plain (`.target/editor-build-errors.txt`), and its whole output. The project of the editor
+  running, and a project declaring no editor, open in the window of the manager, the manager closing for the editor
+  window (`linkedProject`). *New project…* asks
   for a name and a location, and creates the project in a new folder of the location named after it (`My Game` in
   `my_game`) from the template `editor/templates/empty` (`ProjectTemplate`: `{{name}}` and `{{package}}` filled in the
   names and the contents of its files, a name starting with `_` starting with a dot, the scenes given ids of their
@@ -164,6 +187,12 @@ it, as Unreal's launcher module runs the module of a game.
   layer of the debug lines of the scene (*Show the hulls* hides them). The editor does not decompose the models: the
   export of a project will (BAL-138), the `decompose` tool meanwhile; a model without hulls saved gives a body the hull
   of each of its meshes (`SolidObjectModel::hulls`) (`HullsPanel`).
+- **Connections**: an actor has a panel of the connections of its signals to the slots of the actors of the scene
+  (`ConnectionsPanel`, `Node3D.connections`), which the game makes as it builds the scene (`connectActors`), the editor
+  only keeping them: a table of the connections (the signal, the actor receiving it, by its path, and its slot, an actor
+  no longer in the scene told missing), *Remove the connection* removing the one picked in the table, and *Connect*
+  making the one chosen below it: a signal of the actor (its payload told), an actor of the scene having a slot taking
+  that payload (the actor itself among them), and one of those slots. A connection made twice is refused.
 - **Menus**: *Scene* opens a new scene or a scene file, saves the scene (Ctrl+S) or saves it in another file
   (Ctrl+Shift+S), and goes back to the project manager, *Add* adds a cube, a sphere, a plane, a model read from a
   file, an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
@@ -171,6 +200,9 @@ it, as Unreal's launcher module runs the module of a game.
   a camera where the eye of the viewport stands, looking where it looks, a point to the path selected, or a body around
   each node selected, its kinds grouped in submenus opening as they are hovered (*Mesh*, *Light*, *Marker*, *Path*,
   *Volume*, *Physics*, *Camera*), and Ctrl+E opening it under the cursor,
+  then a submenu per category of the actor classes of the game (`#[actor (category-> "Gameplay")]`, *Actors* by
+  default), listing its classes by their labels, each adding an actor of its properties' defaults where a cube goes
+  (none in Balder's own editor),
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
   frames the selection, and *View* hides or shows the icons and the grid, and looks through the camera selected.
 - **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
@@ -225,6 +257,7 @@ executed after commands undone drops them; an open starts the history again (`st
 | `ReparentCommand` | nodes and the nodes under them moved under another parent or among their siblings, dropped in the outline | moving them back to their parents, places, names and transforms |
 | `WrapCommand` | nodes put under new bodies at their places, of shapes fitted to them, a volume turned into a trigger, the bodies selected | the nodes moved back to their parents, places and transforms, the bodies detached |
 | `DuplicateCommand` | copies of nodes beside them, sharing the geometry of their meshes, selected | detaching the copies |
+| `ConnectionsCommand` | the connections of the signals of an actor, one made or removed in the inspector | the connections before |
 | `OpenCommand` | the nodes of the scene replaced by those of a scene file | attaching the nodes replaced again |
 
 ## Property schemas
@@ -291,7 +324,19 @@ node #0c203f1a-b872-4e76-b3e0-0c7c95e00c74 model "table" {
 
 A node is `node #<id> <kind> "<name>" { … }`, the kind being `empty`, `model`, `cube`, `sphere`, `plane`, `light`,
 `marker`, `path`, `path-point`, `volume`, `body`, `character` or `camera`, the points of a path being the `path-point` nodes
-under it, in their order, the parts of a compound body the `volume` nodes under it.
+under it, in their order, the parts of a compound body the `volume` nodes under it, or the type of an actor class
+(see `doc/actors.md`): its entries are its transform, its properties (`#[export]`) and the connections of its signals,
+`on-<signal>: #<id of the actor receiving it> <slot>;`, one line per connection:
+
+```
+node #22222222-2222-4222-8222-222222222222 lever "lever" {
+    position: 4 0 0;
+    on-pressed: #11111111-1111-4111-8111-111111111111 open;
+}
+```
+
+A node of a class the program does not know (a scene of a game opened in Balder's own editor) is kept as an
+`UnknownActor`, an empty of its transform, its other entries and its connections written back as they were read.
 Its id (`Node3D.guid`) is a uuid it keeps from one save to the next, and the nodes under another name it as their
 `parent`, so the file stays flat however deep the tree is: moving a node under another parent changes one line, and a
 node is named by its id rather than by its path. The blocks may come in any order; among siblings, the order of the file

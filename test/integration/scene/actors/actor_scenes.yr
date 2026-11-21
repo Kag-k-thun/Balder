@@ -1,0 +1,178 @@
+in actor_scenes;
+
+use balder::core::error;
+use balder::core::application::signal;
+use balder::math::vector;
+use balder::scene::description::_;
+use balder::scene::actors::{node_connection, unknown_actor, wiring};
+use balder::scene::node::node3D;
+use balder::scene::property::value;
+
+use integration::scene::actors::fixtures;
+use integration::utils::{compare, root};
+
+use std::{fs, uuid};
+
+// The ids of the nodes of the files of the tests
+def DOOR   = "11111111-2222-4333-8444-555555555555";
+def SWITCH = "22222222-3333-4444-8555-666666666666";
+def VAULT  = "33333333-4444-4555-8666-777777777777";
+def LAMP   = "44444444-5555-4666-8777-888888888888";
+
+/**
+ * A door, a switch under it connected to the door and to a vault, the vault, then a node of a class the program does not know
+ * */
+def LEVEL = "scene 1;\n"
+    ~ "\nnode #" ~ DOOR ~ " test-door \"door\" {\n"
+    ~ "    position: 1 0 0;\n"
+    ~ "    speed: 4.5;\n"
+    ~ "    tint: 0 1 0;\n"
+    ~ "    opening: swing;\n"
+    ~ "    label: \"gate\";\n"
+    ~ "    partner: #" ~ VAULT ~ ";\n"
+    ~ "}\n"
+    ~ "\nnode #" ~ SWITCH ~ " test-switch \"lever\" {\n"
+    ~ "    parent: #" ~ DOOR ~ ";\n"
+    ~ "    on-pressed: #" ~ DOOR ~ " open #" ~ VAULT ~ " alarm;\n"
+    ~ "    on-struck: #" ~ VAULT ~ " take-hit;\n"
+    ~ "}\n"
+    ~ "\nnode #" ~ VAULT ~ " test-vault \"vault\" {\n"
+    ~ "    locked: true;\n"
+    ~ "    code: \"1234\";\n"
+    ~ "}\n"
+    ~ "\nnode #" ~ LAMP ~ " old-lamp \"lamp\" {\n"
+    ~ "    position: 0 2 0;\n"
+    ~ "    glow: 0.5 0.5 0.5;\n"
+    ~ "    names: \"a\" \"b\";\n"
+    ~ "    on-lit: #" ~ DOOR ~ " open;\n"
+    ~ "}\n";
+
+/**
+ * @returns: the message of the error reading a scene file throws, empty when it reads it
+ * */
+fn errorOf(content: [c8])-> [c8] {
+    {
+        SceneDescription(content);
+        ""
+    } catch {
+        err: &BalderError => { err.msg }
+    }
+}
+
+/**
+ * @returns: true iif a text holds another one
+ * */
+fn holds(text: [c8], part: [c8])-> bool {
+    if part.len > text.len { return false; }
+    for i in 0us ... text.len - part.len {
+        if text[i .. i + part.len] == part { return true; }
+    }
+
+    false
+}
+
+fn id(text: [c8])-> Uuid {
+    {
+        return std::uuid::to!{Uuid} (text);
+    } catch {
+        _ => {}
+    }
+
+    Uuid::nil()
+}
+
+__test a_scene_file_gives_an_actor_its_properties_and_the_connections_of_its_signals {
+    let nodes = (copy SceneDescription(LEVEL)).nodes;
+    assert (nodes.len == 3us);
+
+    let door = nodes[0];
+    assert (door.kind == NodeKind::ACTOR && door.className == "test-door" && door.typeName() == "test-door");
+    assert (door.value("speed") == PropertyValue::number(4.5f) && door.value("opening") == PropertyValue::choice("swing"));
+    assert (door.value("label") == PropertyValue::text("gate") && door.value("key-count") == PropertyValue::count(1u32));
+    assert (door.value("partner") == PropertyValue::node(id(VAULT)));
+
+    let lever = door.children[0];
+    assert (lever.className == "test-switch" && lever.connections.len == 3us);
+    assert (lever.connections[0].signal == "pressed" && lever.connections[0].slot == "open" && lever.connections[0].target.opCmp(id(DOOR)) == 0);
+    assert (lever.connections[1].slot == "alarm" && lever.connections[2].signal == "struck" && lever.connections[2].slot == "take-hit");
+}
+
+__test an_actor_of_a_class_the_program_does_not_know_keeps_its_entries_as_they_are_written {
+    let nodes = (copy SceneDescription(LEVEL)).nodes;
+    let lamp = nodes[2];
+    assert (lamp.kind == NodeKind::ACTOR && lamp.className == "old-lamp" && lamp.typeName() == "old-lamp");
+    assert (near(lamp.value("position").vector, makeVec3(0.0f, 2.0f, 0.0f)));
+    assert (lamp.entries.len == 2us && lamp.entries[0]._0 == "glow" && lamp.entries[0]._1 == "0.5 0.5 0.5");
+    assert (lamp.entries[1]._1 == "\"a\" \"b\"" && lamp.connections.len == 1us && lamp.connections[0].signal == "lit");
+}
+
+__test a_scene_of_actors_is_written_back_as_it_is_read {
+    let content = (copy SceneDescription(LEVEL)).content();
+    assert (content == LEVEL);
+}
+
+__test the_actors_are_built_with_their_values_and_saved_back {
+    let dmut root = copy Root();
+    let dmut built = alias (copy SceneDescription(LEVEL)).build(alias root);
+    assert (built.len == 3us);
+
+    if let d: &TestDoor = built[0] {
+        assert (d.speed() == 4.5f && d.opening == Opening::SWING && d.label == "gate" && d.labelSet == 1u32);
+        assert (d.guid.opCmp(id(DOOR)) == 0);
+    } else { assert (false); }
+
+    if let l: &UnknownActor = built[2] {
+        assert (l.className == "old-lamp" && l.entries.len == 2us && l.connections.len == 1us);
+    } else { assert (false); }
+
+    let back = (copy SceneDescription(alias root)).content();
+    assert (back == LEVEL);
+}
+
+__test the_connections_of_a_scene_file_are_made_once_built {
+    let dmut root = copy Root();
+    let dmut built = alias (copy SceneDescription(LEVEL)).build(alias root);
+    let dmut box = copy SlotEmitter();
+    let errors = connectActors(alias built, alias root, alias box);
+    assert (errors.len == 1us && holds(errors[0], "'old-lamp' is unknown"));
+
+    let dmut door = alias built[0];
+    let dmut vault = alias built[1];
+    let dmut lever = if let Ok(dmut l) = alias door:.find(Path("lever")) { alias l } else { assert (false); };
+    if let dmut s: &TestSwitch = alias lever {
+        s.pressed:.emit();
+        s:.struckSignal():.emit(5.0f);
+    } else { assert (false); }
+
+    box:.emit();
+    if let d: &TestDoor = door { assert (d.opened); } else { assert (false); }
+    if let v: &TestVault = vault { assert (v.alarms == 1u32 && v.hits == 5.0f); } else { assert (false); }
+}
+
+__test the_errors_of_the_connections_tell_where_and_why {
+    let head = "scene 1;\nnode #" ~ DOOR ~ " test-door \"door\" {}\nnode #" ~ LAMP ~ " light \"lamp\" {}\nnode #" ~ SWITCH ~ " test-switch \"lever\" {\n";
+    let cases = copy [
+        (head ~ "    on-ring: #" ~ DOOR ~ " open;\n}\n", "scene:5:5: test-switch 'lever' has no signal 'ring'"),
+        (head ~ "    on-pressed: #" ~ DOOR ~ ";\n}\n", "on-pressed must be the nodes and the slots it is connected to"),
+        (head ~ "    on-pressed: open #" ~ DOOR ~ ";\n}\n", "on-pressed, the id of a node"),
+        (head ~ "    on-pressed: #" ~ VAULT ~ " open;\n}\n", "scene:5:55: test-switch 'lever' connects pressed to #" ~ VAULT ~ ", no node of the file"),
+        (head ~ "    on-pressed: #" ~ LAMP ~ " open;\n}\n", "connects pressed to light 'lamp', which has no slot"),
+        (head ~ "    on-pressed: #" ~ DOOR ~ " ring;\n}\n", "connects pressed to test-door 'door', which has no slot 'ring'"),
+        (head ~ "    on-pressed: #" ~ DOOR ~ " take-hit;\n}\n", "connects pressed, which gives (), to the slot 'take-hit' of test-door 'door', which takes (f32)"),
+        (head ~ "    speed: 2;\n}\n", "test-switch 'lever' has no entry 'speed'"),
+        ("scene 1;\nnode #" ~ DOOR ~ " empty \"door\" {\n    on-pressed: #" ~ DOOR ~ " open;\n}\n", "empty 'door' has no entry 'on-pressed'")
+    ];
+
+    for c in cases if !holds(errorOf(c._0), c._1) {
+        std::io::println("expected '", c._1, "', got '", errorOf(c._0), "'");
+        assert (false);
+    }
+}
+
+__test a_description_of_an_actor_starts_with_the_defaults_of_its_class {
+    let d = NodeDescription::actor("door", "test-door");
+    assert (d.kind == NodeKind::ACTOR && d.value("speed") == PropertyValue::number(2.0f) && d.value("tint") == PropertyValue::color(makeVec3(1.0f, 0.5f, 0.0f)));
+
+    let u = NodeDescription::actor("lamp", "old-lamp");
+    assert (u.schema().properties.len == 3us && u.schema().noun == "old-lamp");
+}
