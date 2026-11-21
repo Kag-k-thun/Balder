@@ -1,0 +1,539 @@
+in model_file;
+
+use balder::math::_;
+use balder::core::error;
+use balder::scene::animation::{skeleton, skin, utils};
+use balder::scene::asset::{assets, material_asset, sub_mesh};
+use balder::scene::node::node3D::visual::{_, material::_};
+use balder::utils::log;
+
+use ::assimp::_;
+
+use ::std::{conv, fs};
+
+/**
+ * @returns: the mesh asset of a model file (see MeshAsset::read)
+ * */
+pub fn read(path: [c8], lods: bool)-> dmut &MeshAsset
+    throws BalderError
+{
+    let dmut file = copy ModelFile(path, lods);
+    file:.load();
+    file:.asset()
+}
+
+/**
+ * The reading of a model file through assimp into the parts of a mesh asset and the materials embedded in it
+ * @info: the transformations of the nodes of a rigid model are applied to its meshes, merged by material; the meshes of
+ * a skinned model keep their bones, which pre-transforming them would drop, a skeleton giving the joints moving them;
+ * the whole model is scaled and moved into the unit box standing on its origin
+ * */
+class ModelFile {
+
+    // The project path of the file
+    let _path: [c8];
+
+    // True to build the levels of detail of the parts
+    let _lods: bool;
+
+    // The joints of the model when its meshes are skinned, none for a rigid model
+    let mut _skeleton: (&Skeleton)? = none;
+
+    // The materials of the file, in its order
+    let dmut _materials: [&MaterialAsset] = [];
+
+    // The parts read, in the order of the nodes of the file
+    let dmut _parts: [SubMesh] = [];
+
+    pub self (path: [c8], lods: bool)
+        with _path = path
+        , _lods = lods
+    {}
+
+    /**
+     * @returns: the asset of the parts and of the materials read
+     * */
+    pub fn asset(mut self)-> dmut &MeshAsset {
+        copy MeshAsset(self._path, alias self._parts, lods-> self._lods, materials-> alias self._materials,
+                       skeleton-> self._skeleton)
+    }
+
+    /**
+     * Read the materials and the meshes of the file
+     * */
+    pub fn load(mut self)
+        throws BalderError
+    {
+        let filePath = balder::utils::path::projectPath(self._path);
+
+        unsafe {
+            let mut sceneAI = importFile(filePath.toStr(),
+                                         aiPostProcessSteps::TargetRealtime_Quality
+                | aiPostProcessSteps::ConvertToLeftHanded);
+
+            if sceneAI == null {
+                throw copy BalderError("Failed to load model from file " ~ filePath.toStr());
+            }
+
+            {
+                let skinned = self.hasBones(sceneAI);
+                if !skinned {
+                    sceneAI = aiApplyPostProcessing(sceneAI, aiPostProcessSteps::PreTransformVertices);
+                    if sceneAI == null {
+                        throw copy BalderError("Failed to load model from file " ~ filePath.toStr());
+                    }
+                }
+
+                let dir = filePath.parent();
+                let (mins, maxs) = self.computeMinMax(sceneAI.rootNode(), sceneAI, mat4());
+                let dimension = (maxs - mins);
+                let centroid = (maxs + mins) / 2.0f;
+
+                let s = std::algorithm::comparison::max(std::algorithm::comparison::max(dimension.x, dimension.y), dimension.z);
+                let scale = makeVec3(1.0f / s, 1.0f / s, 1.0f / s);
+                let position = makeVec3(-centroid.x, -mins.y, -centroid.z);
+
+                let loadTransform = math::utils::scaling(scale) *
+                    math::utils::translation(position);
+
+                if skinned {
+                    self._skeleton = (copy Skeleton(sceneAI, loadTransform))?;
+                }
+
+                for i in 0u32 .. sceneAI.numMaterials() {
+                    self._materials ~= [self.readMaterial(sceneAI.materials() [i], cast!usize(i), dir)];
+                }
+
+                self:.processSolidNode(sceneAI.rootNode(), sceneAI, loadTransform, mat4());
+            } exit {
+                aiReleaseImport(sceneAI);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          BOUND COMPUTATIONS          ===============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif a mesh of the scene has bones
+     * */
+    @unsafe
+    fn hasBones(self, scene: *aiScene)-> bool {
+        for i in 0u32 .. (*scene).mNumMeshes {
+            if scene.meshes() [i].numBones() > 0u32 {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /**
+     * Compute the bounds of the scene
+     * @params:
+     *    - parent: the transformation of the parent of the node in the scene
+     * @returns:
+     * - 0: the minimum bound
+     * - 1: the maximum bound
+     */
+    @unsafe
+    fn computeMinMax(self, node: *aiNode, scene: *aiScene, parent: mat4)-> (vec3, vec3) {
+        let placement = parent * toMat4(node.transformation());
+        let mut min = vec3(), mut max = vec3();
+        for i in 0 .. node.numMeshes() {
+            // a node gives the indices of its meshes in the meshes of the scene
+            let mesh = scene.meshes() [node.meshes() [i]];
+            let (aux_min, aux_max) = self.computeMinMax(mesh, placement);
+            min = self.updateMin(min, aux_min);
+            max = self.updateMax(max, aux_max);
+        }
+
+        for i in 0 .. (*node).mNumChildren {
+            let child = node.children() [i];
+            let (aux_min, aux_max) = self.computeMinMax(child, scene, placement);
+            min = self.updateMin(min, aux_min);
+            max = self.updateMax(max, aux_max);
+        }
+
+        (min, max)
+    }
+
+    /**
+     * Compute the bound of a mesh
+     * @params:
+     *    - placement: the transformation of the node of the mesh in the scene
+     */
+    @unsafe
+    fn computeMinMax(self, mesh: *aiMesh, placement: mat4)-> (vec3, vec3) {
+        let mut min = vec3(), mut max = vec3();
+        for i in 0u32 .. mesh.numVertices() {
+            let v = mesh.vertices() [i];
+            let p = (placement * makeVec4(v.x, v.y, v.z, 1.0f)).xyz;
+            min = self.updateMin(min, p);
+            max = self.updateMax(max, p);
+        }
+
+        (min, max)
+    }
+
+    /**
+     * @returns: the minimum between the two vectors (field by field)
+     */
+    fn updateMin {T} (self, min: vec3, aux: T)-> vec3 {
+        let min_x = if (min.x > aux.x) { aux.x } else { min.x };
+        let min_y = if (min.y > aux.y) { aux.y } else { min.y };
+        let min_z = if (min.z > aux.z) { aux.z } else { min.z };
+
+        makeVec3(min_x, min_y, min_z)
+    }
+
+    /**
+     * @returns: the maximum between the two vectors (field by field)
+     */
+    fn updateMax {T} (self, max: vec3, aux: T)-> vec3 {
+        let max_x = if (max.x < aux.x) { aux.x } else { max.x };
+        let max_y = if (max.y < aux.y) { aux.y } else { max.y };
+        let max_z = if (max.z < aux.z) { aux.z } else { max.z };
+
+        makeVec3(max_x, max_y, max_z)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          LOADING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the meshes of a node and of its children into parts
+     * @params:
+     *    - loadTransform: the transformation placing the scene in the unit box of the model
+     *    - parent: the transformation of the parent of the node in the scene
+     * */
+    @unsafe
+    fn processSolidNode(mut self, node: *aiNode, scene: *aiScene, loadTransform: mat4, parent: mat4)
+        throws BalderError
+    {
+        let nodeTransform = parent * toMat4(node.transformation());
+        for i in 0 .. node.numMeshes() {
+            // a node gives the indices of its meshes in the meshes of the scene
+            let mesh = scene.meshes()[node.meshes()[i]];
+            self:.processSolidMesh(mesh, loadTransform, nodeTransform);
+        }
+
+        for i in 0 .. (*node).mNumChildren {
+            let child = node.children()[i];
+            self:.processSolidNode(child, scene, loadTransform, nodeTransform);
+        }
+    }
+
+    /**
+     * Read a mesh into a part, drawn by default with the material of the file it names, and build its levels of detail
+     * @params:
+     *    - loadTransform: the transformation placing the scene in the unit box of the model
+     *    - nodeTransform: the transformation of the node of the mesh in the scene
+     * */
+    @unsafe
+    fn processSolidMesh(mut self, mesh: *aiMesh, loadTransform: mat4, nodeTransform: mat4)
+        throws BalderError
+    {
+        let material = if cast!usize(mesh.materialIndex()) < self._materials.len {
+            self._materials[mesh.materialIndex()]
+        } else {
+            copy MaterialAsset(MaterialAsset::DEFAULT, "default")
+        };
+
+        let textured = mesh.numUVComponents(0) != 0;
+        let array = self.loadSolidMeshVertices(mesh, loadTransform, nodeTransform);
+        let mut skin: (Skin)? = none;
+        if let Ok(skeleton) = self._skeleton {
+            if mesh.numBones() > 0u32 {
+                skin = (Skin(mesh, skeleton, loadTransform * nodeTransform))?;
+            }
+        }
+
+        let dmut indices = copy [0u32 ; 3 * mesh.numFaces()];
+
+        for i in 0u32 .. mesh.numFaces() {
+            let face = mesh.faces() [i];
+            if (face.mNumIndices != 3u32) throw copy BalderError("Object is not triangulated");
+            for j in 0u32 .. 3u32 {
+                indices[i * 3u32 + j] = face.mIndices[j];
+            }
+        }
+
+        let aiName = mesh.name();
+        let name = if aiName.len != 0u32 { copy aiName.data[0 .. aiName.len] } else { f"mesh_${self._parts.len}" };
+
+        // the vertices welded as the shader of the material of the part reads them
+        let chain = if self._lods {
+            let vertices = array.compactVertices(material.instance(textured).shaderConfig, forShadow-> false);
+            let welded = weldVertices(indices, vertices, vertices.len / array.positions.len);
+            buildLodChain(array.positions, welded)
+        } else { LodChain(indices) };
+        log::debug #("MeshAsset", self._path, name, "has", chain.levels.len, "levels of detail");
+
+        self._parts ~= [SubMesh(name-> name, geometry-> copy MeshGeometry(array, chain, skin-> skin), material-> material,
+                                textured-> textured)];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          MATERIAL          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the material asset of a material of the file, embedded in the mesh asset: its factors and the paths of
+     * its maps; the material the cache holds under its path when the file was read before (with or without its levels
+     * of detail), the material read put in the cache otherwise, so that one material stands for it
+     * @params:
+     *    - index: the index of the material among those of the file
+     *    - dir: the directory of the file, the paths of the maps relative to it
+     * */
+    @unsafe
+    fn readMaterial(self, mat: *aiMaterial, index: usize, dir: Path)-> dmut &MaterialAsset {
+        let path = MaterialAsset::embeddedPath(self._path, index);
+        if let Ok(dmut cached) = alias Assets::cachedMaterial(path) { return alias cached; }
+
+        // the slots of the maps, by preference: assimp gives the occlusion of glTF as a lightmap
+        let baseColor = copy [aiTextureType::BASE_COLOR, aiTextureType::DIFFUSE];
+        let occlusion = copy [aiTextureType::AMBIENT_OCCLUSION, aiTextureType::LIGHTMAP];
+        let emissive = copy [aiTextureType::EMISSIVE, aiTextureType::EMISSION_COLOR];
+
+        let maps = MaterialMaps(baseColor-> self.texturePath(mat, dir, baseColor),
+                                metallicRoughness-> self.metallicRoughnessPath(mat, dir),
+                                normal-> self.texturePath(mat, dir, copy [aiTextureType::NORMALS]),
+                                occlusion-> self.texturePath(mat, dir, occlusion),
+                                emissive-> self.texturePath(mat, dir, emissive));
+
+        let aiName = mat.name();
+        let name = if aiName.len != 0u32 { copy aiName.data[0 .. aiName.len] } else { f"material ${index}" };
+        let dmut read = copy MaterialAsset(path, name, config-> self.readConfig(mat), maps-> maps);
+        Assets::register(alias read);
+        alias read
+    }
+
+    /**
+     * @returns: the path of the map of a material holding its roughness in green and its metalness in blue, empty when
+     * it has none
+     * @info: assimp gives the map of glTF its own slot, and the same file as the metalness and the roughness maps; two
+     * different files there are not packed that way, and are not read
+     * */
+    fn metallicRoughnessPath(self, mat: *aiMaterial, dir: Path)-> [c8] {
+        let packed = self.texturePath(mat, dir, copy [aiTextureType::GLTF_METALLIC_ROUGHNESS]);
+        if packed != "" {
+            return packed;
+        }
+
+        let metalness = self.texturePath(mat, dir, copy [aiTextureType::METALNESS]);
+        if metalness == self.texturePath(mat, dir, copy [aiTextureType::DIFFUSE_ROUGHNESS]) {
+            return metalness;
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: the path of the first texture of a material in the first of its slots having one, in the directory of
+     * the model when the file is there, empty when it has none
+     * @info: the textures embedded in the file (named *0, *1...) are not read
+     * */
+    fn texturePath(self, mat: *aiMaterial, dir: Path, slots: [aiTextureType])-> [c8] {
+        for slot in slots {
+            if mat.textureCount(slot) == 0 {
+                continue;
+            }
+
+            let ainame = mat.texture(slot, 0);
+            let name = copy ainame.data[0 .. ainame.len];
+            if name.len != 0 && name[0] == '*' {
+                log::warn #("MeshAsset", "The embedded texture", name, "is not read");
+                return "";
+            }
+
+            let path = dir.push(name);
+            return if std::fs::isFile(path) { path.toStr() } else { name };
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: the factors of a material, read from its metallic/roughness properties (glTF), or converted from its
+     * Phong properties (OBJ) when it has none
+     * */
+    fn readConfig(self, mat: *aiMaterial)-> MaterialConfig {
+        let emissive = self.readColor(mat.emissiveColor()) * (mat.emissiveIntensity() ?? 1.0f);
+        let metallic = mat.metallicFactor(), roughness = mat.roughnessFactor();
+        if !metallic.hasValue && !roughness.hasValue {
+            return MaterialConfig::phong(self.readColor(mat.diffuseColor()),
+                                         self.readColor(mat.specularColor()),
+                                         mat.shininess(),
+                                         emissive);
+        }
+
+        let mut config = MaterialConfig();
+        config.baseColor = self.readColor(mat.baseColor() ?? mat.diffuseColor());
+        config.emissive = emissive;
+
+        // the defaults of glTF, a fully rough metal
+        config.metallic = metallic ?? 1.0f;
+        config.roughness = roughness ?? 1.0f;
+
+        config
+    }
+
+    /**
+     * Transform an assimp vector into a balder vector
+     * */
+    fn readColor(self, color: aiColor4D)-> vec3 {
+        makeVec3(color.r, color.g, color.b)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          VERTICES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the vertices of a mesh, every attribute the file gives kept, whatever the material drawing it: the shader
+     * of a material reads the attributes it needs (see MeshArray::compactVertices)
+     * @params:
+     *    - loadTransform: the transformation placing the scene in the unit box of the model, a uniform scale and a
+     *                     translation
+     *    - nodeTransform: the transformation of the node of the mesh in the scene, the identity once pre-transformed
+     * */
+    @unsafe
+    fn loadSolidMeshVertices(self, mesh: *aiMesh, loadTransform: mat4, nodeTransform: mat4)-> MeshArray {
+        let placement = loadTransform * nodeTransform;
+
+        // the normals and the tangents turn with the node, the uniform scale of the load leaving their directions
+        let turned = !(nodeTransform == mat4());
+        let normalMatrix = nodeTransform.mat3().inversed().transposed();
+        let tangentMatrix = nodeTransform.mat3();
+
+        let mut array = MeshArray();
+        array.positions = copy [vec3() ; mesh.numVertices()];
+        if mesh.normals() != null {
+            array.normals = copy [vec3() ; mesh.numVertices()];
+        }
+
+        let mut handedness: [f32] = [];
+        if mesh.tangents() != null && mesh.normals() != null && mesh.textureCoords(0) != null {
+            array.tangents = copy [vec4() ; mesh.numVertices()];
+            handedness = self.tangentHandedness(mesh);
+        }
+
+        if mesh.textureCoords(0) != null {
+            array.textureUVs = copy [vec2() ; mesh.numVertices()];
+        }
+
+        if mesh.textureCoords(1) != null {
+            array.textureUVs2 = copy [vec2() ; mesh.numVertices()];
+        }
+
+        if mesh.colors(0) != null {
+            array.colors = copy [vec3() ; mesh.numVertices()];
+        }
+
+        // the bones of the vertices are kept whatever the material, for the skeleton to move them
+        if mesh.numBones() > 0u32 && self._skeleton.hasValue {
+            let (bones, weights) = readSkinWeights(mesh);
+            array.bones = copy bones;
+            array.weights = copy weights;
+        }
+
+        for i in 0 .. mesh.numVertices() {
+            let pos = mesh.vertices()[i];
+            let v = makeVec4(pos.x, pos.y, pos.z, 1.0f);
+            array.positions[i] = (placement * v).xyz;
+
+            if array.normals.len > i {
+                let norm = mesh.normals() [i];
+                let normal = makeVec3(norm.x, norm.y, norm.z);
+                array.normals[i] = if turned { (normalMatrix * normal).normalized() } else { normal };
+            }
+
+            if array.tangents.len > i {
+                let tan = mesh.tangents() [i];
+                let tangent = makeVec3(tan.x, tan.y, tan.z);
+                array.tangents[i] = makeVec4(if turned { (tangentMatrix * tangent).normalized() } else { tangent },
+                                             handedness[i]);
+            }
+
+            if array.textureUVs.len > i {
+                let tan = mesh.textureCoords(0) [i];
+                array.textureUVs[i] = makeVec2(tan.x, tan.y);
+            }
+
+            if array.textureUVs2.len > i {
+                let tan = mesh.textureCoords(1) [i];
+                array.textureUVs2[i] = makeVec2(tan.x, tan.y);
+            }
+
+            if array.colors.len > i {
+                let tan = mesh.colors(0) [i];
+                array.colors[i] = makeVec3(tan.r, tan.g, tan.b);
+            }
+        }
+
+        array
+    }
+
+    /**
+     * @returns: the handedness of the tangent space of each vertex of a mesh, -1 where the growing v of its texture
+     * coordinates runs against the cross product of its normal and its tangent (a mirrored texture), 1 otherwise
+     * @info: the bitangents of assimp are not read, running along the growing v when the file gives the tangents but
+     * against it when assimp computes them; the growing v is found from the faces around each vertex instead
+     * */
+    @unsafe
+    fn tangentHandedness(self, mesh: *aiMesh)-> [f32] {
+        let dmut along = copy [vec3() ; mesh.numVertices()];
+        for i in 0u32 .. mesh.numFaces() {
+            let face = mesh.faces() [i];
+            if face.mNumIndices != 3u32 { continue; }
+
+            let a = face.mIndices[0], b = face.mIndices[1], c = face.mIndices[2];
+            let (pa, pb, pc) = (mesh.vertices() [a], mesh.vertices() [b], mesh.vertices() [c]);
+            let (ta, tb, tc) = (mesh.textureCoords(0) [a], mesh.textureCoords(0) [b], mesh.textureCoords(0) [c]);
+
+            let e1 = makeVec3(pb.x - pa.x, pb.y - pa.y, pb.z - pa.z);
+            let e2 = makeVec3(pc.x - pa.x, pc.y - pa.y, pc.z - pa.z);
+            let (du1, dv1, du2, dv2) = (tb.x - ta.x, tb.y - ta.y, tc.x - ta.x, tc.y - ta.y);
+
+            let det = du1 * dv2 - du2 * dv1;
+            if det == 0.0f { continue; }
+
+            // the derivative of the position along v on the face
+            let dv = (e2 * du1 - e1 * du2) / det;
+            for v in [a, b, c] {
+                along[v] = along[v] + dv;
+            }
+        }
+
+        let dmut result = copy [1.0f ; mesh.numVertices()];
+        for i in 0u32 .. mesh.numVertices() {
+            let tan = mesh.tangents() [i], norm = mesh.normals() [i];
+            let normal = makeVec3(norm.x, norm.y, norm.z);
+            if normal.cross(makeVec3(tan.x, tan.y, tan.z)).dot(along[i]) < 0.0f {
+                result[i] = -1.0f;
+            }
+        }
+
+        result
+    }
+
+}

@@ -1,0 +1,321 @@
+in mesh_asset;
+
+mod ::model_file;
+
+use balder::core::error;
+use balder::math::bounds;
+use balder::scene::animation::skeleton;
+use balder::scene::asset::{material_asset, sub_mesh};
+use balder::scene::node::node3D::visual::{lod, mesh, primitive};
+use balder::scene::physics;
+use balder::scene::physics::convex_decomposition;
+use balder::utils::log;
+
+use std::fs;
+
+/**
+ * A mesh as an asset, the geometry of a model file or of a primitive, drawn by the meshes of the scenes placing it (see
+ * MeshInstance3D): its parts, each of one material (see SubMesh), and the joints moving them for a skinned model
+ * @info: the path of an asset names it in the cache of the assets (see Assets) and in the scene files: the project path
+ * of its model file, or `engine:/meshes/cube` (MeshAsset::CUBE), `engine:/meshes/sphere` and `engine:/meshes/plane` for
+ * the primitives, built in rather than read; the materials of a model file are embedded assets of it, named
+ * `res:/models/crate.glb#0` (see MaterialAsset::embeddedPath)
+ * */
+pub class MeshAsset {
+
+    // The path naming the asset, in the cache of the assets and in the scene files
+    let _path: [c8];
+
+    // True when the levels of detail of the parts were built
+    let _lods: bool;
+
+    // The parts of the mesh, in the order of the model file
+    let dmut _subMeshes: [SubMesh];
+
+    // The materials embedded in the model file, in its order, those its parts are drawn with by default
+    let dmut _materials: [&MaterialAsset];
+
+    // The joints moving the parts of a skinned model, none for a rigid one
+    let _skeleton: (&Skeleton)?;
+
+    // The box enclosing the parts, in the space of the mesh
+    let _aabb: Aabb;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @params:
+     *    - path: the path naming the asset (see the class)
+     *    - subMeshes: the parts of the mesh
+     *    - lods: true when the levels of detail of the parts were built
+     *    - materials: the materials embedded in the model file
+     *    - skeleton: the joints moving the parts of a skinned model, none for a rigid one
+     * */
+    pub self (path: [c8], dmut subMeshes: [SubMesh], lods: bool = false, dmut materials: [&MaterialAsset] = [],
+              skeleton: (&Skeleton)? = none)
+        with _path = path
+        , _lods = lods
+        , _subMeshes = alias subMeshes
+        , _materials = alias materials
+        , _skeleton = skeleton
+        , _aabb = MeshAsset::boxOf(subMeshes)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the path naming the asset, in the cache of the assets and in the scene files
+     * */
+    @field
+    pub fn path(self)-> [c8] {
+        self._path
+    }
+
+    /**
+     * @returns: true when the levels of detail of the parts were built
+     * */
+    @field
+    pub fn lods(self)-> bool {
+        self._lods
+    }
+
+    /**
+     * @returns: the parts of the mesh, in the order of the model file, a mesh drawing them sharing their geometry
+     * */
+    @field
+    pub fn subMeshes(mut self)-> dmut [SubMesh] {
+        alias self._subMeshes
+    }
+
+    /**
+     * @returns: the parts of the mesh, in the order of the model file
+     * */
+    @field
+    pub fn subMeshes(self)-> [SubMesh] {
+        self._subMeshes
+    }
+
+    /**
+     * @returns: the materials embedded in the model file, in its order, none for a primitive
+     * */
+    @field
+    pub fn materials(mut self)-> dmut [&MaterialAsset] {
+        alias self._materials
+    }
+
+    /**
+     * @returns: the materials embedded in the model file, in its order, none for a primitive
+     * */
+    @field
+    pub fn materials(self)-> [&MaterialAsset] {
+        self._materials
+    }
+
+    /**
+     * @returns: the joints moving the parts of a skinned model, none for a rigid one
+     * */
+    @field
+    pub fn skeleton(self)-> (&Skeleton)? {
+        self._skeleton
+    }
+
+    /**
+     * @returns: the box enclosing the parts, in the space of the mesh
+     * */
+    @field
+    pub fn aabb(self)-> Aabb {
+        self._aabb
+    }
+
+    /**
+     * @returns: the primitive a built-in mesh is, Primitive::NONE for a mesh read from a file
+     * */
+    @field
+    pub fn primitive(self)-> Primitive {
+        MeshAsset::primitiveOf(self._path)
+    }
+
+    /**
+     * @returns: true iif the geometry of a part released its vertices, placed in the geometry pools of a scene (see
+     * MeshGeometry::releaseUnshared): a mesh drawing it in another scene, or in the pool of another shader, would have
+     * none to place
+     * */
+    @field
+    pub fn isReleased(self)-> bool {
+        for s in self._subMeshes if s.geometry.isReleased { return true; }
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PHYSICS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the shape of a collider made of the convex hulls of the parts of the mesh, in the space of the mesh, one
+     * hull by part (see decomposition for a concave model)
+     * @throws: BalderError when a part released its vertices (uploaded in a scene not keeping its triangles, see
+     * Scene.keepsTriangles), or the vertices of a part span no volume
+     * */
+    pub fn hulls(self)-> ColliderShape
+        throws BalderError
+    {
+        let mut parts: [CompoundPart] = [];
+        for s in self._subMeshes {
+            if let Ok(points) = s.geometry.positions {
+                parts ~= [CompoundPart(shape-> ColliderShape::hull(copy ConvexHull(points)))];
+            } else {
+                throw copy BalderError(f"The part ${s.name} of the mesh ${self._path} released its vertices");
+            }
+        }
+
+        ColliderShape::compound(copy CompoundShape(parts))
+    }
+
+    /**
+     * @returns: the triangles of the parts of the mesh, in the space of the mesh, the surface a convex decomposition
+     * splits (see ConvexDecomposition)
+     * @throws: BalderError when a part released its vertices (uploaded in a scene not keeping its triangles, see
+     * Scene.keepsTriangles)
+     * */
+    pub fn triangles(self)-> [Triangle]
+        throws BalderError
+    {
+        let mut result: [Triangle] = [];
+        for s in self._subMeshes {
+            if let Ok(t) = s.geometry.triangles {
+                for i in 0us .. t.len {
+                    result ~= [t.getTriangle(i)];
+                }
+            } else {
+                throw copy BalderError(f"The part ${s.name} of the mesh ${self._path} released its vertices");
+            }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the convex decomposition of the model saved next to its file (see ConvexDecomposition::fileOf), its
+     * hulls in the space of the mesh, the shape of a dynamic body of a concave model (see ConvexDecomposition::shape)
+     * @info: the decomposition is read, never computed: it runs offline, at import or in the editor; a warning tells
+     * when the file of the model changed since it was decomposed
+     * @throws: BalderError when the model has no decomposition, or its file cannot be read
+     * @example:
+     * ```
+     * let mug = Assets::mesh("res:/models/mug/mug.glb");
+     * let dmut body = copy PhysicsBody3D("mug-body", alias level, shape-> mug.decomposition().shape(),
+     *                                    settings-> BodySettings(motion-> BodyMotion::DYNAMIC, mass-> 0.3f));
+     * let dmut _ = copy MeshInstance3D("mug", alias body, mug);
+     * ```
+     * */
+    pub fn decomposition(self)-> &ConvexDecomposition
+        throws BalderError
+    {
+        let decomposition = copy ConvexDecomposition::fromFile(ConvexDecomposition::fileOf(self._path));
+        if decomposition.source != 0u32 && decomposition.source != ConvexDecomposition::checksumOf(self._path) {
+            log::warn #("MeshAsset", f"The model ${self._path} changed since it was decomposed, its hulls may no longer fit it");
+        }
+
+        decomposition
+    }
+
+}
+
+/**
+ * The built-in meshes and the reading of the model files
+ * */
+pub mod MeshAsset {
+
+    /**
+     * The paths of the built-in meshes, the primitives (see primitiveMesh)
+     * */
+    pub def CUBE   = "engine:/meshes/cube";
+    pub def SPHERE = "engine:/meshes/sphere";
+    pub def PLANE  = "engine:/meshes/plane";
+
+    /**
+     * @returns: the mesh of a model file, its parts in the unit box standing on its origin (x and z in [-0.5, 0.5], y in
+     * [0, 1]), each drawn by default with the material of the file it names, embedded in the asset
+     * @params:
+     *    - path: the project path of the file
+     *    - lods: true to build the levels of detail of the parts
+     * @throws: BalderError when the file cannot be read by assimp, or holds a face that is not a triangle
+     * */
+    pub fn read(path: [c8], lods: bool = true)-> dmut &MeshAsset
+        throws BalderError
+    {
+        model_file::read(path, lods)
+    }
+
+    /**
+     * @returns: the built-in mesh of a primitive, of its default tessellation, one part drawn by default with the
+     * default material (see MaterialAsset::DEFAULT)
+     * @params:
+     *    - primitive: the primitive, not Primitive::NONE
+     * @throws: BalderError for Primitive::NONE
+     * */
+    pub fn builtin(primitive: Primitive)-> dmut &MeshAsset
+        throws BalderError
+    {
+        let mesh = if let Ok(m) = primitiveMesh(primitive) { m } else {
+            throw copy BalderError("Primitive::NONE is no built-in mesh");
+        };
+
+        let path = MeshAsset::pathOf(primitive);
+        let dmut geometry = copy MeshGeometry(mesh._0, LodChain(mesh._1), primitive-> primitive);
+        let material = copy MaterialAsset(MaterialAsset::DEFAULT, "default");
+        let dmut parts = copy [SubMesh(name-> Path(path).file(), geometry-> alias geometry, material-> material)];
+        copy MeshAsset(path, alias parts)
+    }
+
+    /**
+     * @returns: the path of the built-in mesh of a primitive, empty for Primitive::NONE
+     * */
+    pub fn pathOf(primitive: Primitive)-> [c8] {
+        match primitive {
+            Primitive::CUBE   => { CUBE }
+            Primitive::SPHERE => { SPHERE }
+            Primitive::PLANE  => { PLANE }
+            _                 => { "" }
+        }
+    }
+
+    /**
+     * @returns: the primitive the built-in mesh of a path is, Primitive::NONE for the path of a file
+     * */
+    pub fn primitiveOf(path: [c8])-> Primitive {
+        if path == CUBE { return Primitive::CUBE; }
+        if path == SPHERE { return Primitive::SPHERE; }
+        if path == PLANE { return Primitive::PLANE; }
+        Primitive::NONE
+    }
+
+    /**
+     * @returns: the box enclosing parts
+     * */
+    pub fn boxOf(parts: [SubMesh])-> Aabb {
+        let mut box = Aabb();
+        for p in parts {
+            box = box.merged(p.geometry.aabb);
+        }
+
+        box
+    }
+
+}

@@ -1,0 +1,233 @@
+in utils;
+
+use balder::core::error;
+use balder::math::vector;
+use balder::scene::node::node3D::visual::material::_;
+use balder::scene::property::{kind, value};
+use balder::utils::path;
+
+use std::{config, conv, fs, stream};
+
+/**
+ * The version of the format of the .material files
+ * */
+def VERSION = 1i64;
+
+/**
+ * The digits written after the decimal point of a number
+ * */
+def DIGITS = 6u32;
+
+/**
+ * @returns: the factors of a material of the values of its entries, the factors of no value holding their defaults
+ * */
+pub fn configOf(values: [([c8], PropertyValue)])-> MaterialConfig {
+    let mut config = MaterialConfig();
+    for v in values {
+        match v._0 {
+            "base-color" => { config.baseColor = (v._1).vector; }
+            "emissive"   => { config.emissive = (v._1).vector; }
+            "metallic"   => { config.metallic = (v._1).number; }
+            "roughness"  => { config.roughness = (v._1).number; }
+            "specular"   => { config.specular = (v._1).number; }
+            "occlusion"  => { config.occlusion = (v._1).number; }
+            _ => {}
+        }
+    }
+
+    config
+}
+
+/**
+ * @returns: the maps of a material of the values of its entries, the maps of no value left empty
+ * */
+pub fn mapsOf(values: [([c8], PropertyValue)])-> MaterialMaps {
+    MaterialMaps(baseColor-> textOf(values, "base-color-map"),
+                 metallicRoughness-> textOf(values, "metallic-roughness-map"),
+                 normal-> textOf(values, "normal-map"),
+                 occlusion-> textOf(values, "occlusion-map"),
+                 emissive-> textOf(values, "emissive-map"))
+}
+
+/**
+ * @returns: the value of an entry of a material of factors and maps, the number 0 for a name of no entry
+ * */
+pub fn valueOf(config: MaterialConfig, maps: MaterialMaps, name: [c8])-> PropertyValue {
+    match name {
+        "base-color"             => { PropertyValue::color(config.baseColor) }
+        "emissive"               => { PropertyValue::color(config.emissive) }
+        "metallic"               => { PropertyValue::number(config.metallic) }
+        "roughness"              => { PropertyValue::number(config.roughness) }
+        "specular"               => { PropertyValue::number(config.specular) }
+        "occlusion"              => { PropertyValue::number(config.occlusion) }
+        "base-color-map"         => { PropertyValue::asset(maps.baseColor) }
+        "metallic-roughness-map" => { PropertyValue::asset(maps.metallicRoughness) }
+        "normal-map"             => { PropertyValue::asset(maps.normal) }
+        "occlusion-map"          => { PropertyValue::asset(maps.occlusion) }
+        "emissive-map"           => { PropertyValue::asset(maps.emissive) }
+        _                        => { PropertyValue() }
+    }
+}
+
+/**
+ * @returns: the name of the material of a file, the name of the file without its directory and its extension
+ * */
+pub fn nameOfFile(path: [c8])-> [c8] {
+    Path(path).stripExtension().file()
+}
+
+/**
+ * @returns: the text of a .material file of the values of the entries of a material: its version, its factors, then the
+ * paths of the maps it has, each entry as a toml one, a colour an array of three numbers
+ * */
+pub fn textOf(values: [([c8], PropertyValue)])-> [c8] {
+    let mut text = "# A material of Balder, its factors and the paths of its maps (see MaterialAsset)\n";
+    text ~= f"version = ${VERSION}\n";
+    for v in values {
+        let value = v._1;
+        match value.kind {
+            PropertyKind::COLOR => {
+                let c = value.vector;
+                text ~= f"${v._0} = [${decimalOf(c.x)}, ${decimalOf(c.y)}, ${decimalOf(c.z)}]\n";
+            }
+            PropertyKind::NUMBER => { text ~= f"${v._0} = ${decimalOf(value.number)}\n"; }
+            _ => {
+                if value.text.len != 0us {
+                    text ~= f"${v._0} = ${quoted(value.text)}\n";
+                }
+            }
+        }
+    }
+
+    text
+}
+
+/**
+ * @returns: the values of the entries a .material file gives (see textOf), by their names
+ * @throws: BalderError when the file cannot be read, is not a toml, is of another version, or holds an entry of the
+ * wrong type, or one a material does not have
+ * */
+pub fn read(path: [c8])-> [([c8], PropertyValue)]
+    throws BalderError
+{
+    let cfg = {
+        toml::parse(readFile(projectPath(path)))
+    } catch {
+        err => {
+            throw copy BalderError(f"Failed to read the material ${path}: ${err}");
+        }
+    };
+
+    if let Ok(Int(value-> v)) = cfg["version"]? {
+        if v != VERSION {
+            throw copy BalderError(f"The material ${path} is of the version ${v}, this Balder reading version ${VERSION}");
+        }
+    } else {
+        throw copy BalderError(f"The material ${path} has no version");
+    }
+
+    let mut values: [([c8], PropertyValue)] = [];
+    for key in cfg.sortedKeys() if key != "version" {
+        let kind = if let Ok(k) = MaterialAsset::entryKind(key) { k } else {
+            throw copy BalderError(f"The material ${path} has an entry '${key}', which no material has");
+        };
+
+        let entry = {
+            cfg[key]
+        } catch {
+            _ => {
+                throw copy BalderError(f"The material ${path} has no entry '${key}'");
+            }
+        };
+
+        values ~= [(key, readEntry(entry, kind, key, path))];
+    }
+
+    values
+}
+
+/**
+ * @returns: the value of an entry of a .material file, of the kind of the entry
+ * @throws: BalderError when it is not: a colour not an array of three numbers, a number not a number, a path not a
+ * string
+ * */
+fn readEntry(entry: &Config, kind: PropertyKind, key: [c8], path: [c8])-> PropertyValue
+    throws BalderError
+{
+    match kind {
+        PropertyKind::COLOR => {
+            if let a: &Array = entry {
+                let numbers = a[];
+                if numbers.len == 3us {
+                    return PropertyValue::color(makeVec3(numberOf(numbers[0], key, path), numberOf(numbers[1], key, path),
+                                                         numberOf(numbers[2], key, path)));
+                }
+            }
+
+            throw copy BalderError(f"The ${key} of the material ${path} must be three numbers");
+        }
+        PropertyKind::NUMBER => { return PropertyValue::number(numberOf(entry, key, path)); }
+        _ => {
+            if let Str(value-> s) = entry {
+                return PropertyValue::asset(s);
+            }
+
+            throw copy BalderError(f"The ${key} of the material ${path} must be the path of a file");
+        }
+    }
+}
+
+/**
+ * @returns: the number of an entry of a .material file, an integer or a float
+ * @throws: BalderError when it is neither
+ * */
+fn numberOf(entry: &Config, key: [c8], path: [c8])-> f32
+    throws BalderError
+{
+    match entry {
+        Float(value-> f) => { return cast!f32(f); }
+        Int(value-> i) => { return cast!f32(i); }
+        _ => {
+            throw copy BalderError(f"The ${key} of the material ${path} must be a number");
+        }
+    }
+}
+
+/**
+ * @returns: the text of the entry of a name among values, empty when none has it
+ * */
+fn textOf(values: [([c8], PropertyValue)], name: [c8])-> [c8] {
+    for v in values if v._0 == name { return (v._1).text; }
+    ""
+}
+
+/**
+ * @returns: a text between double quotes, its quotes and backslashes escaped, as a toml string
+ * */
+fn quoted(text: [c8])-> [c8] {
+    let dmut s = copy StringStream();
+    s:.write('"');
+    for c in text {
+        match c {
+            '"'  => { s:.write("\\\""); }
+            '\\' => { s:.write("\\\\"); }
+            _    => { s:.write(c); }
+        }
+    }
+
+    s:.write('"');
+    s[]
+}
+
+/**
+ * @returns: a number written with DIGITS digits after the decimal point at most, the trailing zeros dropped but one, so
+ * that the toml reads a float
+ * */
+fn decimalOf(f: f32)-> [c8] {
+    let text = to!{[c8]}(f, prec-> DIGITS);
+    let mut end = text.len;
+    while end > 0us && text[end - 1us] == '0' { end -= 1us; }
+    if end > 0us && text[end - 1us] == '.' { end += 1us; }
+
+    if text[0us .. end] == "-0.0" { "0.0" } else { text[0us .. end] }
+}
