@@ -284,6 +284,11 @@ Separator;
 Image "res:/images/logo.png";
 ```
 
+- **A button writes its shortcut after its text.** The `shortcut` of a `PushButton` or a `MenuButton`
+  (`PushButton .item "Save" { shortcut: "Ctrl+S"; }`), the keys doing what it does, is its part `::shortcut`, at the end
+  of its content box and as wide as its text and its margins (a `margin-left` keeps it apart from the label), the
+  `::label` taking the rest: the items of a menu, stretched to the widest one, line their shortcuts up on its right
+  edge, `text-color` muting them. A button without a shortcut gives it no room; `setShortcut` changes it by code.
 - **A toggle is checked by a click.** `CheckBox` and `RadioButton` draw a `::box` on the left of their `::label`,
   16 pixels when its style sets no size, and a `::mark` in the content box of the box, filling it unless sized. They
   are in the state `:checked` while checked, so `CheckBox:checked::mark` colours the mark. `on-toggle` gives the new
@@ -328,12 +333,15 @@ Image "res:/images/logo.png";
   shown only (`TextTreeModel` holds `TreeItem`s, a text and its children). Every node starts collapsed; `expandNode`
   expands a node and its ancestors, `collapseNode` collapses it, forgetting the nodes expanded under it. The rows,
   recycled as in a list view, are its `::row` in the same states, a node having children being preceded by its
-  `::marker`, ▸ collapsed and ▾ in the state `:expanded`, in the states of its row as well. A level indents the rows by
-  the width of the margin box of the marker, set by its style, so that the leaves line up with the text of their
-  siblings having children. A click on the marker, or a double click on the row, expands or collapses the node; the
-  rows are selected as in a list view, the rows under a node collapsed being unselected. `on-select` gives the paths of
-  the selected nodes in the order of the rows, `on-activate` the path of the current node when Enter is pressed on it,
-  or of a leaf double clicked (`fn reached (mut self, node: [usize])`).
+  `::marker`, ▸ collapsed and ▾ in the state `:expanded`, in the states of its row as well; a marker whose style has an
+  `image` (a chevron, another one under `::marker:expanded`) draws it in place of the glyph, `image-fill: false` fitting
+  it in the box of the marker and `image-color` tinting it. A level indents the rows by the style property `indent` of
+  the tree (`indent: 14;`), the width of the margin box of the marker when it is not set, and the leaves keep the room
+  of a marker, so that they line up with the text of their siblings having children. A click on the marker, or a double
+  click on the row, expands or collapses the node; the rows are selected as in a list view, the rows under a node
+  collapsed being unselected. `on-select` gives the paths of the selected nodes in the order of the rows, `on-activate`
+  the path of the current node when Enter is pressed on it, or of a leaf double clicked
+  (`fn reached (mut self, node: [usize])`).
 - **A tree view `draggable: true` drags its selected rows**, once the cursor pressing one of them moves a few pixels
   (a click on a row among several selected selects it alone at its release only, so that they can be dragged
   together). The nodes under another node selected follow it. Over a row, the top quarter drops before its node, the
@@ -362,12 +370,15 @@ Image "res:/images/logo.png";
 - **A collapsible is a section folded under its header**: its `title` follows the marker, ▾ while it is expanded and
   ▸ while it is collapsed, on a single line spanning its content box, the part `::header` (and `::marker`) in the states
   `:hover` and `:pressed`; the collapsible is in the state `:expanded` while it is expanded (`expanded: true` by
-  default), so `Collapsible:expanded::header` styles an open section. Its children are laid out under the header in a
-  column, each as high as its content and an auto width stretched to it, and are out of the layout while it is
-  collapsed, a collapsible being as high as its header then. A click released on the header expands or collapses it, as
-  do Enter and Space while it has the focus, Right expanding it and Left collapsing it; `on-toggle` gives true iif the
-  user expanded it, not when `expanded:` or `setExpanded` does. Sections taller than their panel go in a linear layout
-  that scrolls (`overflow: scroll`), whose min-content is 0 so it never grows its ancestors.
+  default), so `Collapsible:expanded::header` styles an open section. The marker draws its background and its border,
+  and an `image` in place of its glyph, as the marker of a tree view (`Collapsible:expanded::marker` naming the image of
+  an open section); a seam between stacked sections is a border on top of the header (`border-width: 1 0 0 0;`). Its
+  children are laid out under the header in a column, each as high as its content and an auto width stretched to it,
+  and are out of the layout while it is collapsed, a collapsible being as high as its header then. A click released on
+  the header expands or collapses it, as do Enter and Space while it has the focus, Right expanding it and Left
+  collapsing it; `on-toggle` gives true iif the user expanded it, not when `expanded:` or `setExpanded` does. Sections
+  taller than their panel go in a linear layout that scrolls (`overflow: scroll`), whose min-content is 0 so it never
+  grows its ancestors.
 - **A separator is a rule** a pixel thick across its `direction`, a row (horizontal) by default, drawn with its
   background colour. An auto size stretches it along the layout it is in.
 - **An image shows a picture** as the background image of its inline style, so that `image-fill`, `image-keep-ratio`
@@ -1012,13 +1023,13 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `MenuButton`
 
-- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `open-on-hover`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `shortcut`: a string; `open-on-hover`: true or false
 - **Default attribute:** `text`
 - **Children:** its popup, optional
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `label`
+- **Parts:** `label`, `shortcut`
 - **Properties:** `popup-align`: left, center or right, then top, center or bottom
 
 ### `MenuLayout`
@@ -1056,13 +1067,13 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `PushButton`
 
-- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `text`: a string; `shortcut`: a string
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-double-click`
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `label`
+- **Parts:** `label`, `shortcut`
 - **Properties:** none
 
 ### `RadioButton`
@@ -1195,7 +1206,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([[usize]]), `on-activate` ([usize]), `on-drop` (balder::interface::widget::tree::drop::TreeDrop)
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** `row` (states `hover`, `selected`, `current`, `drop`), `marker` (states `hover`, `selected`, `current`, `expanded`), `icon` (states `hover`, `selected`, `current`), `drop`, `scrollbar` (states `hover`, `pressed`)
-- **Properties:** none
+- **Properties:** `indent`: a length in px
 
 ## Style properties
 
