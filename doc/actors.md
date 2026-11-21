@@ -17,17 +17,28 @@ the package `my_game`.
 ```
 my_game/
     project.toml             # its name and its scenes
-    gyllir.toml              # the library of the game, and the editor of the project
+    gyllir.toml              # the library of the game, a shared one
     src/my_game.yr           # the root module of the library: the actor classes go under it
-    editor/main.yr           # the editor of the project, the library of the game linked in
     res/scenes/main.scene
 ```
 
-The library of the game (`my_game`) holds its actor classes. The target `editor` links it with the editor of Balder,
-so that this editor knows the classes of the game; the project manager builds it and runs it each time it opens the
-project (`gyllir build editor`, about a minute the first time, Balder being built with it). A project made before the
-editor target existed opens in Balder's own editor, which keeps the actors of its scenes as unknown ones: add the
-`[targets.editor]` of the template (`editor/templates/empty/gyllir.toml`) and its `editor/main.yr` to it.
+The library of the game (`my_game`) holds its actor classes. It is a shared library (`target/lib/libmy_game.so`) that
+the editor builds and loads when it opens the project (`gyllir build my_game`, about a minute the first time, Balder
+being built with it), the tags of its classes registering them as it is loaded; **Compile** (Ctrl+R) builds it again
+and reloads it after a change of the code. Its target in `gyllir.toml` leaves Balder to the editor loading it:
+
+```
+[targets.my_game]
+type = "shared"
+package-root = "my_game"
+dependencies = ["Balder"]
+host-provided = ["Balder"]
+output-dir = "target/lib"
+```
+
+A project made with an editor target (the template of BAL-128) opens with the actors of its scenes kept as unknown
+ones: give its library the `type` and the `host-provided` above, the `[compiler]` of the template, and remove its
+`[targets.editor]` and its `editor/main.yr`.
 
 ## 2. The class
 
@@ -184,11 +195,16 @@ exactly.
 
 ## 4. In the editor
 
-Open the project from the project manager: its editor is built, a dialog over the manager showing how far, then opens
-on the project; an editor newer than its sources opens right away. A build that fails leaves the manager open, a
-dialog showing its first error as the compiler wrote it, with buttons opening the file of all its errors
-(`.target/editor-build-errors.txt`) and its whole output (`.target/editor-build.log`).
+Open the project from the project manager: the editor opens on it, builds the library of the game in the background,
+the status bar telling how far, then loads it, the scene built again with its classes; a library newer than its
+sources is loaded right away. A build that fails tells its first error in the status bar and in a dialog showing it as
+the compiler wrote it, with buttons opening the file of all its errors (`.target/game-build-errors.txt`) and its whole
+output (`.target/game-build.log`).
 
+- **Compile**, on the right of the menu bar (Ctrl+R), builds the library again and reloads it: a change of the code of
+  the door is taken without leaving the editor, the actors of the scene and their connections kept. What a class no
+  longer declares (a property renamed, a signal or a slot removed) is dropped from the scene and logged, the scene
+  left unsaved; an actor whose class is gone is kept as an unknown one.
 - **Add** lists the classes by category, after the built-in kinds: *Add → Gameplay → Door* adds a door where a cube
   goes, its properties holding their defaults.
 - **The inspector** shows the properties of an actor in the section of its class (or of their groups), edited and
@@ -218,8 +234,8 @@ node #22222222-2222-4222-8222-222222222222 lever "lever" {
 ```
 
 A property holding its default is left out. A node of a class the program does not know (a class renamed, the scene
-opened in Balder's own editor) is kept as an `UnknownActor`: an empty of its transform, its other entries and its
-connections written back as they were read, so that nothing is lost.
+opened while the library of the game is not loaded) is kept as an `UnknownActor`: an empty of its transform, its other
+entries and its connections written back as they were read, so that nothing is lost.
 
 ## 6. In the game
 

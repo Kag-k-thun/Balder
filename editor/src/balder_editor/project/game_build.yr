@@ -1,4 +1,4 @@
-in project_editor;
+in game_build;
 
 use balder_editor::project::build_progress;
 use balder::core::error;
@@ -6,33 +6,33 @@ use balder::core::error;
 use std::{algorithm::searching, concurrency, config, fs, time};
 
 /**
- * The editor of a project: the target `editor` of its gyllir.toml (see the template of the projects), an executable
- * linking the editor of Balder and the library of the game, the actor classes of the game being registered in it; the
- * project manager builds it with gyllir, then runs it on the project
+ * The build of the library of the game of a project: the shared target of its gyllir.toml (`type = "shared"`, see the
+ * template of the projects), lib<output>.so, which the editor loads (see GameLibrary)
  * @info:
  * =====
- * The build runs in the background (`gyllir build editor -v`, in the directory of the project), its output written to
- * a log under the build cache of the project (ProjectEditor::LOG), from which `progress` tells how far it is and
- * `errors` why it failed. The editor runs
- * in the directory of the project, which its main takes as its project and from which it finds the engine it was built
- * against (.deps/Balder):
+ * The build runs in the background (`gyllir build <target> -v`, in the directory of the project), its output written
+ * to a log under the build cache of the project (GameBuild::LOG), from which `progress` tells how far it is and
+ * `errors` why it failed:
  * ```
- * let dmut e = copy ProjectEditor(directory);
- * e:.build();
+ * let dmut b = copy GameBuild(directory);
+ * b:.build();
  * // … at each update
- * if let Ok(code) = e:.finished() {
- *     if code == 0 { e.run(); } else { println(e.errors()); }
+ * if let Ok(code) = b:.finished() {
+ *     if code == 0 { GameLibrary::load(b.library); } else { println(b.errors()); }
  * }
  * ```
  * ====
  * */
-pub class ProjectEditor {
+pub class GameBuild {
 
     // The absolute path of the directory of the project
     let _directory: [c8];
 
-    // The path of the executable of the editor, relative to the directory of the project unless absolute
-    let _executable: [c8];
+    // The name of the shared target of the project
+    let _target: [c8];
+
+    // The path of the library built, relative to the directory of the project unless absolute
+    let _library: [c8];
 
     // The build running, none before build is called
     let dmut _build: (&SubProcess)? = none;
@@ -45,38 +45,47 @@ pub class ProjectEditor {
      * @params:
      *    - directory: the absolute path of the directory of the project
      * @throws:
-     *    - &BalderError: if the gyllir.toml of the project cannot be read, or declares no target `editor`
+     *    - &BalderError: if the gyllir.toml of the project cannot be read, or declares no shared target
      * */
     pub self (directory: [c8])
         with _directory = directory
-        , _executable = executableOf(directory)
+        , _target = GameBuild::sharedTarget(directory)._0
+        , _library = GameBuild::libraryOf(directory)
         throws BalderError
     {}
+
+    /**
+     * @returns: the name of the shared target of the project
+     * */
+    @field
+    pub fn target(self)-> [c8] {
+        self._target
+    }
 
     /**
      * @returns: the path of the log of the build, under the build cache of the project
      * */
     @field
     pub fn log(self)-> [c8] {
-        Path(self._directory).push(ProjectEditor::LOG).toStr()
+        Path(self._directory).push(GameBuild::LOG).toStr()
     }
 
     /**
-     * @returns: the absolute path of the executable of the editor
+     * @returns: the absolute path of the library built, lib<output>.so
      * */
     @field
-    pub fn executable(self)-> [c8] {
-        if Path(self._executable).isAbsolute() { self._executable } else { Path(self._directory).push(self._executable).toStr() }
+    pub fn library(self)-> [c8] {
+        if Path(self._library).isAbsolute() { self._library } else { Path(self._directory).push(self._library).toStr() }
     }
 
     /**
-     * @returns: true iif the editor is built and newer than every source it is built from: the .yr files and the
+     * @returns: true iif the library is built and newer than every source it is built from: the .yr files and the
      * gyllir.toml of the project and of its dependencies (Balder, its bindings, the std), their links followed; the
-     * build of an editor up to date taking gyllir several seconds still, the project manager runs it right away
+     * build of a library up to date taking gyllir several seconds still, the editor loads it right away
      * */
     pub fn isUpToDate(self)-> bool {
         {
-            let built = fileDate(Path(self.executable));
+            let built = fileDate(Path(self.library));
             let mut seen: [[c8]] = [];
             !newerSource(Path(self._directory), built, ref seen)
         } catch {
@@ -85,7 +94,18 @@ pub class ProjectEditor {
     }
 
     /**
-     * Start the build of the editor, in the background
+     * @returns: true iif the build was started and is not finished yet
+     * */
+    pub fn isRunning(mut self)-> bool {
+        if let Ok(dmut p) = alias self._build {
+            return !p:.isFinished();
+        }
+
+        false
+    }
+
+    /**
+     * Start the build of the library, in the background
      * @throws:
      *    - &BalderError: if the build cannot be started
      * */
@@ -101,33 +121,36 @@ pub class ProjectEditor {
             self._progress = copy BuildProgress(self.expectedSteps());
             self._read = 0u64;
 
-            // the log is given to sh as its first argument, so that its path is never read as shell syntax
-            let dmut p = copy SubProcess("sh", copy ["-c", f"exec gyllir build ${ProjectEditor::TARGET} -v > \"$1\" 2>&1",
-                                                    "sh", self.log], cwd-> Path(self._directory));
+            // the log and the target are given to sh as its arguments, so that they are never read as shell syntax
+            let dmut p = copy SubProcess("sh", copy ["-c", "exec gyllir build \"$2\" -v > \"$1\" 2>&1",
+                                                    "sh", self.log, self._target], cwd-> Path(self._directory));
             p:.start(redirect-> false);
             self._build = (alias p)?;
         } catch {
             err: &FsError => {
-                throw copy BalderError(f"The build of the editor of ${self._directory} could not start: ${err}");
+                throw copy BalderError(f"The build of the library of ${self._directory} could not start: ${err}");
             }
         }
     }
 
     /**
-     * @returns: the exit code of the build once it is finished (0 when the editor is built, 127 when gyllir is not
+     * @returns: the exit code of the build once it is finished (0 when the library is built, 127 when gyllir is not
      * found), none while it runs or when it was not started
      * */
     pub fn finished(mut self)-> (i32)? {
         let mut code: (i32)? = none;
         if let Ok(dmut p) = alias self._build {
-            if p:.isFinished() { code = (p:.wait())?; }
+            if p:.isFinished() {
+                code = (p:.wait())?;
+                self._build = none;
+            }
         }
 
         // the steps of a build that succeeded are those the next one expects
         if let Ok(c) = code && c == 0 {
             self:.readLog();
             {
-                utils::writeFile(Path(self._directory).push(ProjectEditor::STEPS).toStr(), f"${self._progress.steps}\n");
+                utils::writeFile(Path(self._directory).push(GameBuild::STEPS).toStr(), f"${self._progress.steps}\n");
             } catch {
                 _ => {}
             }
@@ -161,8 +184,8 @@ pub class ProjectEditor {
     }
 
     /**
-     * Write the errors of the build in a text file of its own, beside the log (ProjectEditor::ERRORS), to be read
-     * without the output of the build around them
+     * Write the errors of the build in a text file of its own, beside the log (GameBuild::ERRORS), to be read without
+     * the output of the build around them
      * @returns: the absolute path of the file
      * @throws:
      *    - &BalderError: if the file cannot be written
@@ -170,8 +193,8 @@ pub class ProjectEditor {
     pub fn writeErrors(self, errors: [[c8]])-> [c8]
         throws BalderError
     {
-        let file = Path(self._directory).push(ProjectEditor::ERRORS).toStr();
-        let mut text = f"The build of the editor of ${self._directory} failed, ${errors.len} errors (its whole output in ${self.log})\n";
+        let file = Path(self._directory).push(GameBuild::ERRORS).toStr();
+        let mut text = f"The build of the library of ${self._directory} failed, ${errors.len} errors (its whole output in ${self.log})\n";
         for e in errors {
             text ~= "\n" ~ e ~ "\n";
         }
@@ -206,11 +229,11 @@ pub class ProjectEditor {
     }
 
     /**
-     * @returns: the steps of the last build of the editor that succeeded, 0 when they are not known
+     * @returns: the steps of the last build of the library that succeeded, 0 when they are not known
      * */
     fn expectedSteps(self)-> u32 {
         {
-            let dmut f = File::open(Path(self._directory).push(ProjectEditor::STEPS));
+            let dmut f = File::open(Path(self._directory).push(GameBuild::STEPS));
             let text = f:.readAll();
             f:.close();
 
@@ -226,59 +249,35 @@ pub class ProjectEditor {
         }
     }
 
-    /**
-     * Run the editor built on the project, in its directory; the program running it waits for it before ending (see
-     * ProjectEditor::waitRunning), so that the terminal it was started from stays with the editor until it is closed
-     * @throws:
-     *    - &BalderError: if the editor cannot be run
-     * */
-    pub fn run(self)
-        throws BalderError
-    {
-        let exe = Path(self.executable);
-        if !isFile(exe) {
-            throw copy BalderError(f"The editor of the project is missing: ${exe.toStr()}");
-        }
-
-        {
-            let dmut p = copy SubProcess(exe.toStr(), copy ["--project", self._directory], cwd-> Path(self._directory));
-            p:.start(redirect-> false);
-            __RUNNING__ ~= [alias p];
-        } catch {
-            err: &FsError => {
-                throw copy BalderError(f"The editor of the project could not run: ${err}");
-            }
-        }
-    }
-
 }
 
 /**
- * The target of the editor of a project
+ * The shared target of a project, and the outputs of its builds
  * */
-pub mod ProjectEditor {
+pub mod GameBuild {
 
     /**
-     * The name of the target of the gyllir.toml of a project building its editor
+     * The name of the target of the gyllir.toml of a project made before the library of its game was shared (BAL-128),
+     * an editor linking it, ignored
      * */
-    pub def TARGET = "editor";
+    pub def EDITOR_TARGET = "editor";
 
     /**
-     * The log of the build of the editor, relative to the directory of the project
+     * The log of the build of the library, relative to the directory of the project
      * */
-    pub def LOG = ".target/editor-build.log";
+    pub def LOG = ".target/game-build.log";
 
     /**
-     * The steps of the last build of the editor that succeeded, relative to the directory of the project, read by the
+     * The steps of the last build of the library that succeeded, relative to the directory of the project, read by the
      * next build to tell how far it is
      * */
-    pub def STEPS = ".target/editor-build.steps";
+    pub def STEPS = ".target/game-build.steps";
 
     /**
-     * The errors of the last build of the editor that failed, plain (see ProjectEditor.writeErrors), relative to the
+     * The errors of the last build of the library that failed, plain (see GameBuild.writeErrors), relative to the
      * directory of the project
      * */
-    pub def ERRORS = ".target/editor-build-errors.txt";
+    pub def ERRORS = ".target/game-build-errors.txt";
 
     /**
      * @returns: an error of the build on one line, its message and the place it names, `Error[E3027] : undefined
@@ -304,76 +303,80 @@ pub mod ProjectEditor {
     }
 
     /**
-     * Wait for the editors of projects this program ran (see ProjectEditor.run) to be closed, the project manager
-     * ending once the editor it opened ends
-     * */
-    pub fn waitRunning() {
-        for dmut p in alias __RUNNING__ {
-            p:.wait();
-        }
-
-        __RUNNING__ = [];
-    }
-
-    /**
-     * @returns: true iif the gyllir.toml of the project of a directory declares a target `editor`, false when it does
-     * not or cannot be read
+     * @returns: true iif the gyllir.toml of the project of a directory declares a shared target, false when it does not
+     * or cannot be read
      * */
     pub fn has(directory: [c8])-> bool {
         {
-            editorTarget(directory);
+            GameBuild::sharedTarget(directory);
             true
         } catch {
             _ => { false }
         }
     }
 
-}
+    /**
+     * @returns: true iif the gyllir.toml of the project of a directory declares the editor of the projects made before
+     * the library of their game was shared (a target `editor`), false when it does not or cannot be read
+     * */
+    pub fn hasEditor(directory: [c8])-> bool {
+        {
+            let cfg = utils::readToml(Path(directory).push("gyllir.toml").toStr());
+            if let Ok(targets) = cfg["targets"]? {
+                return (targets[GameBuild::EDITOR_TARGET]?).hasValue;
+            }
 
-/**
- * The editors of projects this program ran, waited for before it ends
- * */
-lazy dmut __RUNNING__: [&SubProcess] = [];
-
-/**
- * @returns: the table of the target `editor` of the gyllir.toml of a project, and the configuration of the package
- * @throws:
- *    - &BalderError: if the file cannot be read, or declares no target `editor`
- * */
-fn editorTarget(directory: [c8])-> (&Config, &Config)
-    throws BalderError
-{
-    let file = Path(directory).push("gyllir.toml").toStr();
-    let cfg = utils::readToml(file);
-    if let Ok(targets) = cfg["targets"]? {
-        if let Ok(target) = targets[ProjectEditor::TARGET]? {
-            return (target, cfg);
+            false
+        } catch {
+            _ => { false }
         }
     }
 
-    throw copy BalderError(f"${file} declares no target '${ProjectEditor::TARGET}'");
-}
+    /**
+     * @returns: the name and the table of the shared target of the gyllir.toml of a project (`type = "shared"`), the
+     * first one when it declares several, and the configuration of the package
+     * @throws:
+     *    - &BalderError: if the file cannot be read, or declares no shared target
+     * */
+    pub fn sharedTarget(directory: [c8])-> ([c8], &Config, &Config)
+        throws BalderError
+    {
+        let file = Path(directory).push("gyllir.toml").toStr();
+        let cfg = utils::readToml(file);
+        if let Ok(targets: &Dict) = cfg["targets"]? {
+            for name in targets.sortedKeys() {
+                if let Ok(target) = targets[name]? && utils::stringOf(target, "type", file, optional-> true) == "shared" {
+                    return (name, target, cfg);
+                }
+            }
+        }
 
-/**
- * @returns: the path of the executable of the editor of a project, relative to its directory unless absolute: the
- * output of its target (its name by default) in its output directory (the one of the package by default, else the
- * directory of the project), as gyllir names them
- * @throws:
- *    - &BalderError: if the gyllir.toml of the project cannot be read, or declares no target `editor`
- * */
-fn executableOf(directory: [c8])-> [c8]
-    throws BalderError
-{
-    let (target, cfg) = editorTarget(directory);
-    let file = Path(directory).push("gyllir.toml").toStr();
-    let mut output = utils::stringOf(target, "output", file, optional-> true);
-    if output.len == 0us { output = ProjectEditor::TARGET; }
+        throw copy BalderError(f"${file} declares no shared target (type = \"shared\")");
+    }
 
-    let mut dir = utils::stringOf(target, "output-dir", file, optional-> true);
-    if dir.len == 0us { dir = utils::stringOf(cfg, "output-dir", file, optional-> true); }
-    if dir.len == 0us { return output; }
+    /**
+     * @returns: the path of the library of a project, relative to its directory unless absolute: lib<output>.so, the
+     * output of its shared target (its name by default) in its output directory (the one of the package by default,
+     * else the directory of the project), as gyllir names them
+     * @throws:
+     *    - &BalderError: if the gyllir.toml of the project cannot be read, or declares no shared target
+     * */
+    pub fn libraryOf(directory: [c8])-> [c8]
+        throws BalderError
+    {
+        let (name, target, cfg) = GameBuild::sharedTarget(directory);
+        let file = Path(directory).push("gyllir.toml").toStr();
+        let mut output = utils::stringOf(target, "output", file, optional-> true);
+        if output.len == 0us { output = name; }
 
-    Path(dir).push(output).toStr()
+        let library = f"lib${output}.so";
+        let mut dir = utils::stringOf(target, "output-dir", file, optional-> true);
+        if dir.len == 0us { dir = utils::stringOf(cfg, "output-dir", file, optional-> true); }
+        if dir.len == 0us { return library; }
+
+        Path(dir).push(library).toStr()
+    }
+
 }
 
 /**
