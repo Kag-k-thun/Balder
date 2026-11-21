@@ -3,6 +3,7 @@ in reader;
 use balder::math::{utils, vector};
 use balder::scene::node;
 use balder::scene::actors::{node_classes, node_connection};
+use balder::scene::asset::material_asset;
 use balder::scene::description::{kind, node_description};
 use balder::scene::property::{choice, kind, node_property, node_schema, value};
 use balder::utils::{syntax, types};
@@ -12,19 +13,25 @@ use std::{conv, syntax, uuid};
 /**
  * The version of the scene files this Balder reads and writes, the number of their 'scene' statement
  * */
-pub def SCENE_VERSION = 1u32;
+pub def SCENE_VERSION = 2u32;
 
 /**
  * Reader of a scene file into the descriptions of its nodes (see SceneDescription for the format)
  * @info:
  * =====
  * ```
- * file  = "scene" number ";" { asset | node } ;
- * asset = "asset" key "model" string ";" ;
- * node  = "node" "#" uuid kind string "{" { entry } "}" ;
- * entry = name ":" value { value } ";" ;
- * value = number | name | "#" uuid | "@" key ;
+ * file     = "scene" number ";" { asset | material | node } ;
+ * asset    = "asset" key ( "mesh" | "material" ) string ";" ;
+ * material = "material" "#" uuid string "{" { entry } "}" ;
+ * node     = "node" "#" uuid kind string "{" { entry } "}" ;
+ * entry    = name ":" value { value } ";" ;
+ * value    = number | name | string | "#" uuid | "@" key ;
  * ```
+ * An asset is a file a node names by its key, `@<key>`: a mesh (a model file, or a built-in mesh, see MeshAsset) or a
+ * material (a .material file, or a material embedded in a model file, see MaterialAsset). A material block is a
+ * material local to the file (see MaterialAsset::local), its entries those of MaterialAsset::entries, named by its id,
+ * `#<uuid>`, in the material slots of the mesh nodes, `materials: @brick none #<uuid>;` (none for a part drawn with its
+ * own material).
  * The kind of a node is a kind of Balder or the type of an actor class (see ActorClass), whose entries are its
  * properties and the connections of its signals, `on-<signal>: #<id> <slot> { #<id> <slot> } ;`. A node of a type no
  * class has is an actor of a class the program does not know (see UnknownActor): its transform is read, its other
@@ -32,7 +39,8 @@ pub def SCENE_VERSION = 1u32;
  * The blocks of the nodes are flat, each naming its parent by its id: they are put under their parents once every block
  * is read, in the order of the file among their siblings, so a block may come before the block of its parent. The
  * entries of a node are the properties of the schema of its kind (see schemaOf). The reader checks that the ids are
- * distinct, that each parent and asset exists, that no node is under itself, that each entry is a property of the kind
+ * distinct, that each parent, asset and local material exists, that an asset is of the kind its entry reads, that no
+ * node is under itself, that each entry is a property of the kind
  * of its node, is given once and has values of its kind, that a node gives the properties it requires and no asset it
  * does not read, and that one node at most has a unique property true (the active camera).
  * A lenient reader keeps of an actor of a class the program knows only what its class declares: an entry it has no
@@ -52,6 +60,9 @@ pub record SceneReader {
     // What a lenient reader dropped, in the order of the file
     let mut _dropped: [[c8]];
 
+    // The materials local to the file, in its order
+    let mut _materials: [&MaterialAsset];
+
     /**
      * @params:
      *    - content: the content of the scene file
@@ -61,6 +72,7 @@ pub record SceneReader {
         with _scanner = copy Scanner(content)
         , _lenient = lenient
         , _dropped = []
+        , _materials = []
     {}
 
     /**
@@ -69,6 +81,14 @@ pub record SceneReader {
     @field
     pub fn dropped(self)-> [[c8]] {
         self._dropped
+    }
+
+    /**
+     * @returns: the materials local to the file, in its order, once read
+     * */
+    @field
+    pub fn materials(self)-> [&MaterialAsset] {
+        self._materials
     }
 
     /**
@@ -95,8 +115,15 @@ pub record SceneReader {
                 }
 
                 assets = assets ~ [asset];
+            } else if tok.kind == TokenKind::IDENT && tok.text == "material" {
+                let material = self:.readMaterial();
+                for m in self._materials if m.path == material.path {
+                    throw copy SyntaxError(f"material ${material.path[MaterialAsset::LOCAL_PREFIX.len .. $]} declared twice", tok.line, tok.col);
+                }
+
+                self._materials ~= [material];
             } else {
-                throw self._scanner.expected(tok, "a node or an asset");
+                throw self._scanner.expected(tok, "a node, an asset or a material");
             }
         }
 
@@ -108,7 +135,7 @@ pub record SceneReader {
         }
 
         SceneReader::checkConnections(nodes);
-        SceneReader::assemble(SceneReader::resolveAssets(nodes, assets))
+        SceneReader::assemble(SceneReader::resolveAssets(nodes, assets, self._materials))
     }
 
     /*!
@@ -140,7 +167,7 @@ pub record SceneReader {
     }
 
     /**
-     * Read the declaration of an asset after its keyword, `asset table model "res:/models/table.glb";`
+     * Read the declaration of an asset after its keyword, `asset table mesh "res:/models/table.glb";`
      * */
     fn readAsset(mut self)-> Asset
         throws SyntaxError
@@ -151,8 +178,8 @@ pub record SceneReader {
         }
 
         let kind = self._scanner:.next();
-        if kind.kind != TokenKind::IDENT || kind.text != "model" {
-            throw self._scanner.expected(kind, "the kind of the asset, model");
+        if kind.kind != TokenKind::IDENT || (kind.text != "mesh" && kind.text != "material") {
+            throw self._scanner.expected(kind, "the kind of the asset, mesh or material");
         }
 
         let path = self._scanner:.next();
@@ -161,7 +188,51 @@ pub record SceneReader {
         }
 
         self._scanner:.expect(";");
-        Asset(key.text, path.text)
+        Asset(key.text, kind.text, path.text)
+    }
+
+    /**
+     * Read the block of a material local to the file after its keyword, `material #<id> "<name>" { <entries> }`, each
+     * entry one of MaterialAsset::entries
+     * */
+    fn readMaterial(mut self)-> &MaterialAsset
+        throws SyntaxError
+    {
+        let id = self.readId(self._scanner:.next(), "the id of the material, #<uuid>");
+        let nameTok = self._scanner:.next();
+        if nameTok.kind != TokenKind::STRING {
+            throw self._scanner.expected(nameTok, "the name of the material, between quotes");
+        }
+
+        let mut values: [([c8], PropertyValue)] = [];
+        self._scanner:.expect("{");
+        loop {
+            let tok = self._scanner:.next();
+            if tok.kind == TokenKind::DELIM && tok.text == "}" { break; }
+            if tok.kind != TokenKind::IDENT {
+                throw self._scanner.expected(tok, "an entry of the material or '}'");
+            }
+
+            for v in values if v._0 == tok.text {
+                throw copy SyntaxError(f"entry '${tok.text}' given twice", tok.line, tok.col);
+            }
+
+            let kind = if let Ok(k) = MaterialAsset::entryKind(tok.text) { k } else {
+                throw copy SyntaxError(f"material '${nameTok.text}' has no entry '${tok.text}'", tok.line, tok.col);
+            };
+
+            self._scanner:.expect(":");
+            let tokens = self:.readValues();
+            let value = match kind {
+                PropertyKind::COLOR  => { PropertyValue::color(self.vector(tok, tokens)) }
+                PropertyKind::NUMBER => { PropertyValue::number(self.number(tok, tokens)) }
+                _                    => { PropertyValue::asset(self.string(tok, tokens)) }
+            };
+
+            values ~= [(tok.text, value)];
+        }
+
+        copy MaterialAsset::local(id, nameTok.text, values-> values)
     }
 
     /**
@@ -176,7 +247,11 @@ pub record SceneReader {
 
         let kindTok = self._scanner:.next();
         if kindTok.kind != TokenKind::IDENT {
-            throw self._scanner.expected(kindTok, "the kind of the node, empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body, character, camera, or the type of an actor class");
+            throw self._scanner.expected(kindTok, "the kind of the node, empty, mesh, light, marker, path, path-point, volume, body, character, camera, or the type of an actor class");
+        }
+
+        if let Ok(former) = formerKind(kindTok.text) {
+            throw copy SyntaxError(former, kindTok.line, kindTok.col);
         }
 
         let nameTok = self._scanner:.next();
@@ -282,6 +357,8 @@ pub record SceneReader {
         };
         if p.kind == PropertyKind::ASSET {
             node.assets ~= [(p.name, self.asset(key, values))];
+        } else if p.kind == PropertyKind::ASSETS {
+            node.slots ~= [(p.name, self.slots(key, values))];
         } else {
             node.description:.set(p.name, self.readValue(p, key, values));
         }
@@ -419,6 +496,31 @@ pub record SceneReader {
         }
 
         tok.text
+    }
+
+    /**
+     * @returns: the slots of an entry of assets, each an asset of the file `@<key>`, a material local to it `#<uuid>`
+     * (its path, `local:<uuid>`), or none (empty), the keys of the assets resolved once the file is read
+     * */
+    fn slots(self, key: Token, values: [Token])-> [[c8]]
+        throws SyntaxError
+    {
+        let mut res: [[c8]] = [];
+        for tok in values {
+            if tok.kind == TokenKind::DIRECTIVE {
+                res ~= ["@" ~ tok.text];
+            } else if tok.kind == TokenKind::HASH {
+                let id = self.readId(tok, f"${key.text}, the id of a material of the file, #<uuid>");
+                res ~= [MaterialAsset::LOCAL_PREFIX ~ f"${id}"];
+            } else if tok.kind == TokenKind::IDENT && tok.text == "none" {
+                res ~= [""];
+            } else {
+                throw copy SyntaxError(f"${key.text} must be assets, @<key>, materials of the file, #<uuid>, or none",
+                                       tok.line, tok.col);
+            }
+        }
+
+        res
     }
 
     /**
@@ -578,6 +680,9 @@ record FlatNode {
     // The properties of the kind ASSET the block gives, each with the key of the asset it names
     pub let mut assets: [([c8], [c8])];
 
+    // The properties of the kind ASSETS the block gives, each with its slots (see SceneReader::slots)
+    pub let mut slots: [([c8], [[c8]])];
+
     // The place of the block, quoted in the errors
     pub let mut line: usize;
     pub let mut col: usize;
@@ -589,6 +694,7 @@ record FlatNode {
         with description = description
         , parent = none
         , assets = []
+        , slots = []
         , line = line
         , col = col
         , connectedAt = []
@@ -604,11 +710,15 @@ record Asset {
     // The key the nodes name it by, after a '@'
     pub let key: [c8];
 
-    // The project path of the file
+    // The kind of the asset, mesh or material
+    pub let kind: [c8];
+
+    // The path of the asset
     pub let path: [c8];
 
-    pub self (key: [c8], path: [c8])
+    pub self (key: [c8], kind: [c8], path: [c8])
         with key = key
+        , kind = kind
         , path = path
     {}
 
@@ -654,32 +764,64 @@ mod SceneReader {
     }
 
     /**
-     * @returns: the nodes, each property of the kind ASSET given the path of the asset it names
+     * @returns: the nodes, each property of the kind ASSET given the path of the asset it names, each property of the
+     * kind ASSETS the paths of the assets and of the local materials of its slots
      * @throws:
-     *    - &SyntaxError: if a node names an asset not declared
+     *    - &SyntaxError: if a node names an asset not declared, an asset of another kind than its entry reads, or a
+     *                    material the file does not have
      * */
-    pub fn resolveAssets(nodes: [FlatNode], assets: [Asset])-> [FlatNode]
+    pub fn resolveAssets(nodes: [FlatNode], assets: [Asset], materials: [&MaterialAsset])-> [FlatNode]
         throws SyntaxError
     {
         let mut resolved: [FlatNode] = [];
         for n in nodes {
             let mut r = n;
             for named in n.assets {
-                let mut found = false;
-                for a in assets if a.key == named._1 {
-                    r.description:.set(named._0, PropertyValue::asset(a.path));
-                    found = true;
-                }
+                r.description:.set(named._0, PropertyValue::asset(SceneReader::pathOf(n, named._0, "@" ~ named._1, assets, materials)));
+            }
 
-                if !found {
-                    throw copy SyntaxError(f"${n.description.typeName()} '${n.description.name}' names the asset '${named._1}', not declared", n.line, n.col);
-                }
+            for named in n.slots {
+                let paths = copy [SceneReader::pathOf(n, named._0, s, assets, materials) for s in named._1];
+                r.description:.set(named._0, PropertyValue::assets(paths));
             }
 
             resolved = resolved ~ [r];
         }
 
         resolved
+    }
+
+    /**
+     * @returns: the path of what an entry of a node names: an asset of the file `@<key>`, a material local to it
+     * `local:<uuid>`, or none (empty)
+     * @params:
+     *    - property: the name of the entry, a property of the node naming assets
+     *    - named: what the entry names
+     * @throws:
+     *    - &SyntaxError: if it names an asset not declared, an asset of another kind than its entry reads, or a
+     *                    material the file does not have
+     * */
+    pub fn pathOf(n: FlatNode, property: [c8], named: [c8], assets: [Asset], materials: [&MaterialAsset])-> [c8]
+        throws SyntaxError
+    {
+        let what = f"${n.description.typeName()} '${n.description.name}'";
+        if named == "" { return ""; }
+        if MaterialAsset::isLocalPath(named) {
+            for m in materials if m.path == named { return named; }
+            throw copy SyntaxError(f"${what} names the material #${named[MaterialAsset::LOCAL_PREFIX.len .. $]}, not in the file", n.line, n.col);
+        }
+
+        let key = named[1us .. $];
+        let expected = if let Ok(p) = n.description.schema().property(property) { p.asset } else { "" };
+        for a in assets if a.key == key {
+            if expected != "" && a.kind != expected {
+                throw copy SyntaxError(f"${what} names the ${a.kind} '${key}' in its ${property}, which reads a ${expected}", n.line, n.col);
+            }
+
+            return a.path;
+        }
+
+        throw copy SyntaxError(f"${what} names the asset '${key}', not declared", n.line, n.col);
     }
 
     /**

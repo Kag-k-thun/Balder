@@ -3,11 +3,11 @@ in node_description;
 use balder::core::error;
 use balder::scene::physics;
 use balder::scene::actors::{node_classes, node_connection, unknown_actor};
+use balder::scene::asset::assets;
 use balder::scene::description::kind;
 use balder::scene::node;
 use balder::scene::node::node3D;
-use balder::scene::node::node3D::{body, body_shape, camera, character, empty, light, marker, path, path_point, solid, volume};
-use balder::scene::node::node3D::visual::{_, material::_};
+use balder::scene::node::node3D::{body, body_shape, camera, character, empty, light, marker, mesh_instance, path, path_point, volume};
 use balder::scene::property::{node_property, node_schema, value};
 
 use std::uuid;
@@ -20,22 +20,20 @@ use std::uuid;
  * A node is a block of a scene file, naming its parent by its id (see SceneDescription for the file), each entry the
  * value of a property of the schema of its kind (see schemaOf, NodeSchema):
  * ```
- * node #3f2a9c41-1b2c-4d3e-8f00-6a5b4c3d2e1f cube "top" {
+ * node #3f2a9c41-1b2c-4d3e-8f00-6a5b4c3d2e1f mesh "top" {
  *     parent: #9c41e2a0-51be-4c2d-9e3f-0a1b2c3d4e5f;   // none for a node under the root
  *     position: 0 1 0;                                 // in the space of the parent
  *     rotation: 0 90 0;                                // in degrees, along the X, the Y and the Z axes
  *     scale: 1 1 1;
- *     color: 0.5 0.3 0.1;                              // the base colour of a cube, a sphere or a plane
- *     roughness: 0.6;
- *     metallic: 0;
+ *     mesh: @cube;                                     // the mesh asset drawn
+ *     materials: #5d1e0c2a-7b3f-4a9e-8c21-0f6e5d4c3b2a; // the material of each part, none for the part's own
  * }
  * ```
- * The kind is empty, model, cube, sphere, plane, light, marker, path, path-point, volume, body, character or camera, or
- * the type of an actor class (see ActorClass), whose entries are its properties and the connections of its signals,
- * `on-pressed: #<id> open;`.
+ * The kind is empty, mesh, light, marker, path, path-point, volume, body, character or camera, or the type of an actor
+ * class (see ActorClass), whose entries are its properties and the connections of its signals, `on-pressed: #<id> open;`.
  * Every node reads parent, then the properties of its schema: every one its transform (position, rotation, scale), a
- * model its file (required) and lods (Model::schema), a cube, a sphere and a plane their material (IndexedMesh3D::schema),
- * a light, a marker, a path, a volume, a body, a character and a camera theirs (Light::schema...). A description holds a
+ * mesh its mesh (required), its materials, lods and shadows (MeshInstance3D::schema), a light, a marker, a path, a
+ * volume, a body, a character and a camera theirs (Light::schema...). A description holds a
  * value for every property of its kind, the default of the schema until it is given another one.
  * ====
  * */
@@ -98,8 +96,8 @@ pub record NodeDescription {
     /**
      * The description of a node of a scene, and of the nodes under it, as a scene file saves it, each property read
      * from the node (see NodeProperty::get)
-     * @info: the nodes named __…__ are left out (see isReservedName), and so are the meshes of a model, which its file
-     * gives; the nodes under a node are in their order (see Node::getChildrenInOrder), the order a scene file builds them
+     * @info: the nodes named __…__ are left out (see isReservedName), the meshes drawing the parts of a mesh node among
+     * them; the nodes under a node are in their order (see Node::getChildrenInOrder), the order a scene file builds them
      * in
      * @throws:
      *    - &BalderError: if no scene file describes the node, or a node under it (see kindOf)
@@ -122,8 +120,6 @@ pub record NodeDescription {
         for p in self.schema().properties {
             self._values ~= [(p.name, p.get(alias node))];
         }
-
-        if self.kind == NodeKind::MODEL { return; }
 
         for dmut c in alias node:.getChildrenInOrder() if !isReservedName(c.name.file()) {
             if let dmut n: &Node3D = alias c {
@@ -231,7 +227,8 @@ pub record NodeDescription {
      * @info: a body of a hull or a mesh reads its model, a body of a compound takes the volumes under it once they are
      * built (see PhysicsBody3D::reshape); an active camera becomes the active camera of the scene of the parent
      * @throws:
-     *    - &BalderError: if the file of a model cannot be loaded, or a compound has no volume under its body
+     *    - &BalderError: if the mesh or a material of a mesh node cannot be loaded, or a compound has no volume under its
+     *                    body
      * */
     pub fn build(self, dmut parent: &Node)-> dmut &Node3D
         throws BalderError
@@ -271,13 +268,12 @@ pub record NodeDescription {
         throws BalderError
     {
         match self.kind {
-            NodeKind::MODEL => {
-                return copy SolidObjectModel::fromFile(self.name, alias parent, self.value("file").text,
-                                                       lods-> self.value("lods").flag);
+            NodeKind::MESH => {
+                return copy MeshInstance3D(self.name, alias parent,
+                                           alias Assets::mesh(self.value("mesh").text, lods-> self.value("lods").flag),
+                                           materials-> MeshInstance3D::materialsOf(self.value("materials").texts),
+                                           shadow-> self.value("shadows").flag);
             }
-            NodeKind::CUBE       => { return alias self.createMesh(alias parent, Primitive::CUBE, cubeMesh()); }
-            NodeKind::SPHERE     => { return alias self.createMesh(alias parent, Primitive::SPHERE, sphereMesh()); }
-            NodeKind::PLANE      => { return alias self.createMesh(alias parent, Primitive::PLANE, planeMesh()); }
             NodeKind::LIGHT      => { return copy Light(self.name, alias parent, castShadow-> self.value("shadows").flag); }
             NodeKind::MARKER     => { return copy Marker3D(self.name, alias parent); }
             NodeKind::PATH       => { return copy Path3D(self.name, alias parent); }
@@ -330,21 +326,6 @@ pub record NodeDescription {
         }
 
         alias b
-    }
-
-    /**
-     * @returns: a mesh drawing a primitive with the material of the description, under a parent
-     * */
-    fn createMesh(self, dmut parent: &Node, primitive: Primitive, mesh: (MeshArray, [u32]))-> dmut &Node3D
-        throws BalderError
-    {
-        let mut config = MaterialConfig();
-        config.baseColor = self.value("color").vector;
-        config.roughness = self.value("roughness").number;
-        config.metallic = self.value("metallic").number;
-
-        let dmut material = copy ConstantMaterial(config);
-        copy IndexedMesh3D(self.name, alias parent, LodChain(mesh._1), mesh._0, alias material, primitive-> primitive)
     }
 
 }
