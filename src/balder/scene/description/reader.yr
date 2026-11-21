@@ -35,6 +35,10 @@ pub def SCENE_VERSION = 1u32;
  * distinct, that each parent and asset exists, that no node is under itself, that each entry is a property of the kind
  * of its node, is given once and has values of its kind, that a node gives the properties it requires and no asset it
  * does not read, and that one node at most has a unique property true (the active camera).
+ * A lenient reader keeps of an actor of a class the program knows only what its class declares: an entry it has no
+ * property for, a signal it does not have, a connection to a slot its target does not have or that does not take the
+ * payload of the signal are dropped, each told (see dropped), rather than refused; the editor reads its scene that way
+ * when it loads the library of the game again, its classes changed.
  * ====
  * */
 pub record SceneReader {
@@ -42,13 +46,30 @@ pub record SceneReader {
     // The scanner of the file
     let dmut _scanner: &Scanner;
 
+    // True iif what the class of an actor does not declare is dropped rather than refused
+    let _lenient: bool;
+
+    // What a lenient reader dropped, in the order of the file
+    let mut _dropped: [[c8]];
+
     /**
      * @params:
      *    - content: the content of the scene file
+     *    - lenient: drop what the class of an actor does not declare rather than refuse it
      * */
-    pub self (content: [c8])
+    pub self (content: [c8], lenient: bool = false)
         with _scanner = copy Scanner(content)
+        , _lenient = lenient
+        , _dropped = []
     {}
+
+    /**
+     * @returns: what a lenient reader dropped, an entry, a signal or a connection each, `door 'gate' has no entry 'speed'`
+     * */
+    @field
+    pub fn dropped(self)-> [[c8]] {
+        self._dropped
+    }
 
     /**
      * Read the whole content
@@ -80,6 +101,12 @@ pub record SceneReader {
         }
 
         SceneReader::checkUnique(nodes);
+        if self._lenient {
+            let (kept, dropped) = SceneReader::withoutBrokenConnections(nodes);
+            nodes = kept;
+            self._dropped ~= dropped;
+        }
+
         SceneReader::checkConnections(nodes);
         SceneReader::assemble(SceneReader::resolveAssets(nodes, assets))
     }
@@ -184,7 +211,7 @@ pub record SceneReader {
             given = given ~ [tok.text];
             self._scanner:.expect(":");
             let values = self:.readValues();
-            self.readEntry(ref node, schema, tok, values);
+            self:.readEntry(ref node, schema, tok, values);
         }
 
         SceneReader::checkGiven(node, schema, given);
@@ -226,7 +253,7 @@ pub record SceneReader {
      *    - key: the name of the entry
      *    - values: the tokens of its value
      * */
-    fn readEntry(self, ref mut node: FlatNode, schema: &NodeSchema, key: Token, values: [Token])
+    fn readEntry(mut self, ref mut node: FlatNode, schema: &NodeSchema, key: Token, values: [Token])
         throws SyntaxError
     {
         if key.text == "parent" {
@@ -236,13 +263,18 @@ pub record SceneReader {
 
         let d = node.description;
         if d.kind == NodeKind::ACTOR && key.text.len > 3us && key.text[0us .. 3us] == "on-" {
-            self.readConnections(ref node, key, values);
+            self:.readConnections(ref node, key, values);
             return;
         }
 
         let p = if let Ok(p) = schema.property(key.text) { p } else {
             if d.kind == NodeKind::ACTOR && !actorClass(d.className).hasValue && values.len != 0us {
                 node.description.entries ~= [(key.text, self._scanner.source(values[0].start, values[$ - 1us].end))];
+                return;
+            }
+
+            if self._lenient && d.kind == NodeKind::ACTOR {
+                self._dropped ~= [self.foreign(node, key).msg];
                 return;
             }
 
@@ -259,14 +291,20 @@ pub record SceneReader {
      * Read the connections of a signal of an actor, `on-pressed: #<id> open #<id> unlock;`, a signal its class has (any
      * signal for a class the program does not know)
      * */
-    fn readConnections(self, ref mut node: FlatNode, key: Token, values: [Token])
+    fn readConnections(mut self, ref mut node: FlatNode, key: Token, values: [Token])
         throws SyntaxError
     {
         let d = node.description;
         let signal = key.text[3us .. $];
         if let Ok(c) = actorClass(d.className) {
             if !c.signal(signal).hasValue {
-                throw copy SyntaxError(f"${d.typeName()} '${d.name}' has no signal '${signal}'", key.line, key.col);
+                let msg = f"${d.typeName()} '${d.name}' has no signal '${signal}'";
+                if self._lenient {
+                    self._dropped ~= [msg];
+                    return;
+                }
+
+                throw copy SyntaxError(msg, key.line, key.col);
             }
         }
 
@@ -677,39 +715,86 @@ mod SceneReader {
     pub fn checkConnections(nodes: [FlatNode])
         throws SyntaxError
     {
+        let index = SceneReader::indexOf(nodes);
+        for n in nodes {
+            for i in 0us .. n.description.connections.len {
+                if let Ok(err) = SceneReader::connectionError(nodes, index, n, i) { throw err; }
+            }
+        }
+    }
+
+    /**
+     * @returns: the nodes without their connections that checkConnections refuses, and what was dropped, a connection
+     * each, for a lenient reader
+     * */
+    pub fn withoutBrokenConnections(nodes: [FlatNode])-> ([FlatNode], [[c8]]) {
+        let index = SceneReader::indexOf(nodes);
+        let mut res: [FlatNode] = [];
+        let mut dropped: [[c8]] = [];
+        for n in nodes {
+            let mut kept = n;
+            kept.description.connections = [];
+            kept.connectedAt = [];
+            for i, c in n.description.connections {
+                if let Ok(err) = SceneReader::connectionError(nodes, index, n, i) {
+                    dropped ~= [err.msg];
+                } else {
+                    kept.description.connections ~= [c];
+                    kept.connectedAt ~= [n.connectedAt[i]];
+                }
+            }
+
+            res ~= [kept];
+        }
+
+        (res, dropped)
+    }
+
+    /**
+     * @returns: the indexes of the nodes by their ids
+     * */
+    pub fn indexOf(nodes: [FlatNode])-> [Uuid => usize] {
         let dmut index: [Uuid => usize] = copy [];
         for i, n in nodes { index[n.description.id] = i; }
+        index
+    }
 
-        for n in nodes {
-            let d = n.description;
-            for i, c in d.connections {
-                let at = n.connectedAt[i];
-                let what = f"${d.typeName()} '${d.name}'";
-                let t = if let Ok(j) = index[c.target] { nodes[j].description } else {
-                    throw copy SyntaxError(f"${what} connects ${c.signal} to #${c.target}, no node of the file", at._0, at._1);
-                };
+    /**
+     * @returns: why a connection of a node is refused (see checkConnections), at its slot, none when it is not
+     * @params:
+     *    - index: the indexes of the nodes by their ids
+     *    - i: the index of the connection among those of the node
+     * */
+    pub fn connectionError(nodes: [FlatNode], index: [Uuid => usize], n: FlatNode, i: usize)-> (&SyntaxError)? {
+        let d = n.description;
+        let c = d.connections[i];
+        let at = n.connectedAt[i];
+        let what = f"${d.typeName()} '${d.name}'";
+        let t = if let Ok(j) = index[c.target] { nodes[j].description } else {
+            return (copy SyntaxError(f"${what} connects ${c.signal} to #${c.target}, no node of the file", at._0, at._1))?;
+        };
 
-                let target = f"${t.typeName()} '${t.name}'";
-                if t.kind != NodeKind::ACTOR {
-                    throw copy SyntaxError(f"${what} connects ${c.signal} to ${target}, which has no slot", at._0, at._1);
-                }
+        let target = f"${t.typeName()} '${t.name}'";
+        if t.kind != NodeKind::ACTOR {
+            return (copy SyntaxError(f"${what} connects ${c.signal} to ${target}, which has no slot", at._0, at._1))?;
+        }
 
-                if let Ok(tc) = actorClass(t.className) {
-                    let slot = if let Ok(s) = tc.slot(c.slot) { s } else {
-                        throw copy SyntaxError(f"${what} connects ${c.signal} to ${target}, which has no slot '${c.slot}'", at._0, at._1);
-                    };
+        if let Ok(tc) = actorClass(t.className) {
+            let slot = if let Ok(s) = tc.slot(c.slot) { s } else {
+                return (copy SyntaxError(f"${what} connects ${c.signal} to ${target}, which has no slot '${c.slot}'", at._0, at._1))?;
+            };
 
-                    if let Ok(sc) = actorClass(d.className) {
-                        if let Ok(signal) = sc.signal(c.signal) {
-                            if !sameTypes(signal.payload, slot.params) {
-                                throw copy SyntaxError(f"${what} connects ${c.signal}, which gives ${signature(signal.payload)}, to the slot '${c.slot}' of ${target}, which takes ${signature(slot.params)}",
-                                                       at._0, at._1);
-                            }
-                        }
+            if let Ok(sc) = actorClass(d.className) {
+                if let Ok(signal) = sc.signal(c.signal) {
+                    if !sameTypes(signal.payload, slot.params) {
+                        return (copy SyntaxError(f"${what} connects ${c.signal}, which gives ${signature(signal.payload)}, to the slot '${c.slot}' of ${target}, which takes ${signature(slot.params)}",
+                                                 at._0, at._1))?;
                     }
                 }
             }
         }
+
+        none
     }
 
     /**
