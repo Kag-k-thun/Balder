@@ -1,0 +1,1121 @@
+in bar;
+
+use balder::core::dispose;
+use balder::core::application::signal;
+use balder::interface::style;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::layout;
+use balder::interface::widget::tab_bar::tab_move;
+use balder::interface::widget::text::label;
+use balder::math::vector;
+
+use ::sdl3::{keycode, mouse};
+
+use ::std::algorithm::comparison;
+
+// The distance the cursor goes from where it pressed a tab before the tab is dragged, in pixels
+def DRAG_DISTANCE = 4.0f;
+
+// The index standing for no tab
+def NO_TAB = usize::max;
+
+// The glyph of the button closing a tab, and of the one asking for a new tab, when their style has no image
+def CLOSE_GLYPH = "×";
+def ADD_GLYPH = "+";
+
+/**
+ * What the left button pressed in a tab bar
+ * */
+enum Press : u8
+| NOTHING = 0u8 // nothing, or the bar between the tabs
+| TAB     = 1u8 // a tab, selected and dragged
+| CLOSE   = 2u8 // the button closing a tab
+| ADD     = 3u8; // the button asking for a new tab
+
+/**
+ * A part of a tab bar drawn by a label on a single line, the background and the border of its part: the icon, the dot
+ * and the button closing a tab, the button asking for a new one
+ * */
+class TabPart over Label {
+
+    // The glyph written when the style of the part has no image, "" for none
+    let _glyph: [c8];
+
+    /**
+     * @params:
+     *    - part: the name of the part
+     *    - glyph: the glyph written when its style has no image, drawn in place of it
+     * */
+    pub self (dmut manager: &WidgetManager, part: [c8], glyph: [c8] = "")
+        with super(alias manager, "")
+        , _glyph = glyph
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart(part);
+        self:.forceNoWrap(true);
+        self:.setText(glyph);
+    }
+
+    /**
+     * Give the part a style, its glyph left out when the style has an image
+     * */
+    pub fn setPartStyle(mut self, style: &Style) {
+        self:.setStyle(style);
+        self:.setText(if style.backgroundImage._1 != "" { "" } else { self._glyph });
+    }
+
+    /**
+     * @returns: the width of the margin box of the part, in pixels
+     * */
+    pub fn width(mut self)-> f32 {
+        self:.measureIntrinsicWidths()._1
+    }
+
+    /**
+     * Place the part at a position of a tab, as wide as its margin box, centred in a height
+     * @params:
+     *    - pos: the absolute position of the left of the room of the part, at the top of the content box of the tab
+     *    - width: the width of the room of the part
+     *    - height: the height of the content box of the tab
+     *    - container: the size of the content box of the tab
+     * */
+    pub fn place(mut self, pos: vec2, width: f32, height: f32, depth: u32, container: vec2) {
+        let (_, own) = self:.measureIntrinsicHeights(width);
+        let h = min(own, height);
+        self:.setSize(pos + makeVec2(0.0f, (height - h) / 2.0f), makeVec2(width, h), depth, container);
+    }
+}
+
+/**
+ * A tab of a tab bar: a label on a single line drawing the background and the border of the part ::tab, its text the
+ * title, after the part ::icon (drawn when its style has an image), then the part ::dot while it is unsaved and the
+ * part ::close in a bar whose tabs close
+ * */
+class BarTab over Label {
+
+    // The icon, before the title
+    let dmut _icon: &TabPart;
+
+    // The dot of a tab unsaved, after the title
+    let dmut _dot: &TabPart;
+
+    // The button closing the tab, at the end
+    let dmut _close: &TabPart;
+
+    // True iif the tab has unsaved changes, its dot drawn
+    let mut _unsaved: bool = false;
+
+    // True iif the tab gives room to its button closing it, and true iif it draws it
+    let mut _closable: bool = true;
+    let mut _closeShown: bool = false;
+
+    /**
+     * @params:
+     *    - title: the text of the tab
+     * */
+    pub self (dmut manager: &WidgetManager, title: [c8])
+        with super(alias manager, "")
+        , _icon = copy TabPart(alias manager, "icon")
+        , _dot = copy TabPart(alias manager, "dot")
+        , _close = copy TabPart(alias manager, "close", glyph-> CLOSE_GLYPH)
+    {
+        self._hasBackground = true;
+        self._hasBorder = true;
+        self:.setOwnerPart("tab");
+        self:.forceNoWrap(true);
+        self:.forceAlign(true);
+        self:.setText(title);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SET/GET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the dot of a tab unsaved, or none
+     * */
+    pub fn setUnsaved(mut self, unsaved: bool) {
+        if unsaved == self._unsaved { return; }
+
+        self._unsaved = unsaved;
+        self:.showParts();
+        self:.relayout();
+    }
+
+    /**
+     * @returns: true iif the tab has unsaved changes
+     * */
+    pub fn isUnsaved(self)-> bool {
+        self._unsaved
+    }
+
+    /**
+     * Give the button closing the tab room, or none
+     * */
+    pub fn setClosable(mut self, closable: bool) {
+        if closable == self._closable { return; }
+
+        self._closable = closable;
+        self:.showParts();
+        self:.relayout();
+    }
+
+    /**
+     * Draw the button closing the tab, in a tab closable, or leave its room empty
+     * */
+    pub fn showClose(mut self, shown: bool) {
+        if shown == self._closeShown { return; }
+
+        self._closeShown = shown;
+        self:.showParts();
+    }
+
+    /**
+     * Give the parts of the tab the styles of the parts ::icon, ::dot and ::close of its bar
+     * */
+    pub fn setPartStyles(mut self, icon: &Style, dot: &Style, close: &Style) {
+        self._icon:.setPartStyle(icon);
+        self._dot:.setPartStyle(dot);
+        self._close:.setPartStyle(close);
+    }
+
+    /**
+     * @returns: true iif a position is over the button closing the tab, while it is drawn
+     * @params:
+     *    - pos: the absolute position, in pixels
+     * */
+    pub fn isOnClose(self, pos: vec2)-> bool {
+        if !self._closable || !self._closeShown { return false; }
+
+        let at = self._close.getAbsolutePosition(), size = self._close.getAbsoluteSize();
+        pos.x >= at.x && pos.x <= at.x + size.x && pos.y >= at.y && pos.y <= at.y + size.y
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The icon at the start of the content box, the title after it, then the dot and the button closing the tab at its
+     * end
+     * */
+    over onUpdateSize(mut self) {
+        self.__super__:.onUpdateSize();
+        if !self._attached { return; }
+
+        let icon = self._icon:.width(), dot = self:.dotWidth(), close = self:.closeWidth();
+        if self._absoluteSize.x > 0.0f {
+            self._relTextPos = makeVec2(icon / self._absoluteSize.x, self._relTextPos.y);
+        }
+
+        let pos = self._absolutePosition, size = self._absoluteSize, depth = self._depth + 1;
+        self._icon:.place(pos, icon, size.y, depth, size);
+        self._dot:.place(pos + makeVec2(size.x - close - dot, 0.0f), dot, size.y, depth, size);
+        self._close:.place(pos + makeVec2(size.x - close, 0.0f), close, size.y, depth, size);
+        self:.onUpdateScissors();
+    }
+
+    over onUpdateScissors(mut self) {
+        self._icon:.setScissors(self._scissorPos, self._scissorSize);
+        self._dot:.setScissors(self._scissorPos, self._scissorSize);
+        self._close:.setScissors(self._scissorPos, self._scissorSize);
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        max(self._depth, max(self._icon.getMaxDepth(), max(self._dot.getMaxDepth(), self._close.getMaxDepth())))
+    }
+
+    /**
+     * The content of a tab is its icon, its title, its dot and its button closing it
+     * */
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        let parts = self._icon:.width() + self:.dotWidth() + self:.closeWidth();
+        let (minWidth, maxWidth) = self.__super__:.measureContentWidths();
+        (minWidth + parts, maxWidth + parts)
+    }
+
+    prot over measureContentHeights(mut self, width: f32)-> (f32, f32) {
+        let (minHeight, maxHeight) = self.__super__:.measureContentHeights(width);
+        let mut parts = 0.0f;
+        for h in copy [self._icon:.measureIntrinsicHeights(self._icon:.width())._1,
+                       self._dot:.measureIntrinsicHeights(self:.dotWidth())._1,
+                       self._close:.measureIntrinsicHeights(self:.closeWidth())._1] {
+            parts = max(parts, h);
+        }
+
+        (max(minHeight, parts), max(maxHeight, parts))
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          ATTACH/DETACH          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        self._icon:.onAttach((self)?);
+        self._dot:.onAttach((self)?);
+        self._close:.onAttach((self)?);
+        self:.showParts();
+    }
+
+    over onHide(mut self) {
+        self._icon:.hide();
+        self._dot:.hide();
+        self._close:.hide();
+    }
+
+    over onShow(mut self) {
+        self._icon:.show();
+        self:.showParts();
+    }
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self._icon:.dispose();
+            self._dot:.dispose();
+            self._close:.dispose();
+            self.__super__:.dispose();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the dot of a tab unsaved and the button closing a tab drawing it, hide them otherwise
+     * */
+    fn showParts(mut self) {
+        if !self._attached { return; }
+
+        let drawn = self.isDrawn();
+        if drawn && self._unsaved { self._dot:.show(); } else { self._dot:.hide(); }
+        if drawn && self._closable && self._closeShown { self._close:.show(); } else { self._close:.hide(); }
+    }
+
+    /**
+     * @returns: the width of the dot, none for a tab saved
+     * */
+    fn dotWidth(mut self)-> f32 {
+        if self._unsaved { self._dot:.width() } else { 0.0f }
+    }
+
+    /**
+     * @returns: the width of the button closing the tab, none for a tab that does not close
+     * */
+    fn closeWidth(mut self)-> f32 {
+        if self._closable { self._close:.width() } else { 0.0f }
+    }
+}
+
+/**
+ * A row of tabs, each the title of a document, one of them selected, as the tabs of the documents of an editor: a tab
+ * selected by a click, closed by its button or the middle button, dragged to another place, and a button asking for a
+ * new tab after the last one
+ * @info:
+ * =====
+ * The bar holds the tabs, not what they show: the user asks, the code does. A tab pressed by the left button is
+ * selected and `on-select` tells its index; a click released on the button closing a tab (or a click of the middle
+ * button on a tab) asks to close it, `on-close` telling its index, the code removing it (see removeTab) once it is
+ * closed, after asking about its unsaved changes; a tab dragged moves among the others as the cursor passes the middle
+ * of its neighbours, `on-move` telling each move (TabMove); a click released on the button after the tabs asks for a
+ * new tab, `on-add`. The code adds, removes, moves, renames and selects the tabs without emitting the signals.
+ *
+ * The tabs are the part `::tab`, each as wide as its content, in the states `:hover` under the cursor, `:pressed` while
+ * the left button holds it, `:selected`, `:unsaved` while it has unsaved changes and `:dragged` while it is dragged. In
+ * a tab, its title follows the part `::icon` (drawn when its style has an image), then come the part `::dot` while it
+ * is unsaved and the part `::close`, drawn on the tab selected and on the tab hovered of a bar whose tabs close
+ * (`closable: true`, the default), its room kept on the others; the three parts take the states of their tab, but
+ * `::close`, in `:hover` and `:pressed` of its own. The part `::add` follows the tabs in a bar that asks for new ones
+ * (`addable: true`, the default), in `:hover` and `:pressed`. The button closing a tab writes × and the one asking for
+ * a new one +, unless their style has an image, drawn in place of the glyph. The bar is as wide as its tabs at most and
+ * has no width of its own at least, the tabs past its end being cut.
+ * ====
+ * @example:
+ * ```
+ * TabBar #DOCUMENTS .documents { on-select: documents::select; on-close: documents::close; on-move: documents::move;
+ *                                on-add: documents::new; }
+ * ```
+ * */
+pub class TabBar over Layout {
+
+    // The tabs, in their order
+    let dmut _tabs: [&BarTab] = [];
+
+    // The button asking for a new tab, after the tabs
+    let dmut _add: &TabPart;
+
+    // The tab selected, none when there is none
+    let mut _selected: (usize)? = none;
+
+    // True iif the tabs have a button closing them, and true iif the bar has a button asking for a new one
+    let mut _closable: bool = true;
+    let mut _addable: bool = true;
+
+    // The position and the size of the margin box of each tab, then of the button asking for a new one, relative to the
+    // content box
+    let dmut _relPos: [vec2] = [];
+    let dmut _relSize: [vec2] = [];
+
+    prot { // mouse events
+
+        // The tab under the cursor, and true iif the cursor is over its button closing it, or over the button asking
+        // for a new tab
+        let mut _hoverTab: usize = NO_TAB;
+        let mut _hoverClose: bool = false;
+        let mut _hoverAdd: bool = false;
+
+        // What the left button pressed, the tab it pressed, where, and how far from the left of the tab
+        let mut _press: Press = Press::NOTHING;
+        let mut _pressedTab: usize = 0us;
+        let mut _pressedAt: vec2 = vec2();
+        let mut _grab: f32 = 0.0f;
+
+        // True while the tab pressed is dragged
+        let mut _dragging: bool = false;
+
+        // The tab the middle button pressed, closed when it is released over it
+        let mut _middlePressed: usize = NO_TAB;
+    }
+
+    prot { // signals
+        let dmut _selectedSignal: (&Signal!{usize})? = none;
+        let dmut _closeSignal: (&Signal!{usize})? = none;
+        let dmut _movedSignal: (&Signal!{TabMove})? = none;
+        let dmut _addSignal: (&Signal!{()})? = none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "TabBar")
+        , _add = copy TabPart(alias manager, "add", glyph-> ADD_GLYPH)
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TABS          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add a tab after the others, not selected
+     * @params:
+     *    - title: the text of the tab
+     *    - unsaved: true iif the tab starts with unsaved changes
+     * @returns: the index of the tab
+     * */
+    pub fn addTab(mut self, title: [c8], unsaved: bool = false)-> usize {
+        let dmut tab = copy BarTab(alias self._manager, title);
+        tab:.setClosable(self._closable);
+        tab:.setUnsaved(unsaved);
+        self._tabs ~= [alias tab];
+
+        if self._attached {
+            tab:.onAttach((self)?);
+            if !self.isDrawn() { tab:.hide(); }
+            self:.styleTabs();
+        }
+
+        self._manager:.updateWidgets();
+        self._tabs.len - 1us
+    }
+
+    /**
+     * Remove a tab, the tab after it taking its place; removing the tab selected selects the one taking its place, or
+     * the one before it when it was the last (see TabBar::selectedAfterRemoval), without emitting on-select
+     * */
+    pub fn removeTab(mut self, index: usize) {
+        if index >= self._tabs.len { return; }
+
+        self._tabs[index]:.dispose();
+        let dmut kept: [&BarTab] = [];
+        for i, dmut t in alias self._tabs if i != index {
+            kept ~= [alias t];
+        }
+
+        self._tabs = alias kept;
+        self._selected = TabBar::selectedAfterRemoval(self._selected, index, self._tabs.len);
+        self:.resetMouse();
+        self:.styleTabs();
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * Move a tab to another place among the tabs, the selection following it (see TabMove), without emitting on-move
+     * */
+    pub fn moveTab(mut self, from: usize, to: usize) {
+        if from >= self._tabs.len || to >= self._tabs.len || from == to { return; }
+
+        let dmut moved = alias self._tabs[from];
+        let dmut rest: [&BarTab] = [];
+        for i, dmut t in alias self._tabs if i != from {
+            rest ~= [alias t];
+        }
+
+        let dmut order: [&BarTab] = [];
+        for i, dmut t in alias rest {
+            if i == to { order ~= [alias moved]; }
+            order ~= [alias t];
+        }
+
+        if to == rest.len { order ~= [alias moved]; }
+        self._tabs = alias order;
+
+        if let Ok(s) = self._selected {
+            self._selected = (TabBar::movedIndex(s, from, to))?;
+        }
+
+        self:.styleTabs();
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * Select a tab, none for none, without emitting on-select
+     * */
+    pub fn select(mut self, index: (usize)?) {
+        if let Ok(i) = index && i >= self._tabs.len { return; }
+
+        self._selected = index;
+        self:.styleTabs();
+    }
+
+    /**
+     * @returns: the index of the tab selected, none when there is none
+     * */
+    pub fn getSelected(self)-> (usize)? {
+        self._selected
+    }
+
+    /**
+     * @returns: the number of tabs
+     * */
+    pub fn getCount(self)-> usize {
+        self._tabs.len
+    }
+
+    /**
+     * Change the text of a tab
+     * */
+    pub fn setTitle(mut self, index: usize, title: [c8]) {
+        if index >= self._tabs.len || self._tabs[index].getText() == title { return; }
+
+        self._tabs[index]:.setText(title);
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * @returns: the text of a tab, "" for an index of no tab
+     * */
+    pub fn getTitle(self, index: usize)-> [c8] {
+        if index >= self._tabs.len { return ""; }
+        self._tabs[index].getText()
+    }
+
+    /**
+     * Mark a tab as having unsaved changes, its dot drawn, or as having none
+     * */
+    pub fn setUnsaved(mut self, index: usize, unsaved: bool) {
+        if index >= self._tabs.len || self._tabs[index].isUnsaved() == unsaved { return; }
+
+        self._tabs[index]:.setUnsaved(unsaved);
+        self:.styleTabs();
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * @returns: true iif a tab has unsaved changes
+     * */
+    pub fn isUnsaved(self, index: usize)-> bool {
+        if index >= self._tabs.len { return false; }
+        self._tabs[index].isUnsaved()
+    }
+
+    /**
+     * Give the tabs a button closing them, or none
+     * */
+    pub fn setClosable(mut self, closable: bool) {
+        self._closable = closable;
+        for dmut t in alias self._tabs { t:.setClosable(closable); }
+        self._manager:.updateWidgets();
+    }
+
+    /**
+     * Give the bar a button asking for a new tab after the tabs, or none
+     * */
+    pub fn setAddable(mut self, addable: bool) {
+        if addable == self._addable { return; }
+
+        self._addable = addable;
+        if self._attached {
+            if addable && self.isDrawn() { self._add:.show(); } else { self._add:.hide(); }
+        }
+
+        self._manager:.updateWidgets();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHILDREN          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the tabs, then the button asking for a new one
+     * */
+    pub over getChildren(mut self)-> dmut [&Widget] {
+        let dmut res: [&Widget] = [];
+        for dmut t in alias self._tabs {
+            res ~= [alias t];
+        }
+
+        res ~= [alias self._add];
+        alias res
+    }
+
+    pub over onAttach(mut self, parent: (&Widget)?) {
+        self.__super__:.onAttach(parent);
+        if !self._addable { self._add:.hide(); }
+        self:.styleTabs();
+    }
+
+    over onShow(mut self) {
+        for dmut t in alias self._tabs { t:.show(); }
+        if self._addable { self._add:.show(); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          STYLE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    prot over onApplyStyle(mut self) {
+        self:.styleTabs();
+    }
+
+    prot over restyleChildren(mut self, deep: bool)-> bool {
+        let layout = self.__super__:.restyleChildren(deep);
+        self:.styleTabs();
+        layout
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DRAW SIZE          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The tabs in a row from the start of the content box, as high as it, each as wide as its content, then the button
+     * asking for a new tab, centred in the height
+     * */
+    over onUpdateSize(mut self) {
+        let container = self._absoluteSize;
+        let dmut children = self:.getChildren();
+        self._relPos = copy [vec2(); children.len];
+        self._relSize = copy [vec2(); children.len];
+
+        let mut x = 0.0f;
+        for i, dmut c in alias children {
+            let adds = i == self._tabs.len;
+            if adds && !self._addable { break; }
+
+            let margins = c.getMarginSize(container);
+            let width = c:.measureWidth(container, stretch-> false) + margins.x;
+            let height = if adds { min(container.y, c:.measureHeight(width - margins.x, container, stretch-> false) + margins.y) } else { container.y };
+            let (relPos, relSize) = self:.placeChild(alias c, self._absolutePosition + makeVec2(x, (container.y - height) / 2.0f),
+                                                     makeVec2(width, height), self._depth + 1);
+            self._relPos[i] = relPos;
+            self._relSize[i] = relSize;
+            x += width;
+        }
+    }
+
+    over onUpdateScissors(mut self) {
+        let dmut children = self:.getChildren();
+        for i, dmut c in alias children if i < self._relPos.len {
+            self:.clipChild(alias c, self._relPos[i], self._relSize[i]);
+        }
+    }
+
+    pub over getMaxDepth(self)-> u32 {
+        let mut depth = max(self._depth, self._add.getMaxDepth());
+        for t in self._tabs { depth = max(depth, t.getMaxDepth()); }
+        depth
+    }
+
+    /**
+     * The content of a tab bar is its tabs and its button asking for a new one in a row, the bar having no width of its
+     * own at least, its tabs past its end being cut
+     * */
+    prot over measureContentWidths(mut self)-> (f32, f32) {
+        let mut width = 0.0f;
+        for dmut t in alias self._tabs {
+            width += t:.measureIntrinsicWidths()._1;
+        }
+
+        if self._addable { width += self._add:.measureIntrinsicWidths()._1; }
+        (0.0f, width)
+    }
+
+    prot over measureContentHeights(mut self, _: f32)-> (f32, f32) {
+        let mut height = 0.0f;
+        for dmut t in alias self._tabs {
+            let w = t:.measureIntrinsicWidths()._1;
+            height = max(height, t:.measureIntrinsicHeights(w)._1);
+        }
+
+        if self._addable {
+            let w = self._add:.measureIntrinsicWidths()._1;
+            height = max(height, self._add:.measureIntrinsicHeights(w)._1);
+        }
+
+        (height, height)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOUSE EVENTS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The bar takes the focus of the left button, to drag the tab it pressed
+     * */
+    pub over isFocusableLeftClick(self)-> bool {
+        true
+    }
+
+    pub over loseFocusOnReleaseLeft(self)-> bool {
+        true
+    }
+
+    /**
+     * The tab, the button closing it or the button asking for a new tab under the cursor, styled as such
+     * */
+    pub over onHover(mut self, pos: vec2)-> dmut (&Widget)? {
+        self:.setHover(true);
+        self:.hoverAt(self.absoluteOf(pos));
+        (alias self)?
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        self:.setHover(false);
+        if self._hoverTab != NO_TAB || self._hoverAdd {
+            self._hoverTab = NO_TAB;
+            self._hoverClose = false;
+            self._hoverAdd = false;
+            self:.styleTabs();
+        }
+    }
+
+    /**
+     * The left button selects the tab it presses, emitting on-select when it was not selected, and keeps it to drag it,
+     * or presses the button closing it, or the button asking for a new tab; the middle button presses a tab to close it
+     * */
+    pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        let at = self.absoluteOf(pos);
+        self:.hoverAt(at);
+        if button == SDL_BUTTON_MIDDLE {
+            self._middlePressed = self._hoverTab;
+            return (alias self)?;
+        }
+
+        if button != SDL_BUTTON_LEFT { return (alias self)?; }
+
+        self._press = Press::NOTHING;
+        if self._hoverAdd {
+            self._press = Press::ADD;
+        } else if self._hoverTab != NO_TAB {
+            let i = self._hoverTab;
+            self._pressedTab = i;
+            if self._hoverClose {
+                self._press = Press::CLOSE;
+            } else {
+                self._press = Press::TAB;
+                self._pressedAt = at;
+                self._grab = at.x - self._tabs[i].getAbsolutePosition().x;
+                if !self.isSelected(i) {
+                    self._selected = (i)?;
+                    if let Ok(dmut s) = alias self._selectedSignal { s:.emit(i); }
+                }
+            }
+        }
+
+        self:.styleTabs();
+        (alias self)?
+    }
+
+    /**
+     * The tab pressed by the left button is dragged once the cursor went far enough, moving past a neighbour as the
+     * cursor takes it past its middle, on-move telling each move
+     * */
+    pub over onSliding(mut self, pos: vec2, _: vec2, button: u8) {
+        if button != SDL_BUTTON_LEFT { return; }
+
+        let at = self.absoluteOf(pos);
+        self:.hoverAt(at);
+        if self._press != Press::TAB || self._pressedTab >= self._tabs.len { return; }
+
+        if !self._dragging {
+            if (at - self._pressedAt).length() < DRAG_DISTANCE { return; }
+            self._dragging = true;
+            self:.styleTabs();
+        }
+
+        let mut lefts: [f32] = [], mut widths: [f32] = [];
+        for t in self._tabs {
+            lefts ~= [t.getAbsolutePosition().x];
+            widths ~= [t.getAbsoluteSize().x];
+        }
+
+        let from = self._pressedTab;
+        let to = TabBar::dragTarget(lefts, widths, from, at.x - self._grab);
+        if to != from {
+            self:.moveTab(from, to);
+            self._pressedTab = to;
+            if let Ok(dmut s) = alias self._movedSignal { s:.emit(TabMove(from-> from, to-> to)); }
+        }
+    }
+
+    /**
+     * The left button released over the button closing the tab it pressed emits on-close, over the button asking for a
+     * new tab on-add, and ends a drag; the middle button released over the tab it pressed emits on-close
+     * */
+    pub over onClickEnd(mut self, button: u8)-> dmut (&Widget)? {
+        if button == SDL_BUTTON_MIDDLE {
+            let pressed = self._middlePressed;
+            self._middlePressed = NO_TAB;
+            if pressed != NO_TAB && self._hoverTab == pressed {
+                if let Ok(dmut s) = alias self._closeSignal { s:.emit(pressed); }
+            }
+
+            return (alias self)?;
+        }
+
+        if button != SDL_BUTTON_LEFT { return (alias self)?; }
+
+        let press = self._press, pressed = self._pressedTab;
+        self._press = Press::NOTHING;
+        self._dragging = false;
+        self:.styleTabs();
+
+        if press == Press::CLOSE && self._hoverClose && self._hoverTab == pressed {
+            if let Ok(dmut s) = alias self._closeSignal { s:.emit(pressed); }
+        } else if press == Press::ADD && self._hoverAdd {
+            if let Ok(dmut s) = alias self._addSignal { s:.emit(); }
+        }
+
+        (alias self)?
+    }
+
+    /**
+     * Escape ends a drag, the tab staying where it was taken
+     * */
+    pub over onKeyPressed(mut self, key: SDL_Keycode, _: SDL_Keymod)-> bool {
+        if key == SDLK_ESCAPE && self._press != Press::NOTHING {
+            self:.resetMouse();
+            self:.styleTabs();
+            return true;
+        }
+
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted when the user selects a tab, with its index
+     * */
+    pub fn selected(mut self)-> dmut &Signal!{usize} {
+        if let Ok(dmut s) = alias self._selectedSignal { return alias s; }
+
+        let dmut s = copy Signal!{usize} ();
+        self._selectedSignal = (alias s)?;
+        alias s
+    }
+
+    /**
+     * @returns: the signal emitted when the user asks to close a tab, with its index, the tab staying until it is
+     * removed
+     * */
+    pub fn closeRequested(mut self)-> dmut &Signal!{usize} {
+        if let Ok(dmut s) = alias self._closeSignal { return alias s; }
+
+        let dmut s = copy Signal!{usize} ();
+        self._closeSignal = (alias s)?;
+        alias s
+    }
+
+    /**
+     * @returns: the signal emitted when the user drags a tab to another place, at each place it moves to
+     * */
+    pub fn moved(mut self)-> dmut &Signal!{TabMove} {
+        if let Ok(dmut s) = alias self._movedSignal { return alias s; }
+
+        let dmut s = copy Signal!{TabMove} ();
+        self._movedSignal = (alias s)?;
+        alias s
+    }
+
+    /**
+     * @returns: the signal emitted when the user asks for a new tab
+     * */
+    pub fn addRequested(mut self)-> dmut &Signal!{()} {
+        if let Ok(dmut s) = alias self._addSignal { return alias s; }
+
+        let dmut s = copy Signal!{()} ();
+        self._addSignal = (alias s)?;
+        alias s
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DISPOSING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Disposable {
+        pub over dispose(mut self) {
+            self.__super__:.dispose();
+            self._tabs = [];
+
+            if let Ok(dmut s) = alias self._selectedSignal { s:.clear(); }
+            if let Ok(dmut s) = alias self._closeSignal { s:.clear(); }
+            if let Ok(dmut s) = alias self._movedSignal { s:.clear(); }
+            if let Ok(dmut s) = alias self._addSignal { s:.clear(); }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the tab, the button closing it or the button asking for a new tab under a position, styling them again when
+     * it changed
+     * @params:
+     *    - at: the absolute position, in pixels
+     * */
+    fn hoverAt(mut self, at: vec2) {
+        let mut tab = NO_TAB, mut close = false, mut add = false;
+        if self._addable && TabBar::contains(self._add.getAbsolutePosition(), self._add.getAbsoluteSize(), at) {
+            add = true;
+        } else {
+            for i, t in self._tabs if TabBar::contains(t.getAbsolutePosition(), t.getAbsoluteSize(), at) {
+                tab = i;
+                close = t.isOnClose(at);
+                break;
+            }
+        }
+
+        if tab == self._hoverTab && close == self._hoverClose && add == self._hoverAdd { return; }
+
+        self._hoverTab = tab;
+        self._hoverClose = close;
+        self._hoverAdd = add;
+        self:.styleTabs();
+    }
+
+    /**
+     * Forget what the buttons of the mouse pressed, a drag ending where the tab is
+     * */
+    fn resetMouse(mut self) {
+        self._press = Press::NOTHING;
+        self._dragging = false;
+        self._middlePressed = NO_TAB;
+        self._hoverTab = NO_TAB;
+        self._hoverClose = false;
+        self._hoverAdd = false;
+    }
+
+    /**
+     * Give each tab and its parts the styles of the parts ::tab, ::icon, ::dot and ::close in the states of the tab,
+     * the button closing a tab drawn on the tab selected and on the tab hovered, and the button asking for a new tab
+     * the style of the part ::add in its states
+     * */
+    fn styleTabs(mut self) {
+        if !self._attached { return; }
+
+        let path = self.getStylePath();
+        let manager = self._manager:.getStyleManager();
+        for i, dmut t in alias self._tabs {
+            let hovered = self._hoverTab == i;
+            let pressed = self._pressedTab == i && self._press != Press::NOTHING;
+
+            let mut states: [[c8]] = [];
+            if hovered { states ~= ["hover"]; }
+            if pressed && self._press == Press::TAB { states ~= ["pressed"]; }
+            if self.isSelected(i) { states ~= ["selected"]; }
+            if t.isUnsaved() { states ~= ["unsaved"]; }
+            if pressed && self._dragging { states ~= ["dragged"]; }
+
+            let mut closeStates: [[c8]] = [];
+            if hovered && self._hoverClose { closeStates ~= ["hover"]; }
+            if pressed && self._press == Press::CLOSE { closeStates ~= ["pressed"]; }
+            if self.isSelected(i) { closeStates ~= ["selected"]; }
+
+            t:.setStyle(manager.computePart(path, self._currentStyle, "tab", states-> states));
+            t:.setPartStyles(manager.computePart(path, self._currentStyle, "icon", states-> states),
+                             manager.computePart(path, self._currentStyle, "dot", states-> states),
+                             manager.computePart(path, self._currentStyle, "close", states-> closeStates));
+            t:.showClose(hovered || self.isSelected(i));
+        }
+
+        let mut addStates: [[c8]] = [];
+        if self._hoverAdd { addStates ~= ["hover"]; }
+        if self._press == Press::ADD { addStates ~= ["pressed"]; }
+        self._add:.setPartStyle(manager.computePart(path, self._currentStyle, "add", states-> addStates));
+    }
+
+    /**
+     * @returns: true iif a tab is selected
+     * */
+    fn isSelected(self, index: usize)-> bool {
+        if let Ok(s) = self._selected { s == index } else { false }
+    }
+
+    /**
+     * @returns: the absolute position of a position relative to the margin box of the bar
+     * */
+    fn absoluteOf(self, pos: vec2)-> vec2 {
+        self._absoluteFullPosition + pos * self._absoluteFullSize
+    }
+}
+
+/**
+ * The tab bars in a .gui file, and where their tabs go
+ * */
+pub mod TabBar {
+
+    /**
+     * @returns: the place a tab dragged goes to among the tabs: past each neighbour the middle of the tab dragged
+     * passed, the middle of the neighbour as it was laid out
+     * @params:
+     *    - lefts: the left of each tab, as laid out
+     *    - widths: the width of each tab
+     *    - dragged: the index of the tab dragged
+     *    - left: where the left of the tab dragged is dragged to
+     * */
+    pub fn dragTarget(lefts: [f32], widths: [f32], dragged: usize, left: f32)-> usize {
+        if dragged >= lefts.len || lefts.len != widths.len { return dragged; }
+
+        let centre = left + widths[dragged] / 2.0f;
+        let mut target = dragged;
+        for j in dragged + 1us .. lefts.len {
+            if centre > lefts[j] + widths[j] / 2.0f { target = j; }
+        }
+
+        for k in 0us .. dragged {
+            let j = dragged - 1us - k;
+            if centre < lefts[j] + widths[j] / 2.0f { target = j; }
+        }
+
+        target
+    }
+
+    /**
+     * @returns: the tab selected once a tab is removed: the same tab, its index shifted when it came after the one
+     * removed; the tab taking the place of the one removed when it was selected, or the one before it when it was the
+     * last; none when nothing was selected or no tab is left
+     * @params:
+     *    - selected: the tab selected before the removal
+     *    - removed: the index of the tab removed
+     *    - count: the number of tabs left
+     * */
+    pub fn selectedAfterRemoval(selected: (usize)?, removed: usize, count: usize)-> (usize)? {
+        let s = if let Ok(s) = selected { s } else { return none; };
+        if count == 0us { return none; }
+        if s > removed { return (s - 1us)?; }
+        if s < removed { return (s)?; }
+
+        (min(removed, count - 1us))?
+    }
+
+    /**
+     * @returns: the index of a tab once another tab (or itself) is moved from a place to another
+     * */
+    pub fn movedIndex(index: usize, from: usize, to: usize)-> usize {
+        if index == from { return to; }
+        if from < index && index <= to { return index - 1us; }
+        if to <= index && index < from { return index + 1us; }
+        index
+    }
+
+    /**
+     * @returns: true iif a position is in a box
+     * */
+    pub fn contains(at: vec2, size: vec2, pos: vec2)-> bool {
+        pos.x >= at.x && pos.x < at.x + size.x && pos.y >= at.y && pos.y < at.y + size.y
+    }
+
+    /**
+     * @returns: the schema of the tab bars, closable: whether their tabs have a button closing them, addable: whether
+     * they have a button asking for a new tab, tabs: the titles of their first tabs, the first one selected
+     * */
+    pub fn schema()-> &WidgetSchema {
+        let tabStates = copy ["hover", "pressed", "selected", "unsaved", "dragged"];
+        copy WidgetSchema("TabBar",
+                          |dmut m, id|-> dmut &Widget => copy TabBar(alias m, id),
+                          attributes-> copy [copy Setter!{&TabBar, bool}("closable", |dmut b, c| => { b:.setClosable(c); }),
+                                             copy Setter!{&TabBar, bool}("addable", |dmut b, a| => { b:.setAddable(a); }),
+                                             copy Setter!{&TabBar, [[c8]]}("tabs", |dmut b, titles| => {
+                                                 for t in titles { b:.addTab(t); }
+                                                 if b.getCount() != 0us && !b.getSelected().hasValue { b:.select((0us)?); }
+                                             })],
+                          signals-> copy [copy Emitter!{&TabBar, usize}("on-select", |dmut b|-> dmut &Signal!{usize} => alias b:.selected()),
+                                          copy Emitter!{&TabBar, usize}("on-close", |dmut b|-> dmut &Signal!{usize} => alias b:.closeRequested()),
+                                          copy Emitter!{&TabBar, TabMove}("on-move", |dmut b|-> dmut &Signal!{TabMove} => alias b:.moved()),
+                                          copy Emitter!{&TabBar, ()}("on-add", |dmut b|-> dmut &Signal!{()} => alias b:.addRequested())],
+                          states-> copy ["hover", "focus"],
+                          parts-> copy ["tab", "icon", "dot", "close", "add"],
+                          partStates-> copy ["tab" => tabStates, "icon" => tabStates, "dot" => tabStates,
+                                             "close" => copy ["hover", "pressed", "selected"], "add" => copy ["hover", "pressed"]])
+    }
+}

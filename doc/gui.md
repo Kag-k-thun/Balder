@@ -280,6 +280,8 @@ TableView #SONGS { multiple: true; on-select: listed; on-activate: play; }  // f
 Collapsible #ADVANCED "Advanced" { expanded: false; on-toggle: folded;  // fn folded (mut self, expanded: bool)
     CheckBox "Vertical sync";
 }
+TabBar #DOCUMENTS { tabs: "main", "level_2"; on-select: shown; on-close: closing;  // fn closing (mut self, tab: usize)
+                    on-move: moved; on-add: added; }                     // fn moved (mut self, m: TabMove)
 Separator;
 Image "res:/images/logo.png";
 ```
@@ -379,6 +381,22 @@ Image "res:/images/logo.png";
   collapsing it; `on-toggle` gives true iif the user expanded it, not when `expanded:` or `setExpanded` does. Sections
   taller than their panel go in a linear layout that scrolls (`overflow: scroll`), whose min-content is 0 so it never
   grows its ancestors.
+- **A tab bar is a row of tabs** naming documents, one of them selected, which it does not show: the code adds, removes,
+  moves, renames, marks and selects the tabs (`addTab`, `removeTab`, `moveTab`, `setTitle`, `setUnsaved`, `select`)
+  without a signal, and the user asks. A press of the left button on a tab selects it, `on-select` giving its index; a
+  click released on the cross of a tab, or of the middle button on a tab, asks to close it, `on-close` giving its index,
+  the tab staying until the code removes it (after asking about its unsaved changes); a tab dragged moves past a
+  neighbour as the middle of the tab passes the middle of the neighbour, `on-move` giving each move (`TabMove`, its
+  `from` and its `to`), Escape ending the drag; a click released on the + after the tabs asks for a new one, `on-add`.
+  Removing the tab selected selects the one taking its place, or the one before it when it was the last. The tabs are
+  its `::tab`, each as wide as its content and as high as the bar, in the states `:hover`, `:pressed`, `:selected`,
+  `:unsaved` and `:dragged`; in a tab, the title follows the `::icon` (drawn when its style has an `image`), then come
+  the `::dot` of a tab unsaved and the `::close`, drawn on the tab selected and on the tab hovered, its room kept on the
+  others (`closable: false` gives it none). The three parts take the states of their tab, but `::close`, in `:hover` and
+  `:pressed` of its own and `:selected`. The `::add` follows the tabs (`addable: false` leaves it out), in `:hover` and
+  `:pressed`. The cross writes × and the + writes +, unless their style has an `image` (`engine:/images/ui/close.svg`,
+  `engine:/images/ui/plus.svg`), drawn in place of the glyph. The bar is as wide as its tabs at most and has no
+  min-content width, the tabs past its end being cut. `tabs:` gives it its first tabs, the first one selected.
 - **A separator is a rule** a pixel thick across its `direction`, a row (horizontal) by default, drawn with its
   background colour. An auto size stretches it along the layout it is in.
 - **An image shows a picture** as the background image of its inline style, so that `image-fill`, `image-keep-ratio`
@@ -1163,6 +1181,17 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** `grip` (states `hover`), `bbox`
 - **Properties:** `direction`: row or column
+
+### `TabBar`
+
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `closable`: true or false; `addable`: true or false; `tabs`: strings separated by commas
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` (usize), `on-close` (usize), `on-move` (balder::interface::widget::tab_bar::tab_move::TabMove), `on-add`
+- **States:** `hover`, `focus`
+- **Parts:** `tab` (states `hover`, `pressed`, `selected`, `unsaved`, `dragged`), `icon` (states `hover`, `pressed`, `selected`, `unsaved`, `dragged`), `dot` (states `hover`, `pressed`, `selected`, `unsaved`, `dragged`), `close` (states `hover`, `pressed`, `selected`), `add` (states `hover`, `pressed`)
+- **Properties:** none
 
 ### `TabLayout`
 

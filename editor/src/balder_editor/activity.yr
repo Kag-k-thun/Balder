@@ -1,11 +1,12 @@
 in activity;
 
-use balder_editor::{arguments, build_error_dialog, command, connections_panel, editor, hulls_panel, inspector_panel, manager, naming, outline_panel, project, viewport};
+use balder_editor::{arguments, build_error_dialog, command, connections_panel, document, editor, hulls_panel, inspector_panel, manager, naming, outline_panel, project, viewport};
 use balder_editor::command::{add, duplicate, open, projection, remove, transform, volume, wrap};
 use balder_editor::project::{game_build, game_library, recent};
 use balder::core::{_, application::_};
 use balder::interface::dialog;
 use balder::interface::widget::{button::menu, button::push, layout::d3scene, layout::linear, text::label, tree::view};
+use balder::interface::widget::tab_bar::{bar, tab_move};
 use balder::math::vector;
 use balder::scene::{description::_, editable, property::value};
 use balder::scene::actors::node_classes;
@@ -42,6 +43,9 @@ def GRID_ITEM = "BAR/VIEW/GRID";
 // The path of the item of the View menu looking through the camera selected, or through the camera of the editor again
 def THROUGH_ITEM = "BAR/VIEW/THROUGH";
 
+// The path of the tabs of the documents, on the top row
+def DOCUMENTS = "BAR/DOCUMENTS";
+
 // The colour seen where nothing is drawn while the scene has no environment, a grey (linear, exposed and tone mapped
 // with the scene)
 def BACKGROUND = makeVec3(0.07f, 0.07f, 0.075f);
@@ -65,19 +69,29 @@ def BUILD_ERROR_DIALOG = "ui/build_error.gui";
 def BUILD_REFRESH = 250u64;
 
 /**
- * What the editor does once the unsaved changes of the scene are saved or discarded
+ * What the editor does once the unsaved changes of the documents are saved or discarded
  * */
 enum Pending : u8
 | NOTHING = 0u8
-| NEW     = 1u8
-| OPEN    = 2u8
-| QUIT    = 3u8
-| MANAGER = 4u8;
+| CLOSE   = 1u8 // close the document asked about
+| QUIT    = 2u8 // quit, every document saved or discarded
+| MANAGER = 3u8; // go back to the project manager, every document saved or discarded
 
 
 /**
  * The editor of Balder: the outline of the scene on the left, the viewport in the middle, the inspector of the node
- * selected on the right, under a menu bar opening, saving, adding, copying and removing nodes, above a status bar
+ * selected on the right, under a top row of the menus opening, saving, adding, copying and removing nodes, then of the
+ * tabs of the scenes opened, above a status bar
+ * @info:
+ * =====
+ * Each scene opened is a document (SceneDocument) in a tab of its own, with its file, its history, its selection and
+ * the eye of the editor camera: a click on a tab (or Ctrl+Tab, Ctrl+Shift+Tab) shows its scene in the viewport, the
+ * nodes of the other documents kept out of the scene meanwhile, as they were left; a tab is dragged to another place,
+ * closed by its cross, the middle button or Ctrl+W (asking about its unsaved changes first), and + (or Ctrl+N) opens a
+ * new scene in a tab of its own. Opening a scene already open shows its tab; a scene opened takes the place of a new
+ * scene never changed, and gets a tab of its own otherwise. Closing the last tab leaves a new scene. Quit and Back to
+ * the project manager ask about the unsaved changes of each document in turn.
+ * ====
  * @info:
  * =====
  * The editor edits a project (see Project), the one of the project path (getProjectPath), opened by the project
@@ -103,14 +117,16 @@ enum Pending : u8
  * ====
  * @info:
  * =====
- * Every change of the scene is a command run through the SceneEditor, which keeps their history; the viewport, focused
- * by a click, takes the keys W, E and R (the gizmo), Delete, Ctrl+D and F, the window Ctrl+Z (undo), Ctrl+Shift+Z and
- * Ctrl+Y (redo), Ctrl+S (save), Ctrl+Shift+S (save as) and Ctrl+E (the Add menu, under the cursor). The items Undo and Redo of the Edit menu name the change they
- * undo or redo. View → Look through the camera selected draws the viewport through a camera of the scene, its moves
- * recorded as commands, until View → Look through the editor camera, or until the camera leaves the scene.
- * The scene has unsaved changes while its history is not where it was at the last save (a change made, or undone),
- * shown in the title of the window and on the right of the status bar. A new scene, blank, has no file yet: its first
- * save asks for one. New, Open and Quit ask whether to save the changes first, or discard them, or do nothing.
+ * Every change of the scene is a command run through the SceneEditor, which keeps it in the history of the document
+ * shown; the viewport, focused by a click, takes the keys W, E and R (the gizmo), Delete, Ctrl+D and F, the window
+ * Ctrl+Z (undo), Ctrl+Shift+Z and Ctrl+Y (redo), Ctrl+N (new scene), Ctrl+O (open), Ctrl+W (close), Ctrl+S (save),
+ * Ctrl+Shift+S (save as), Ctrl+Tab and Ctrl+Shift+Tab (the next and the previous tab) and Ctrl+E (the Add menu, under
+ * the cursor). The items Undo and Redo of the Edit menu name the change they undo or redo. View → Look through the
+ * camera selected draws the viewport through a camera of the scene, its moves recorded as commands, until View → Look
+ * through the editor camera, or until the camera leaves the scene. A scene has unsaved changes while its history is not
+ * where it was at the last save (a change made, or undone), shown by a dot on its tab, in the title of the window and
+ * on the right of the status bar. A new scene, blank, has no file yet: its first save asks for one. Closing a scene,
+ * Quit and Back to the project manager ask whether to save the changes first, or discard them, or do nothing.
  * ====
  * */
 pub class EditorActivity over Activity {
@@ -139,14 +155,24 @@ pub class EditorActivity over Activity {
     // The directory of the model chosen last, the dialog adding a model starting from it, empty before the first one
     let mut _modelDirectory: [c8] = "";
 
-    // The file of the scene, where it is saved, empty for a new scene; res:/… under the res/ directory of the project
-    let mut _path: [c8] = "";
+    // The scenes opened, in the order of their tabs, the one shown being the document of the editor
+    let dmut _documents: [&SceneDocument] = [];
 
-    // The speeds of the flights of the viewport in the scene files opened, by their path, each scene flown at its own
+    // The tabs of the documents, once the interface is loaded
+    let dmut _tabs: (&TabBar)? = none;
+
+    // The speeds of the flights of the viewport in the scene files closed, by their path, a scene opened again flown at
+    // the speed it was
     let dmut _flightPaces: [[c8] => f32] = copy [];
 
     // What to do once the unsaved changes are saved or discarded
     let mut _pending: Pending = Pending::NOTHING;
+
+    // The document a close waits for, its unsaved changes saved or discarded
+    let dmut _closing: (&SceneDocument)? = none;
+
+    // The documents whose unsaved changes were discarded while quitting, or going back to the project manager
+    let dmut _discarded: [&SceneDocument] = [];
 
     // True while a dialog of the editor asks something, the keys saving the scene and the quitting waiting for its
     // answer
@@ -180,6 +206,7 @@ pub class EditorActivity over Activity {
         self:.slot("scene::open", &self:.onOpenClicked);
         self:.slot("scene::save", &self:.onSaveClicked);
         self:.slot("scene::save-as", &self:.onSaveAsClicked);
+        self:.slot("scene::close", &self:.onCloseClicked);
         self:.slot("scene::manager", &self:.onManagerClicked);
         self:.slot("scene::quit", &self:.onQuitClicked);
         self:.slot("add::cube", &self:.onAddCube);
@@ -217,6 +244,10 @@ pub class EditorActivity over Activity {
         self:.slot("gizmo::rotate", &self:.onRotateClicked);
         self:.slot("gizmo::scale", &self:.onScaleClicked);
         self:.slot("game::compile", &self:.onCompileClicked);
+        self:.slot("documents::select", &self:.onTabSelected);
+        self:.slot("documents::close", &self:.onTabClosed);
+        self:.slot("documents::move", &self:.onTabMoved);
+        self:.slot("documents::new", &self:.onTabAdded);
 
         let dmut outline = copy OutlinePanel(&self:.setStatus);
         self:.behavior("outline", alias outline);
@@ -243,12 +274,19 @@ pub class EditorActivity over Activity {
             self._gridLabel = (alias l)?;
         }
 
+        if let Ok(dmut b: &TabBar) = self.gui:.find(DOCUMENTS) {
+            self._tabs = (alias b)?;
+        }
+
         if let Ok(dmut w: &Scene3DLayout) = self.gui:.find("BODY/MAIN/VIEW") {
             if let Ok(dmut s: &EditableScene) = alias w:.getScene() {
                 s.background = BACKGROUND;
-                let dmut e = copy SceneEditor(alias s);
+                let dmut first = copy SceneDocument();
+                self:.addDocument(alias first);
+                let dmut e = copy SceneEditor(alias s, alias first);
                 e:.edited():.connect(self.box, &self:.onEdited);
                 self._editor = (alias e)?;
+                self:.showTabs();
             }
         }
 
@@ -310,12 +348,10 @@ pub class EditorActivity over Activity {
         self:.saveRecent(recent);
 
         let (notice, toBuild) = self:.findLibrary(directory);
+        // the first document is a new scene, which the first scene opened takes the place of
         let scene = self.firstScene(recent.sceneOf(directory));
-        if scene.len == 0us {
-            self:.newScene();
-        } else {
-            self:.openScene(scene);
-        }
+        if scene.len != 0us { self:.openScene(scene); }
+        self:.showDocument();
 
         if notice.len != 0us { self:.notify(notice); }
         if toBuild { self:.compile(); }
@@ -575,49 +611,65 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Load the library of the game built, in place of the one loaded, the scene rebuilt with its classes: described as
-     * its file would save it, its nodes dropped (with the history naming them) before the library loaded is closed,
-     * then built again from its description, read leniently, once the library is loaded; its unsaved changes stay
-     * unsaved, and so does a scene that lost what the classes no longer declare
+     * Load the library of the game built, in place of the one loaded, the scenes of the documents rebuilt with its
+     * classes: each described as its file would save it, the nodes of every document dropped (with the histories naming
+     * them) before the library loaded is closed, then the scene shown built again from its description, read leniently,
+     * once the library is loaded, the scenes of the other documents when they are shown next; their unsaved changes
+     * stay unsaved, and so does a scene that lost what the classes no longer declare
      * */
     fn reload(mut self) {
         let library = if let Ok(b) = self._build { b.library } else { return; };
         let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
 
-        let mut content = "";
+        let mut contents: [[c8]] = [];
         {
-            let dmut scene = alias e.scene;
-            content = copy SceneDescription(alias scene:.getRootNode()).content();
+            for dmut d in alias self._documents {
+                if d is e.document {
+                    let dmut scene = alias e.scene;
+                    contents ~= [copy SceneDescription(alias scene:.getRootNode()).content()];
+                } else {
+                    contents ~= [d:.describeParked()];
+                }
+            }
         } catch {
             err: &BalderError => {
-                log::error #("Editor", "Failed to describe the scene to reload the library of the game", err);
+                log::error #("Editor", "Failed to describe the scenes to reload the library of the game", err);
                 self:.setStatus(f"The library was not reloaded: ${err.msg}");
                 return;
             }
         }
 
-        let unsaved = e.unsaved;
-        let name = self.documentName();
+        let mut unsaved: [bool] = [];
+        for d in self._documents { unsaved ~= [d.unsaved]; }
+
         self:.dropNodes();
         let mut status = self:.loadLibrary(library);
-        {
-            let description = copy SceneDescription(content, file-> name, lenient-> true);
-            for d in description.dropped {
-                log::warn #("Editor", f"Reloading the library of the game: ${d}, dropped");
-            }
+        for i, dmut d in alias self._documents {
+            {
+                let description = copy SceneDescription(contents[i], file-> d.name, lenient-> true);
+                for x in description.dropped {
+                    log::warn #("Editor", f"Reloading the library of the game: ${x} in ${d.name}, dropped");
+                }
 
-            self:.run(copy OpenCommand(description, name));
-            if unsaved || description.dropped.len != 0us { e:.markUnsaved(); }
-            if description.dropped.len != 0us {
-                status ~= f"; ${description.dropped.len} entries of the scene its classes no longer declare dropped (see the log)";
-            }
-        } catch {
-            err: &BalderError => {
-                // never the case of a scene this Balder wrote: kept where it can be read again
-                log::error #("Editor", "Failed to build the scene again with the library of the game", err);
-                let kept = self.keepContent(content);
-                e:.markUnsaved();
-                status = f"The scene could not be built again (${err.msg}), kept in ${kept}";
+                let changed = unsaved[i] || description.dropped.len != 0us;
+                if d is e.document {
+                    self:.run(copy OpenCommand(description, d.name));
+                    if changed { e:.markUnsaved(); }
+                } else {
+                    d:.replaceParked((description)?, changed);
+                }
+
+                if description.dropped.len != 0us {
+                    status ~= f"; ${description.dropped.len} entries of ${d.name} its classes no longer declare dropped (see the log)";
+                }
+            } catch {
+                err: &BalderError => {
+                    // never the case of a scene this Balder wrote: kept where it can be read again
+                    log::error #("Editor", f"Failed to build ${d.name} again with the library of the game", err);
+                    let kept = self.keepContent(contents[i]);
+                    if d is e.document { e:.markUnsaved(); } else { d:.replaceParked(none, true); }
+                    status = f"${d.name} could not be built again (${err.msg}), kept in ${kept}";
+                }
             }
         }
 
@@ -627,10 +679,15 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Drop the nodes of the scene, the history naming them dropped with them, so that no node of a class of the library
-     * of the game outlives it
+     * Drop the nodes of every document, the histories naming them dropped with them, so that no node of a class of the
+     * library of the game outlives it
      * */
     fn dropNodes(mut self) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        for dmut d in alias self._documents if !(d is e.document) {
+            d:.replaceParked(none, d.unsaved);
+        }
+
         let nodes: [NodeDescription] = [];
         self:.run(copy OpenCommand(copy SceneDescription(nodes), self.documentName()));
     }
@@ -680,11 +737,15 @@ pub class EditorActivity over Activity {
      */
 
     fn onNewClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.ask(Pending::NEW); }
+        if b == SDL_BUTTON_LEFT { self:.newScene(); }
     }
 
     fn onOpenClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.ask(Pending::OPEN); }
+        if b == SDL_BUTTON_LEFT { self:.chooseScene(); }
+    }
+
+    fn onCloseClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.closeShown(); }
     }
 
     fn onSaveClicked(mut self, b: u8) {
@@ -711,9 +772,10 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * The keys of the window: Ctrl+Z undoes the last change, Ctrl+Shift+Z and Ctrl+Y redo it, Ctrl+S saves the scene,
-     * Ctrl+Shift+S saves it in another file, Ctrl+E opens the Add menu under the cursor, Ctrl+R compiles the library of
-     * the game and loads it
+     * The keys of the window: Ctrl+Z undoes the last change, Ctrl+Shift+Z and Ctrl+Y redo it, Ctrl+N opens a new scene,
+     * Ctrl+O a scene file, Ctrl+W closes the scene shown, Ctrl+S saves it, Ctrl+Shift+S saves it in another file,
+     * Ctrl+Tab and Ctrl+PageDown show the next tab, Ctrl+Shift+Tab and Ctrl+PageUp the previous one, Ctrl+E opens the
+     * Add menu under the cursor, Ctrl+R compiles the library of the game and loads it
      * */
     fn onKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
         let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
@@ -728,6 +790,16 @@ pub class EditorActivity over Activity {
             self:.saveAs();
         } else if key == SDLK_S {
             self:.save();
+        } else if key == SDLK_N && !shift {
+            self:.newScene();
+        } else if key == SDLK_O && !shift {
+            self:.chooseScene();
+        } else if key == SDLK_W && !shift {
+            self:.closeShown();
+        } else if (key == SDLK_TAB && !shift) || key == SDLK_PAGEDOWN {
+            self:.showNeighbour(true);
+        } else if key == SDLK_TAB || key == SDLK_PAGEUP {
+            self:.showNeighbour(false);
         } else if key == SDLK_E && !shift {
             self:.openAddMenu();
         } else if key == SDLK_R && !shift {
@@ -736,27 +808,46 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Replace the nodes of the scene by none, a new scene starting blank, saved in a file of its own
+     * Open a new scene, blank, in a tab of its own, saved in a file of its own
      * */
     fn newScene(mut self) {
-        let nodes: [NodeDescription] = [];
-        if self:.run(copy OpenCommand(copy SceneDescription(nodes), "a new scene")) {
-            self:.keepFlightPace("");
-            self._path = "";
-        }
+        let dmut d = copy SceneDocument();
+        self:.addDocument(alias d);
+        self:.switchDocument(alias d);
+        self:.setStatus("New scene");
     }
 
     /**
-     * Replace the nodes of the scene by those of a scene file
+     * Open a scene file, in the tab showing it when it is open, in place of the scene shown when it is a new scene
+     * never changed, in a tab of its own otherwise
      * */
     fn openScene(mut self, path: [c8]) {
+        let opened = qualifiedPath(path);
+        for dmut d in alias self._documents if d.path == opened {
+            self:.switchDocument(alias d);
+            self:.setStatus(f"${d.name} is open");
+            return;
+        }
+
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
         {
             let description = copy SceneDescription::fromFile(path);
+            if !e.document.isBlank {
+                let dmut d = copy SceneDocument();
+                self:.addDocument(alias d);
+                self:.switchDocument(alias d);
+            }
+
             if self:.run(copy OpenCommand(description, Path(path).file())) {
-                let opened = qualifiedPath(path);
-                self:.keepFlightPace(opened);
-                self._path = opened;
+                let dmut d = alias e.document;
+                d.path = opened;
+                if let Ok(p) = self._flightPaces[opened] {
+                    d.flightPace = p;
+                    if let Ok(dmut v) = alias self._viewport { v.flightPace = p; }
+                }
+
                 self:.keepEdited(opened);
+                self:.showDocument();
             }
         } catch {
             err: &BalderError => {
@@ -766,20 +857,198 @@ pub class EditorActivity over Activity {
         }
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DOCUMENTS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     /**
-     * Keep the speed of the flights of the viewport in the scene left, and fly the scene opened at the speed it was
-     * flown at, a scene not opened yet (or a new one) at the speed of a flight
-     * @params:
-     *    - opened: the path of the scene opened, empty for a new scene
+     * A tab is clicked: its document is shown
      * */
-    fn keepFlightPace(mut self, opened: [c8]) {
+    fn onTabSelected(mut self, index: usize) {
+        if index < self._documents.len {
+            self:.switchDocument(alias self._documents[index]);
+        }
+    }
+
+    /**
+     * The cross of a tab, or the middle button, asks to close its document
+     * */
+    fn onTabClosed(mut self, index: usize) {
+        if index < self._documents.len && !self._asking {
+            self:.requestClose(alias self._documents[index]);
+        }
+    }
+
+    /**
+     * A tab is dragged to another place: its document follows it
+     * */
+    fn onTabMoved(mut self, moved: TabMove) {
+        if moved.from >= self._documents.len || moved.to >= self._documents.len { return; }
+
+        let dmut d = alias self._documents[moved.from];
+        let dmut rest: [&SceneDocument] = [];
+        for i, dmut x in alias self._documents if i != moved.from {
+            rest ~= [alias x];
+        }
+
+        let dmut order: [&SceneDocument] = [];
+        for i, dmut x in alias rest {
+            if i == moved.to { order ~= [alias d]; }
+            order ~= [alias x];
+        }
+
+        if moved.to == rest.len { order ~= [alias d]; }
+        self._documents = alias order;
+    }
+
+    /**
+     * The + after the tabs opens a new scene
+     * */
+    fn onTabAdded(mut self) {
+        self:.newScene();
+    }
+
+    /**
+     * Put a document after the others, in a tab of its own
+     * */
+    fn addDocument(mut self, dmut d: &SceneDocument) {
+        self._documents ~= [alias d];
+        if let Ok(dmut t) = alias self._tabs {
+            t:.addTab(d.title, unsaved-> d.unsaved);
+        }
+    }
+
+    /**
+     * Show a document in the viewport, the document shown kept as it is left: its nodes out of the scene, its
+     * selection, and the eye of the editor camera, which takes the one the document shown had (the camera looked
+     * through left first); a document whose nodes were dropped meanwhile builds them again
+     * */
+    fn switchDocument(mut self, dmut d: &SceneDocument) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        if d is e.document {
+            self:.showTabs();
+            return;
+        }
+
         if let Ok(dmut v) = alias self._viewport {
-            if self._path.len != 0us {
-                self._flightPaces[self._path] = v.flightPace;
+            if v.lookedThrough.hasValue { v:.lookThrough(none); }
+            e.document:.keepView(v.orbit, v.flightPace);
+        }
+
+        e:.switchTo(alias d);
+        if let Ok(dmut v) = alias self._viewport {
+            v.orbit = d.orbit;
+            v.flightPace = d.flightPace;
+        }
+
+        if let Ok(rebuilt) = d:.takeDescription() {
+            self:.run(copy OpenCommand(rebuilt._0, d.name));
+            if rebuilt._1 { e:.markUnsaved(); }
+        }
+
+        self:.keepEdited(d.path);
+        self:.showThrough();
+        self:.showDocument();
+        self:.showHistory();
+    }
+
+    /**
+     * Show the tab after the one shown, or the one before it, going round
+     * */
+    fn showNeighbour(mut self, next: bool) {
+        let count = self._documents.len;
+        if count < 2us { return; }
+
+        let i = self.shownIndex();
+        let to = if next { (i + 1us) % count } else { (i + count - 1us) % count };
+        self:.switchDocument(alias self._documents[to]);
+    }
+
+    /**
+     * Close the document shown, asking first about its unsaved changes
+     * */
+    fn closeShown(mut self) {
+        if self._asking { return; }
+
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        self:.requestClose(alias e.document);
+    }
+
+    /**
+     * Close a document, shown first and asked about when it has unsaved changes: saved, discarded, or kept open
+     * */
+    fn requestClose(mut self, dmut d: &SceneDocument) {
+        if !d.unsaved {
+            self:.closeDocument(alias d);
+            return;
+        }
+
+        self:.switchDocument(alias d);
+        self._closing = (alias d)?;
+        self:.askAbout(d, Pending::CLOSE);
+    }
+
+    /**
+     * Close a document for good, its nodes dropped: the document after it is shown when it was shown, or the one before
+     * it when it was the last, a new scene when it was the only one
+     * */
+    fn closeDocument(mut self, dmut d: &SceneDocument) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let mut index = 0us;
+        for i, x in self._documents if x is d { index = i; }
+
+        if d is e.document {
+            if self._documents.len == 1us {
+                self:.newScene();
+            } else {
+                let next = if index + 1us < self._documents.len { index + 1us } else { index - 1us };
+                self:.switchDocument(alias self._documents[next]);
+            }
+        }
+
+        if d.path.len != 0us { self._flightPaces[d.path] = d.flightPace; }
+        d:.replaceParked(none, false);
+
+        let dmut kept: [&SceneDocument] = [];
+        for dmut x in alias self._documents if !(x is d) {
+            kept ~= [alias x];
+        }
+
+        self._documents = alias kept;
+        if let Ok(dmut t) = alias self._tabs { t:.removeTab(index); }
+        self:.showTabs();
+        self:.setStatus(f"Closed ${d.name}");
+    }
+
+    /**
+     * Write the title of each document on its tab, a dot on those with unsaved changes, the tab of the document shown
+     * selected
+     * */
+    fn showTabs(mut self) {
+        let shown = self.shownIndex();
+        if let Ok(dmut t) = alias self._tabs {
+            for i, d in self._documents {
+                t:.setTitle(i, d.title);
+                t:.setUnsaved(i, d.unsaved);
             }
 
-            v.flightPace = if let Ok(p) = self._flightPaces[opened] { p } else { CameraFlight().pace };
+            t:.select((shown)?);
         }
+    }
+
+    /**
+     * @returns: the index of the document shown among the documents, 0 before there is one
+     * */
+    fn shownIndex(self)-> usize {
+        if let Ok(e) = self._editor {
+            for i, d in self._documents if d is e.document { return i; }
+        }
+
+        0us
     }
 
     /*!
@@ -791,61 +1060,102 @@ pub class EditorActivity over Activity {
      */
 
     /**
-     * Do something that drops the scene (open a new scene, open a scene file, quit), asking first whether to save its
-     * unsaved changes, discard them or do nothing
+     * Do something that drops the documents (quit, go back to the project manager), asking first about the unsaved
+     * changes of each document in turn, shown as it is asked about: saved, discarded, or kept, nothing done
      * */
     fn ask(mut self, then: Pending) {
-        if !self.unsaved() {
-            self:.proceed(then);
-            return;
-        }
-
-        self._pending = then;
-        let question = match then {
-            Pending::NEW  => { "before starting a new scene?" }
-            Pending::OPEN => { "before opening another scene?" }
-            Pending::MANAGER => { "before going back to the project manager?" }
-            _             => { "before quitting?" }
-        };
-
-        let dmut d = copy MessageDialog(f"Save the changes to ${self.documentName()} ${question}", title-> "Unsaved changes",
-                                        yes-> "Save", no-> "Discard", cancel-> "Cancel");
-        d:.answered():.connect(self.box, &self:.onUnsavedAnswered);
-        self:.openDialog(alias d);
-    }
-
-    /**
-     * The unsaved changes are saved (the pending action following the save), discarded, or kept, nothing done
-     * */
-    fn onUnsavedAnswered(mut self, status: MessageDialogStatus) {
-        self._asking = false;
-        match status {
-            MessageDialogStatus::YES => { self:.save(); }
-            MessageDialogStatus::NO  => { self:.proceed(self._pending); }
-            _ => {
-                self._pending = Pending::NOTHING;
-                self:.setStatus("Kept the unsaved changes");
+        for dmut d in alias self._documents if d.unsaved {
+            let mut discarded = false;
+            for x in self._discarded if x is d { discarded = true; }
+            if !discarded {
+                self:.switchDocument(alias d);
+                self:.askAbout(d, then);
+                return;
             }
         }
-    }
 
-    /**
-     * Do what was waiting for the unsaved changes to be saved or discarded
-     * */
-    fn proceed(mut self, then: Pending) {
-        self._pending = Pending::NOTHING;
+        self._discarded = [];
         match then {
-            Pending::NEW  => { self:.newScene(); }
-            Pending::OPEN => { self:.chooseScene(); }
-            Pending::QUIT => { self.app:.close(alias self); }
+            Pending::QUIT    => { self.app:.close(alias self); }
             Pending::MANAGER => { self:.openManager(); }
             _ => {}
         }
     }
 
     /**
-     * Open the project manager, the editor closing, its nodes dropped and the library of the game closed; not while the
-     * library is being built, the build going on
+     * Ask whether to save the unsaved changes of a document before doing something, to discard them or to do nothing
+     * */
+    fn askAbout(mut self, d: &SceneDocument, then: Pending) {
+        self._pending = then;
+        let question = match then {
+            Pending::CLOSE   => { "before closing it?" }
+            Pending::MANAGER => { "before going back to the project manager?" }
+            _                => { "before quitting?" }
+        };
+
+        let dmut dialog = copy MessageDialog(f"Save the changes to ${d.name} ${question}", title-> "Unsaved changes",
+                                             yes-> "Save", no-> "Discard", cancel-> "Cancel");
+        dialog:.answered():.connect(self.box, &self:.onUnsavedAnswered);
+        self:.openDialog(alias dialog);
+    }
+
+    /**
+     * The unsaved changes of the document shown are saved (the pending action following the save), discarded, or kept,
+     * nothing done
+     * */
+    fn onUnsavedAnswered(mut self, status: MessageDialogStatus) {
+        self._asking = false;
+        match status {
+            MessageDialogStatus::YES => { self:.save(); }
+            MessageDialogStatus::NO  => { self:.discard(); }
+            _ => {
+                self._pending = Pending::NOTHING;
+                self._closing = none;
+                self._discarded = [];
+                self:.setStatus("Kept the unsaved changes");
+            }
+        }
+    }
+
+    /**
+     * Discard the unsaved changes of the document shown, then do what was waiting for them
+     * */
+    fn discard(mut self) {
+        let then = self._pending;
+        if then == Pending::CLOSE {
+            self:.proceed(then);
+            return;
+        }
+
+        if let Ok(dmut e) = alias self._editor {
+            self._discarded ~= [alias e.document];
+        }
+
+        self:.ask(then);
+    }
+
+    /**
+     * Do what was waiting for the unsaved changes to be saved or discarded: close the document asked about, or ask
+     * about the next document before quitting or going back to the project manager, done once none is left
+     * */
+    fn proceed(mut self, then: Pending) {
+        self._pending = Pending::NOTHING;
+        match then {
+            Pending::CLOSE => {
+                if let Ok(dmut d) = alias self._closing {
+                    self._closing = none;
+                    self:.closeDocument(alias d);
+                }
+            }
+            Pending::QUIT    => { self:.ask(then); }
+            Pending::MANAGER => { self:.ask(then); }
+            _ => {}
+        }
+    }
+
+    /**
+     * Open the project manager, the editor closing, the nodes of its documents dropped and the library of the game
+     * closed; not while the library is being built, the build going on
      * */
     fn openManager(mut self) {
         if let Ok(dmut b) = alias self._build && b:.isRunning() {
@@ -887,21 +1197,23 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Save the scene in its file, asking for one when it has none, then do what was waiting for the save
+     * Save the scene shown in its file, asking for one when it has none, then do what was waiting for the save
      * */
     fn save(mut self) {
-        if self._path.len == 0us {
+        let path = self.shownPath();
+        if path.len == 0us {
             self:.saveAs();
-        } else if self:.write(self._path) {
+        } else if self:.write(path) {
             self:.proceed(self._pending);
         }
     }
 
     /**
-     * Ask for the file to save the scene in, then save it there
+     * Ask for the file to save the scene shown in, then save it there
      * */
     fn saveAs(mut self) {
-        let name = if self._path.len == 0us { "scene." ~ SCENE_EXTENSION } else { Path(self._path).file() };
+        let path = self.shownPath();
+        let name = if path.len == 0us { "scene." ~ SCENE_EXTENSION } else { Path(path).file() };
         let dmut d = copy FileDialog(FileDialogMode::SAVE, directory-> self._directory, filters-> sceneExtensions(),
                                      title-> "Save the scene", name-> name);
         d:.answered():.connect(self.box, &self:.onSaveChosen);
@@ -922,11 +1234,14 @@ pub class EditorActivity over Activity {
             }
         } else {
             self._pending = Pending::NOTHING;
+            self._closing = none;
+            self._discarded = [];
         }
     }
 
     /**
-     * Write the scene in a file, which becomes its file
+     * Write the scene shown in a file, which becomes its file; a scene of another tab saved in that file before is no
+     * longer said to be in it
      * @returns: true iif the file is written, the status bar telling why it is not
      * */
     fn write(mut self, path: [c8])-> bool {
@@ -940,11 +1255,18 @@ pub class EditorActivity over Activity {
                 log::error #("Editor", "Failed to save the scene", err);
                 self:.setStatus(err.msg);
                 self._pending = Pending::NOTHING;
+                self._closing = none;
+                self._discarded = [];
                 return false;
             }
         }
 
-        self._path = path;
+        for dmut d in alias self._documents if d.path == path && !(d is e.document) {
+            d.path = "";
+        }
+
+        let dmut shown = alias e.document;
+        shown.path = path;
         e:.markSaved();
         self:.keepEdited(path);
         self:.showDocument();
@@ -960,8 +1282,8 @@ pub class EditorActivity over Activity {
     }
 
     /**
-     * Show the file of the scene and whether it has unsaved changes, in the title of the window and on the right of the
-     * status bar
+     * Show the file of the scene shown and whether it has unsaved changes, in the title of the window, on its tab and
+     * on the right of the status bar
      * */
     fn showDocument(mut self) {
         let unsaved = self.unsaved();
@@ -970,24 +1292,34 @@ pub class EditorActivity over Activity {
         let project = if let Ok(p) = self._project { p.name } else { "no project" };
         self.window:.setName(f"${name}${mark} - ${project} - Balder editor");
 
+        let path = self.shownPath();
         if let Ok(dmut l) = alias self._document {
-            let file = if self._path.len == 0us { "New scene, not saved yet" } else { self._path };
+            let file = if path.len == 0us { "New scene, not saved yet" } else { path };
             l:.setText(if unsaved { file ~ " — unsaved changes" } else { file });
         }
+
+        self:.showTabs();
     }
 
     /**
-     * @returns: true iif the scene has changes not saved, its history not being where it was at the last save
+     * @returns: true iif the scene shown has changes not saved, its history not being where it was at the last save
      * */
     fn unsaved(self)-> bool {
         if let Ok(e) = self._editor { e.unsaved } else { false }
     }
 
     /**
-     * @returns: the name of the scene, the name of its file, or 'the new scene'
+     * @returns: the name of the scene shown, the name of its file, or 'the new scene'
      * */
     fn documentName(self)-> [c8] {
-        if self._path.len == 0us { "the new scene" } else { Path(self._path).file() }
+        if let Ok(e) = self._editor { e.document.name } else { "the new scene" }
+    }
+
+    /**
+     * @returns: the file of the scene shown, empty for a new scene
+     * */
+    fn shownPath(self)-> [c8] {
+        if let Ok(e) = self._editor { e.document.path } else { "" }
     }
 
     /*!

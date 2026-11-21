@@ -2,11 +2,13 @@
 
 The editor of Balder lives in `editor/`, beside the library, as the start of a game engine editor. It edits a
 project: it opens on the project manager, then the editor window shows the outline of the scene on the left, its
-viewport in the middle and the inspector of the node selected on the right, under a menu bar and above a status bar.
-The window reads as one: no space between its panels but a seam of a pixel (`$edge`), the space inside the rows and
-never around them, bars and rows of 22 to 28 pixels (the menu bar 28, its items 24 with their shortcut right-aligned
-and muted, the rows of the outline 22, the headers of the sections of the inspector 24, the status bar 22), square
-panels and corners of 3 pixels for the fields and the buttons, 4 for the popups (`editor/ui/theme.style`).
+viewport in the middle and the inspector of the node selected on the right, under a top row and above a status bar.
+The top row holds the logo, the menus (Scene, Add, Edit, View, Gizmo), a seam, the tabs of the scenes opened (see the
+documents below), then Compile, and Play, Pause and Stop, idle until the play mode (BAL-134). The window reads as one:
+no space between its panels but a seam of a pixel (`$edge`), the space inside the rows and never around them, bars and
+rows of 22 to 32 pixels (the top row 32, the items of the menus 24 with their shortcut right-aligned and muted, the
+rows of the outline 22, the headers of the sections of the inspector 24, the status bar 22), square panels and corners
+of 3 pixels for the fields and the buttons, 4 for the popups (`editor/ui/theme.style`).
 
 ```
 gyllir build editor
@@ -98,6 +100,37 @@ module of a game.
   becoming its main scene; a scene saved elsewhere is not one of its scenes. The title tells the scene and the project.
   *Scene → Back to the project manager* closes the editor for the manager, asking first about the unsaved changes, and
   closes the library of the game (not while it is being built).
+
+## Documents
+
+Each scene opened is a document (`SceneDocument`), in a tab of the top row (`TabBar`, see `doc/gui.md`): the name of
+its file without its extension (`new scene` for a new one) after the icon of a scene, a dot while it has unsaved
+changes, the tab shown on the colour of the panels and underlined in the accent. A document has its file, the history
+of its changes (`EditHistory`), its selection and the eye of the editor camera (where it looks and the speed of its
+flights), and switching tabs keeps them all.
+
+- **One viewport.** The editor shows one document at a time, in its one scene (`SceneEditor::switchTo`): the nodes of
+  the document left go out of the scene, under a root of their own, with the nodes it had selected and its active
+  camera, and the nodes of the document shown come back, in their order, as Godot keeps the scenes of its other tabs
+  out of its tree. The nodes keep their ids, their transforms and their meshes (an `EditableScene` keeps the vertices of
+  its meshes, to enter it again), and the commands of the history keep naming them. The camera looked through is left
+  for the editor camera first. The outline, the inspector and its panels follow the document shown.
+- **Tabs.** A click on a tab, Ctrl+Tab (or Ctrl+PageDown) and Ctrl+Shift+Tab (or Ctrl+PageUp) show a document; a tab is
+  dragged to another place among the tabs; its cross (on the tab shown and on the tab hovered), the middle button,
+  Ctrl+W or *Scene → Close the scene* close it, and + after the tabs, Ctrl+N or *Scene → New scene* opens a new scene in
+  a tab of its own.
+- **Opening.** *Scene → Open a scene…* (Ctrl+O) opens a scene file in a tab of its own, or in place of the new scene
+  shown when it was never changed (the editor starts on one), or shows its tab when it is open already. A scene file
+  closed and opened again is flown at the speed it was.
+- **Closing.** A document with unsaved changes is shown and asked about first: saved, discarded, or kept open. Closing
+  the tab shown shows the tab after it, or the one before it when it was the last; closing the last tab leaves a new
+  scene. *Quit* (or closing the window) and *Back to the project manager* ask about each document with unsaved changes
+  in turn, each shown as it is asked about, Cancel keeping them all.
+- **Saving.** Ctrl+S saves the document shown, Ctrl+Shift+S in another file; a scene of another tab that was saved in
+  that file is no longer said to be in it, and becomes a new scene.
+- **Compile.** Reloading the library of the game describes every document as its file would save it, drops their
+  nodes, and builds the scene shown again once the library is loaded, the others when they are shown next, their
+  unsaved changes staying unsaved.
 
 ## Using it
 
@@ -204,9 +237,9 @@ module of a game.
   no longer in the scene told missing), *Remove the connection* removing the one picked in the table, and *Connect*
   making the one chosen below it: a signal of the actor (its payload told), an actor of the scene having a slot taking
   that payload (the actor itself among them), and one of those slots. A connection made twice is refused.
-- **Menus**: *Scene* opens a new scene or a scene file, saves the scene (Ctrl+S) or saves it in another file
-  (Ctrl+Shift+S), and goes back to the project manager, *Add* adds a cube, a sphere, a plane (mesh nodes of the
-  built-in meshes, drawn with the default material), a model read from a file (a mesh node of its mesh), an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
+- **Menus**: *Scene* opens a new scene (Ctrl+N) or a scene file (Ctrl+O), each in a tab of its own, closes the scene
+  shown (Ctrl+W), saves it (Ctrl+S) or saves it in another file (Ctrl+Shift+S), and goes back to the project manager,
+  *Add* adds a cube, a sphere, a plane (mesh nodes of the built-in meshes, drawn with the default material), a model read from a file (a mesh node of its mesh), an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
   box), a character or a light where the centre of the viewport meets a surface (or at the point the camera looks at),
   a camera where the eye of the viewport stands, looking where it looks, a point to the path selected, or a body around
   each node selected, its kinds grouped in submenus opening as they are hovered (*Mesh*, *Light*, *Marker*, *Path*,
@@ -217,16 +250,17 @@ module of a game.
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
   frames the selection, and *View* hides or shows the icons and the grid, and looks through the camera selected; an
   item writes its shortcut on its right (`shortcut:` of a `PushButton`).
-- **Undo**: Ctrl+Z undoes the last change, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is. Every change of the
-  scene is undone, the nodes selected before it being selected again; the steps of one field of the inspector (its
-  arrows clicked, its keys held, its wheel turned) are undone as one change. Opening a scene starts the history again.
+- **Undo**: Ctrl+Z undoes the last change of the scene shown, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is,
+  each document having its own history. Every change of the scene is undone, the nodes selected before it being
+  selected again; the steps of one field of the inspector (its arrows clicked, its keys held, its wheel turned) are
+  undone as one change. A scene opened starts a history of its own.
 
-- **Saving**: a change marks the scene as unsaved, by a `*` in the title of the window and on the right of the status
-  bar, which tells the file of the scene, until it is saved; undoing the changes made since the last save marks it
-  saved again. A new scene starts blank, and has no file yet: its first save asks for one, in the `res/scenes` of the
-  project, given the extension `.scene` when it has none. New, Open, Back to the project manager and Quit (from the menu or by
-  closing the window) ask whether to save the changes first, to discard them, or to do nothing. The file dialogs create
-  a folder (*New folder*) in the folder they show.
+- **Saving**: a change marks the scene as unsaved, by a dot on its tab, a `*` in the title of the window and on the
+  right of the status bar, which tells the file of the scene, until it is saved; undoing the changes made since the last
+  save marks it saved again. A new scene starts blank, and has no file yet: its first save asks for one, in the
+  `res/scenes` of the project, given the extension `.scene` when it has none. Closing a scene, Back to the project
+  manager and Quit (from the menu or by closing the window) ask whether to save the changes first, to discard them, or
+  to do nothing (see the documents above). The file dialogs create a folder (*New folder*) in the folder they show.
 
 The nodes named `__…__` belong to the editor (its camera, the gizmo, the icons): they are neither shown, nor removed with the
 scene, nor saved.
@@ -234,8 +268,8 @@ scene, nor saved.
 ## Commands
 
 Every change of the scene is a command (`EditCommand`) run by `SceneEditor::execute`, which applies it, keeps it in
-its history and emits `edited`; the outline, the inspector and the status bar follow the changes from there. A drag of
-the gizmo moves the nodes while it lasts and is recorded as a `TransformCommand` once released.
+the history of the document shown (`EditHistory`) and emits `edited`; the outline, the inspector and the status bar
+follow the changes from there. A drag of the gizmo moves the nodes while it lasts and is recorded as a `TransformCommand` once released.
 
 Each command reverts the change it made (`revert`), on the scene as it left it, and makes it again when applied anew,
 on the scene as it found it. `SceneEditor::undo` reverts the last command applied and `redo` applies again the last one
