@@ -1,0 +1,173 @@
+in tooltip;
+
+use balder::interface::style;
+use balder::interface::loader::parser;
+use balder::interface::loader::registry;
+use balder::interface::loader::registry::error;
+use balder::interface::widget::tooltip::{layer, timer, tip};
+use balder::math::vector;
+
+use integration::utils::loader;
+
+use std::{syntax, time};
+
+/**
+ * @returns: the style of the first rule of a .style content
+ * */
+fn decoded(content: [c8])-> &Style
+    throws SyntaxError, LoadError
+{
+    let dmut constants = copy Constants();
+    let dmut reader = StyleReader(content);
+    let sheet = SheetDecoder(WidgetRegistry(), "test.style").decode(reader:.read(alias constants));
+    sheet.rules[0].style
+}
+
+/**
+ * @returns: the reason the check of a .gui content is refused, "" when it is accepted
+ * */
+fn refusal(content: [c8])-> [c8]
+    throws SyntaxError
+{
+    let doc = document(content);
+    let dmut registry = WidgetRegistry();
+    {
+        registry:.check(doc, "test.gui");
+        ""
+    } catch {
+        e: &LoadError => { e.reason }
+    }
+}
+
+/**
+ * @returns: a timer of a delay of 500 ms and a grace of 300 ms
+ * */
+fn sample()-> TooltipTimer {
+    TooltipTimer(millis(500u64), millis(300u64))
+}
+
+__test a_tooltip_opens_under_the_cursor {
+    let at = TooltipLayer::place(makeVec2(100.0f, 50.0f), makeVec2(80.0f, 24.0f), makeVec2(400.0f, 300.0f));
+    assert (at == makeVec2(100.0f, 50.0f + TOOLTIP_CURSOR_HEIGHT));
+}
+
+__test a_tooltip_without_room_under_the_cursor_opens_above_it {
+    let at = TooltipLayer::place(makeVec2(100.0f, 290.0f), makeVec2(80.0f, 24.0f), makeVec2(400.0f, 300.0f));
+    assert (at == makeVec2(100.0f, 290.0f - TOOLTIP_CURSOR_GAP - 24.0f));
+}
+
+__test a_tooltip_past_the_right_side_moves_back_inside_the_window {
+    let at = TooltipLayer::place(makeVec2(380.0f, 50.0f), makeVec2(80.0f, 24.0f), makeVec2(400.0f, 300.0f));
+    assert (at == makeVec2(320.0f, 50.0f + TOOLTIP_CURSOR_HEIGHT));
+}
+
+__test a_tooltip_larger_than_the_window_keeps_its_top_left_corner_inside {
+    let at = TooltipLayer::place(makeVec2(10.0f, 5.0f), makeVec2(500.0f, 400.0f), makeVec2(400.0f, 300.0f));
+    assert (at == makeVec2(0.0f, 0.0f));
+}
+
+__test the_tooltip_is_shown_once_the_delay_is_over {
+    let dmut t = sample();
+    assert (!t:.tick(millis(600u64)) && !t.isShown());
+
+    t:.start();
+    assert (t.isWaiting());
+    assert (!t:.tick(millis(200u64)));
+    assert (!t:.tick(millis(200u64)));
+    assert (t:.tick(millis(200u64)) && t.isShown() && !t.isWaiting());
+
+    // shown once
+    assert (!t:.tick(millis(200u64)) && t.isShown());
+}
+
+__test leaving_the_widget_before_the_delay_shows_nothing {
+    let dmut t = sample();
+    t:.start();
+    assert (!t:.tick(millis(400u64)));
+    t:.stop();
+    assert (!t:.tick(millis(400u64)) && !t.isShown() && !t.isWaiting());
+
+    // the delay starts again on the next widget
+    t:.start();
+    assert (!t:.tick(millis(400u64)));
+    assert (t:.tick(millis(100u64)));
+}
+
+__test within_the_grace_the_next_tooltip_is_shown_at_once {
+    let dmut t = sample();
+    t:.start();
+    assert (t:.tick(millis(500u64)));
+
+    // the cursor leaves the widget, crosses a gap, then enters the next one
+    t:.stop();
+    assert (!t:.tick(millis(100u64)));
+    t:.start();
+    assert (t:.tick(millis(16u64)));
+}
+
+__test after_the_grace_the_next_tooltip_waits_for_the_delay {
+    let dmut t = sample();
+    t:.start();
+    assert (t:.tick(millis(500u64)));
+
+    t:.stop();
+    assert (!t:.tick(millis(400u64)));
+    t:.start();
+    assert (!t:.tick(millis(16u64)));
+    assert (t:.tick(millis(500u64)));
+}
+
+__test a_press_cancels_the_tooltip_and_its_grace {
+    let dmut t = sample();
+    t:.start();
+    assert (!t:.tick(millis(400u64)));
+    t:.cancel();
+    assert (!t:.tick(millis(400u64)) && !t.isWaiting());
+
+    t:.start();
+    assert (t:.tick(millis(500u64)));
+    t:.cancel();
+    assert (!t.isShown());
+
+    // no grace after a press: the next tooltip waits for the delay
+    t:.start();
+    assert (!t:.tick(millis(16u64)));
+}
+
+__test the_tooltip_type {
+    let registry = WidgetRegistry();
+    if let Ok(schema) = registry.get("Tooltip") {
+        assert (schema.defaultAttribute == "text");
+        assert (schema.attribute("shortcut").hasValue);
+        assert (schema.parts == ["label", "shortcut"]);
+        assert (schema.property("delay").hasValue);
+        assert (!schema.children.hasValue);
+    } else {
+        assert (false);
+    }
+
+    assert (refusal("Tooltip \"Save the scene\" { shortcut: \"Ctrl+S\"; }") == "");
+}
+
+__test every_type_takes_a_tooltip_and_its_shortcut {
+    let registry = WidgetRegistry();
+    for schema in registry.selectable("") {
+        assert (schema.attribute("tooltip").hasValue && schema.attribute("tooltip-shortcut").hasValue);
+    }
+
+    assert (refusal("LinearLayout { PushButton \"Save\" { tooltip: \"Save the scene\"; tooltip-shortcut: \"Ctrl+S\"; } }") == "");
+    assert (refusal("Box { tooltip: 12; }") == "attribute 'tooltip' of 'Box': expected a string, found '12'");
+}
+
+__test the_delay_of_the_tooltips {
+    let s = decoded("Tooltip { delay: 300ms; }");
+    assert (s.getCustom!{Duration}("delay") == (millis(300u64))?);
+    assert (decoded("Tooltip { delay: 1.5s; }").getCustom!{Duration}("delay") == (millis(1500u64))?);
+    assert (!decoded("Tooltip { radius: 4; }").getCustom!{Duration}("delay").hasValue);
+    assert (Tooltip::defaultDelay() == millis(500u64));
+}
+
+__test the_parts_of_the_tooltips {
+    let s = decoded("Tooltip::shortcut { text-color: #9aa3ab; margin-left: 16; }");
+    assert (s.textColor._0 && s.marginLeft == (true, Length(16.0f)));
+}
