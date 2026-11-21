@@ -15,7 +15,7 @@ target/bin/balder-editor --engine-dir path/to/balder           # run from elsewh
 | Directory | Holds |
 |---|---|
 | `editor/src` | the sources, the library `balder_editor` (the target `balder-editor` of `gyllir.toml`, built as `libBalderEditor.a`), its entry `runEditor` |
-| `editor/bin` | the `main` of Balder's own editor, the target `editor` (built as `balder-editor`) |
+| `editor/bin` | the `main` of the editor, the target `editor` (built as `balder-editor`, `exports = true`) |
 | `editor/ui` | the `.gui` and the `.style` files of its interface |
 | `editor/templates` | the templates a new project starts from (`empty`) |
 | `editor/editor.toml`, `editor/manager.toml` | the configurations of the window of the editor and of the project manager |
@@ -27,10 +27,9 @@ A project is a game made with Balder, a directory as Godot or Unreal have one:
 ```
 my_game/
     project.toml             # its name, its scenes by name, the scene the game starts with
-    gyllir.toml              # the library of the game, and the editor of the project, depending on Balder
+    gyllir.toml              # the library of the game, a shared one, depending on Balder
     gyllir.toml.override     # the link of Balder to the engine of the editor, local, ignored by git
     src/my_game.yr           # the root module of the library: its actor classes
-    editor/main.yr           # the main of the editor of the project, the library of the game linked in
     res/scenes/main.scene    # its files, named res:/… (scenes, models, textures...)
     .gitignore
 ```
@@ -45,18 +44,20 @@ main = "res:/scenes/main.scene"
 ```
 
 The scenes are named, the game loading a scene by its name and the export knowing the scenes it ships. A project has
-no `main`: its library holds what the game adds to the engine, and the export (BAL-138) builds the executable around
-it, as Unreal's launcher module runs the module of a game.
+no `main`: its library holds what the game adds to the engine, and the export (BAL-138) is to build the executable
+around it, a runtime of Balder loading the library and starting the main scene, as Unreal's launcher module runs the
+module of a game.
 
-- **The editor of a project.** The `gyllir.toml` of a project declares two targets: the library of the game
-  (`my_game`, in `target/lib`), its actor classes (see `doc/actors.md`), and `editor` (`my_game-editor`, in
-  `target/bin`), an executable linking the library of the editor (`balder_editor`) and the library of the game, whose
-  main runs the editor (`runEditor (args, ".", ".deps/Balder")`): the project its own, the engine the one it was built
-  against. The library of a game is linked whole (gyllir builds a library as one object), so the `#[actor]` tags of its
-  classes register them at the start of the program without the main naming them; that is how the editor knows the
-  actor classes of the game, gyllir having no shared library to load them. Balder's own editor (`target/bin/balder-editor`)
-  has none: it opens a project in its window when the project declares no editor, the actors of its scenes kept as
-  unknown ones.
+- **The library of the game.** The `gyllir.toml` of a project declares the library of the game as a shared target
+  (`type = "shared"`, `libmy_game.so` in `target/lib`), its actor classes (see `doc/actors.md`), compiled against
+  Balder without linking it (`host-provided = ["Balder"]`) and by the compiler Balder pins (`[compiler]`, filled from
+  the engine's `gyllir.toml` at the creation of the project): the editor holds Balder and the std, linked with its
+  symbols exported (`exports = true`), so that the library runs on the runtime of the editor. The editor loads it
+  (`GameLibrary`, `etc::dl`'s `SharedLibrary`), the `#[actor]` tags of its classes registering them as it opens; one
+  library is loaded at a time, so that two projects never share the registry of the node classes. A library that
+  cannot be loaded (a missing symbol, a library built against another Balder) is told in the status bar, the actors of
+  the scenes kept as unknown ones. A project made with the template of BAL-128 (an `editor` target linking the library
+  of the game) opens, its `editor` target ignored, the status bar telling how to make its library a shared one.
 - **Paths.** `res:/` names the files of the project (`setProjectPath`), `engine:/` and `shaders:/` the files of the
   engine (`setEnginePath`): its shaders, the files of its dialogs, its fonts, its images and its tables of colours. The
   two are the same directory unless one moves, the examples and the tests running from the engine's directory; the
@@ -66,29 +67,33 @@ it, as Unreal's launcher module runs the module of a game.
   its files.
 - **The project manager** (`ProjectManagerActivity`) is the first window: the projects opened last, their names, their
   folders and when they were opened, the one opened last first (a project whose `project.toml` is gone listed as
-  missing). A double click, Enter or *Open* opens one: a project declaring an editor has it built in the background
-  (`gyllir build editor -v` in its folder, its output in `.target/editor-build.log`, `ProjectEditor`), unless the
-  editor is newer than every source it is built from, then run on the project, the manager closing its window and
-  waiting for the editor, so that the terminal it was started from stays with it. While the build runs, a dialog over
-  the manager, which takes no click meanwhile, fills a bar as far as the build is and tells its step, the target
-  compiled and its modules (`BuildDialog`, `BuildProgress`: the steps of the last build, in
-  `.target/editor-build.steps`, tell how many to expect); the build is not cancelled, Escape leaving the dialog open. A
-  build that fails closes the dialog and leaves the manager open, the status bar telling the first error of the
-  compiler and where it is, and a dialog showing that error as the compiler wrote it, its place and its code
-  (`BuildErrorDialog`), with buttons opening, in the application of the desktop (`xdg-open`), the file of all the
-  errors of the build, plain (`.target/editor-build-errors.txt`), and its whole output. The project of the editor
-  running, and a project declaring no editor, open in the window of the manager, the manager closing for the editor
-  window (`linkedProject`). *New project…* asks
+  missing). A double click, Enter or *Open* opens one in the editor window, the manager closing. *New project…* asks
   for a name and a location, and creates the project in a new folder of the location named after it (`My Game` in
-  `my_game`) from the template `editor/templates/empty` (`ProjectTemplate`: `{{name}}` and `{{package}}` filled in the
-  names and the contents of its files, a name starting with `_` starting with a dot, the scenes given ids of their
-  own); *Import…* opens the folder of a project; *Remove from the list* forgets one, its files staying. The list is kept
-  in `$XDG_CONFIG_HOME/balder/projects.toml` (`~/.config/balder/projects.toml`, `RecentProjects`), with the scene of
-  each project edited last and the location of the last project created.
-- **The editor** opens on the scene of the project edited last, or on its main scene, or on a new scene. A scene saved
+  `my_game`) from the template `editor/templates/empty` (`ProjectTemplate`: `{{name}}`, `{{package}}` and
+  `{{compiler}}` filled in the names and the contents of its files, a name starting with `_` starting with a dot, the
+  scenes given ids of their own); *Import…* opens the folder of a project; *Remove from the list* forgets one, its
+  files staying. The list is kept in `$XDG_CONFIG_HOME/balder/projects.toml` (`~/.config/balder/projects.toml`,
+  `RecentProjects`), with the scene of each project edited last and the location of the last project created.
+- **The editor** opens on the scene of the project edited last, or on its main scene, or on a new scene. A library of
+  the game newer than every source it is built from (the `.yr` files and the `gyllir.toml` of the project and of its
+  dependencies, Balder included) is loaded first; otherwise the editor builds it in the background (`GameBuild`,
+  `gyllir build <target> -v` in the folder of the project, its output in `.target/game-build.log`), the status bar
+  telling how far (`BuildProgress`: the step, the target compiled and its modules, the steps of the last build, in
+  `.target/game-build.steps`, telling how many to expect), then loads it, the scene built again with its classes.
+  **Compile**, the button on the right of the menu bar (or Ctrl+R), builds it again and reloads it, a change of the
+  code of an actor taken without leaving the editor: the scene is described as its file would save it, its nodes
+  dropped with the history naming them, the library closed (its classes unregistered, `unregisterActorClass`, the
+  members and the schemas read from the classes dropped) and opened again, then the scene is built again from its
+  description, read leniently (`SceneDescription (content, lenient-> true)`: an entry, a signal or a connection its
+  class no longer declares dropped and logged, an actor of a class gone kept as an unknown one); the history starts
+  again, the unsaved changes staying unsaved. A build that fails tells its first error in the status bar and in a
+  dialog showing it as the compiler wrote it, its place and its code (`BuildErrorDialog`), with buttons opening, in the
+  application of the desktop (`xdg-open`), the file of all the errors of the build, plain
+  (`.target/game-build-errors.txt`), and its whole output; the library loaded stays. A scene saved
   under `res/` joins the scenes of the project, named after its file (`level_2` when `level` is taken), the first one
   becoming its main scene; a scene saved elsewhere is not one of its scenes. The title tells the scene and the project.
-  *Scene → Back to the project manager* closes the editor for the manager, asking first about the unsaved changes.
+  *Scene → Back to the project manager* closes the editor for the manager, asking first about the unsaved changes, and
+  closes the library of the game (not while it is being built).
 
 ## Using it
 
