@@ -131,8 +131,9 @@ void main() {
     // the material has no map, its factors used as they are
     surface = vec2 (1.0);
     emissive = vec4 (1.0);
-    // the debug views show a flat colour, the composition lighting it from the eye
-    if (inDebug.x != 0u) {
+    // the debug views of the geometry show a flat colour, the composition lighting it from the eye, the views of the
+    // channels of the materials (from 4, see DebugView) shaded by the composition from the materials
+    if (inDebug.x != 0u && inDebug.x < 4u) {
         albedo = vec4 (debugColor (), 1.0);
         surface = vec2 (0.0, 1.0);
         emissive = vec4 (0.0);

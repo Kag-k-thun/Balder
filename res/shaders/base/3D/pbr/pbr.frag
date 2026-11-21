@@ -71,6 +71,9 @@ layout (std430, set = 0, binding = 7) readonly buffer Materials {
 // The bit of the material word set when the object is outlined, the other bits holding its material
 const uint OUTLINED = 0x80000000u;
 
+// The first debug view of a channel of the materials (see DebugView), shaded by the composition from the materials
+const uint FIRST_CHANNEL_VIEW = 4u;
+
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -201,8 +204,8 @@ void main() {
     surface = vec2 (metallicRoughness.b, metallicRoughness.g);
     emissive = vec4 (texture (emissiveMap, uv).rgb, 1.0);
 
-    // the debug views show a flat colour, the composition lighting it from the eye
-    if (inDebug.x != 0u) {
+    // the debug views of the geometry show a flat colour, the composition lighting it from the eye
+    if (inDebug.x != 0u && inDebug.x < FIRST_CHANNEL_VIEW) {
         albedo = vec4 (debugColor (), 1.0);
         surface = vec2 (0.0, 1.0);
         emissive = vec4 (0.0);
