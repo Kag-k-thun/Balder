@@ -5,6 +5,7 @@ use balder::math::{bounds, matrix, vector};
 use balder::scene::animation::{clip, joint_pose, skeleton};
 use balder::scene::asset::{assets, material_asset, mesh_asset};
 use balder::scene::node::node3D::visual::{indexed_mesh, primitive};
+use balder::scene::node::node3D::visual::material::maps;
 use balder::scene::physics;
 use balder::scene::physics::convex_decomposition;
 use balder::scene::property::{group, kind, node_schema, typed_property};
@@ -41,6 +42,11 @@ pub class MeshInstance3D over Node3D {
 
     // The meshes drawing the parts, by the index of the part
     let dmut _draws: [&IndexedMesh3D] = [];
+
+    // The revision of the material of each part its draw was built or refreshed at, and the maps it was built with, by
+    // the index of the part (see refresh)
+    let mut _revisions: [mut u64] = [];
+    let mut _builtMaps: [mut [c8]] = [];
 
     // The transformation of each joint of the skeleton in the mesh at the last pose, written again in place at each pose
     let dmut _globals: [mat4] = [];
@@ -327,18 +333,71 @@ pub class MeshInstance3D over Node3D {
         }
 
         self._draws = [];
+        let mut revisions: [u64] = [], mut maps: [[c8]] = [];
         for i in 0us .. self._mesh.subMeshes.len {
-            let material = self.materialOf(i);
-            let textured = self._mesh.subMeshes[i].textured;
-            let dmut draw = copy IndexedMesh3D::sharing(MeshInstance3D::drawName(i), alias self,
-                                                        alias self._mesh.subMeshes[i].geometry,
-                                                        material.instance(textured), shadow-> self._castShadow);
-
-            // a node built under a node already placed is placed once its transform is set
-            draw.position = vec3();
-            draw.forcedLod = self._forcedLod;
+            let dmut draw = self:.buildDraw(i);
             self._draws ~= [alias draw];
+            revisions ~= [self.materialOf(i).revision];
+            maps ~= [mapsKey(self.materialOf(i).maps)];
         }
+
+        self._revisions = copy revisions;
+        self._builtMaps = copy maps;
+    }
+
+    /**
+     * @returns: a mesh drawing a part with its material, sharing the geometry of the part, at the place of the node
+     * */
+    fn buildDraw(mut self, part: usize)-> dmut &IndexedMesh3D
+        throws BalderError
+    {
+        let material = self.materialOf(part);
+        let textured = self._mesh.subMeshes[part].textured;
+        let dmut draw = copy IndexedMesh3D::sharing(MeshInstance3D::drawName(part), alias self,
+                                                    alias self._mesh.subMeshes[part].geometry,
+                                                    material.instance(textured), shadow-> self._castShadow);
+
+        // a node built under a node already placed is placed once its transform is set
+        draw.position = vec3();
+        draw.forcedLod = self._forcedLod;
+        alias draw
+    }
+
+    /**
+     * Draw the parts whose material changed since their draw was built (see MaterialAsset::setValue) as it is now: its
+     * factors given to the draw in place while its maps are the same, the draw of the part built again otherwise (the
+     * shader or the textures changing)
+     * @returns: true iif a part was drawn again or given new factors
+     * @throws: BalderError when the configuration of the shader of a material cannot be loaded, or the factors cannot be
+     * registered in the scene
+     * */
+    pub fn refresh(mut self)-> bool
+        throws BalderError
+    {
+        let mut changed = false;
+        for i in 0us .. self._draws.len {
+            let material = self.materialOf(i);
+            if material.revision == self._revisions[i] { continue; }
+
+            let maps = mapsKey(material.maps);
+            if maps == self._builtMaps[i] {
+                self._draws[i]:.setMaterialConfig(material.config);
+            } else {
+                let mut order = 0us;
+                for j, c in self.childrenInOrder() if c is self._draws[i] { order = j; }
+
+                self._draws[i]:.dispose();
+                let dmut draw = self:.buildDraw(i);
+                draw:.moveUnder(alias self, at-> order);
+                self._draws[i] = alias draw;
+                self._builtMaps[i] = maps;
+            }
+
+            self._revisions[i] = material.revision;
+            changed = true;
+        }
+
+        changed
     }
 
 }
@@ -360,6 +419,28 @@ pub mod MeshInstance3D {
      * */
     pub fn drawName(part: usize)-> [c8] {
         f"__draw_${part}__"
+    }
+
+    /**
+     * Draw the materials changed of the mesh nodes under a node, the node itself included, as they are now (see refresh):
+     * called once the entries of materials changed, the nodes of a scene following them
+     * @returns: the number of nodes drawn again
+     * */
+    pub fn refreshUnder(dmut node: &Node)-> usize {
+        let mut count = 0us;
+        if let dmut m: &MeshInstance3D = alias node {
+            {
+                if m:.refresh() { count += 1us; }
+            } catch {
+                err => { log::error #("MeshInstance3D", f"${m.name.file()} keeps its draws:", err); }
+            }
+        }
+
+        for dmut c in alias node:.getChildrenInOrder() {
+            count += MeshInstance3D::refreshUnder(alias c);
+        }
+
+        count
     }
 
     /**
@@ -490,4 +571,12 @@ pub mod MeshInstance3D {
         ""
     }
 
+}
+
+/**
+ * @returns: the paths of maps in one text, two materials of the same maps being drawn by the same shader with the same
+ * textures
+ * */
+fn mapsKey(maps: MaterialMaps)-> [c8] {
+    f"${maps.baseColor};${maps.metallicRoughness};${maps.normal};${maps.occlusion};${maps.emissive}"
 }
