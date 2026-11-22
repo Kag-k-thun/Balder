@@ -1,0 +1,256 @@
+in gear;
+
+use main::mesh_builder;
+
+use balder::core::error;
+use balder::math::{quaternion, rigid_transform, vector};
+use balder::scene::physics;
+
+use std::math;
+
+/**
+ * The teeth of a gear
+ * */
+pub enum Toothing : u8
+| RATCHET = 0u8 // the teeth of an escape wheel: sharp tips leaning forward, the wheel turning clockwise
+| WHEEL   = 1u8 // rounded teeth, narrowing from the root to the tip
+| LANTERN = 2u8; // pins between two discs, the pinion of a tower clock
+
+/**
+ * The depth of the root of a tooth under the pitch circle, and the height of its tip above, in modules
+ * */
+def DEDENDUM = 1.25f;
+def ADDENDUM = 1.0f;
+
+/**
+ * The height of a tooth of a ratchet, its tip on the pitch circle, in modules, and the angle its front leans by, in
+ * pitches
+ * */
+def RATCHET_HEIGHT = 2.5f;
+def RATCHET_LEAN = 0.08f;
+
+/**
+ * The radius of a pin of a lantern, in modules
+ * */
+def PIN = 0.5f;
+
+/**
+ * The thickness of the rim of a wheel, in modules, and of its spokes
+ * */
+def RIM = 1.5f;
+def SPOKE = 1.2f;
+
+/**
+ * A gear turning about the Z axis of its arbor: its teeth, its size and its plane
+ * @info: the teeth are the convex parts of the shape of the arbor, the rim, the spokes and the discs of a lantern only
+ * drawn
+ * */
+pub record Gear {
+
+    // The kind of its teeth
+    pub let toothing: Toothing;
+
+    // The number of its teeth, or of the pins of a lantern
+    pub let teeth: u32;
+
+    // The diameter of the pitch circle over the number of teeth, in metres
+    pub let module: f32;
+
+    // The depth of its mid plane along Z, the front of the clock towards -Z
+    pub let z: f32;
+
+    // Its thickness along Z, the length of the pins of a lantern
+    pub let thickness: f32;
+
+    // The angle of its first tooth, in radians
+    pub let mut phase: f32 = 0.0f;
+
+    pub self (toothing: Toothing, teeth: u32, module: f32, z: f32, thickness: f32)
+        with toothing = toothing
+        , teeth = teeth
+        , module = module
+        , z = z
+        , thickness = thickness
+    {}
+
+    /**
+     * @returns: the radius of the pitch circle, the tips of a ratchet on it
+     * */
+    @field
+    pub fn radius(self)-> f32 {
+        self.module * cast!f32(self.teeth) / 2.0f
+    }
+
+    /**
+     * @returns: the angle between two teeth
+     * */
+    @field
+    pub fn pitch(self)-> f32 {
+        TURN / cast!f32(self.teeth)
+    }
+
+    /**
+     * @returns: the radius of the circle its teeth stand on
+     * */
+    @field
+    pub fn root(self)-> f32 {
+        match self.toothing {
+            Toothing::RATCHET => { self.radius - RATCHET_HEIGHT * self.module }
+            Toothing::LANTERN => { self.radius }
+            _                 => { self.radius - DEDENDUM * self.module }
+        }
+    }
+
+    /**
+     * @returns: the radius of the pins of a lantern
+     * */
+    @field
+    pub fn pinRadius(self)-> f32 {
+        PIN * self.module
+    }
+
+    /**
+     * @returns: the angle of a tooth
+     * */
+    pub fn angleOf(self, i: u32)-> f32 {
+        self.phase + self.pitch * cast!f32(i)
+    }
+
+    /**
+     * @returns: the outlines of the teeth, convex, in the plane of the arbor; none for a lantern
+     * */
+    pub fn outlines(self)-> [[vec2]] {
+        let mut result: [[vec2]] = [];
+        if self.toothing == Toothing::LANTERN { return result; }
+
+        for i in 0u32 .. self.teeth {
+            let a = self.angleOf(i);
+            if self.toothing == Toothing::RATCHET {
+                // the tip on the pitch circle, the front face going back down to the root, the back sloping to the root
+                // further back, the tooth sunk into the rim
+                let low = self.root, sunk = self.root - 0.5f * self.module;
+                let front = a + RATCHET_LEAN * self.pitch, back = a + 0.55f * self.pitch;
+                result = result ~ [copy [polar(a, self.radius), polar(front, low), polar(back, low),
+                                         polar(back, sunk), polar(front, sunk)]];
+            } else {
+                // half widths at heights above the pitch circle, the tooth narrowing to its rounded tip
+                let p = self.module * 3.1415927f;
+                let heights = [-DEDENDUM - 0.5f, 0.0f, 0.5f, 0.8f, ADDENDUM];
+                let halves = [0.25f, 0.225f, 0.19f, 0.14f, 0.06f];
+                let mut outline: [vec2] = [];
+                for k in 0 .. 5 {
+                    let r = self.radius + heights[k] * self.module;
+                    let half = halves[k] * p / r;
+                    outline = outline ~ [polar(a - half, r), polar(a + half, r)];
+                }
+
+                result = result ~ [outline];
+            }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the centres of the pins of a lantern, in the plane of the arbor; none for another gear
+     * */
+    pub fn pins(self)-> [vec2] {
+        let mut result: [vec2] = [];
+        if self.toothing != Toothing::LANTERN { return result; }
+
+        for i in 0u32 .. self.teeth {
+            result = result ~ [polar(self.angleOf(i), self.radius)];
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the parts of the shape of the arbor the teeth make: a hull per tooth, a cylinder per pin
+     * */
+    pub fn parts(self)-> [CompoundPart]
+        throws BalderError
+    {
+        let mut result: [CompoundPart] = [];
+        let near = self.z - self.thickness / 2.0f, far = self.z + self.thickness / 2.0f;
+        for outline in self.outlines() {
+            let mut points: [vec3] = [];
+            for p in outline {
+                points = points ~ [makeVec3(p, near), makeVec3(p, far)];
+            }
+
+            result = result ~ [CompoundPart(shape-> ColliderShape::hull(copy ConvexHull(points)))];
+        }
+
+        // a cylinder stands along Y, turned along Z
+        let along = Quaternion::fromAxisAngle(1.5707964f, makeVec3(1.0f, 0.0f, 0.0f));
+        for c in self.pins() {
+            result = result ~ [CompoundPart(shape-> ColliderShape::cylinder(self.pinRadius, self.thickness),
+                                            place-> RigidTransform(position-> makeVec3(c, self.z), rotation-> along))];
+        }
+
+        result
+    }
+
+    /**
+     * Draw the gear: its teeth on a rim held by spokes, a disc for a small one; the pins of a lantern between two discs
+     * */
+    pub fn draw(self, dmut mesh: &MeshBuilder, hub: f32) {
+        let near = self.z - self.thickness / 2.0f, far = self.z + self.thickness / 2.0f;
+        if self.toothing == Toothing::LANTERN {
+            for c in self.pins() {
+                mesh:.cylinder(c, self.pinRadius, near, far, segments-> 12u32);
+            }
+
+            let disc = self.radius + 2.0f * self.pinRadius;
+            mesh:.cylinder(vec2(), disc, near - 0.006f, near);
+            mesh:.cylinder(vec2(), disc, far, far + 0.006f);
+            return;
+        }
+
+        for outline in self.outlines() {
+            mesh:.prism(outline, near, far);
+        }
+
+        let inner = self.root - RIM * self.module;
+        if self.teeth <= 16u32 || inner < hub * 3.0f {
+            mesh:.cylinder(vec2(), self.root, near, far, segments-> 48u32);
+            return;
+        }
+
+        mesh:.ring(vec2(), inner, self.root, near, far, segments-> 96u32);
+        mesh:.cylinder(vec2(), hub * 2.0f, near, far);
+        let spokes = if self.radius > 0.25f { 6u32 } else { 4u32 };
+        for s in 0u32 .. spokes {
+            let a = self.phase + TURN * cast!f32(s) / cast!f32(spokes);
+            mesh:.bar(vec2(), polar(a, inner + 0.5f * self.module), SPOKE * self.module + 0.01f,
+                      near + self.thickness * 0.15f, far - self.thickness * 0.15f);
+        }
+    }
+
+    /**
+     * @returns: the gear turned so that it meshes with another gear whose centre lies at an angle from its own, a gap of
+     * its teeth facing a tooth of the other (see pointing)
+     * */
+    pub fn facing(self, angle: f32)-> Gear {
+        let mut g = self;
+        g.phase = angle + self.pitch / 2.0f;
+        g
+    }
+
+    /**
+     * @returns: the gear turned so that one of its teeth points at an angle, to the gap of the gear it meshes with
+     * */
+    pub fn pointing(self, angle: f32)-> Gear {
+        let mut g = self;
+        g.phase = angle;
+        g
+    }
+}
+
+/**
+ * @returns: the point at an angle and a distance from the origin
+ * */
+pub fn polar(angle: f32, distance: f32)-> vec2 {
+    makeVec2(math::cos(angle) * distance, math::sin(angle) * distance)
+}

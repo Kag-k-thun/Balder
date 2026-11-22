@@ -1,0 +1,199 @@
+in pendulum;
+
+use main::{gear, mesh_builder};
+
+use balder::core::error;
+use balder::math::{quaternion, rigid_transform, vector};
+use balder::scene::physics;
+
+use std::math;
+
+/**
+ * The pendulum and the anchor it rocks, one body turning about the pivot of the anchor, under the escape wheel: a recoil
+ * anchor, its two pallets dipping in turn between the teeth of the wheel, each sloped so that the tooth escaping from it
+ * pushes the pendulum on
+ * @info:
+ * =====
+ * The pivot is on the tangents to the tips of the wheel at the two pallets, a quarter of a turn apart (seven teeth and a
+ * half of a wheel of thirty): a tooth pressing a pallet square to its tangent pushes towards the pivot and turns
+ * nothing, the slope of the pallet turns that push into an impulse. The parts are in the space of the body, its origin
+ * the pivot.
+ * ====
+ * */
+pub record Pendulum {
+
+    // The pivot of the anchor in the plane of the clock
+    pub let pivot: vec2;
+
+    // The centre of the escape wheel, and the radius of the tips of its teeth
+    pub let wheel: vec2;
+    pub let tips: f32;
+
+    // The depth of the plane of the wheel, the pallets in it
+    pub let z: f32;
+
+    // The depth of the plane of the rod and of the bob, behind the wheel
+    pub let rodZ: f32;
+
+    // The distance from the pivot to the centre of the bob
+    pub let length: f32;
+
+    // The mass of the whole, in kilograms, most of it in the bob
+    pub let mass: f32;
+
+    // The collision layer of the plane of the pallets, the escape wheel sharing it (see movement::layerOf)
+    pub let mut layer: u32 = 1u32;
+
+    // How deep the pallets dip inside the tips with the pendulum at rest, in metres
+    pub let mut dip: f32 = 0.006f;
+
+    // The slope of the pallets from the square of their tangent, in radians
+    pub let mut slope: f32 = 0.3f;
+
+    // The size of a pallet: its thickness along the push of the tooth, its length across, in metres
+    pub let mut palletWidth: f32 = 0.014f;
+    pub let mut palletLength: f32 = 0.05f;
+
+    // The radius of the bob and its thickness
+    pub let mut bob: f32 = 0.1f;
+    pub let mut bobThickness: f32 = 0.04f;
+
+    // The width of the rod
+    pub let mut rod: f32 = 0.016f;
+
+    pub self (pivot: vec2, wheel: vec2, tips: f32, z: f32, rodZ: f32, length: f32, mass: f32)
+        with pivot = pivot
+        , wheel = wheel
+        , tips = tips
+        , z = z
+        , rodZ = rodZ
+        , length = length
+        , mass = mass
+    {}
+
+    /**
+     * @returns: the angles of the two pallets on the wheel, from its centre: a quarter of a turn apart, the pivot on the
+     * bisector of the two
+     * */
+    pub fn palletAngles(self)-> (f32, f32) {
+        let d = self.pivot - self.wheel;
+        let towards = math::atan2(d.y, d.x);
+        (towards - 0.7853982f, towards + 0.7853982f)
+    }
+
+    /**
+     * @returns: the outline of the pallet at an angle of the wheel, in the plane of the clock
+     * */
+    pub fn palletAt(self, angle: f32)-> [vec2] {
+        let radial = polar(angle, 1.0f);
+        let tip = self.wheel + radial * self.tips;
+
+        // the way the tooth moves there, the wheel turning clockwise, and whether that is away from the pivot
+        let motion = makeVec2(radial.y, -radial.x);
+        let away = if motion.dot(tip - self.pivot) > 0.0f { 1.0f } else { -1.0f };
+
+        // the turn of the anchor lifting the pallet out of the wheel
+        let arm = tip - self.pivot;
+        let lifts = if makeVec2(-arm.y, arm.x).dot(radial) > 0.0f { 1.0f } else { -1.0f };
+
+        // the push of the tooth on the pallet, sloped from the tangent towards the turn that lifts it
+        let push = turned(motion, self.slope * lifts * away);
+        let mut inward = makeVec2(-push.y, push.x);
+        if inward.dot(self.wheel - tip) < 0.0f { inward = -inward; }
+
+        let inner = tip + inward * self.dip;
+        let outer = tip + inward * (self.dip - self.palletLength);
+        copy [inner, outer, outer + push * self.palletWidth, inner + push * self.palletWidth]
+    }
+
+    /**
+     * @returns: the centre of the bob in the plane of the clock
+     * */
+    @field
+    pub fn bobCentre(self)-> vec2 {
+        self.pivot - makeVec2(0.0f, self.length)
+    }
+
+    /**
+     * @returns: the shape of the pendulum in the space of its body: the pallets, the rod and the bob
+     * */
+    pub fn shape(self)-> ColliderShape
+        throws BalderError
+    {
+        let mut parts: [CompoundPart] = [];
+        let (a, b) = self.palletAngles();
+        for angle in [a, b] {
+            parts = parts ~ [self.prismPart(self.palletAt(angle), self.z, 0.03f)];
+        }
+
+        let rod = self.bobCentre;
+        let across = makeVec2(self.rod / 2.0f, 0.0f);
+        parts = parts ~ [self.prismPart(copy [self.pivot - across, self.pivot + across, rod + across, rod - across],
+                                        self.rodZ, 0.012f)];
+
+        let along = Quaternion::fromAxisAngle(1.5707964f, makeVec3(1.0f, 0.0f, 0.0f));
+        parts = parts ~ [CompoundPart(shape-> ColliderShape::cylinder(self.bob, self.bobThickness),
+                                      place-> RigidTransform(position-> makeVec3(self.bobCentre - self.pivot, self.rodZ), rotation-> along))];
+
+        ColliderShape::compound(copy CompoundShape(parts))
+    }
+
+    /**
+     * Draw the anchor: its pallets and the arms holding them to its arbor, in the space of the body
+     * */
+    pub fn drawAnchor(self, dmut mesh: &MeshBuilder) {
+        let (a, b) = self.palletAngles();
+        for angle in [a, b] {
+            let outline = self.palletAt(angle);
+            let mut local: [vec2] = [];
+            for p in outline {
+                local = local ~ [p - self.pivot];
+            }
+
+            mesh:.prism(local, self.z - 0.015f, self.z + 0.015f);
+            let foot = (outline[1] + outline[2]) / 2.0f - self.pivot;
+            mesh:.bar(vec2(), foot, 0.022f, self.z - 0.008f, self.z + 0.008f);
+        }
+
+        mesh:.cylinder(vec2(), 0.022f, self.z - 0.01f, self.z + 0.01f);
+        mesh:.cylinder(vec2(), 0.008f, self.z - 0.03f, self.rodZ + 0.02f, segments-> 16u32);
+    }
+
+    /**
+     * Draw the rod and the crutch holding it to the arbor of the anchor, in the space of the body
+     * */
+    pub fn drawRod(self, dmut mesh: &MeshBuilder) {
+        mesh:.bar(vec2(), self.bobCentre - self.pivot, self.rod, self.rodZ - 0.006f, self.rodZ + 0.006f);
+        mesh:.cylinder(vec2(), 0.018f, self.rodZ - 0.012f, self.rodZ + 0.012f);
+    }
+
+    /**
+     * Draw the bob, in the space of the body
+     * */
+    pub fn drawBob(self, dmut mesh: &MeshBuilder) {
+        mesh:.cylinder(self.bobCentre - self.pivot, self.bob, self.rodZ - self.bobThickness / 2.0f,
+                       self.rodZ + self.bobThickness / 2.0f, segments-> 48u32);
+    }
+
+    /**
+     * @returns: the hull of an outline of the plane of the clock between two depths, in the space of the body
+     * */
+    fn prismPart(self, outline: [vec2], z: f32, thickness: f32)-> CompoundPart
+        throws BalderError
+    {
+        let mut points: [vec3] = [];
+        for p in outline {
+            points = points ~ [makeVec3(p - self.pivot, z - thickness / 2.0f), makeVec3(p - self.pivot, z + thickness / 2.0f)];
+        }
+
+        CompoundPart(shape-> ColliderShape::hull(copy ConvexHull(points)))
+    }
+}
+
+/**
+ * @returns: a direction turned counterclockwise by an angle
+ * */
+fn turned(v: vec2, angle: f32)-> vec2 {
+    let c = math::cos(angle), s = math::sin(angle);
+    makeVec2(v.x * c - v.y * s, v.x * s + v.y * c)
+}
