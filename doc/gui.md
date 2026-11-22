@@ -758,7 +758,7 @@ compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part {
   application), then by specificity (ids, then classes, states and parts, then types, summed over the compounds), then
   in the order they were loaded, the later one winning a tie. A rule matching through several of its selectors takes
   the specificity of the most specific one.
-- The inherited properties (`text-color`, the `font-*` properties, `text-xalign`, `text-yalign`, `text-wrap`, and those
+- The inherited properties (`text-color`, the `font-*` properties, `text-xalign`, `text-yalign`, `text-wrap`, `text-overflow`, and those
   a widget type registers as inherited) pass from a widget to its children and to its parts. Set the font once on a
   container.
 - The inline style a widget is given by code (`Widget.setInlineStyle`) comes after every rule.
@@ -1254,6 +1254,7 @@ Every widget reads these properties. An inherited property passes from a widget 
 | `text-xalign` | left, center or right | yes |  |
 | `text-yalign` | top, center or bottom | yes |  |
 | `text-wrap` | wrap or nowrap | yes | yes |
+| `text-overflow` | clip or ellipsis | yes | yes |
 | `image` | a string |  |  |
 | `image-color` | a colour |  |  |
 | `image-fill` | true or false |  |  |
