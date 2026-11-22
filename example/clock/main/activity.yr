@@ -1,0 +1,509 @@
+in activity;
+
+use main::{arbor, gear, mesh_builder};
+
+use balder::core::{_, application::_};
+use balder::interface::widget::layout::_;
+use balder::math::_;
+use balder::scene::node::{node3D::_, node3D::body, node3D::camera, node3D::joint, node3D::visual::_, node3D::visual::material::_};
+use balder::scene::physics;
+use balder::utils::log;
+
+use sdl3::_;
+
+use std::{math, time, time::date};
+
+/**
+ * The categories of the debug view of the physics drawn from the start (see Scene::physicsDebug), set by '--debug'
+ * */
+pub lazy dmut __DEBUG__ = copy [0u32];
+
+/**
+ * The torque of the mainspring on the centre arbor, in newton metres: a motor of that torque at most, its speed (radians
+ * a second, clockwise) never reached while the anchor holds the train, the speed the train races at once it is lifted
+ * */
+def MAINSPRING = 3.0f;
+def RACING = -0.2f;
+
+/**
+ * The damping of the swing of the pendulum, the air it moves through, and the speed of its first swing, in radians a
+ * second
+ * */
+def PENDULUM_DAMPING = 0.025f;
+def FIRST_SWING = 0.2f;
+
+/**
+ * The friction of the teeth on each other
+ * */
+def TEETH_FRICTION = 0.1f;
+
+/**
+ * The collision layer of the frame, in no mask
+ * */
+def FRAME_LAYER = 0x80000000u32;
+
+/**
+ * The point the camera turns about
+ * */
+def CENTRE = makeVec3(0.0f, -0.55f, -0.2f);
+
+/**
+ * Where the pillars holding the plates stand, clear of every wheel
+ * */
+def PILLARS = [makeVec2(-0.62f, 0.3f), makeVec2(0.6f, 0.42f), makeVec2(0.45f, -0.58f), makeVec2(-0.45f, -1.1f)];
+
+/**
+ * The radii of the chapter ring of the hours, and of the ring of the seconds about the escape arbor
+ * */
+def CHAPTER = (0.56f, 0.7f);
+def SECONDS = (0.15f, 0.2f);
+
+/**
+ * The depth of the wall behind the clock, and the height of the floor
+ * */
+def WALL = 0.2f;
+def FLOOR = -2.8f;
+
+/**
+ * A skeleton clock run by its physics: nothing is animated, every wheel is a dynamic body on a hinge of the frame, its
+ * teeth the convex parts of its shape pushing the pins and the teeth of the next one; the mainspring is a motor of a
+ * bounded torque on the centre arbor, the pendulum rocks the anchor that lets the escape wheel go by one tooth a swing.
+ * The hands start at the time of the day.
+ *
+ * Space lifts the anchor out of the escape wheel, the train racing under the mainspring, and drops it back in; the right
+ * button turns the camera, the wheel zooms; 'S', 'C' and 'J' toggle the debug view of the colliders, of the contacts and
+ * of the joints
+ * */
+pub class ClockActivity over Activity {
+
+    let dmut _scene: (&Scene)? = none;
+    let dmut _cam: (&PerspectiveCamera)? = none;
+    let dmut _pendulum: (&PhysicsBody3D)? = none;
+
+    // The layer of the pallets, and whether the anchor is lifted out of the escape wheel
+    let mut _palletLayer: u32 = 1u32;
+    let mut _lifted: bool = false;
+
+    let mut _brass: MaterialConfig = MaterialConfig();
+    let mut _steel: MaterialConfig = MaterialConfig();
+    let mut _blued: MaterialConfig = MaterialConfig();
+    let mut _enamel: MaterialConfig = MaterialConfig();
+
+    // The camera turning about the centre: its yaw and its pitch, in degrees, and its distance
+    let mut _yaw: f32 = 165.0f;
+    let mut _pitch: f32 = -6.0f;
+    let mut _distance: f32 = 3.0f;
+    let mut _turning: bool = false;
+    let mut _turnStart: (i32, i32) = (0, 0);
+
+    pub self (uid: usize, dmut app: &Application, dmut window: &Window)
+        with super(uid, alias app, alias window)
+    {
+        self._brass.baseColor = makeVec3(0.95f, 0.68f, 0.25f);
+        self._brass.metallic = 1.0f;
+        self._brass.roughness = 0.4f;
+        self._steel.baseColor = makeVec3(0.72f, 0.73f, 0.76f);
+        self._steel.metallic = 1.0f;
+        self._steel.roughness = 0.3f;
+        self._blued.baseColor = makeVec3(0.08f, 0.1f, 0.25f);
+        self._blued.metallic = 1.0f;
+        self._blued.roughness = 0.25f;
+        self._enamel.baseColor = makeVec3(0.93f, 0.91f, 0.84f);
+        self._enamel.roughness = 0.5f;
+    }
+
+    over onStart(mut self) {
+        self.input:.quit():.connect(self.box, &self:.onQuit);
+        self.input:.keyboard(KeyInfo(SDLK_SPACE, KeyEvent::DOWN)):.connect(self.box, &self:.onLift);
+        self.input:.keyboard(KeyInfo(SDLK_S, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleShapes);
+        self.input:.keyboard(KeyInfo(SDLK_C, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleContacts);
+        self.input:.keyboard(KeyInfo(SDLK_J, KeyEvent::DOWN)):.connect(self.box, &self:.onToggleJoints);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::DOWN)):.connect(self.box, &self:.onTurnStart);
+        self.input:.mouse(MouseInfo(SDL_BUTTON_RIGHT, KeyEvent::RELEASE)):.connect(self.box, &self:.onTurnEnd);
+        self.input:.mouseMotion():.connect(self.box, &self:.onMouseMove);
+        self.input:.mouseWheel():.connect(self.box, &self:.onWheel);
+
+        {
+            self.gui:.loadStyleFile("res:/config/clock.style");
+            self.gui:.loadGUIFile("res:/config/clock.gui");
+        } catch {
+            err => {
+                log::error #("Clock", "Failed to load the interface", err);
+                return;
+            }
+        }
+
+        if let Ok(dmut w: &Scene3DLayout) = self.gui:.find("scene") {
+            self._scene = w:.getScene();
+        }
+
+        {
+            if let Ok(dmut s: &Scene) = alias self._scene {
+                s.background = makeVec3(0.08f, 0.08f, 0.1f);
+                s.ambient = makeVec3(0.35f, 0.33f, 0.32f);
+                s.ambientOcclusion = true;
+                s.physicsDebug = __DEBUG__[0];
+                self:.createLight(alias s);
+                self:.createRoom(alias s);
+                let frame = self:.createFrame(alias s);
+                self:.createMovement(alias s, frame);
+                self:.createPendulum(alias s, frame);
+                self:.createCamera(alias s);
+            }
+        } catch {
+            err => {
+                log::error #("Clock", "Failed to build the clock", err);
+            }
+        }
+    }
+
+    over onUpdate(mut self, _: Duration) {
+        self:.followCentre();
+    }
+
+    pub fn onQuit(mut self) {
+        self.app:.close(alias self);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          INPUTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Lift the anchor out of the escape wheel, its pallets touching nothing, the train racing under the mainspring; or
+     * drop it back in, a tooth caught by the next pallet it meets
+     * */
+    pub fn onLift(mut self, _: KeyInfo) {
+        if let Ok(dmut p) = alias self._pendulum {
+            self._lifted = !self._lifted;
+            let layer = if self._lifted { 0u32 } else { self._palletLayer };
+            self.window:.lockFrame();
+            p.layer = layer;
+            p.mask = layer;
+            self.window:.unlockFrame();
+        }
+    }
+
+    pub fn onToggleShapes(mut self, _: KeyInfo) {
+        self:.toggleDebug(PhysicsDebug::SHAPES);
+    }
+
+    pub fn onToggleContacts(mut self, _: KeyInfo) {
+        self:.toggleDebug(PhysicsDebug::CONTACTS);
+    }
+
+    pub fn onToggleJoints(mut self, _: KeyInfo) {
+        self:.toggleDebug(PhysicsDebug::JOINTS);
+    }
+
+    pub fn onTurnStart(mut self, x: i32, y: i32, _: MouseInfo) {
+        self._turning = true;
+        self._turnStart = (x, y);
+    }
+
+    pub fn onTurnEnd(mut self, _: i32, _: i32, _: MouseInfo) {
+        self._turning = false;
+    }
+
+    pub fn onMouseMove(mut self, x: i32, y: i32, _: f32, _: f32) {
+        if !self._turning { return; }
+
+        self._yaw = (self._yaw + cast!f32(x - self._turnStart._0) * 0.2f) % 360.0f;
+        self._pitch = std::algorithm::comparison::clamp(self._pitch + cast!f32(self._turnStart._1 - y) * 0.2f, -80.0f, 60.0f);
+        self._turnStart = (x, y);
+    }
+
+    pub fn onWheel(mut self, _: i32, _: i32, _: i32, w: i32) {
+        self._distance = std::algorithm::comparison::clamp(self._distance - cast!f32(w) * 0.25f, 0.8f, 12.0f);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCENE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The frame: a static body holding the hinges of the arbors, drawn as the two plates of a skeleton clock, the pillars
+     * between them, the chapter ring of the hours and the ring of the seconds; it touches nothing
+     * */
+    fn createFrame(mut self, dmut scene: &Scene)-> dmut &PhysicsBody3D
+        throws BalderError
+    {
+        let settings = BodySettings(layer-> FRAME_LAYER, mask-> 0u32);
+        let dmut frame = copy PhysicsBody3D("frame", alias scene:.getRootNode(),
+                                            shape-> ColliderShape::box(makeVec3(0.05f, 0.05f, 0.05f)), settings-> settings);
+
+        let c = movement::centreOf(), t = movement::thirdOf(), e = movement::escapeOf(), m = movement::minuteWheelOf();
+        let p = movement::pendulum().pivot;
+
+        // the back plate, behind the escape wheel, holding every arbor and the anchor; the front one before the hour
+        // wheel, holding the arbors running through it
+        let dmut plates = copy MeshBuilder();
+        let backPlate = (movement::BACK_PLATE, movement::BACK_PLATE + 0.012f);
+        let frontPlate = (movement::FRONT_PLATE - 0.012f, movement::FRONT_PLATE);
+        for plate in [backPlate, frontPlate] {
+            let (z0, z1) = plate;
+            let front = z1 == movement::FRONT_PLATE;
+            plates:.bar(PILLARS[0], c, 0.05f, z0, z1);
+            plates:.bar(c, PILLARS[1], 0.05f, z0, z1);
+            plates:.bar(c, t, 0.05f, z0, z1);
+            plates:.bar(t, PILLARS[3], 0.04f, z0, z1);
+            plates:.bar(t, e, 0.04f, z0, z1);
+            plates:.bar(e, PILLARS[2], 0.04f, z0, z1);
+            if front {
+                plates:.bar(c, m, 0.04f, z0, z1);
+            } else {
+                plates:.bar(e, p, 0.04f, z0, z1);
+                plates:.cylinder(p, 0.035f, z0, z1);
+            }
+
+            for at in [c, t, e] {
+                plates:.cylinder(at, 0.035f, z0, z1);
+            }
+
+            for at in PILLARS {
+                plates:.cylinder(at, 0.04f, z0, z1);
+            }
+        }
+
+        // the pillars between the plates, and the posts fixing the back plate to the wall
+        for at in PILLARS {
+            plates:.cylinder(at, 0.022f, movement::FRONT_PLATE - 0.03f, movement::BACK_PLATE);
+            plates:.cylinder(at, 0.018f, movement::BACK_PLATE, WALL);
+        }
+
+        self:.drawMesh(alias frame, "plates", plates, self._brass);
+
+        // the chapter ring, its hour marks, and the ring of the seconds
+        let dmut dial = copy MeshBuilder();
+        let (chapterIn, chapterOut) = CHAPTER;
+        let (secondsIn, secondsOut) = SECONDS;
+        let zDial = movement::DIAL_PLANE;
+        dial:.ring(c, chapterIn, chapterOut, zDial - 0.004f, zDial + 0.004f, segments-> 96u32);
+        dial:.ring(e, secondsIn, secondsOut, zDial - 0.004f, zDial + 0.004f, segments-> 64u32);
+        self:.drawMesh(alias frame, "dial", dial, self._enamel);
+
+        let dmut marks = copy MeshBuilder();
+        for h in 0 .. 12 {
+            let a = cast!f32(h) * TURN / 12.0f;
+            let long = if h % 3 == 0 { 0.1f } else { 0.07f };
+            marks:.bar(polar(a, chapterOut - 0.015f), polar(a, chapterOut - 0.015f - long), if h % 3 == 0 { 0.022f } else { 0.012f },
+                       zDial - 0.008f, zDial - 0.004f);
+        }
+
+        for s in 0 .. 60 {
+            let a = cast!f32(s) * TURN / 60.0f;
+            let long = if s % 5 == 0 { 0.03f } else { 0.015f };
+            marks:.bar(e + polar(a, secondsOut - 0.005f), e + polar(a, secondsOut - 0.005f - long), 0.004f,
+                       zDial - 0.008f, zDial - 0.004f);
+        }
+
+        self:.drawMesh(alias frame, "marks", marks, self._blued);
+
+        alias frame
+    }
+
+    /**
+     * The arbors of the movement, each a dynamic body on a hinge of the frame, the centre one driven by the mainspring,
+     * and the hands they carry, set at the time of the day
+     * */
+    fn createMovement(mut self, dmut scene: &Scene, frame: &PhysicsBody3D)
+        throws BalderError
+    {
+        let now = DateTime(Instant::now());
+        let seconds = cast!f32(now.second);
+        let minutes = cast!f32(now.minute) + seconds / 60.0f;
+        let hours = cast!f32(now.hour % 12) + minutes / 60.0f;
+
+        for a in movement::arbors() {
+            let settings = BodySettings(motion-> BodyMotion::DYNAMIC, mass-> a.mass, friction-> TEETH_FRICTION,
+                                        layer-> a.layer, mask-> a.layer, canSleep-> false);
+            let dmut body = copy PhysicsBody3D(a.name, alias scene:.getRootNode(), shape-> a.shape(), settings-> settings);
+            body.position = makeVec3(a.centre, 0.0f);
+
+            let dmut gears = copy MeshBuilder();
+            a.drawGears(alias gears);
+            self:.drawMesh(alias body, a.name ~ "-gears", gears, self._brass);
+
+            let dmut axle = copy MeshBuilder();
+            if a.name == "hour" {
+                axle:.cylinder(vec2(), AXLE * 1.8f, a.back, a.front, segments-> 16u32);
+            } else {
+                a.drawAxle(alias axle);
+            }
+
+            self:.drawMesh(alias body, a.name ~ "-axle", axle, self._steel);
+
+            // the hands, pointing at the time from the arbor at rest
+            let dmut hand = copy MeshBuilder();
+            match a.name {
+                "escape" => { self:.drawHand(alias hand, seconds / 60.0f, 0.18f, 0.006f, a.front + 0.004f); }
+                "centre" => { self:.drawHand(alias hand, minutes / 60.0f, 0.62f, 0.016f, a.front + 0.004f); }
+                "hour"   => { self:.drawHand(alias hand, hours / 12.0f, 0.42f, 0.028f, a.front + 0.004f); }
+                _        => {}
+            }
+
+            self:.drawMesh(alias body, a.name ~ "-hand", hand, self._blued);
+
+            let mut hinge = JointSettings(kind-> JointKind::HINGE);
+            if a.name == "centre" {
+                hinge.motor = true;
+                hinge.motorSpeed = RACING;
+                hinge.maxMotorForce = MAINSPRING;
+            }
+
+            let dmut j = copy Joint3D(a.name ~ "-hinge", alias scene:.getRootNode(), frame, body, settings-> hinge);
+            j:.setTransform(makeVec3(a.centre, 0.0f), hingeTurn(), makeVec3(1.0f, 1.0f, 1.0f));
+        }
+    }
+
+    /**
+     * The pendulum and its anchor, on a hinge of the frame under the escape wheel, sent on its first swing
+     * */
+    fn createPendulum(mut self, dmut scene: &Scene, frame: &PhysicsBody3D)
+        throws BalderError
+    {
+        let p = movement::pendulum();
+        self._palletLayer = p.layer;
+
+        let mut settings = BodySettings(motion-> BodyMotion::DYNAMIC, mass-> p.mass, friction-> TEETH_FRICTION,
+                                        layer-> p.layer, mask-> p.layer, canSleep-> false);
+        settings.angularDamping = PENDULUM_DAMPING;
+        settings.linearDamping = 0.0f;
+
+        let shape = p.shape();
+        let dmut body = copy PhysicsBody3D("pendulum", alias scene:.getRootNode(), shape-> shape, settings-> settings);
+        body.position = makeVec3(p.pivot, 0.0f);
+
+        let dmut anchor = copy MeshBuilder();
+        p.drawAnchor(alias anchor);
+        self:.drawMesh(alias body, "anchor", anchor, self._steel);
+
+        let dmut rod = copy MeshBuilder();
+        p.drawRod(alias rod);
+        self:.drawMesh(alias body, "rod", rod, self._steel);
+
+        let dmut bob = copy MeshBuilder();
+        p.drawBob(alias bob);
+        self:.drawMesh(alias body, "bob", bob, self._brass);
+
+        let dmut j = copy Joint3D("pendulum-hinge", alias scene:.getRootNode(), frame, body,
+                                  settings-> JointSettings(kind-> JointKind::HINGE));
+        j:.setTransform(makeVec3(p.pivot, 0.0f), hingeTurn(), makeVec3(1.0f, 1.0f, 1.0f));
+
+        // turning about the pivot, its centre of mass moving with it
+        let com = MassProperties(shape, p.mass).centre;
+        body:.setVelocity(makeVec3(-com.y * FIRST_SWING, com.x * FIRST_SWING, 0.0f),
+                          angular-> makeVec3(0.0f, 0.0f, FIRST_SWING));
+        self._pendulum = (alias body)?;
+    }
+
+    /**
+     * The wall the clock hangs on, and a floor under it
+     * */
+    fn createRoom(mut self, dmut scene: &Scene)
+        throws BalderError
+    {
+        let mut wood = MaterialConfig();
+        wood.baseColor = makeVec3(0.16f, 0.09f, 0.05f);
+        wood.roughness = 0.75f;
+
+        let (array, indices) = cubeMesh();
+        let dmut wall = copy IndexedMesh3D("wall", alias scene:.getRootNode(), LodChain(indices), array,
+                                           copy ConstantMaterial(wood));
+        wall.position = makeVec3(0.0f, FLOOR, WALL + 0.05f);
+        wall.scale = makeVec3(8.0f, 6.0f, 0.1f);
+
+        let mut stone = MaterialConfig();
+        stone.baseColor = makeVec3(0.45f, 0.44f, 0.42f);
+        stone.roughness = 0.9f;
+
+        let (plane, planeIndices) = planeMesh();
+        let dmut floor = copy IndexedMesh3D("floor", alias scene:.getRootNode(), LodChain(planeIndices), plane,
+                                            copy ConstantMaterial(stone));
+        floor.position = makeVec3(0.0f, FLOOR, -2.0f);
+        floor.scale = makeVec3(8.0f, 1.0f, 8.0f);
+    }
+
+    /**
+     * A sun from the front, casting the shadows of the wheels on each other and on the wall
+     * */
+    fn createLight(mut self, dmut scene: &Scene) {
+        let dmut sun = copy Light("sun", scene:.getRootNode(), castShadow-> true);
+        sun.direction = makeVec3(-0.35f, -0.55f, 0.75f);
+        sun.intensity = 2.6f;
+        sun.color = makeVec3(1.0f, 0.95f, 0.85f);
+    }
+
+    fn createCamera(mut self, dmut scene: &Scene) {
+        let dmut cam = copy PerspectiveCamera("cam", scene:.getRootNode());
+        cam.fov = 50.0f;
+        cam.near = 0.05f;
+        cam.far = 60.0f;
+        self._cam = (alias cam)?;
+        self:.followCentre();
+    }
+
+    /**
+     * Draw a hand pointing at a fraction of a turn of its dial, clockwise from twelve, a short tail behind its axis
+     * */
+    fn drawHand(mut self, dmut mesh: &MeshBuilder, fraction: f32, length: f32, width: f32, z: f32) {
+        let a = TURN / 4.0f - fraction * TURN;
+        mesh:.bar(polar(a, -length * 0.2f), polar(a, length), width, z, z + 0.006f);
+        mesh:.prism(copy [polar(a, length), polar(a, length - width * 2.5f) + polar(a + TURN / 4.0f, width),
+                          polar(a, length - width * 2.5f) - polar(a + TURN / 4.0f, width), polar(a, length + width * 2.0f)],
+                    z, z + 0.006f);
+        mesh:.cylinder(vec2(), width * 1.4f, z, z + 0.008f, segments-> 20u32);
+    }
+
+    /**
+     * Draw the solids of a builder as a mesh of a material under a node, in its space
+     * */
+    fn drawMesh(mut self, dmut parent: &Node, name: [c8], mesh: &MeshBuilder, material: MaterialConfig)
+        throws BalderError
+    {
+        let (array, indices) = mesh.finish();
+        if indices.len == 0us { return; }
+
+        copy IndexedMesh3D(name, alias parent, LodChain(indices), array, copy ConstantMaterial(material));
+    }
+
+    /**
+     * Draw a category of the debug view of the physics, or stop drawing it
+     * */
+    fn toggleDebug(mut self, category: u32) {
+        if let Ok(dmut s) = alias self._scene {
+            s.physicsDebug = s.physicsDebug ^ category;
+        }
+    }
+
+    /**
+     * Place the camera about the centre, along the yaw and the pitch
+     * */
+    fn followCentre(mut self) {
+        if let Ok(dmut cam) = alias self._cam {
+            let pitch = math::utils::radian(self._pitch);
+            let yaw = math::utils::radian(self._yaw);
+            let look = makeVec3(-cos(pitch) * sin(yaw), sin(pitch), -cos(pitch) * cos(yaw));
+            let position = CENTRE - look * self._distance;
+            if position != cam.position {
+                cam.position = position;
+                cam.target = CENTRE;
+            }
+        }
+    }
+}
+
+/**
+ * @returns: the turn of the frame of a hinge, its X axis along the Z axis of the arbors
+ * */
+fn hingeTurn()-> Quaternion {
+    Quaternion::fromAxisAngle(-1.5707964f, makeVec3(0.0f, 1.0f, 0.0f))
+}
