@@ -55,6 +55,12 @@ metallic = 0.0
 roughness = 0.6
 specular = 0.5
 occlusion = 1.0
+normal-strength = 1.0
+emissive-strength = 1.0
+tiling-u = 2.0
+tiling-v = 2.0
+offset-u = 0.0
+offset-v = 0.0
 base-color-map = "res:/textures/brick.png"
 normal-map = "res:/textures/brick_normal.png"
 ```
@@ -63,6 +69,9 @@ normal-map = "res:/textures/brick_normal.png"
 |---|---|
 | `base-color`, `emissive` | a linear colour, multiplying the texels of the map of the same name (decoded from sRGB) |
 | `metallic`, `roughness`, `specular`, `occlusion` | as `MaterialConfig` has them |
+| `normal-strength` | how far the normal map bends the normals (the scale of the normal texture of glTF), 0 flat, 1 as the map is |
+| `emissive-strength` | the factor of the emissive colour, above 1 for an HDR glow |
+| `tiling-u`, `tiling-v`, `offset-u`, `offset-v` | the texture coordinates of every map: those of the vertices times the tiling plus the offset |
 | `base-color-map`, `metallic-roughness-map`, `normal-map`, `occlusion-map`, `emissive-map` | the path of a texture, the maps as `MaterialMaps` has them |
 
 Each part a node draws takes a `Material` of its own from the asset (`MaterialAsset.instance`): a metallic/roughness
@@ -70,6 +79,12 @@ material when it has maps other than its base colour, a material of its base col
 a constant material when it has none or when the vertices of the part have no texture coordinates. The materials of the
 same shader and the same maps share their resources, and the parts of the same geometry draw as instances of one
 command.
+
+A material changes an entry at a time (`setValue`) or all of them (`setValues`, the `values` it had given back), its
+`revision` counting the changes; `duplicate` copies it under another path. The mesh nodes drawing it follow it once
+told (`MeshInstance3D.refresh`, `MeshInstance3D::refreshUnder` for the nodes under a root): a part whose maps are the
+same takes the new factors in place (`IndexedMesh3D.setMaterialConfig`, its material word written again), a part whose
+maps changed is drawn again by a new mesh, where the old one was among the children of the node.
 
 ## The cache
 
