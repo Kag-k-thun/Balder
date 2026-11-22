@@ -1,6 +1,6 @@
 in activity;
 
-use balder_editor::{arguments, build_error_dialog, command, connections_panel, document, editor, hulls_panel, inspector_panel, manager, material_document, material_panel, material_preview, naming, outline_panel, project, scene_document, viewport};
+use balder_editor::{arguments, build_error_dialog, command, connections_panel, document, editor, hulls_panel, inspector_panel, manager, material_document, material_panel, material_preview, material_slots_panel, naming, outline_panel, project, scene_document, viewport};
 use balder_editor::command::{add, duplicate, open, projection, property, remove, transform, volume, wrap};
 use balder_editor::project::{game_build, game_library, recent};
 use balder::core::{_, application::_};
@@ -94,7 +94,9 @@ enum MaterialChoice : u8
 | NEW       = 0u8 // a new material, written then opened
 | OPEN      = 1u8 // a material opened
 | SAVE_AS   = 2u8 // the material of a file shown, saved in another file it edits from then on
-| EXTRACT   = 3u8; // a copy of the material read only shown, the meshes of the scene drawing it drawing the copy
+| EXTRACT   = 3u8 // a copy of the material read only shown, the meshes of the scene drawing it drawing the copy
+| DUPLICATE = 4u8 // a copy of the material of a part of the mesh inspected, drawing the part
+| CHOOSE    = 5u8; // the material drawing a part of the mesh inspected
 
 
 /**
@@ -180,8 +182,9 @@ pub class EditorActivity over Activity {
     // The tabs of the documents, once the interface is loaded
     let dmut _tabs: (&TabBar)? = none;
 
-    // The material editor, once the interface is loaded
+    // The material editor, and the panel of the materials of the mesh inspected, once the interface is loaded
     let dmut _materials: (&MaterialPanel)? = none;
+    let dmut _slots: (&MaterialSlotsPanel)? = none;
 
     // The material shown in place of the panels of the scene, none while a scene is shown
     let dmut _material: (&MaterialDocument)? = none;
@@ -190,8 +193,10 @@ pub class EditorActivity over Activity {
     let mut _materialDirectory: [c8] = "";
     let mut _imageDirectory: [c8] = "";
 
-    // What the material file being chosen is for, and the entry of the map whose image is being chosen
+    // What the material file being chosen is for, the part of the mesh inspected it is for, and the entry of the map
+    // whose image is being chosen
     let mut _materialChoice: MaterialChoice = MaterialChoice::OPEN;
+    let mut _slotPart: usize = 0us;
     let mut _browsedMap: [c8] = "";
 
     // The speeds of the flights of the viewport in the scene files closed, by their path, a scene opened again flown at
@@ -292,6 +297,8 @@ pub class EditorActivity over Activity {
         self:.behavior("hulls", alias hulls);
         let dmut links = copy ConnectionsPanel(alias self.gui, alias self.box, &self:.setStatus);
         self:.behavior("connections", alias links);
+        let dmut slots = copy MaterialSlotsPanel(alias self.gui, alias self.box, &self:.setStatus);
+        self:.behavior("materials", alias slots);
         let dmut materials = copy MaterialPanel(alias self.gui, alias self.box, &self:.setStatus);
         self:.behavior("material", alias materials);
         self._materialDirectory = projectDirectory("materials");
@@ -350,13 +357,18 @@ pub class EditorActivity over Activity {
             inspector:.bind(alias e);
             hulls:.bind(alias e);
             links:.bind(alias e);
+            slots:.bind(alias e);
             materials:.bind(alias e);
 
+            slots:.editAsked():.connect(self.box, &self:.onEditMaterial);
+            slots:.duplicateAsked():.connect(self.box, &self:.onDuplicateMaterial);
+            slots:.chooseAsked():.connect(self.box, &self:.onChooseMaterial);
             materials:.edited():.connect(self.box, &self:.onMaterialEdited);
             materials:.browseAsked():.connect(self.box, &self:.onBrowseMap);
             materials:.extractAsked():.connect(self.box, &self:.onExtractMaterial);
             materials:.environmentAsked():.connect(self.box, &self:.onChooseEnvironment);
             materials:.userPicked():.connect(self.box, &self:.onUserPicked);
+            self._slots = (alias slots)?;
             self._materials = (alias materials)?;
         } else {
             log::error #("Editor", "The viewport of the editor has no editable scene");
@@ -1546,7 +1558,7 @@ pub class EditorActivity over Activity {
      * */
     fn chooseMaterialFile(mut self, choice: MaterialChoice, title: [c8], name: [c8]) {
         self._materialChoice = choice;
-        let opens = choice == MaterialChoice::OPEN;
+        let opens = choice == MaterialChoice::OPEN || choice == MaterialChoice::CHOOSE;
         let dmut d = copy FileDialog(if opens { FileDialogMode::OPEN } else { FileDialogMode::SAVE },
                                      directory-> self._materialDirectory, filters-> materialExtensions(), title-> title,
                                      name-> if opens { "" } else { name ~ "." ~ MATERIAL_EXTENSION });
@@ -1570,7 +1582,7 @@ pub class EditorActivity over Activity {
             return;
         };
 
-        let opens = self._materialChoice == MaterialChoice::OPEN;
+        let opens = self._materialChoice == MaterialChoice::OPEN || self._materialChoice == MaterialChoice::CHOOSE;
         let file = if opens || Path(chosen).extension() == MATERIAL_EXTENSION { chosen } else { chosen ~ "." ~ MATERIAL_EXTENSION };
         self._materialDirectory = Path(file).parent().toStr();
         let p = qualifiedPath(file);
@@ -1588,6 +1600,11 @@ pub class EditorActivity over Activity {
                     if self:.saveMaterialAs(p) { self:.proceed(self._pending); }
                 }
                 MaterialChoice::EXTRACT => { self:.extractTo(p); }
+                MaterialChoice::DUPLICATE => { self:.duplicateTo(p); }
+                MaterialChoice::CHOOSE => {
+                    Assets::material(p);
+                    if let Ok(dmut slots) = alias self._slots { slots:.setSlot(self._slotPart, p); }
+                }
             }
         } catch {
             err: &BalderError => {
@@ -1731,6 +1748,24 @@ pub class EditorActivity over Activity {
     }
 
     /**
+     * Copy the material of the part of the mesh inspected asked about in a file, the part drawn with the copy, opened
+     * in a tab of its own
+     * */
+    fn duplicateTo(mut self, path: [c8])
+        throws BalderError
+    {
+        let dmut slots = if let Ok(dmut s) = alias self._slots { alias s } else { return; };
+        let (material, mesh) = if let Ok(m) = slots:.mesh() { (m.materialOf(self._slotPart), m.mesh.path) } else { return; };
+
+        material.duplicate(path, Document::stem(path)).save(path);
+        Assets::forget(path);
+        Assets::material(path);
+        if slots:.setSlot(self._slotPart, path) {
+            self:.openMaterial(path, mesh);
+        }
+    }
+
+    /**
      * Write the material shown again in its tab, in the panels and in the title, once its document changed of material
      * */
     fn refreshMaterial(mut self) {
@@ -1755,6 +1790,27 @@ pub class EditorActivity over Activity {
 
         self:.showDocument();
         self:.showHistory();
+    }
+
+    /**
+     * The material of a part of the mesh inspected is to be edited in a tab of its own, its preview drawing the mesh
+     * */
+    fn onEditMaterial(mut self, part: usize) {
+        let dmut slots = if let Ok(dmut s) = alias self._slots { alias s } else { return; };
+        let (path, mesh) = if let Ok(m) = slots:.mesh() { (m.materialOf(part).path, m.mesh.path) } else { return; };
+        self:.openMaterial(path, mesh);
+    }
+
+    fn onDuplicateMaterial(mut self, part: usize) {
+        let dmut slots = if let Ok(dmut s) = alias self._slots { alias s } else { return; };
+        let name = if let Ok(m) = slots:.mesh() { m.materialOf(part).name } else { return; };
+        self._slotPart = part;
+        self:.chooseMaterialFile(MaterialChoice::DUPLICATE, "Duplicate the material to a file", name);
+    }
+
+    fn onChooseMaterial(mut self, part: usize) {
+        self._slotPart = part;
+        self:.chooseMaterialFile(MaterialChoice::CHOOSE, "Draw the part with a material file", "");
     }
 
     fn onExtractMaterial(mut self) {
