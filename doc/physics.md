@@ -585,6 +585,15 @@ tumbling down stairs, and teapots falling on each other, the hulls of their deco
 (`res/models/teapot/teapot.hulls`) their shape; Space throws a ball from the camera, `P` fires a plank spinning, a
 bullet.
 
+The `clock` example (`./clock`) is a skeleton pendulum clock run by the physics alone: every wheel is a dynamic
+compound body on a hinge of a static frame, its teeth convex hulls (the lantern pinions, cylinder pins) pushing the next
+arbor's teeth, the mainspring a hinge motor of a bounded torque whose speed the train never reaches while the anchor
+holds it. A recoil anchor rocked by the pendulum (a beat a second) lets the escape wheel go by a tooth a swing, the
+seconds hand turning once a minute, the minute and hour hands set to the time of day when it starts. Each plane where
+two arbors mesh is a collision layer, so only the meshing bodies are tested against each other. It needs 8 sub steps and
+4 iterations (`res/config/clock.toml`): with the default 4 and 2, the escapement lets a tooth slip now and then. Space
+lifts the anchor out, the train racing under the mainspring, and drops it back in.
+
 A body turns by its angular velocity through `Quaternion::integrated`, and is placed by a `RigidTransform` (a rotation
 then a translation). A `Node3D` holds its rotation as a quaternion: the Euler angles it is given are kept for the editor
 and the scene files, and read from the quaternion once it is set as one (`orientation`).
