@@ -1,0 +1,764 @@
+in material_panel;
+
+use balder_editor::{command, editor, material_document, material_preview, preview_settings, scene_document, texture_info};
+use balder_editor::command::material;
+use balder::core::application::signal;
+use balder::core::config::shader;
+use balder::core::error;
+use balder::interface;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget;
+use balder::interface::widget::button::{check, dropdown, push};
+use balder::interface::widget::table::{texts, view};
+use balder::interface::widget::text::_;
+use balder::math::vector;
+use balder::scene::asset::material_asset;
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{camera, mesh_instance};
+use balder::scene::property::value;
+use balder::utils::path;
+
+use std::fs;
+
+// The path of the material editor in the interface of the editor, and of its panels
+def MATERIAL = "BODY/MATERIAL";
+def PROPERTIES = "BODY/MATERIAL/PROPERTIES";
+def INFO = "BODY/MATERIAL/INFO";
+def VIEW = "BODY/MATERIAL/VIEW";
+
+// The fields of the axes of a vector row
+def AXES = ["X", "Y", "Z"];
+
+// The class of a widget taking no room (see inspector.style), and of a field greyed, the material being read only
+def ABSENT = "absent";
+def IDLE = "idle";
+
+// The rows of the numbers of the material, by their entries
+def NUMBER_ROWS = [("metallic", "SURFACE/METALLIC"), ("roughness", "SURFACE/ROUGHNESS"), ("specular", "SURFACE/SPECULAR"),
+                   ("normal-strength", "NORMALS/STRENGTH"), ("occlusion", "OCCLUSION/STRENGTH"),
+                   ("emissive-strength", "EMISSION/STRENGTH"), ("tiling-u", "UV/TILING_U"), ("tiling-v", "UV/TILING_V"),
+                   ("offset-u", "UV/OFFSET_U"), ("offset-v", "UV/OFFSET_V")];
+
+// The rows of the colours of the material, and of its maps, by their entries
+def COLOR_ROWS = [("base-color", "BASE/COLOR"), ("emissive", "EMISSION/COLOR")];
+def MAP_ROWS = [("base-color-map", "BASE/MAP"), ("metallic-roughness-map", "SURFACE/MAP"), ("normal-map", "NORMALS/MAP"),
+                ("occlusion-map", "OCCLUSION/MAP"), ("emissive-map", "EMISSION/MAP")];
+
+// The channels of the dropdown of the preview, in its order
+def CHANNELS = [DebugView::NONE, DebugView::BASE_COLOR, DebugView::ROUGHNESS, DebugView::METALLIC, DebugView::NORMALS,
+                DebugView::OCCLUSION, DebugView::EMISSIVE];
+
+/**
+ * A mesh node of a scene opened drawing the material shown, a row of the table 'Used by'
+ * */
+record MaterialUser {
+
+    // The scene of the node
+    pub let dmut scene: &SceneDocument;
+
+    // The node
+    pub let dmut node: &MeshInstance3D;
+
+    pub self (dmut scene: &SceneDocument, dmut node: &MeshInstance3D)
+        with scene = alias scene
+        , node = alias node
+    {}
+
+}
+
+/**
+ * The material editor, shown in place of the panels of the scene while a material is the document shown, mounted under
+ * the behavior 'material' (see material.gui): the preview of the material, its properties, and what the editor knows of
+ * it (its shader, its textures, its warnings, the nodes drawing it)
+ * @info:
+ * =====
+ * A field changed gives the material its value through a MaterialCommand: executed in the history of the document of a
+ * material of a file (see MaterialDocument), in the history of the scene of a material local to it, the scene being
+ * the document of the editor while its material is shown. The steps of one field merge into one command. A material
+ * embedded in a model file, or built in, is read only: a field changed is written back, Extract to a file making a copy
+ * that can be changed. Choosing an image, extracting and picking a node are asked of the activity (see browseAsked,
+ * extractAsked, userPicked), which opens the dialogs and shows the scenes.
+ * ====
+ * */
+pub class MaterialPanel over Behavior {
+
+    // The interface holding the fields
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the slots are emitted in
+    let dmut _box: &SlotEmitter;
+
+    // Shows a message in the status bar
+    let _status: dg ([c8])-> void;
+
+    // The editor of the scenes, once bound
+    let dmut _editor: (&SceneEditor)? = none;
+
+    // The document shown, none while a scene is
+    let dmut _document: (&MaterialDocument)? = none;
+
+    // The preview, once bound
+    let dmut _preview: (&MaterialPreview)? = none;
+
+    // The scenes opened, the nodes drawing the material being looked for in them
+    let dmut _scenes: [&SceneDocument] = [];
+
+    // The rows of the tables of the textures and of the nodes drawing the material, and those nodes
+    let dmut _textures: &TextTableModel = copy TextTableModel(headers-> copy ["Map", "File", "Size", "Format", "Space", "Memory"]);
+    let dmut _usersModel: &TextTableModel = copy TextTableModel(headers-> copy ["Scene", "Node"]);
+    let dmut _users: [MaterialUser] = [];
+
+    // The textures read, by their entry and their path
+    let dmut _read: [[c8] => TextureInfo] = copy [];
+
+    // Emitted after a change of the material, made, undone or redone
+    let dmut _edited: &Signal!{()} = copy Signal!{()} ();
+
+    // Emitted with the entry of a map whose image is to be chosen
+    let dmut _browseAsked: &Signal!{[c8]} = copy Signal!{[c8]} ();
+
+    // Emitted when the material shown is to be extracted to a file
+    let dmut _extractAsked: &Signal!{()} = copy Signal!{()} ();
+
+    // Emitted when an HDR map is to be chosen to light the preview
+    let dmut _environmentAsked: &Signal!{()} = copy Signal!{()} ();
+
+    // Emitted with the index of the node picked in the table 'Used by' (see userAt)
+    let dmut _userPicked: &Signal!{usize} = copy Signal!{usize} ();
+
+    /**
+     * @params:
+     *    - gui: the interface holding the fields
+     *    - box: the mailbox the slots are emitted in
+     *    - status: shows a message in the status bar
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, status: dg ([c8])-> void)
+        with _gui = alias gui
+        , _box = alias box
+        , _status = status
+    {
+        // the slots the 'on-…' attributes of material.gui name
+        self:.slot("number", &self:.onNumber);
+        self:.slot("axis", &self:.onAxis);
+        self:.slot("map", &self:.onMap);
+        self:.slot("browse", &self:.onBrowse);
+        self:.slot("clear", &self:.onClear);
+        self:.slot("shape", &self:.onShape);
+        self:.slot("lighting", &self:.onLighting);
+        self:.slot("channel", &self:.onChannel);
+        self:.slot("background", &self:.onBackground);
+        self:.slot("frame", &self:.onFrame);
+        self:.slot("extract", &self:.onExtract);
+        self:.slot("user", &self:.onUser);
+    }
+
+    /**
+     * Bind the panel to the editor of the scenes, once the interface is loaded
+     * */
+    pub fn bind(mut self, dmut editor: &SceneEditor) {
+        self._editor = (alias editor)?;
+        if let Ok(dmut t: &TableView) = self._gui:.find(INFO ~ "/TEXTURES") { t:.setModel(alias self._textures); }
+        if let Ok(dmut t: &TableView) = self._gui:.find(INFO ~ "/USERS") { t:.setModel(alias self._usersModel); }
+        if let Ok(dmut p: &MaterialPreview) = self._gui:.find(VIEW ~ "/PREVIEW/ORBIT") {
+            self._preview = (alias p)?;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted after a change of the material, made, undone or redone
+     * */
+    pub fn edited(mut self)-> dmut &Signal!{()} {
+        alias self._edited
+    }
+
+    /**
+     * @returns: the signal emitted with the entry of a map whose image is to be chosen (see setMap)
+     * */
+    pub fn browseAsked(mut self)-> dmut &Signal!{[c8]} {
+        alias self._browseAsked
+    }
+
+    /**
+     * @returns: the signal emitted when the material shown is to be extracted to a file
+     * */
+    pub fn extractAsked(mut self)-> dmut &Signal!{()} {
+        alias self._extractAsked
+    }
+
+    /**
+     * @returns: the signal emitted when an HDR map is to be chosen to light the preview (see setEnvironment)
+     * */
+    pub fn environmentAsked(mut self)-> dmut &Signal!{()} {
+        alias self._environmentAsked
+    }
+
+    /**
+     * @returns: the signal emitted with the index of the node picked in the table 'Used by' (see userAt)
+     * */
+    pub fn userPicked(mut self)-> dmut &Signal!{usize} {
+        alias self._userPicked
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SHOWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Show a material document in place of the panels of the scene, or the panels of the scene again, the document left
+     * keeping how its preview showed it
+     * @params:
+     *    - document: the document shown, none to show the scene
+     *    - scenes: the scenes opened, the nodes drawing the material being looked for in them
+     * */
+    pub fn show(mut self, dmut document: (&MaterialDocument)?, dmut scenes: [&SceneDocument]) {
+        self:.keepPreview();
+        self._document = alias document;
+        self._scenes = alias scenes;
+        self._read = copy [];
+
+        self:.setPresent(MATERIAL, document.hasValue);
+        self:.setPresent("BODY/MAIN", !document.hasValue);
+        if document.hasValue { self:.refresh(); }
+    }
+
+    /**
+     * Keep how the preview shows the material in its document, as it is left
+     * */
+    pub fn keepPreview(mut self) {
+        if let Ok(dmut d) = alias self._document {
+            if let Ok(p) = self._preview { d.preview = p.settings; }
+        }
+    }
+
+    /**
+     * Write the material shown in the fields, its information and its preview, as it is now (once changed, undone or
+     * redone)
+     * */
+    pub fn refresh(mut self) {
+        let d = if let Ok(d) = self._document { d } else { return; };
+        let m = d.material;
+
+        self:.setLabel(PROPERTIES ~ "/KIND", m.name);
+        self:.setLabel(PROPERTIES ~ "/ORIGIN", originOf(d));
+        self:.setPresent(PROPERTIES ~ "/EXTRACT", d.isReadOnly);
+
+        // the fields of a material read only are greyed, Extract to a file making a copy that can be changed
+        let idle = d.isReadOnly;
+        for r in NUMBER_ROWS {
+            let path = PROPERTIES ~ "/" ~ r._1 ~ "/VALUE";
+            if let Ok(dmut s: &SpinBox) = self._gui:.find(path) {
+                s:.setValue(m.value(r._0).number);
+            }
+
+            self:.setIdle(path, idle);
+        }
+
+        for r in COLOR_ROWS {
+            let c = m.value(r._0).vector;
+            let values = [c.x, c.y, c.z];
+            for j, axis in AXES {
+                let path = PROPERTIES ~ "/" ~ r._1 ~ "/" ~ axis;
+                if let Ok(dmut s: &SpinBox) = self._gui:.find(path) {
+                    s:.setValue(values[j]);
+                }
+
+                self:.setIdle(path, idle);
+            }
+        }
+
+        for r in MAP_ROWS {
+            let row = PROPERTIES ~ "/" ~ r._1;
+            if let Ok(dmut t: &InputText) = self._gui:.find(row ~ "/VALUE") {
+                t:.setText(m.value(r._0).text);
+            }
+
+            for part in ["/VALUE", "/BROWSE", "/CLEAR"] {
+                self:.setIdle(row ~ part, idle);
+            }
+        }
+
+        self:.writeInfo();
+        self:.showPreview();
+    }
+
+    /**
+     * @returns: the node picked in the table 'Used by' and its scene, none past the rows
+     * */
+    pub fn userAt(mut self, index: usize)-> dmut (MaterialUser)? {
+        if index < self._users.len { return (alias self._users[index])?; }
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          INFORMATION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write what the editor knows of the material: the shader it is drawn with, its textures, what looks wrong with
+     * them, and the nodes of the scenes opened drawing it
+     * */
+    fn writeInfo(mut self) {
+        let d = if let Ok(d) = self._document { d } else { return; };
+        let m = d.material;
+
+        self:.setLabel(INFO ~ "/SHADER", shaderText(m));
+
+        let mut rows: [[[c8]]] = [];
+        let mut infos: [TextureInfo] = [];
+        for r in MAP_ROWS {
+            let p = m.value(r._0).text;
+            if p.len == 0us { continue; }
+
+            let info = self:.textureOf(r._0, p);
+            infos ~= [info];
+            let size = if info.found { f"${info.width}×${info.height}" } else { "missing" };
+            let entry = r._0;
+            rows ~= [copy [entry[0us .. entry.len - 4us], Path(p).file(), size, shortFormat(info.format),
+                           if info.linear { "linear" } else { "sRGB" }, if info.found { memoryText(info.memory()) } else { "" }]];
+        }
+
+        self._textures:.setRows(rows);
+        self:.setLabel(INFO ~ "/WARNINGS", warningsOf(infos));
+        self:.writeUsers();
+    }
+
+    /**
+     * Fill the table 'Used by' with the mesh nodes of the scenes opened drawing the material
+     * */
+    fn writeUsers(mut self) {
+        let d = if let Ok(d) = self._document { d } else { return; };
+        let material = d.material;
+
+        let dmut users: [MaterialUser] = [];
+        let mut rows: [[[c8]]] = [];
+        if let Ok(dmut e) = alias self._editor {
+            for dmut s in alias self._scenes {
+                let dmut root = if s is e.document { alias e.scene:.getRootNode() } else { alias s:.parkedRoot() };
+                let dmut nodes: [&Node] = [];
+                root:.getAllNodes(ref nodes);
+                for dmut n in alias nodes if let dmut mesh: &MeshInstance3D = alias n {
+                    let mut draws = false;
+                    for i in 0us .. mesh.mesh.subMeshes.len if mesh.materialOf(i) is material { draws = true; }
+                    if draws {
+                        users ~= [MaterialUser(alias s, alias mesh)];
+                        rows ~= [copy [s.title, mesh.name.file()]];
+                    }
+                }
+            }
+        }
+
+        self._users = alias users;
+        self._usersModel:.setRows(rows);
+        if let Ok(dmut t: &TableView) = self._gui:.find(INFO ~ "/USERS") { t:.clearSelection(); }
+    }
+
+    /**
+     * @returns: the texture of a map, read once while the document is shown
+     * */
+    fn textureOf(mut self, entry: [c8], path: [c8])-> TextureInfo {
+        let key = entry ~ "|" ~ path;
+        if let Ok(t) = self._read[key] { return t; }
+
+        let info = TextureInfo::read(entry, path);
+        self._read[key] = info;
+        info
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PREVIEW          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Show the material in the preview as its document tells, the choices of the bar written
+     */
+    fn showPreview(mut self) {
+        let d = if let Ok(d) = self._document { d } else { return; };
+        let settings = d.preview;
+        let environment = if let Ok(dmut e) = alias self._editor { e.scene.environment } else { "" };
+        if let Ok(dmut p) = alias self._preview {
+            p:.show(d.material, settings, environment);
+        }
+
+        self:.select(VIEW ~ "/SHAPE", cast!usize(cast!u32(settings.shape)));
+        self:.select(VIEW ~ "/LIGHTING", cast!usize(cast!u32(settings.lighting)));
+        let mut channel = 0us;
+        for i, c in CHANNELS if c == settings.channel { channel = i; }
+        self:.select(VIEW ~ "/CHANNEL", channel);
+        if let Ok(dmut c: &CheckBox) = self._gui:.find(VIEW ~ "/BACKGROUND") { c:.setChecked(settings.background); }
+    }
+
+    /**
+     * Change how the preview shows the material, kept by its document
+     * */
+    fn changePreview(mut self, settings: PreviewSettings) {
+        if let Ok(dmut d) = alias self._document {
+            d.preview = settings;
+        }
+
+        self:.showPreview();
+    }
+
+    /**
+     * @returns: how the preview shows the material, the eye where the user turned it
+     * */
+    fn previewSettings(self)-> PreviewSettings {
+        if let Ok(p) = self._preview { return p.settings; }
+        if let Ok(d) = self._document { return d.preview; }
+        PreviewSettings()
+    }
+
+    fn onShape(mut self, index: usize) {
+        let mut s = self.previewSettings();
+        s.shape = match index { 1us => { PreviewShape::CUBE } 2us => { PreviewShape::PLANE } 3us => { PreviewShape::MESH } _ => { PreviewShape::SPHERE } };
+        if s.shape == PreviewShape::MESH && s.mesh.len == 0us {
+            self._status("The material was not opened from a mesh: the sphere stands in for it");
+        }
+
+        self:.changePreview(s);
+        self:.onFrame(1u8);
+    }
+
+    fn onLighting(mut self, index: usize) {
+        let mut s = self.previewSettings();
+        if index == 2us {
+            // the HDR map is chosen first, the lighting changed once it is (see setEnvironment)
+            self:.select(VIEW ~ "/LIGHTING", cast!usize(cast!u32(s.lighting)));
+            self._environmentAsked:.emit();
+            return;
+        }
+
+        s.lighting = if index == 1us { PreviewLighting::SCENE } else { PreviewLighting::STUDIO };
+        if s.lighting == PreviewLighting::SCENE {
+            if let Ok(dmut e) = alias self._editor && e.scene.environment.len == 0us {
+                self._status("The scene shown has no environment: the preview is lit by its key light alone");
+            }
+        }
+
+        self:.changePreview(s);
+    }
+
+    /**
+     * Light the preview by an HDR map chosen
+     * */
+    pub fn setEnvironment(mut self, path: [c8]) {
+        let mut s = self.previewSettings();
+        s.lighting = PreviewLighting::ENVIRONMENT;
+        s.environment = path;
+        self:.changePreview(s);
+    }
+
+    fn onChannel(mut self, index: usize) {
+        let mut s = self.previewSettings();
+        s.channel = if index < CHANNELS.len { CHANNELS[index] } else { DebugView::NONE };
+        self:.changePreview(s);
+    }
+
+    fn onBackground(mut self, shown: bool) {
+        let mut s = self.previewSettings();
+        s.background = shown;
+        self:.changePreview(s);
+    }
+
+    fn onFrame(mut self, _: u8) {
+        if let Ok(dmut p) = alias self._preview { p:.frame(); }
+        self:.keepPreview();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          EDITING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onNumber(mut self, entry: [c8], value: f32) {
+        self:.edit(entry, PropertyValue::number(value), entry);
+    }
+
+    fn onAxis(mut self, entry: [c8], axis: u32, value: f32) {
+        let before = if let Ok(d) = self._document { d.material.value(entry).vector } else { return; };
+        let mut c: [mut f32] = copy [before.x, before.y, before.z];
+        if axis < 3u32 { c[axis] = value; }
+        self:.edit(entry, PropertyValue::color(makeVec3(c[0], c[1], c[2])), f"${entry}/${axis}");
+    }
+
+    fn onMap(mut self, entry: [c8], text: [c8]) {
+        self:.setMap(entry, if text.len == 0us { "" } else { qualifiedPath(text) });
+    }
+
+    fn onBrowse(mut self, entry: [c8], _: u8) {
+        if let Ok(d) = self._document && d.isReadOnly {
+            self:.refuse();
+            return;
+        }
+
+        self._browseAsked:.emit(entry);
+    }
+
+    fn onClear(mut self, entry: [c8], _: u8) {
+        self:.setMap(entry, "");
+    }
+
+    fn onExtract(mut self, _: u8) {
+        self._extractAsked:.emit();
+    }
+
+    fn onUser(mut self, rows: [usize]) {
+        if rows.len == 1us { self._userPicked:.emit(rows[0]); }
+    }
+
+    /**
+     * Give a map of the material the texture of a path, none for an empty path
+     * */
+    pub fn setMap(mut self, entry: [c8], path: [c8]) {
+        self:.edit(entry, PropertyValue::asset(path), "");
+    }
+
+    /**
+     * Give an entry of the material a value, through a command, a material read only refusing it
+     * @params:
+     *    - field: the field the change was typed in, the steps of one field merging, empty for none
+     * */
+    fn edit(mut self, entry: [c8], value: PropertyValue, field: [c8]) {
+        let dmut d = if let Ok(dmut d) = alias self._document { alias d } else { return; };
+        if d.isReadOnly {
+            self:.refuse();
+            return;
+        }
+
+        if d.material.value(entry) == value { return; }
+        self:.run(copy MaterialCommand(alias d.material, entry, value, field-> field));
+    }
+
+    /**
+     * Tell why a material read only is not changed, its fields written back
+     * */
+    fn refuse(mut self) {
+        self._status("This material is read only: Extract to a file makes a copy that can be changed");
+        self:.refresh();
+    }
+
+    /**
+     * Change the material through the history it belongs to: the history of the scene of a material local to it (the
+     * document of the editor), the history of the document otherwise, then show it as it is now
+     * */
+    fn run(mut self, dmut command: &EditCommand) {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let dmut d = if let Ok(dmut d) = alias self._document { alias d } else { return; };
+        {
+            if d.isLocal {
+                e:.execute(alias command);
+            } else {
+                d:.execute(alias e.scene, alias command);
+            }
+        } catch {
+            err: &BalderError => { self._status(err.msg); }
+        }
+
+        self:.changed();
+    }
+
+    /**
+     * Undo the last change of the material of a file shown
+     * @returns: true iif a change was undone
+     * */
+    pub fn undo(mut self)-> bool {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return false; };
+        let dmut d = if let Ok(dmut d) = alias self._document { alias d } else { return false; };
+        if !d:.undo(alias e.scene).hasValue { return false; }
+
+        self:.changed();
+        true
+    }
+
+    /**
+     * Make again the last change of the material of a file shown that was undone
+     * @returns: true iif a change was made again
+     * */
+    pub fn redo(mut self)-> bool {
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return false; };
+        let dmut d = if let Ok(dmut d) = alias self._document { alias d } else { return false; };
+        {
+            if !d:.redo(alias e.scene).hasValue { return false; }
+        } catch {
+            err: &BalderError => {
+                self._status(err.msg);
+                return false;
+            }
+        }
+
+        self:.changed();
+        true
+    }
+
+    /**
+     * The material changed: the preview draws it as it is, the fields and the information follow, and edited is emitted
+     * */
+    fn changed(mut self) {
+        if let Ok(dmut p) = alias self._preview { p:.refresh(); }
+        self:.refresh();
+        self._edited:.emit();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          WIDGETS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn setLabel(mut self, path: [c8], text: [c8]) {
+        if let Ok(dmut l: &Label) = self._gui:.find(path) { l:.setText(text); }
+    }
+
+    fn select(mut self, path: [c8], index: usize) {
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(path) { d:.setSelected(index); }
+    }
+
+    /**
+     * Make a widget present, or absent, taking no room
+     * */
+    fn setPresent(mut self, path: [c8], present: bool) {
+        self:.setClass(path, ABSENT, !present);
+    }
+
+    /**
+     * Grey a field, or show it as it is
+     * */
+    fn setIdle(mut self, path: [c8], idle: bool) {
+        self:.setClass(path, IDLE, idle);
+    }
+
+    /**
+     * Give a widget a class, or take it away, its other classes kept
+     * */
+    fn setClass(mut self, path: [c8], name: [c8], given: bool) {
+        if let Ok(dmut w) = alias self._gui:.find(path) {
+            let mut classes: [[c8]] = [];
+            for c in w.getClasses() if c != name {
+                classes ~= [c];
+            }
+
+            if given { classes ~= [name]; }
+            if classes != w.getClasses() { w:.setClasses(classes); }
+        }
+    }
+
+}
+
+/**
+ * @returns: where a material comes from, and where its changes go
+ * */
+fn originOf(d: &MaterialDocument)-> [c8] {
+    let m = d.material;
+    if m.isLocal {
+        let scene = if let Ok(s) = d.scene { s.title } else { "its scene" };
+        return f"Local to ${scene}: its changes are changes of the scene, saved with it";
+    }
+
+    if let Ok(model) = MaterialAsset::modelOf(m.path) {
+        return f"Embedded in ${model._0}: read only, extracted to a file to be changed";
+    }
+
+    if d.isReadOnly { return "Built in the engine, drawing the built-in meshes: read only, extracted to a file to be changed"; }
+    f"The file ${m.path}, shared by every mesh drawing it"
+}
+
+/**
+ * @returns: the shader a material is drawn with, and why
+ * */
+fn shaderText(m: &MaterialAsset)-> [c8] {
+    let shader = m.shaderOf(true);
+    let why = match shader {
+        DefaultShaders::PBR_3D => { "metallic/roughness, its maps sampled in the g-buffer" }
+        DefaultShaders::TEXTURE_3D => { "its base colour map alone, the other factors constant" }
+        _ => { "constant, of no map" }
+    };
+
+    f"${Path(shader).file()}: ${why}. A mesh without texture coordinates draws it with color.toml. The meshes of the same shader and the same maps are drawn by one command."
+}
+
+/**
+ * @returns: what looks wrong with the textures of a material, a line each, 'None' when nothing does
+ * */
+fn warningsOf(infos: [TextureInfo])-> [c8] {
+    let mut lines: [[c8]] = [];
+    for t in infos {
+        let w = t.warning();
+        if w.len != 0us { lines ~= [w]; }
+    }
+
+    // a file loaded once by the window, in the colour space of its first use
+    for i, a in infos {
+        for j in i + 1us .. infos.len {
+            let b = infos[j];
+            if a.path == b.path && a.linear != b.linear {
+                lines ~= [f"${a.path} is both a map of colours and a map of data: the window loads it once, in the colour space of its first use"];
+            }
+        }
+    }
+
+    let mut sizes: [[c8]] = [];
+    for t in infos if t.found {
+        let s = f"${t.width}×${t.height}";
+        let mut known = false;
+        for x in sizes if x == s { known = true; }
+        if !known { sizes ~= [s]; }
+    }
+
+    if sizes.len > 1us {
+        let mut all = "";
+        for i, s in sizes { all ~= (if i == 0us { "" } else { ", " }) ~ s; }
+        lines ~= [f"The maps are of different sizes (${all}): their texels do not line up"];
+    }
+
+    if lines.len == 0us { return "None"; }
+
+    let mut text = "";
+    for i, l in lines { text ~= (if i == 0us { "" } else { "\n" }) ~ "• " ~ l; }
+    text
+}
+
+/**
+ * @returns: an SDL pixel format without its prefix, `RGB24` for `SDL_PIXELFORMAT_RGB24`
+ * */
+fn shortFormat(format: [c8])-> [c8] {
+    let prefix = "SDL_PIXELFORMAT_";
+    if format.len > prefix.len && format[0us .. prefix.len] == prefix { return format[prefix.len .. $]; }
+    format
+}
+
+/**
+ * @returns: a number of bytes in words, in KiB or MiB
+ * */
+fn memoryText(bytes: u64)-> [c8] {
+    if bytes >= 1048576u64 {
+        let tenths = (bytes * 10u64) / 1048576u64;
+        return f"${tenths / 10u64}.${tenths % 10u64} MiB";
+    }
+
+    f"${(bytes + 1023u64) / 1024u64} KiB"
+}

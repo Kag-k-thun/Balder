@@ -1,0 +1,320 @@
+in material_preview;
+
+use balder_editor::preview_settings;
+use balder::interface::loader::registry::schema;
+use balder::interface::widget::layout::d3scene::overlay;
+use balder::math::{_, bounds};
+use balder::scene;
+use balder::scene::asset::{assets, material_asset, mesh_asset};
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{camera, light, mesh_instance};
+use balder::utils::log;
+
+use ::sdl3::{keyboard, keycode, mouse};
+
+// The names of the nodes of the preview, under the root of its scene
+def CAMERA_NODE = "camera";
+def LIGHT_NODE = "key-light";
+def SHAPE_NODE = "shape";
+
+// The environment of the studio lights, built in the engine
+def STUDIO_ENVIRONMENT = "engine:/environments/studio_small_09_1k.hdr";
+
+// The grey behind the shape while the background is hidden, linear
+def GREY = makeVec3(0.18f, 0.18f, 0.19f);
+
+// How fast the eye turns around the shape as the cursor slides, and slides with Shift
+def ORBIT_SPEED = 5.0f;
+def PAN_SPEED = 1.2f;
+
+/**
+ * The preview of a material: an overlay of a Scene3D of its own drawing the material on a shape (a sphere, a cube, a
+ * plane, or the mesh it was opened from), under studio lights, the environment of the scene shown, or an HDR map
+ * chosen, its background seen or a grey, lit or one of its channels alone (see DebugView), the eye turned around the
+ * shape by the left or the middle button (slid with Shift), brought closer by the wheel
+ * @info: the scene of the preview keeps the vertices of its meshes (an EditableScene), the meshes being shared with the
+ * scenes of the editor
+ * */
+pub class MaterialPreview over SceneOverlay {
+
+    // The camera of the preview, once the scene is created
+    let dmut _camera: (&PerspectiveCamera)? = none;
+
+    // The node drawing the shape, none before a material is shown
+    let dmut _shape: (&MeshInstance3D)? = none;
+
+    // The material shown, none before one is
+    let mut _material: (&MaterialAsset)? = none;
+
+    // How the material is shown
+    let mut _settings: PreviewSettings = PreviewSettings();
+
+    // The path of the mesh of the shape drawn, empty before one is
+    let mut _meshShown: [c8] = "";
+
+    // The environment lighting the scene of the preview, empty for none
+    let mut _environment: [c8] = "";
+
+    /**
+     * @params:
+     *    - manager: the interface holding the widget
+     *    - id: the id of the widget
+     * */
+    pub self (dmut manager: &WidgetManager, id: [c8])
+        with super(alias manager, id, "MaterialPreview")
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SHOWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: how the material is shown, the eye where the user turned it
+     * */
+    @field
+    pub fn settings(self)-> PreviewSettings {
+        self._settings
+    }
+
+    /**
+     * Show a material as settings tell
+     * @params:
+     *    - material: the material shown
+     *    - settings: how to show it
+     *    - sceneEnvironment: the environment of the scene shown in the viewport, empty for none, for
+     *      PreviewLighting::SCENE
+     * */
+    pub fn show(mut self, material: &MaterialAsset, settings: PreviewSettings, sceneEnvironment: [c8]) {
+        let materialChanged = if let Ok(m) = self._material { !(m is material) } else { true };
+        self._material = (material)?;
+        self._settings = settings;
+        let mesh = meshOf(settings);
+        if materialChanged || mesh != self._meshShown {
+            self:.buildShape(mesh, frame-> mesh != self._meshShown && settings.shape != PreviewShape::MESH);
+        }
+
+        self:.light(sceneEnvironment);
+        if let Ok(dmut c) = alias self._camera {
+            c.debugView = settings.channel;
+        }
+
+        self:.placeCamera();
+    }
+
+    /**
+     * Draw the material shown as it is now, once its entries changed (see MeshInstance3D::refresh)
+     * */
+    pub fn refresh(mut self) {
+        if let Ok(dmut s) = alias self._shape {
+            MeshInstance3D::refreshUnder(alias s);
+        }
+    }
+
+    /**
+     * Turn the eye toward the shape again, from the distance it is seen whole at
+     * */
+    pub fn frame(mut self) {
+        if let Ok(s) = self._shape {
+            self._settings.orbit:.frame(boxOf(s.mesh));
+        }
+
+        self:.placeCamera();
+    }
+
+    /**
+     * Create the camera and the key light of the preview once its scene is created, the scene seen through the camera
+     * */
+    pub over onSceneCreated(mut self, dmut scene: &Scene) {
+        self.__super__:.onSceneCreated(alias scene);
+
+        let dmut cam = copy PerspectiveCamera(CAMERA_NODE, alias scene:.getRootNode());
+        cam.fov = 40.0f;
+        cam.near = 0.01f;
+        cam.far = 200.0f;
+        scene:.setViewCamera(alias cam);
+        self._camera = (alias cam)?;
+
+        let dmut key = copy Light(LIGHT_NODE, alias scene:.getRootNode());
+        key.direction = makeVec3(-0.5f, -0.7f, -0.5f);
+        key.intensity = 2.0f;
+
+        // a material shown before the scene was created
+        if self._material.hasValue {
+            self:.buildShape(meshOf(self._settings), frame-> false);
+        }
+
+        self:.placeCamera();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SCENE          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the material on the mesh of a path, in place of the shape drawn
+     * @params:
+     *    - frame: true to turn the eye toward the new shape
+     * */
+    fn buildShape(mut self, mesh: [c8], frame: bool) {
+        if let Ok(dmut s) = alias self._shape {
+            s:.dispose();
+            self._shape = none;
+        }
+
+        self._meshShown = "";
+        let dmut scene = if let Ok(dmut s) = alias self:.getScene() { alias s } else { return; };
+        let material = if let Ok(m) = self._material { m } else { return; };
+        {
+            let dmut asset = alias Assets::mesh(mesh);
+            self._meshShown = mesh;
+            let slots = copy [(material)? for _ in 0us .. asset.subMeshes.len];
+            let dmut shape = copy MeshInstance3D(SHAPE_NODE, alias scene:.getRootNode(), alias asset, materials-> slots);
+            self._shape = (alias shape)?;
+            if frame || self._settings.shape == PreviewShape::MESH {
+                self._settings.orbit:.frame(boxOf(asset));
+            }
+        } catch {
+            err => {
+                log::error #("MaterialPreview", f"Failed to draw the material on ${mesh}", err);
+            }
+        }
+    }
+
+    /**
+     * Light the scene as the settings tell, the background seen or a grey
+     * @params:
+     *    - sceneEnvironment: the environment of the scene shown in the viewport, empty for none
+     * */
+    fn light(mut self, sceneEnvironment: [c8]) {
+        let dmut scene = if let Ok(dmut s) = alias self:.getScene() { alias s } else { return; };
+        let wanted = match self._settings.lighting {
+            PreviewLighting::SCENE       => { sceneEnvironment }
+            PreviewLighting::ENVIRONMENT => { self._settings.environment }
+            _                            => { STUDIO_ENVIRONMENT }
+        };
+
+        if wanted != self._environment {
+            {
+                scene:.setEnvironment(wanted);
+                self._environment = wanted;
+            } catch {
+                err => {
+                    log::error #("MaterialPreview", f"Failed to light the preview by ${wanted}", err);
+                }
+            }
+        }
+
+        scene.skybox = self._settings.background && self._environment.len != 0us;
+        scene.background = GREY;
+    }
+
+    /**
+     * Place the camera at the eye, looking at the shape
+     * */
+    fn placeCamera(mut self) {
+        if let Ok(dmut cam) = alias self._camera {
+            self._settings.orbit.applyTo(alias cam);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          MOUSE EVENTS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A click of the left button keeps the focus on the preview, its slides turning the eye
+     * */
+    pub over isFocusableLeftClick(self)-> bool {
+        true
+    }
+
+    /**
+     * A click of the middle button keeps the focus on the preview, its slides turning the eye
+     * */
+    pub over isFocusableMiddleClick(self)-> bool {
+        true
+    }
+
+    /**
+     * The left and the middle buttons turn the eye around the shape, slide it with Shift
+     * */
+    pub over onSliding(mut self, _: vec2, speed: vec2, button: u8) {
+        if button != SDL_BUTTON_LEFT && button != SDL_BUTTON_MIDDLE { return; }
+
+        if (SDL_GetModState() & SDL_KMOD_SHIFT) != 0u16 {
+            self._settings.orbit:.pan(speed.x * PAN_SPEED, speed.y * PAN_SPEED);
+        } else {
+            self._settings.orbit:.orbit(speed.x * ORBIT_SPEED, speed.y * ORBIT_SPEED);
+        }
+
+        self:.placeCamera();
+    }
+
+    /**
+     * The wheel brings the eye closer to the shape, or farther from it
+     * */
+    pub over onScroll(mut self, _: vec2, _: i32, amountY: i32)-> bool {
+        if amountY == 0 { return false; }
+
+        self._settings.orbit:.zoom(amountY);
+        self:.placeCamera();
+        true
+    }
+
+}
+
+/**
+ * The schema of the preview, registered in the interface of the editor
+ * */
+pub mod MaterialPreview {
+
+    /**
+     * @returns: the schema of the previews of the materials, the overlay of an editable Scene3D
+     * */
+    pub fn schema()-> &WidgetSchema {
+        copy WidgetSchema("MaterialPreview",
+                          |dmut m, id|-> dmut &Widget => {
+                              copy MaterialPreview(alias m, id)
+                          })
+    }
+
+}
+
+/**
+ * @returns: the path of the mesh a preview draws the material on
+ * */
+fn meshOf(settings: PreviewSettings)-> [c8] {
+    match settings.shape {
+        PreviewShape::CUBE  => { return MeshAsset::CUBE; }
+        PreviewShape::PLANE => { return MeshAsset::PLANE; }
+        PreviewShape::MESH  => { if settings.mesh.len != 0us { return settings.mesh; } }
+        _ => {}
+    }
+
+    MeshAsset::SPHERE
+}
+
+/**
+ * @returns: the box enclosing the parts of a mesh
+ * */
+fn boxOf(mesh: &MeshAsset)-> Aabb {
+    let mut box = Aabb();
+    for s in mesh.subMeshes {
+        box = box.merged(s.geometry.aabb);
+    }
+
+    box
+}
