@@ -1,0 +1,193 @@
+in mesh_builder;
+
+use balder::math::vector;
+use balder::scene::node::node3D::visual::array;
+
+use std::math;
+
+/**
+ * A full turn, in radians
+ * */
+pub def TURN = 6.2831853f;
+
+/**
+ * The vertices of a mesh made of solids lying across the Z axis: prisms of a convex outline, cylinders and rings, each
+ * between two depths, their faces flat but the round sides of the cylinders and of the rings
+ * @info: the triangles face outward, cross (b - a, c - a) along the normal of their surface
+ * */
+pub class MeshBuilder {
+
+    let dmut _positions: [vec3] = [];
+    let dmut _normals: [vec3] = [];
+    let mut _indices: [u32] = [];
+
+    pub self () {}
+
+    /**
+     * Add a prism of a convex outline, its points in any order, between two depths
+     * */
+    pub fn prism(mut self, points: [vec2], z0: f32, z1: f32) {
+        let outline = counterclockwise(points);
+        let n = cast!u32(outline.len);
+        if n < 3u32 { return; }
+
+        let (near, far) = if z0 < z1 { (z0, z1) } else { (z1, z0) };
+
+        // the caps, fans of the outline, the near one facing -z
+        let nearFirst = self.count();
+        for p in outline {
+            self:.vertex(makeVec3(p, near), makeVec3(0.0f, 0.0f, -1.0f));
+        }
+
+        let farFirst = self.count();
+        for p in outline {
+            self:.vertex(makeVec3(p, far), makeVec3(0.0f, 0.0f, 1.0f));
+        }
+
+        for i in 1u32 .. n - 1u32 {
+            self:.triangle(nearFirst, nearFirst + i + 1u32, nearFirst + i);
+            self:.triangle(farFirst, farFirst + i, farFirst + i + 1u32);
+        }
+
+        // the sides, a quad of its own normal along each edge
+        for i in 0u32 .. n {
+            let a = outline[i], b = outline[(i + 1u32) % n];
+            let edge = b - a;
+            let normal = makeVec3(edge.y, -edge.x, 0.0f).normalized();
+            let first = self.count();
+            self:.vertex(makeVec3(a, near), normal);
+            self:.vertex(makeVec3(b, near), normal);
+            self:.vertex(makeVec3(b, far), normal);
+            self:.vertex(makeVec3(a, far), normal);
+            self:.triangle(first, first + 1u32, first + 2u32);
+            self:.triangle(first, first + 2u32, first + 3u32);
+        }
+    }
+
+    /**
+     * Add a cylinder along the Z axis between two depths, its side smooth
+     * */
+    pub fn cylinder(mut self, centre: vec2, radius: f32, z0: f32, z1: f32, segments: u32 = 32u32) {
+        self:.ring(centre, 0.0f, radius, z0, z1, segments-> segments);
+    }
+
+    /**
+     * Add a ring along the Z axis between two depths, a disc when its inner radius is 0, its sides smooth
+     * */
+    pub fn ring(mut self, centre: vec2, inner: f32, outer: f32, z0: f32, z1: f32, segments: u32 = 64u32) {
+        let (near, far) = if z0 < z1 { (z0, z1) } else { (z1, z0) };
+        let hollow = inner > 0.0f;
+
+        let mut around: [vec2] = [];
+        for s in 0u32 ... segments {
+            let a = TURN * cast!f32(s) / cast!f32(segments);
+            around = around ~ [makeVec2(math::cos(a), math::sin(a))];
+        }
+
+        // the outer side, then the inner one facing the axis
+        for side in [true, false] {
+            if !side && !hollow { break; }
+
+            let r = if side { outer } else { inner };
+            let first = self.count();
+            for d in around {
+                let normal = if side { makeVec3(d, 0.0f) } else { makeVec3(-d, 0.0f) };
+                self:.vertex(makeVec3(centre + d * r, near), normal);
+                self:.vertex(makeVec3(centre + d * r, far), normal);
+            }
+
+            for s in 0u32 .. segments {
+                let a = first + 2u32 * s;
+                if side {
+                    self:.triangle(a, a + 2u32, a + 3u32);
+                    self:.triangle(a, a + 3u32, a + 1u32);
+                } else {
+                    self:.triangle(a, a + 3u32, a + 2u32);
+                    self:.triangle(a, a + 1u32, a + 3u32);
+                }
+            }
+        }
+
+        // the faces, the near one facing -z
+        for face in [near, far] {
+            let normal = makeVec3(0.0f, 0.0f, if face == near { -1.0f } else { 1.0f });
+            let first = self.count();
+            for d in around {
+                self:.vertex(makeVec3(centre + d * inner, face), normal);
+                self:.vertex(makeVec3(centre + d * outer, face), normal);
+            }
+
+            for s in 0u32 .. segments {
+                let a = first + 2u32 * s;
+                if face == near {
+                    self:.triangle(a, a + 3u32, a + 1u32);
+                    self:.triangle(a, a + 2u32, a + 3u32);
+                } else {
+                    self:.triangle(a, a + 1u32, a + 3u32);
+                    self:.triangle(a, a + 3u32, a + 2u32);
+                }
+            }
+        }
+    }
+
+    /**
+     * Add a bar of a width going from a point to another, between two depths
+     * */
+    pub fn bar(mut self, from: vec2, to: vec2, width: f32, z0: f32, z1: f32) {
+        let along = (to - from).normalized();
+        let across = makeVec2(-along.y, along.x) * (width / 2.0f);
+        self:.prism(copy [from - across, to - across, to + across, from + across], z0, z1);
+    }
+
+    /**
+     * @returns: the vertices and the indices of the solids added
+     * */
+    pub fn finish(self)-> (MeshArray, [u32]) {
+        let mut array = MeshArray();
+        array.positions = copy self._positions;
+        array.normals = copy self._normals;
+        (array, self._indices)
+    }
+
+    fn count(self)-> u32 {
+        cast!u32(self._positions.len)
+    }
+
+    fn vertex(mut self, position: vec3, normal: vec3) {
+        self._positions = self._positions ~ copy [position];
+        self._normals = self._normals ~ copy [normal];
+    }
+
+    fn triangle(mut self, a: u32, b: u32, c: u32) {
+        self._indices = self._indices ~ copy [a, b, c];
+    }
+}
+
+/**
+ * @returns: the points of a convex outline in their counterclockwise order about their centre
+ * */
+fn counterclockwise(points: [vec2])-> [vec2] {
+    let mut centre = vec2();
+    for p in points {
+        centre = centre + p;
+    }
+
+    centre = centre / cast!f32(cast!u64(points.len));
+
+    // an insertion sort by angle, the outlines having a few points
+    let dmut sorted: [vec2] = copy points;
+    let dmut angles: [f32] = copy [math::atan2(p.y - centre.y, p.x - centre.x) for p in points];
+    for i in 1us .. sorted.len {
+        let mut j = i;
+        while j > 0us && angles[j - 1us] > angles[j] {
+            let a = angles[j], p = sorted[j];
+            angles[j] = angles[j - 1us];
+            sorted[j] = sorted[j - 1us];
+            angles[j - 1us] = a;
+            sorted[j - 1us] = p;
+            j -= 1us;
+        }
+    }
+
+    sorted
+}
