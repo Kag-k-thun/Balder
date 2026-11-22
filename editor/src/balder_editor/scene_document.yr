@@ -1,0 +1,279 @@
+in scene_document;
+
+use balder_editor::{document, history, naming, orbit};
+use balder::core::error;
+use balder::scene::{description, editable};
+use balder::scene::node;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::{camera, mesh_instance};
+use balder::scene::node::node3D::camera::flight;
+
+use std::fs;
+
+/**
+ * The root the nodes of a document hang from while another document is shown, in no scene
+ * */
+class ParkedRoot over Node {
+
+    pub self ()
+        with super::root("")
+    {}
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+}
+
+/**
+ * A scene opened in the editor, in a tab of its own: its file, the history of its changes, and, while another document
+ * is shown, its nodes, the nodes it had selected and the eye of the editor camera looking at it
+ * @info:
+ * =====
+ * The editor shows one document at a time in its viewport, the nodes of the others being kept out of the scene, under a
+ * root of their own (park), and put back in it, in their order, when their document is shown again (unpark), as Godot
+ * keeps the scenes of its other tabs out of its tree: they keep their ids, their transforms and their meshes (an
+ * EditableScene keeps the vertices of its meshes, to enter it again), and the commands of the history of the document
+ * keep naming them. A document whose nodes were dropped while it was not shown (the library of the game reloaded) holds
+ * the description of its nodes instead, built when it is shown next (see takeDescription).
+ * ====
+ * */
+pub class SceneDocument over Document {
+
+    // The history of the changes of the scene
+    let dmut _history: &EditHistory = copy EditHistory();
+
+    // The nodes of the scene, under the root of the document while another document is shown
+    let dmut _parked: &ParkedRoot = copy ParkedRoot();
+
+    // The nodes selected when the document was left
+    let dmut _selected: [&Node3D] = [];
+
+    // The active camera of the scene when the document was left, made active again when it is shown (the first camera
+    // entering a scene becoming its active one)
+    let dmut _activeCamera: (&Camera)? = none;
+
+    // The eye of the editor camera when the document was left, and the speed of its flights
+    let mut _orbit: OrbitView = OrbitView();
+    let mut _flightPace: f32 = CameraFlight().pace;
+
+    // The nodes to build when the document is shown next, in place of the nodes it had, and true iif they hold unsaved
+    // changes
+    let mut _description: (&SceneDescription)? = none;
+    let mut _descriptionUnsaved: bool = false;
+
+    /**
+     * A new scene, blank, without a file
+     * */
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the name of the scene, the name of its file, or 'the new scene'
+     * */
+    @field
+    pub over name(self)-> [c8] {
+        if self._path.len == 0us { "the new scene" } else { Path(self._path).file() }
+    }
+
+    /**
+     * @returns: the title of the tab of the document, the name of its file without its extension, 'new scene' for a
+     * new scene
+     * */
+    @field
+    pub over title(self)-> [c8] {
+        if self._path.len == 0us { return "new scene"; }
+        Document::stem(self._path)
+    }
+
+    /**
+     * @returns: the history of the changes of the scene
+     * */
+    @field
+    pub fn history(mut self)-> dmut &EditHistory {
+        alias self._history
+    }
+
+    /**
+     * @returns: true iif the scene changed since it was opened or saved last
+     * */
+    @field
+    pub over unsaved(self)-> bool {
+        if self._description.hasValue { return self._descriptionUnsaved; }
+        self._history.unsaved
+    }
+
+    /**
+     * @returns: true iif the document is a new scene never changed, which a scene opened takes the place of
+     * */
+    @field
+    pub over isBlank(self)-> bool {
+        self._path.len == 0us && self._history.isEmpty && !self._history.unsaved && !self._description.hasValue
+    }
+
+    /**
+     * @returns: the eye of the editor camera when the document was left
+     * */
+    @field
+    pub fn orbit(self)-> OrbitView {
+        self._orbit
+    }
+
+    /**
+     * @returns: the speed of the flights of the editor camera in the scene
+     * */
+    @field
+    pub fn flightPace(self)-> f32 {
+        self._flightPace
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Keep the eye of the editor camera and the speed of its flights, as the document is left
+     * */
+    pub fn keepView(mut self, orbit: OrbitView, flightPace: f32) {
+        self._orbit = orbit;
+        self._flightPace = flightPace;
+    }
+
+    /**
+     * Keep the speed of the flights of the editor camera in the scene
+     * */
+    @field
+    pub fn flightPace(mut self, pace: f32) {
+        self._flightPace = pace;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          NODES          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Take the nodes of the document out of the scene, in their order, the nodes of the editor staying, keeping the
+     * nodes selected and the active camera
+     * */
+    pub fn park(mut self, dmut scene: &EditableScene) {
+        self._selected = [];
+        let dmut selection = alias scene.selection;
+        for dmut n in alias selection.nodes {
+            self._selected ~= [alias n];
+        }
+
+        selection:.clear();
+        self._activeCamera = alias scene:.getActiveCamera();
+
+        let dmut root = alias scene:.getRootNode();
+        let dmut nodes: [&Node] = [];
+        for dmut n in alias root:.getChildrenInOrder() if !isEditorNode(n) {
+            nodes ~= [alias n];
+        }
+
+        for dmut n in alias nodes {
+            n:.moveUnder(alias self._parked, at-> LAST_PLACE);
+        }
+    }
+
+    /**
+     * Put the nodes of the document back in the scene, after the nodes of the editor, in their order, its active camera
+     * active again and the nodes it had selected selected again
+     * */
+    pub fn unpark(mut self, dmut scene: &EditableScene) {
+        // the materials changed while another document was shown, drawn as they are now before the nodes enter the scene
+        MeshInstance3D::refreshUnder(alias self._parked);
+
+        let dmut root = alias scene:.getRootNode();
+        let dmut nodes: [&Node] = [];
+        for dmut n in alias self._parked:.getChildrenInOrder() {
+            nodes ~= [alias n];
+        }
+
+        for dmut n in alias nodes {
+            n:.moveUnder(alias root, at-> LAST_PLACE);
+        }
+
+        if let Ok(dmut c) = alias self._activeCamera && c:.getScene().hasValue {
+            scene:.setActiveCamera(alias c);
+        }
+
+        self._activeCamera = none;
+        let dmut selection = alias scene.selection;
+        selection:.clear();
+        for dmut n in alias self._selected {
+            selection:.add(alias n);
+        }
+
+        self._selected = [];
+    }
+
+    /**
+     * @returns: the root the nodes of the document hang from while another document is shown, in no scene
+     * */
+    pub fn parkedRoot(mut self)-> dmut &Node {
+        alias self._parked
+    }
+
+    /**
+     * @returns: the description of the nodes of the document while another document is shown, as its file would save
+     * them
+     * @throws: BalderError when a node cannot be described
+     * */
+    pub fn describeParked(mut self)-> [c8]
+        throws BalderError
+    {
+        if let Ok(d) = self._description { return d.content(); }
+        copy SceneDescription(alias self._parked).content()
+    }
+
+    /**
+     * Drop the nodes of the document while another document is shown, its history with them, keeping a description to
+     * build in their place when it is shown next
+     * @params:
+     *    - description: the nodes to build, none to build none
+     *    - unsaved: true iif they hold unsaved changes
+     * */
+    pub fn replaceParked(mut self, description: (&SceneDescription)?, unsaved: bool) {
+        let dmut nodes: [&Node] = [];
+        for dmut n in alias self._parked:.getChildrenInOrder() {
+            nodes ~= [alias n];
+        }
+
+        for dmut n in alias nodes { n:.dispose(); }
+
+        self._selected = [];
+        self._activeCamera = none;
+        self._history:.restart();
+        self._description = description;
+        self._descriptionUnsaved = unsaved;
+    }
+
+    /**
+     * Take the description of the nodes to build in place of the nodes the document had, none when it keeps its nodes
+     * @returns: the description, and true iif its nodes hold unsaved changes
+     * */
+    pub fn takeDescription(mut self)-> (&SceneDescription, bool)? {
+        if let Ok(d) = self._description {
+            self._description = none;
+            return (d, self._descriptionUnsaved)?;
+        }
+
+        none
+    }
+
+}

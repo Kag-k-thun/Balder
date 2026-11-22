@@ -45,6 +45,35 @@ layout (set = 0, binding = 4) uniform sampler2D normalMap;
 layout (set = 0, binding = 5) uniform sampler2D occlusionMap;
 layout (set = 0, binding = 6) uniform sampler2D emissiveMap;
 
+// A metallic/roughness material (MaterialConfig), laid out as the composition reads it
+struct Material {
+    vec3 baseColor;
+    float metallic;
+    vec3 emissive;
+    float roughness;
+    float specular;
+    float occlusion;
+
+    // How far the normal map bends the normals, scaling the slopes it gives them
+    float normalStrength;
+    float emissiveStrength;
+
+    // The tiling and the offset of the texture coordinates of the maps
+    vec2 tiling;
+    vec2 offset;
+};
+
+// The materials of the scene, by the index the material word of an object holds
+layout (std430, set = 0, binding = 7) readonly buffer Materials {
+    Material materials [];
+};
+
+// The bit of the material word set when the object is outlined, the other bits holding its material
+const uint OUTLINED = 0x80000000u;
+
+// The first debug view of a channel of the materials (see DebugView), shaded by the composition from the materials
+const uint FIRST_CHANNEL_VIEW = 4u;
+
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -82,13 +111,14 @@ vec2 octEncode (vec3 n) {
 }
 
 /**
- * @returns: the normal of the surface at the fragment, its interpolated normal bent by the normal map
+ * @returns: the normal of the surface at the fragment, its interpolated normal bent by the normal map, its slopes scaled
+ * by a strength
  * @info: the tangent space is the tangent, along the growing u, the bitangent, along the growing v, which runs down the
  * images (the texture coordinates of the meshes start at the top left), and the normal; the normal maps point their y up
  * the images (as glTF and OpenGL read them), against the bitangent; the handedness flips the bitangent where the
  * texture is mirrored
  */
-vec3 bentNormal () {
+vec3 bentNormal (vec2 uv, float strength) {
     vec3 N = normalize (inNormals);
 
     // the tangent made perpendicular to the interpolated normal; none where the texture coordinates are degenerate
@@ -100,7 +130,8 @@ vec3 bentNormal () {
     T = normalize (T);
     vec3 B = cross (N, T) * (inTangents.w < 0.0 ? -1.0 : 1.0);
 
-    vec3 m = texture (normalMap, inUV).xyz * 2.0 - 1.0;
+    vec3 m = texture (normalMap, uv).xyz * 2.0 - 1.0;
+    m.xy *= strength;
     return normalize (T * m.x - B * m.y + N * m.z);
 }
 
@@ -163,15 +194,18 @@ vec3 debugColor () {
 void main() {
     crossFade ();
 
-    normals = octEncode (bentNormal ());
-    albedo = vec4 (texture (baseColorMap, inUV).rgb, texture (occlusionMap, inUV).r);
+    Material mat = materials [inMaterial & ~OUTLINED];
+    vec2 uv = inUV * mat.tiling + mat.offset;
 
-    vec4 metallicRoughness = texture (metallicRoughnessMap, inUV);
+    normals = octEncode (bentNormal (uv, mat.normalStrength));
+    albedo = vec4 (texture (baseColorMap, uv).rgb, texture (occlusionMap, uv).r);
+
+    vec4 metallicRoughness = texture (metallicRoughnessMap, uv);
     surface = vec2 (metallicRoughness.b, metallicRoughness.g);
-    emissive = vec4 (texture (emissiveMap, inUV).rgb, 1.0);
+    emissive = vec4 (texture (emissiveMap, uv).rgb, 1.0);
 
-    // the debug views show a flat colour, the composition lighting it from the eye
-    if (inDebug.x != 0u) {
+    // the debug views of the geometry show a flat colour, the composition lighting it from the eye
+    if (inDebug.x != 0u && inDebug.x < FIRST_CHANNEL_VIEW) {
         albedo = vec4 (debugColor (), 1.0);
         surface = vec2 (0.0, 1.0);
         emissive = vec4 (0.0);

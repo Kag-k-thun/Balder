@@ -1,0 +1,292 @@
+in material_slots_panel;
+
+use balder_editor::{command, editor};
+use balder_editor::command::property;
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget;
+use balder::interface::widget::table::{texts, view};
+use balder::scene::asset::{assets, material_asset};
+use balder::scene::edit::property_edit;
+use balder::scene::node::node3D::mesh_instance;
+use balder::scene::property::value;
+
+use std::uuid;
+
+// The path of the panel of the materials in the interface of the editor
+def SLOTS = "BODY/MAIN/INSPECTOR/MATERIALS";
+
+// The class of the panel while the node inspected is not a mesh, displayed none (see inspector.style)
+def ABSENT = "absent";
+
+/**
+ * The panel of the materials of the mesh node selected last, under its properties, mounted under the behavior
+ * 'materials': a row per part of its mesh (the part, the material it is drawn with, where the material comes from), the
+ * part picked edited in a tab of its own (Edit), given a copy of its material local to the scene (Make unique), a copy
+ * in a .material file (Duplicate to a file…), a material file chosen (Use a material file…), or its own material again
+ * @info: the materials are assets shared by the meshes drawing them, edited in the material editor (see MaterialPanel),
+ * not in the inspector; a slot changed goes through a PropertyCommand of the materials of the node, undone as the other
+ * changes of the scene. Editing, duplicating and choosing a file are asked of the activity (see editAsked,
+ * duplicateAsked, chooseAsked), which opens the tabs and the dialogs
+ * */
+pub class MaterialSlotsPanel over Behavior {
+
+    // The interface holding the fields
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the slots of the selection and of the editor are emitted in
+    let dmut _box: &SlotEmitter;
+
+    // Shows a message in the status bar
+    let _status: dg ([c8])-> void;
+
+    // The editor of the scene, once bound
+    let dmut _editor: (&SceneEditor)? = none;
+
+    // The mesh inspected, the node selected last when it is a mesh node
+    let dmut _mesh: (&MeshInstance3D)? = none;
+
+    // The rows of the table of the parts
+    let dmut _model: &TextTableModel = copy TextTableModel(headers-> copy ["Part", "Material", "From"]);
+
+    // The part picked in the table, none when no row is
+    let mut _picked: (usize)? = none;
+
+    // Emitted with the part whose material is to be edited in a tab of its own
+    let dmut _editAsked: &Signal!{usize} = copy Signal!{usize} ();
+
+    // Emitted with the part whose material is to be copied in a .material file
+    let dmut _duplicateAsked: &Signal!{usize} = copy Signal!{usize} ();
+
+    // Emitted with the part to draw with a .material file to choose
+    let dmut _chooseAsked: &Signal!{usize} = copy Signal!{usize} ();
+
+    /**
+     * @params:
+     *    - gui: the interface holding the fields
+     *    - box: the mailbox the slots of the selection and of the editor are emitted in
+     *    - status: shows a message in the status bar
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, status: dg ([c8])-> void)
+        with _gui = alias gui
+        , _box = alias box
+        , _status = status
+    {
+        // the slots the 'on-…' attributes of inspector.gui name
+        self:.slot("picked", &self:.onPicked);
+        self:.slot("edit", &self:.onEditClicked);
+        self:.slot("unique", &self:.onUniqueClicked);
+        self:.slot("duplicate", &self:.onDuplicateClicked);
+        self:.slot("choose", &self:.onChooseClicked);
+        self:.slot("own", &self:.onOwnClicked);
+    }
+
+    /**
+     * Follow the mesh node selected last in the scene of an editor, and the changes of the scene, once the interface is
+     * loaded
+     * */
+    pub fn bind(mut self, dmut editor: &SceneEditor) {
+        let dmut scene = alias editor.scene;
+        let dmut selection = alias scene.selection;
+        selection:.changed():.connect(alias self._box, &self:.onSelectionChanged);
+        editor:.edited():.connect(alias self._box, &self:.onEdited);
+        self._editor = (alias editor)?;
+
+        if let Ok(dmut t: &TableView) = self._gui:.find(SLOTS ~ "/TABLE") {
+            t:.setModel(alias self._model);
+        }
+
+        self:.onSelectionChanged();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SIGNALS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the signal emitted with the part whose material is to be edited in a tab of its own
+     * */
+    pub fn editAsked(mut self)-> dmut &Signal!{usize} {
+        alias self._editAsked
+    }
+
+    /**
+     * @returns: the signal emitted with the part whose material is to be copied in a .material file (see setSlot)
+     * */
+    pub fn duplicateAsked(mut self)-> dmut &Signal!{usize} {
+        alias self._duplicateAsked
+    }
+
+    /**
+     * @returns: the signal emitted with the part to draw with a .material file to choose (see setSlot)
+     * */
+    pub fn chooseAsked(mut self)-> dmut &Signal!{usize} {
+        alias self._chooseAsked
+    }
+
+    /**
+     * @returns: the mesh inspected, none while the node selected last is not a mesh node
+     * */
+    pub fn mesh(mut self)-> dmut (&MeshInstance3D)? {
+        alias self._mesh
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSPECTING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Inspect the node selected last when it is a mesh node, the panel taking no room otherwise
+     * */
+    fn onSelectionChanged(mut self) {
+        let dmut mesh: (&MeshInstance3D)? = none;
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            let dmut nodes = alias selection.nodes;
+            if nodes.len != 0us {
+                if let dmut m: &MeshInstance3D = alias nodes[$ - 1us] { mesh = (alias m)?; }
+            }
+        }
+
+        self._mesh = alias mesh;
+        if let Ok(dmut w) = alias self._gui:.find(SLOTS) {
+            let mut classes: [[c8]] = [];
+            for c in w.getClasses() if c != ABSENT { classes ~= [c]; }
+            if !mesh.hasValue { classes ~= [ABSENT]; }
+            w:.setClasses(classes);
+        }
+
+        self:.refresh();
+    }
+
+    /**
+     * A change of the scene, the materials of the mesh inspected among them (undone or redone)
+     * */
+    fn onEdited(mut self, _: &EditCommand) {
+        self:.refresh();
+    }
+
+    /**
+     * Write a row per part of the mesh inspected, the material it is drawn with and where it comes from
+     * */
+    fn refresh(mut self) {
+        let mut rows: [[[c8]]] = [];
+        if let Ok(m) = self._mesh {
+            for i in 0us .. m.mesh.subMeshes.len {
+                let material = m.materialOf(i);
+                let own = i >= m.materials.len || !m.materials[i].hasValue;
+                rows ~= [copy [f"${i}", material.name, (if own { "own: " } else { "" }) ~ originOf(material)]];
+            }
+        }
+
+        let kept = self._picked;
+        self._model:.setRows(rows);
+        if let Ok(dmut t: &TableView) = self._gui:.find(SLOTS ~ "/TABLE") {
+            t:.clearSelection();
+        }
+
+        self._picked = none;
+        if let Ok(p) = kept && p < rows.len { self._picked = (p)?; }
+        if rows.len == 1us { self._picked = (0us)?; }
+    }
+
+    fn onPicked(mut self, rows: [usize]) {
+        self._picked = if rows.len == 1us { (rows[0])? } else { none };
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SLOTS          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn onEditClicked(mut self, _: u8) {
+        if let Ok(p) = self:.pickedPart() { self._editAsked:.emit(p); }
+    }
+
+    fn onDuplicateClicked(mut self, _: u8) {
+        if let Ok(p) = self:.pickedPart() { self._duplicateAsked:.emit(p); }
+    }
+
+    fn onChooseClicked(mut self, _: u8) {
+        if let Ok(p) = self:.pickedPart() { self._chooseAsked:.emit(p); }
+    }
+
+    /**
+     * The part picked gets a copy of its material, local to the scene file, its own to change
+     * */
+    fn onUniqueClicked(mut self, _: u8) {
+        let part = if let Ok(p) = self:.pickedPart() { p } else { return; };
+        let material = if let Ok(m) = self._mesh { m.materialOf(part) } else { return; };
+
+        let dmut unique = MaterialAsset::local(v4(), material.name ~ " (unique)", values-> material.values());
+        Assets::register(alias unique);
+        if self:.setSlot(part, unique.path) {
+            self._status(f"Part ${part} is drawn with ${unique.name}, local to the scene: Edit changes it alone");
+        }
+    }
+
+    fn onOwnClicked(mut self, _: u8) {
+        if let Ok(p) = self:.pickedPart() { self:.setSlot(p, ""); }
+    }
+
+    /**
+     * @returns: the part picked in the table, the status bar telling to pick one when none is
+     * */
+    fn pickedPart(mut self)-> (usize)? {
+        if !self._mesh.hasValue { return none; }
+        if let Ok(p) = self._picked { return (p)?; }
+
+        self._status("Pick a part in the table of the materials first");
+        none
+    }
+
+    /**
+     * Draw a part of the mesh inspected with the material of a path, or with its own for an empty path, through a
+     * command
+     * @returns: true iif the slot changed
+     * */
+    pub fn setSlot(mut self, part: usize, path: [c8])-> bool {
+        let dmut mesh = if let Ok(dmut m) = alias self._mesh { alias m } else { return false; };
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return false; };
+        let property = if let Ok(p) = MeshInstance3D::schema().property("materials") { p } else { return false; };
+
+        let current = MeshInstance3D::pathsOf(mesh.materials);
+        let mut paths: [[c8]] = [];
+        for i in 0us .. mesh.mesh.subMeshes.len {
+            paths ~= [if i == part { path } else if i < current.len { current[i] } else { "" }];
+        }
+
+        {
+            return e:.execute(copy PropertyCommand(copy [PropertyEdit(alias mesh, property, PropertyValue::assets(paths))]));
+        } catch {
+            err: &BalderError => { self._status(err.msg); }
+        }
+
+        false
+    }
+
+}
+
+/**
+ * @returns: where a material comes from, in a word: a file, local to the scene, embedded in a model, or built in
+ * */
+fn originOf(m: &MaterialAsset)-> [c8] {
+    if m.isLocal { return "local to the scene"; }
+    if m.isEmbedded { return "embedded in the model"; }
+    if m.path.len > 7us && m.path[0us .. 7us] == "engine:" { return "built in"; }
+    m.path
+}

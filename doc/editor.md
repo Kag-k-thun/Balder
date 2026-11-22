@@ -117,7 +117,7 @@ flights), and switching tabs keeps them all.
   for the editor camera first. The outline, the inspector and its panels follow the document shown.
 - **Tabs.** A click on a tab, Ctrl+Tab (or Ctrl+PageDown) and Ctrl+Shift+Tab (or Ctrl+PageUp) show a document; a tab is
   dragged to another place among the tabs; its cross (on the tab shown and on the tab hovered), the middle button,
-  Ctrl+W or *Scene → Close the scene* close it, and + after the tabs, Ctrl+N or *Scene → New scene* opens a new scene in
+  Ctrl+W or *Scene → Close the tab* close it, and + after the tabs, Ctrl+N or *Scene → New scene* opens a new scene in
   a tab of its own.
 - **Opening.** *Scene → Open a scene…* (Ctrl+O) opens a scene file in a tab of its own, or in place of the new scene
   shown when it was never changed (the editor starts on one), or shows its tab when it is open already. A scene file
@@ -131,6 +131,35 @@ flights), and switching tabs keeps them all.
 - **Compile.** Reloading the library of the game describes every document as its file would save it, drops their
   nodes, and builds the scene shown again once the library is loaded, the others when they are shown next, their
   unsaved changes staying unsaved.
+
+A material is a document too (`MaterialDocument`, over `Document` as `SceneDocument` is), opened from the panel of the
+materials of the inspector or by *Scene → New material…* and *Scene → Open a material…*, in a tab named after it: the
+material editor (`MaterialPanel`, `editor/ui/material.gui`) takes the place of the outline, the viewport and the
+inspector, and the *Add*, *View* and *Gizmo* menus go while it is shown. The material edited is the one of the cache of
+the assets, shared by every mesh node drawing it, so a change is seen at once in the scenes (see the materials of
+`doc/assets.md`); the scenes not shown draw it as it is when they are shown again.
+
+- **Its kinds.** A `.material` file has the history of its own document, a dot on its tab while it has unsaved changes,
+  Ctrl+S writing the file and Ctrl+Shift+S writing another one, which the tab edits from then on; its changes discarded
+  (closing it, quitting) give it back the values it was saved with. A material local to a scene file belongs to that
+  scene: its tab shows the scene in the background, its changes are commands of the history of the scene, saved with it,
+  and it closes with the scene. A material embedded in a model file, or the default material, is read only: *Extract to
+  a file…* writes a `.material` copy, the mesh nodes of the scene shown drawing it drawing the copy (one change of the
+  scene), the tab editing the copy.
+- **Preview.** A `Scene3D` of its own (`MaterialPreview`, an overlay of it) draws the material on a sphere, a cube, a
+  plane, or the mesh it was opened from, under studio lights, the environment of the scene shown or an HDR map chosen,
+  its background seen or a grey; the left or the middle button turns the eye around the shape (Shift slides it), the
+  wheel brings it closer, *Frame* looks at the whole shape. *Lit* shows the material lit, the other choices one channel
+  alone (the debug views of a camera, see `doc/render-graph.md`). Each tab keeps how its preview shows it.
+- **Properties.** Grouped by what they do, each factor with the map multiplying it: the base colour (three fields, no
+  colour picker yet, BAL-130), the metalness, the roughness and the specular with their map, the normal strength and
+  the normal map, the occlusion, the emissive colour and its HDR strength, and the tiling and the offset of the texture
+  coordinates. A map is a path, applied when Enter is pressed, chosen by … or removed by ×. The steps of one field are
+  undone as one change (`MaterialCommand`).
+- **Information.** The shader the material is drawn with and why, its textures (their size, the format of their file,
+  the colour space they are read in, the memory they take, `TextureInfo`), what looks wrong with them (a file missing,
+  a normal map stored in sRGB, a grey metallic/roughness map, one file read as colours and as data, maps of different
+  sizes), and the mesh nodes of the scenes opened drawing it, a row picked showing its scene and selecting it.
 
 ## Using it
 
@@ -225,6 +254,12 @@ flights), and switching tabs keeps them all.
   and the shape of a body and the capsule of a character (their colliders built). A name is applied when Enter is
   pressed. One direction light casts shadows at a time. Each section is a `Collapsible` the user folds by its header,
   and the inspector scrolls over the sections taller than the window instead of growing the editor.
+- **Materials**: a mesh node has a panel of the materials of its parts (`MaterialSlotsPanel`): a row per part, the
+  material it is drawn with and where it comes from (a file, local to the scene, embedded in the model, built in, `own:`
+  before the material of the mesh itself). The part picked has its material edited in a tab of its own (*Edit the
+  material*, its preview drawing the mesh), is given a copy of it local to the scene (*Make unique*) or in a
+  `.material` file (*Duplicate to a file…*, opened in a tab), a material file chosen (*Use a material file…*), or its
+  own material again (*Use the part's own*), each a change of the materials of the node.
 - **Convex hulls**: a mesh node of a model file has a panel of the convex decomposition saved next to its file (`teapot.obj` giving
   `teapot.hulls`, see the convex decomposition of `doc/physics.md`), the shape of a body of the hulls of the model: the
   hulls and their vertices, the settings they were made with, drawn over the model, each in its colour, in the `hulls`
@@ -237,8 +272,8 @@ flights), and switching tabs keeps them all.
   no longer in the scene told missing), *Remove the connection* removing the one picked in the table, and *Connect*
   making the one chosen below it: a signal of the actor (its payload told), an actor of the scene having a slot taking
   that payload (the actor itself among them), and one of those slots. A connection made twice is refused.
-- **Menus**: *Scene* opens a new scene (Ctrl+N) or a scene file (Ctrl+O), each in a tab of its own, closes the scene
-  shown (Ctrl+W), saves it (Ctrl+S) or saves it in another file (Ctrl+Shift+S), and goes back to the project manager,
+- **Menus**: *Scene* opens a new scene (Ctrl+N) or a scene file (Ctrl+O), each in a tab of its own, closes the tab
+  shown (Ctrl+W), opens a new material or a material file in a tab of its own, saves the document shown (Ctrl+S) or saves it in another file (Ctrl+Shift+S), and goes back to the project manager,
   *Add* adds a cube, a sphere, a plane (mesh nodes of the built-in meshes, drawn with the default material), a model read from a file (a mesh node of its mesh), an empty, a marker (a spawn point, a waypoint, a socket), a path of three points, a volume, a body (a static unit
   box), a character or a light where the centre of the viewport meets a surface (or at the point the camera looks at),
   a camera where the eye of the viewport stands, looking where it looks, a point to the path selected, or a body around
@@ -250,8 +285,8 @@ flights), and switching tabs keeps them all.
   *Edit* undoes and redoes the changes, its items naming them (`Undo: Deleted cube`), then duplicates, deletes and
   frames the selection, and *View* hides or shows the icons and the grid, and looks through the camera selected; an
   item writes its shortcut on its right (`shortcut:` of a `PushButton`).
-- **Undo**: Ctrl+Z undoes the last change of the scene shown, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus is,
-  each document having its own history. Every change of the scene is undone, the nodes selected before it being
+- **Undo**: Ctrl+Z undoes the last change of the document shown, Ctrl+Shift+Z or Ctrl+Y redoes it, wherever the focus
+  is, each document having its own history (a local material sharing the history of its scene). Every change of the scene is undone, the nodes selected before it being
   selected again; the steps of one field of the inspector (its arrows clicked, its keys held, its wheel turned) are
   undone as one change. A scene opened starts a history of its own.
 

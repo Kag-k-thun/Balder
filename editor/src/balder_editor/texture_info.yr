@@ -1,0 +1,139 @@
+in texture_info;
+
+use balder::math::vector;
+use balder::utils::path;
+
+use std::{conv, fs};
+
+use ::sdl3::{image, pixels, surface};
+
+// The number of texels read along each side of an image to tell what it holds
+def SAMPLES = 32;
+
+/**
+ * The texture a map of a material names, as the material editor tells it: its file, its size, the format of its file,
+ * the colour space it is sampled in, the memory it takes once loaded, and the mean of its texels, which tells a normal
+ * map stored in sRGB, or a metallic/roughness map whose channels hold the same values
+ * @info: a texture is loaded in RGBA8, without mip maps, decoded from sRGB when it holds colours (the base colour and the
+ * emissive maps), read as it is stored when it holds data (see MetallicRoughnessMaterial)
+ * */
+pub record TextureInfo {
+
+    // The entry of the material naming the map (`normal-map`), and the path of its texture
+    pub let mut entry: [c8] = "";
+    pub let mut path: [c8] = "";
+
+    // True when the file exists and could be read
+    pub let mut found: bool = false;
+
+    // Its size, in texels
+    pub let mut width: u32 = 0u32;
+    pub let mut height: u32 = 0u32;
+
+    // The pixel format of the file, as SDL names it (`SDL_PIXELFORMAT_RGB24`)
+    pub let mut format: [c8] = "";
+
+    // True when the texels hold data, read as they are stored, false when they hold colours in sRGB
+    pub let mut linear: bool = false;
+
+    // The mean of the texels read, each channel between 0 and 1, as stored
+    pub let mut mean: vec4 = vec4();
+
+    // True when the red, the green and the blue of every texel read are the same
+    pub let mut grey: bool = false;
+
+    /**
+     * The texture of a map, read from its file
+     * @params:
+     *    - entry: the entry of the material naming the map
+     *    - path: the path of its texture
+     * */
+    pub self read(entry: [c8], path: [c8])
+        with entry = entry
+        , path = path
+        , linear = TextureInfo::isData(entry)
+    {
+        let dmut surf = IMG_Load(conv::toStringZ(projectPath(path).toStr()));
+        if surf == null { return; }
+
+        let format = unsafe { std::conv::fromStringZ(SDL_GetPixelFormatName((*surf).format)) };
+        let dmut rgba = SDL_ConvertSurface(alias surf, pixels::SDL_PIXELFORMAT_RGBA32);
+        if rgba == null {
+            SDL_DestroySurface(alias surf);
+            return;
+        }
+
+        let w = unsafe { (*rgba).w }, h = unsafe { (*rgba).h }, pitch = unsafe { (*rgba).pitch };
+        let texels = cast!(*u8)(unsafe { (*rgba).pixels });
+        let mut sum = vec4(), mut grey = true, mut count = 0;
+        for sy in 0 .. SAMPLES {
+            for sx in 0 .. SAMPLES {
+                let x = (sx * w) / SAMPLES, y = (sy * h) / SAMPLES;
+                let at = cast!usize(y * pitch + x * 4);
+                let r = unsafe { texels[at] }, g = unsafe { texels[at + 1us] }, b = unsafe { texels[at + 2us] };
+                let a = unsafe { texels[at + 3us] };
+                sum = sum + makeVec4(cast!f32(cast!u32(r)), cast!f32(cast!u32(g)), cast!f32(cast!u32(b)), cast!f32(cast!u32(a))) / 255.0f;
+                if r != g || g != b { grey = false; }
+                count += 1;
+            }
+        }
+
+        SDL_DestroySurface(alias rgba);
+        SDL_DestroySurface(alias surf);
+
+        self.found = true;
+        self.width = cast!u32(w);
+        self.height = cast!u32(h);
+        self.format = format;
+        self.mean = sum / cast!f32(count);
+        self.grey = grey;
+    }
+
+    /**
+     * @returns: the memory the texture takes once loaded, in bytes, four per texel
+     * */
+    pub fn memory(self)-> u64 {
+        cast!u64(self.width) * cast!u64(self.height) * 4u64
+    }
+
+    /**
+     * @returns: why the texture is not what its map needs, empty when it is: a file missing, a normal map whose flat
+     * texels are not those of a tangent-space normal map stored as data, a metallic/roughness map holding the same values
+     * in its channels
+     * */
+    pub fn warning(self)-> [c8] {
+        if !self.found { return f"${self.path} is missing, or is not an image"; }
+
+        if self.entry == "normal-map" {
+            let flat = (self.mean.x + self.mean.y) / 2.0f;
+            if flat > 0.64f && flat < 0.82f && self.mean.z > 0.85f {
+                return f"${self.path} looks stored in sRGB: the flat texels of a normal map are (128, 128, 255), read as they are stored";
+            }
+
+            if self.mean.z < 0.6f {
+                return f"${self.path} does not look like a normal map in tangent space, mostly blue";
+            }
+        }
+
+        if self.entry == "metallic-roughness-map" && self.grey {
+            return f"${self.path} is grey: its roughness is read in green and its metalness in blue (as glTF packs them), the two being the same here";
+        }
+
+        ""
+    }
+
+}
+
+/**
+ * The colour spaces of the maps
+ * */
+pub mod TextureInfo {
+
+    /**
+     * @returns: true iif the map of an entry holds data, read as it is stored, false for a map of colours in sRGB
+     * */
+    pub fn isData(entry: [c8])-> bool {
+        entry == "metallic-roughness-map" || entry == "normal-map" || entry == "occlusion-map"
+    }
+
+}

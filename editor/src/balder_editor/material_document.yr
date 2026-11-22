@@ -1,0 +1,293 @@
+in material_document;
+
+use balder_editor::{command, document, history, preview_settings, scene_document};
+use balder::core::error;
+use balder::scene::asset::material_asset;
+use balder::scene::editable;
+use balder::scene::node::node3D::mesh_instance;
+use balder::scene::property::value;
+
+use std::fs;
+
+/**
+ * A material opened in the editor, in a tab of its own (see MaterialPanel): the material asset edited, the history of
+ * its changes, the values it had when it was opened or saved last, and how its preview shows it
+ * @info:
+ * =====
+ * The material edited is the one of the cache of the assets (see Assets), shared by every mesh node drawing it: a change
+ * is seen at once in the viewport. Three kinds of materials are opened:
+ * - a .material file: its changes are in the history of the document, unsaved until the file is written, given back
+ *   when they are discarded;
+ * - a material local to a scene file (see MaterialAsset::local): its changes are in the history of its scene, shown in
+ *   the viewport while the material is (see scene), and saved with it;
+ * - a material embedded in a model file, or the default material: read only, extracted to a .material file to be
+ *   changed.
+ * ====
+ * */
+pub class MaterialDocument over Document {
+
+    // The material edited
+    let dmut _material: &MaterialAsset;
+
+    // The scene file a local material belongs to, whose history keeps its changes
+    let dmut _scene: (&SceneDocument)?;
+
+    // The history of the changes of a material of a file
+    let dmut _history: &EditHistory = copy EditHistory();
+
+    // The values of the entries of the material when it was opened or saved last, given back when its changes are
+    // discarded
+    let mut _saved: [([c8], PropertyValue)];
+
+    // How the preview shows the material
+    let mut _preview: PreviewSettings;
+
+    /**
+     * @params:
+     *    - material: the material edited, the one of the cache of the assets
+     *    - scene: the scene file of a material local to it, none for another material
+     *    - mesh: the mesh the material is opened from, drawn in the preview, empty for none
+     * */
+    pub self (dmut material: &MaterialAsset, dmut scene: (&SceneDocument)? = none, mesh: [c8] = "")
+        with _material = alias material
+        , _scene = alias scene
+        , _saved = material.values()
+        , _preview = PreviewSettings(shape-> if mesh.len == 0us { PreviewShape::SPHERE } else { PreviewShape::MESH },
+                                     mesh-> mesh)
+    {
+        self._path = material.path;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the material edited
+     * */
+    @field
+    pub fn material(mut self)-> dmut &MaterialAsset {
+        alias self._material
+    }
+
+    /**
+     * @returns: the material edited
+     * */
+    @field
+    pub fn material(self)-> &MaterialAsset {
+        self._material
+    }
+
+    /**
+     * @returns: the scene file of a material local to it, none for another material
+     * */
+    @field
+    pub fn scene(mut self)-> dmut (&SceneDocument)? {
+        alias self._scene
+    }
+
+    /**
+     * @returns: the scene file of a material local to it, none for another material
+     * */
+    @field
+    pub fn scene(self)-> (&SceneDocument)? {
+        self._scene
+    }
+
+    /**
+     * @returns: the history of the changes of a material of a file
+     * */
+    @field
+    pub fn history(self)-> &EditHistory {
+        self._history
+    }
+
+    /**
+     * @returns: true iif the material is a .material file
+     * */
+    @field
+    pub fn isFile(self)-> bool {
+        !self._material.isLocal && !self.isReadOnly
+    }
+
+    /**
+     * @returns: true iif the material is local to a scene file
+     * */
+    @field
+    pub fn isLocal(self)-> bool {
+        self._material.isLocal
+    }
+
+    /**
+     * @returns: true iif the material cannot be changed: embedded in a model file, or built in (the default material)
+     * */
+    @field
+    pub fn isReadOnly(self)-> bool {
+        self._material.isEmbedded || MaterialDocument::isBuiltIn(self._material.path)
+    }
+
+    /**
+     * @returns: the name of the material, in a sentence
+     * */
+    @field
+    pub over name(self)-> [c8] {
+        if self._material.isLocal {
+            if let Ok(s) = self._scene { return f"the material '${self._material.name}' of ${s.name}"; }
+            return f"the material '${self._material.name}'";
+        }
+
+        if self._material.isEmbedded || MaterialDocument::isBuiltIn(self._material.path) {
+            return f"the material '${self._material.name}' (${self._material.path})";
+        }
+
+        Path(self._material.path).file()
+    }
+
+    /**
+     * @returns: the title of the tab of the document, the name of the material
+     * */
+    @field
+    pub over title(self)-> [c8] {
+        self._material.name
+    }
+
+    /**
+     * @returns: true iif a material of a file changed since it was opened or saved last, the changes of a local one being
+     * those of its scene
+     * */
+    @field
+    pub over unsaved(self)-> bool {
+        self.isFile && self._history.unsaved
+    }
+
+    /**
+     * @returns: how the preview shows the material
+     * */
+    @field
+    pub fn preview(self)-> PreviewSettings {
+        self._preview
+    }
+
+    /**
+     * Keep how the preview shows the material, as the document is left
+     * */
+    @field
+    pub fn preview(mut self, settings: PreviewSettings) {
+        self._preview = settings;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          HISTORY          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Make a change of a material of a file, kept in its history, or merged into the last command executed (the steps of
+     * one field), the nodes of a scene drawing it following
+     * @returns: true iif the material changed
+     * @throws: BalderError if the change cannot be made
+     * */
+    pub fn execute(mut self, dmut scene: &EditableScene, dmut command: &EditCommand)-> bool
+        throws BalderError
+    {
+        if !command:.apply(alias scene) { return false; }
+
+        self._history:.push(alias command);
+        self._history:.setChange(command.describe());
+        true
+    }
+
+    /**
+     * Revert the last change of a material of a file
+     * @returns: the change reverted, none when there is none to undo
+     * */
+    pub fn undo(mut self, dmut scene: &EditableScene)-> (&EditCommand)? {
+        let dmut command = if let Ok(dmut c) = alias self._history:.back() { alias c } else { return none; };
+        command:.revert(alias scene);
+        self._history:.setChange("Undone: " ~ command.describe());
+        (command)?
+    }
+
+    /**
+     * Make again the last change of a material of a file that was undone
+     * @returns: the change made again, none when there is none to redo
+     * @throws: BalderError if the change cannot be made again
+     * */
+    pub fn redo(mut self, dmut scene: &EditableScene)-> (&EditCommand)?
+        throws BalderError
+    {
+        let dmut command = if let Ok(dmut c) = alias self._history:.next() { alias c } else { return none; };
+        if !command:.apply(alias scene) { return none; }
+
+        self._history:.forward();
+        self._history:.setChange("Redone: " ~ command.describe());
+        (command)?
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FILES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write the material in its .material file, saved as it stands
+     * @throws: BalderError when the file cannot be written
+     * */
+    pub fn save(mut self)
+        throws BalderError
+    {
+        self._material.save(self._material.path);
+        self._saved = self._material.values();
+        self._history:.markSaved();
+    }
+
+    /**
+     * Give the material back the values it had when it was opened or saved last, its changes discarded, the nodes of a
+     * scene drawing it following (those of the other scenes when they are shown)
+     * */
+    pub fn discard(mut self, dmut scene: &EditableScene) {
+        self._material:.setValues(self._saved);
+        self._history:.restart();
+        MeshInstance3D::refreshUnder(alias scene:.getRootNode());
+    }
+
+    /**
+     * Edit another material in place of the one edited (the copy of a material extracted or saved in another file),
+     * its history starting again, its preview kept
+     * @params:
+     *    - material: the material edited from now on
+     *    - scene: the scene file of a material local to it, none for another material
+     * */
+    pub fn retarget(mut self, dmut material: &MaterialAsset, dmut scene: (&SceneDocument)? = none) {
+        self._material = alias material;
+        self._scene = alias scene;
+        self._path = material.path;
+        self._saved = material.values();
+        self._history:.restart();
+    }
+
+}
+
+/**
+ * The kinds of the materials opened
+ * */
+pub mod MaterialDocument {
+
+    /**
+     * @returns: true iif a path names a material built in the engine, the default material
+     * */
+    pub fn isBuiltIn(path: [c8])-> bool {
+        path.len > 7us && path[0us .. 7us] == "engine:"
+    }
+
+}

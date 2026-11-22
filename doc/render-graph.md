@@ -185,6 +185,11 @@ flowchart LR
 | `post_bloom_mip<k>`, `post_bloom_up<k>` | transient (`R16G16B16A16_SFLOAT`, storage, 2^k times smaller) | the downsampling and the upsampling passes of the bloom | the next pass of the bloom |
 | `output` | imported image (`R8G8B8A8_UNORM` written, sampled through an `R8G8B8A8_SRGB` view) | the last pass of the post-process chain, the tone mapping without effects in display space | the screen |
 
+The `debugView` of a camera (`DebugView`) shows what its g-buffer holds instead of the materials lit: a colour per
+triangle, per cluster or per level of detail, written in the g-buffer by the shaders of the materials and lit from the
+eye by the composition, or one channel of the materials alone, unlit, written by the composition (the base colour, the roughness or the metalness in grey, the normals bent by
+their maps, the occlusion of the maps, the emitted light), as the preview of the material editor shows them.
+
 ## Skinning
 
 A mesh whose vertices are moved by the joints of a skeleton (a `Skin`, read by `MeshAsset::read` from a glTF or an
