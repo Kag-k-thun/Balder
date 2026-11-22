@@ -1162,13 +1162,13 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `SpinBox`
 
-- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more; `prefix`: a string
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-change` (f32)
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `label`, `selection`, `cursor`, `up` (states `hover`, `pressed`), `down` (states `hover`, `pressed`)
+- **Parts:** `label`, `selection`, `cursor`, `up` (states `hover`, `pressed`), `down` (states `hover`, `pressed`), `prefix`
 - **Properties:** none
 
 ### `Splitter`
