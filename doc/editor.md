@@ -232,9 +232,10 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   goes neither under itself nor under a node under it (the meshes drawing the parts of a mesh node are its own, and
   hidden: a node dropped on a mesh node goes under it as under any other), and a
   node named as a child of its new parent takes a free name (`cube_2`).
-- **Inspector**: the name of the node selected last, then a section for each group of the properties its class
-  declares (see the property schemas below), refreshed as the gizmo moves it: *Transform* for every node (its position,
-  its rotation in degrees, its scale), then *Mesh* (the mesh drawn and the material of each part, told by their names,
+- **Inspector**: a head telling the node selected last, its icon beside its name, edited in place (applied when
+  Enter is pressed), over its kind (*Nothing selected* when no node is), then a section for each group of the
+  properties its class declares (see the property schemas below), refreshed as the gizmo moves it: *Transform* for
+  every node (its position, its rotation in degrees, its scale), then *Mesh* (the mesh drawn and the material of each part, told by their names,
   `own` for a part drawn with the material of its mesh, whether the levels of detail of a model file are built, whether
   it casts shadows), *Light* (its type, its colour, its intensity,
   its direction, its range for a point or a spot light, the angles of its cone for a spot light, its shadows),
@@ -251,9 +252,24 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   several nodes of different classes show the properties they share; a field changed gives its value to every node
   selected, a component of a vector or a layer changing that component or that layer of each, its others kept. The
   properties a node takes at its creation only are told, not changed, but the projection of a camera (replacing it),
-  and the shape of a body and the capsule of a character (their colliders built). A name is applied when Enter is
-  pressed. One direction light casts shadows at a time. Each section is a `Collapsible` the user folds by its header,
-  and the inspector scrolls over the sections taller than the window instead of growing the editor.
+  and the shape of a body and the capsule of a character (their colliders built). One direction light casts shadows
+  at a time. Each section is a `Collapsible` the user folds by its header.
+  - *Rows*: a row holds the label of its property on the left, in a column of the same width in every row and cut
+    before an ellipsis when longer, and its field filling the rest: a spin box, the three spin boxes of a vector
+    lettered X, Y and Z (R, G and B for a colour) by their prefix, a box, a dropdown, a text, or the 32 boxes of the
+    layers under their label.
+  - *Filter*: the loupe of the head, or Ctrl+F, opens a filter under the head while a node is selected, its text
+    focused; each key typed keeps the rows whose label, or the name of whose section, holds the text, whatever the case
+    of its letters, a section named by it keeping all of its rows, and the panels below (*Materials*, *Convex hulls*,
+    *Connections*) whose title holds it. The first letter typed expands every section, their folds restored once the
+    text is cleared; the loupe, or Ctrl+F, closes the filter again, the text cleared.
+  - *Footer*: with several nodes selected, a note at the bottom tells how many, and that a change applies to all of
+    them: `3 nodes selected: a change applies to all of them`, followed by `, 2 properties they don't all share are
+    hidden` when the node selected last has properties another node selected does not (the rows the filter keeps
+    only). It is absent with one node selected, or none.
+
+  The head, the filter and the footer stay in place, the sections and the panels scrolling between them instead of
+  growing the editor.
 - **Materials**: a mesh node has a panel of the materials of its parts (`MaterialSlotsPanel`): a row per part, the
   material it is drawn with and where it comes from (a file, local to the scene, embedded in the model, built in, `own:`
   before the material of the mesh itself). The part picked has its material edited in a tab of its own (*Edit the
