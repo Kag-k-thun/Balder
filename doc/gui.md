@@ -272,6 +272,8 @@ RadioButton "Low" { group: "quality"; }
 RadioButton "High" { group: "quality"; checked: true; }
 Slider #VOLUME 40 { max: 100; step: 1; on-change: volume; }             // fn volume (mut self, value: f32)
 SpinBox #COUNT 3 { min: 1; max: 12; decimals: 0; on-change: count; }
+SpinBox #X 0 { prefix: "X"; decimals: 2; on-change: moved; }            // the letter of an axis before the value
+InputText #FIND { on-edit: search; on-validate: found; }                // fn search (mut self, text: [c8])
 ProgressBar #LEVEL 0.25 { max: 1; }
 Dropdown #THEME "Dark", "Light" { selected: 0; on-change: theme; }      // fn theme (mut self, index: usize)
 ListView #FILES { multiple: true; on-select: picked; on-activate: open; }  // fn picked (mut self, rows: [usize])
@@ -305,7 +307,18 @@ Image "res:/images/logo.png";
   moves a slider by a step, a hundredth of the range without one, and a spin box only while it has the focus, the
   wheel over a spin box without it scrolling the layout around it. A spin box reads the text typed when it
   loses the focus, and writes the value again with its `decimals`; its arrows are `::up` and `::down`, in the states
-  `:hover` and `:pressed`. `on-change` gives the value the user chose.
+  `:hover` and `:pressed`. `on-change` gives the value the user chose. Its `prefix` (`setPrefix` by code) is a text
+  written at the left of its padding box, its part `::prefix`, as wide as the `width` of the part or as its text when
+  the part sets none (`SpinBox::prefix { width: 16; text-color: #e06c75; }`); the value is laid out between the prefix
+  and the arrows. A spin box without a prefix gives it no room.
+- **An input text tells each edit and its validation.** `on-edit` gives the text after each change the user makes to
+  it (a key typed, a deletion, a paste, a cut), not when `text:` or `setText` sets it, nor when a change leaves it as it
+  was; `on-validate` gives the text when Enter or Escape is pressed or the input loses the focus.
+- **A label cuts a line too wide before an ellipsis** when its style sets `text-overflow: ellipsis` (inherited, `clip`
+  by default): a text of one line, not wrapped (`text-wrap: nowrap`), wider than the content box of the label keeps the
+  graphemes that fit with `…` after them, a space before the cut left out (`Inner…`, not `Inner …`), the ellipsis
+  alone when no grapheme fits. The text of the label is kept whole (`getText`), only its drawing is cut; a wrapped
+  text, or one of several lines, is clipped.
 - **A dropdown opens its list in its menu layout**, as a menu button its popup, so it works only inside a `MenuLayout`.
   The list is its `::popup`, at least as wide as the dropdown, its items its `::item` in the states `:hover` and
   `:selected`. It opens under the dropdown, or above it when its items do not fit under it and there is more room above,
@@ -758,7 +771,7 @@ compound    = [ Type | "*" ] { "#" ident | "." ident | ":" state } [ "::" part {
   application), then by specificity (ids, then classes, states and parts, then types, summed over the compounds), then
   in the order they were loaded, the later one winning a tie. A rule matching through several of its selectors takes
   the specificity of the most specific one.
-- The inherited properties (`text-color`, the `font-*` properties, `text-xalign`, `text-yalign`, `text-wrap`, and those
+- The inherited properties (`text-color`, the `font-*` properties, `text-xalign`, `text-yalign`, `text-wrap`, `text-overflow`, and those
   a widget type registers as inherited) pass from a widget to its children and to its parts. Set the font once on a
   container.
 - The inline style a widget is given by code (`Widget.setInlineStyle`) comes after every rule.
@@ -1001,7 +1014,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Default attribute:** `text`
 - **Children:** none
 - **Attributes of the children:** none
-- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-validate` ([c8])
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-validate` ([c8]), `on-edit` ([c8])
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** `label`, `selection`, `cursor`
 - **Properties:** none
@@ -1162,13 +1175,13 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `SpinBox`
 
-- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `value`: a number; `min`: a number; `max`: a number; `step`: a number; `decimals`: an integer of 0 or more; `prefix`: a string
 - **Default attribute:** `value`
 - **Children:** none
 - **Attributes of the children:** none
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-change` (f32)
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `label`, `selection`, `cursor`, `up` (states `hover`, `pressed`), `down` (states `hover`, `pressed`)
+- **Parts:** `label`, `selection`, `cursor`, `up` (states `hover`, `pressed`), `down` (states `hover`, `pressed`), `prefix`
 - **Properties:** none
 
 ### `Splitter`
@@ -1254,6 +1267,7 @@ Every widget reads these properties. An inherited property passes from a widget 
 | `text-xalign` | left, center or right | yes |  |
 | `text-yalign` | top, center or bottom | yes |  |
 | `text-wrap` | wrap or nowrap | yes | yes |
+| `text-overflow` | clip or ellipsis | yes | yes |
 | `image` | a string |  |  |
 | `image-color` | a colour |  |  |
 | `image-fill` | true or false |  |  |
