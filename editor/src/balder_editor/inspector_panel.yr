@@ -1,6 +1,6 @@
 in inspector_panel;
 
-use balder_editor::{arguments, command, editor, outline};
+use balder_editor::{arguments, command, editor};
 use balder_editor::command::{active_camera, body, projection, property, rename};
 use balder::core::application::signal;
 use balder::core::error;
@@ -10,6 +10,7 @@ use balder::interface::loader::registry::behavior;
 use balder::interface::style;
 use balder::interface::widget::box;
 use balder::interface::widget::button::{check, dropdown};
+use balder::interface::widget::layout::collapsible;
 use balder::interface::widget::text::_;
 use balder::math::{_, utils};
 use balder::scene::asset::assets;
@@ -23,17 +24,33 @@ use balder::scene::property::{kind, node_property, node_schema, value};
 
 use std::{char, conv, stream};
 
+use ::sdl3::mouse;
+
 // The path in the interface of the editor of the head of the inspector (the icon, the name and the kind of the node), of
 // the sections of the properties in it, and of the panel of the convex hulls of a model, filled by the HullsPanel
 def HEAD = "BODY/MAIN/INSPECTOR/HEAD";
 def PROPERTIES = "BODY/MAIN/INSPECTOR/PROPERTIES";
 def HULLS = "BODY/MAIN/INSPECTOR/HULLS";
 
+// The path of the row of the filter, and of the loupe opening it (see Inspector)
+def FILTER = "BODY/MAIN/INSPECTOR/FILTER";
+def FIND = HEAD ~ "/FIND";
+
+// The class of the loupe while the filter is open (see inspector.style)
+def OPEN = "open";
+
 // The fields of the axes of a vector row
 def AXES = ["X", "Y", "Z"];
 
 // The class of a section or of a row the nodes inspected do not use, displayed none (see inspector.style)
 def ABSENT = "absent";
+
+// The class of a panel whose title does not hold the filter, displayed none apart from ABSENT, which the panel sets
+// itself (see inspector.style)
+def FILTERED = "filtered";
+
+// The panels under the sections, with their titles, filtered as the sections are
+def PANELS = [("BODY/MAIN/INSPECTOR/MATERIALS", "Materials"), (HULLS, "Convex hulls"), ("BODY/MAIN/INSPECTOR/CONNECTIONS", "Connections")];
 
 // The keys of the properties the editor changes through commands of their own: the projection of a camera replaces it
 // (see ProjectionCommand), the active camera is one of the scene (see ActiveCameraCommand), the shape of a body and its
@@ -155,6 +172,15 @@ pub class InspectorPanel over Behavior {
     // The sections of the groups, by name, with their paths
     let mut _sections: [([c8], [c8])] = [];
 
+    // True while the filter is open, shown under the head when a node is selected
+    let mut _searching: bool = false;
+
+    // The text the rows are filtered by, in lower case, empty to show them all
+    let mut _filter: [c8] = "";
+
+    // Whether each section was expanded, by path, when a filter was typed, restored once it is cleared
+    let dmut _folds: [[c8] => bool] = copy [];
+
     /**
      * @params:
      *    - gui: the interface holding the fields
@@ -173,6 +199,8 @@ pub class InspectorPanel over Behavior {
         self:.slot("choice", &self:.onChoice);
         self:.slot("text", &self:.onText);
         self:.slot("bit", &self:.onBit);
+        self:.slot("search", &self:.onSearch);
+        self:.slot("find", &self:.onFindClicked);
     }
 
     /**
@@ -189,6 +217,34 @@ pub class InspectorPanel over Behavior {
         self._editor = (alias editor)?;
 
         self:.onSelectionChanged();
+    }
+
+    /**
+     * Open the filter, its text focused, while a node is selected, or close it, the text cleared (the loupe, Ctrl+F)
+     * */
+    pub fn toggleSearch(mut self) {
+        if !self._searching && !self._node.hasValue { return; }
+
+        self._gui:.holdLayout();
+        self._searching = !self._searching;
+        if let Ok(dmut input: &InputText) = self._gui:.find(FILTER ~ "/SEARCH") {
+            if self._searching {
+                self._gui:.setFocus((alias input)?);
+            } else {
+                input:.setText("");
+                self:.onSearch("");
+            }
+        }
+
+        self:.refresh();
+        self._gui:.releaseLayout();
+    }
+
+    /**
+     * The loupe was clicked: the filter is opened, or closed (see toggleSearch)
+     * */
+    fn onFindClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.toggleSearch(); }
     }
 
     /*!
@@ -251,7 +307,7 @@ pub class InspectorPanel over Behavior {
         let id = idOf(p.name);
         let path = section ~ "/" ~ id;
         let editable = p.settable() || isOwnEdit(key);
-        let label = if p.label.len != 0us { p.label } else { p.name };
+        let label = labelOf(p);
         let r = p.range;
         let bounds = f"min: ${decimal(r.min)}; max: ${decimal(r.max)}; step: ${decimal(r.step)}; ";
         let slot = quoted(key);
@@ -402,7 +458,7 @@ pub class InspectorPanel over Behavior {
 
         let mut shownSections: [[c8]] = [];
         for row in self._rows {
-            let shown = self:.writeRow(row);
+            let shown = self:.writeRow(row) && self.matches(row);
             self:.setPresent(row.path, shown);
             if shown { shownSections ~= [row.section]; }
         }
@@ -419,6 +475,29 @@ pub class InspectorPanel over Behavior {
         }
 
         self:.setPresent(HULLS, fromFile);
+        for panel in PANELS {
+            self:.setClass(panel._0, FILTERED, !self.holdsFilter(panel._1));
+        }
+    }
+
+    /**
+     * @returns: true iif a row passes the filter: its label or the name of its section holds it, a section named by the
+     * filter keeping all of its rows
+     * */
+    fn matches(self, row: InspectorRow)-> bool {
+        if self.holdsFilter(labelOf(row.property)) { return true; }
+        for s in self._sections if s._1 == row.section {
+            return self.holdsFilter(s._0);
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif a text holds the filter, whatever the case of its letters; every text holds an empty filter
+     * */
+    fn holdsFilter(self, text: [c8])-> bool {
+        self._filter.len == 0us || contains(lowerCase(text), self._filter)
     }
 
     /**
@@ -441,6 +520,9 @@ pub class InspectorPanel over Behavior {
         self:.setIcon(HEAD ~ "/ICON", icon);
         self:.setPresent(HEAD ~ "/ICON", self._node.hasValue);
         self:.setPresent(HEAD ~ "/NAME", self._node.hasValue);
+        self:.setPresent(FIND, self._node.hasValue);
+        self:.setPresent(FILTER, self._searching && self._node.hasValue);
+        self:.setClass(FIND, OPEN, self._searching);
     }
 
     /**
@@ -544,13 +626,20 @@ pub class InspectorPanel over Behavior {
      * Make a section or a row present, or absent, taking no room
      * */
     fn setPresent(mut self, path: [c8], present: bool) {
+        self:.setClass(path, ABSENT, !present);
+    }
+
+    /**
+     * Give a widget a class, or take it away, its other classes kept
+     * */
+    fn setClass(mut self, path: [c8], name: [c8], on: bool) {
         if let Ok(dmut w) = alias self._gui:.find(path) {
             let mut classes: [[c8]] = [];
-            for c in w.getClasses() if c != ABSENT {
+            for c in w.getClasses() if c != name {
                 classes ~= [c];
             }
 
-            if !present { classes ~= [ABSENT]; }
+            if on { classes ~= [name]; }
             w:.setClasses(classes);
         }
     }
@@ -573,6 +662,34 @@ pub class InspectorPanel over Behavior {
 
         // a name refused is written back
         self:.refresh();
+    }
+
+    /**
+     * The filter was edited: the rows are filtered by it; the first letter typed expands every section, their folds
+     * saved, restored once the filter is cleared
+     * */
+    fn onSearch(mut self, text: [c8]) {
+        let filter = lowerCase(text);
+        self._gui:.holdLayout();
+        if self._filter.len == 0us && filter.len != 0us {
+            self._folds = copy [];
+            for s in self._sections {
+                if let Ok(dmut c: &Collapsible) = self._gui:.find(s._1) {
+                    self._folds[s._1] = c.isExpanded();
+                    c:.setExpanded(true);
+                }
+            }
+        } else if self._filter.len != 0us && filter.len == 0us {
+            for s in self._sections {
+                if let Ok(expanded) = self._folds[s._1] {
+                    if let Ok(dmut c: &Collapsible) = self._gui:.find(s._1) { c:.setExpanded(expanded); }
+                }
+            }
+        }
+
+        self._filter = filter;
+        self:.refresh();
+        self._gui:.releaseLayout();
     }
 
     /**
@@ -813,6 +930,32 @@ fn materialName(path: [c8])-> [c8] {
     }
 
     path
+}
+
+/**
+ * @returns: the label of the row of a property, its name when it has none
+ * */
+fn labelOf(p: &NodeProperty)-> [c8] {
+    if p.label.len != 0us { p.label } else { p.name }
+}
+
+/**
+ * @returns: a text, its letters in lower case
+ * */
+fn lowerCase(text: [c8])-> [c8] {
+    copy [toLower(c) for c in text]
+}
+
+/**
+ * @returns: true iif a word appears in a text
+ * */
+fn contains(text: [c8], word: [c8])-> bool {
+    if word.len > text.len { return false; }
+    for i in 0us .. text.len - word.len + 1us {
+        if text[i .. i + word.len] == word { return true; }
+    }
+
+    false
 }
 
 /**
