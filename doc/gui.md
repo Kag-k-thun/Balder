@@ -997,6 +997,17 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Parts:** none
 - **Properties:** `columns`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content; `rows`: one or more tracks: lengths in px or %, shares in fr, auto, min-content or max-content
 
+### `IconButton`
+
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `name`: a string; `icon`: a string; `shortcut`: a string; `checkable`: true or false; `checked`: true or false; `group`: a string
+- **Default attribute:** `name`
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-toggle` (bool)
+- **States:** `hover`, `focus`, `pressed`, `checked`, `first`, `last`
+- **Parts:** none
+- **Properties:** none
+
 ### `Image`
 
 - **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `src`: a string
@@ -1039,7 +1050,7 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Signals:** `on-click` (u8), `on-focus`, `on-blur`
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** `scrollbar` (states `hover`, `pressed`)
-- **Properties:** `direction`: row or column; `overflow`: hidden or scroll; `scroll-speed`: a number of 0 or more
+- **Properties:** `direction`: row or column; `overflow`: hidden or scroll; `scroll-speed`: a number of 0 or more; `gap`: a length in px
 
 ### `ListView`
 
@@ -1227,6 +1238,28 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **States:** `hover`, `focus`, `pressed`
 - **Parts:** `header` (states `hover`, `ascending`, `descending`), `row` (states `hover`, `selected`, `current`), `cell` (states `hover`, `selected`, `current`), `scrollbar` (states `hover`, `pressed`)
 - **Properties:** none
+
+### `ToolBar`
+
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
+- **Default attribute:** none
+- **Children:** any number
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** `direction`: row or column; `gap`: a length in px
+
+### `ToolGroup`
+
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
+- **Default attribute:** none
+- **Children:** any number
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** `direction`: row or column; `gap`: a length in px
 
 ### `Tooltip`
 
