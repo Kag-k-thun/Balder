@@ -1,0 +1,321 @@
+in dock_rails;
+
+use balder::core::application::signal;
+use balder::interface;
+use balder::interface::widget;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget::dock_rail::{dock_state, rail, rail_drop, rail_place, rail_section, rail_tool};
+use balder::interface::widget::layout;
+use balder::interface::widget::layout::{linear, splitter};
+
+// The rails on the outer edges of the window
+def LEFT_RAIL = "BODY/LEFT_RAIL";
+def RIGHT_RAIL = "BODY/RIGHT_RAIL";
+
+// The splitter of the docks and the viewport, the docks and their slots anonymous under it
+def MAIN = "BODY/MAIN";
+
+// The classes of the docks, of their slots, and of a widget taking no room
+def DOCK = "dock";
+def SLOT = "slot";
+def ABSENT = "absent";
+
+/**
+ * The docks of the editor and their rails, mounted under the behavior 'docks': a rail of tools on each outer edge of
+ * the window, its dock beside it, the viewport between the docks
+ * @info:
+ * =====
+ * A tool is the icon of a panel, its id the id of the panel: the docks and their slots have no id, so that the path of
+ * a panel (BODY/MAIN/<id>) is the same in whichever slot it is. The tools above the separator of a rail show their
+ * panels in the top slot of its dock, those below in its bottom slot; a slot shows one panel at a time, a click on a
+ * tool showing it and a click on the tool shown folding its slot (see DockState). Two slots shown split the dock,
+ * resized by its grip, one fills it, none leaves its room to the viewport, as the fold button of the head of a panel
+ * does for the whole dock. A tool dragged across the separator, or to the other rail, moves there with its panel,
+ * shown in its new slot when it was shown. The tools of the foot stay where they are.
+ * ====
+ * */
+pub class DockRails over Behavior {
+
+    // The interface holding the rails and the docks
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the signals of the rails are emitted in, after the events that emitted them
+    let dmut _box: &SlotEmitter;
+
+    // The rails, the left one then the right one, once bound
+    let dmut _rails: [&DockRail] = [];
+
+    // The docks, the left one then the right one, and their slots, the top then the bottom of each
+    let dmut _docks: [&Splitter] = [];
+    let dmut _layouts: [&LinearLayout] = [];
+
+    // What each dock shows, the left one then the right one
+    let mut _states: [mut DockState] = [];
+
+    /**
+     * @params:
+     *    - gui: the interface holding the rails and the docks
+     *    - box: the mailbox the signals of the rails are emitted in
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter)
+        with _gui = alias gui
+        , _box = alias box
+    {
+        self:.slot("fold", &self:.onFold);
+    }
+
+    /**
+     * Find the rails, the docks and their slots once the interface is loaded, give the rails their tools, and show the
+     * outline and the inspector
+     * @returns: false when the interface lacks a rail, a dock or a slot
+     * */
+    pub fn bind(mut self)-> bool {
+        for path in [LEFT_RAIL, RIGHT_RAIL] {
+            if let Ok(dmut r: &DockRail) = self._gui:.find(path) {
+                r:.activated():.connect(alias self._box, &self:.onActivated);
+                r:.dragged():.connect(alias self._box, &self:.onDragged);
+                r:.dropped():.connect(alias self._box, &self:.onDropped);
+                self._rails ~= [alias r];
+            }
+        }
+
+        if let Ok(dmut main) = alias self._gui:.find(MAIN) {
+            self:.collect(alias main);
+        }
+
+        if self._rails.len != 2us || self._docks.len != 2us || self._layouts.len != 4us { return false; }
+
+        self._rails[0us]:.setTools(DockRails::leftTools());
+        self._rails[1us]:.setTools(DockRails::rightTools());
+        self._states = copy [DockState(top-> "OUTLINE"), DockState(top-> "INSPECTOR")];
+        self:.apply();
+        true
+    }
+
+    /**
+     * Show the panel of a tool when it is not shown, its dock opened (Ctrl+F shows the inspector before its filter)
+     * */
+    pub fn reveal(mut self, id: [c8]) {
+        if let Ok((side, tool)) = self.toolOf(id) {
+            if DockState::shown(self._states[side], tool.section) == id { return; }
+
+            self._states[side] = DockState::open(DockState::press(self._states[side], tool.section, id));
+            self:.apply();
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A tool clicked shows its panel, or folds its slot when it was shown
+     * */
+    fn onActivated(mut self, id: [c8]) {
+        if let Ok((side, tool)) = self.toolOf(id) {
+            self._states[side] = DockState::click(self._states[side], id, tool.section);
+            self:.apply();
+        }
+    }
+
+    /**
+     * The fold button of the head of a panel folds the dock the panel is in
+     * @params:
+     *    - panel: the id of the panel, bound by the .gui file
+     * */
+    fn onFold(mut self, panel: [c8], _: u8) {
+        if let Ok((side, _)) = self.toolOf(panel) {
+            self._states[side] = DockState::fold(self._states[side]);
+            self:.apply();
+        }
+    }
+
+    /**
+     * Mark the place under the cursor in the rail it is over
+     * */
+    fn onDragged(mut self, drop: RailDrop) {
+        for dmut r in alias self._rails {
+            r:.showDrop(r.placeAt(drop.at));
+        }
+    }
+
+    /**
+     * Move a tool dropped over a rail to the place under the cursor, nothing being moved when it is over neither
+     * */
+    fn onDropped(mut self, drop: RailDrop) {
+        for dmut r in alias self._rails {
+            r:.showDrop(none);
+        }
+
+        for side in 0us .. self._rails.len {
+            if let Ok(place) = self._rails[side].placeAt(drop.at) {
+                self:.moveTool(drop.tool, side, place);
+                return;
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PRIVATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Move a tool to a place of a rail, its panel to the slot of the place, shown there when it was shown
+     * @params:
+     *    - side: the rail of the place, 0 for the left one
+     * */
+    fn moveTool(mut self, id: [c8], side: usize, place: RailPlace) {
+        if let Ok((from, tool)) = self.toolOf(id) {
+            if tool.foot { return; }
+
+            let shown = DockState::shown(self._states[from], tool.section) == id;
+            self._states[from] = DockState::release(self._states[from], id);
+
+            if from != side {
+                self._rails[from]:.setTools(DockRail::withoutTool(self._rails[from].getTools(), id));
+            }
+
+            self._rails[side]:.setTools(DockRail::withToolAt(self._rails[side].getTools(), tool, place));
+            self:.movePanel(id, side * 2us + DockRails::slotOf(place.section));
+
+            if shown {
+                self._states[side] = DockState::press(self._states[side], place.section, id);
+            }
+
+            self:.apply();
+        }
+    }
+
+    /**
+     * Move the panel of a tool to a slot, out of the slot it is in
+     * @params:
+     *    - to: the index of the slot, the top then the bottom of the left dock, then of the right one
+     * */
+    fn movePanel(mut self, id: [c8], to: usize) {
+        for i in 0us .. self._layouts.len if i != to {
+            for dmut p in alias self._layouts[i]:.getChildren() if p.id == id {
+                self._layouts[i]:.takeChild(p);
+                self._layouts[to]:.insertChild(alias p);
+                p:.onAttach((self._layouts[to])?);
+                return;
+            }
+        }
+    }
+
+    /**
+     * Show what the states of the docks say: in each slot the panel of its tool shown, the others absent, a slot showing
+     * none absent, a dock showing none absent (the viewport taking its room), the buttons of the tools shown checked
+     * */
+    fn apply(mut self) {
+        self._gui:.holdLayout();
+        for side in 0us .. self._rails.len {
+            let state = self._states[side];
+            for k, section in copy [RailSection::TOP, RailSection::BOTTOM] {
+                let shown = DockState::shown(state, section);
+                let dmut slot = alias self._layouts[side * 2us + k];
+                for dmut p in alias slot:.getChildren() {
+                    DockRails::setPresent(alias p, shown != "" && p.id == shown);
+                }
+
+                DockRails::setPresent(alias slot, shown != "");
+            }
+
+            DockRails::setPresent(alias self._docks[side], DockState::isOpen(state));
+            self._rails[side]:.setChecked(DockState::checked(state));
+        }
+
+        self._gui:.releaseLayout();
+    }
+
+    /**
+     * @returns: the rail of a tool (0 for the left one) and the tool, none for an id no rail holds
+     * */
+    fn toolOf(self, id: [c8])-> ((usize, RailTool))? {
+        for side, r in self._rails {
+            for t in r.getTools() if t.id == id {
+                return ((side, t))?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Find the docks (the splitters of the class dock) and their slots (the linear layouts of the class slot) under a
+     * widget, in the order of the file
+     * */
+    fn collect(mut self, dmut w: &Widget) {
+        let classes = w.getClasses();
+        if let dmut l: &LinearLayout = alias w {
+            if DockRail::holds(classes, SLOT) {
+                self._layouts ~= [alias l];
+                return;
+            }
+        }
+
+        if let dmut s: &Splitter = alias w {
+            if DockRail::holds(classes, DOCK) { self._docks ~= [alias s]; }
+        }
+
+        if let dmut l: &Layout = alias w {
+            for dmut c in alias l:.getChildren() {
+                self:.collect(alias c);
+            }
+        }
+    }
+}
+
+/**
+ * The tools of the rails at the start, and the slots of their sections
+ * */
+@companion
+pub mod DockRails {
+
+    /**
+     * @returns: the tools of the left rail: the outline on top, the files and the camera preview below, the settings of
+     * the project at its foot
+     * */
+    pub fn leftTools()-> [RailTool] {
+        copy [RailTool(id-> "OUTLINE", name-> "Outline", icon-> "engine:/images/ui/outline.svg"),
+              RailTool(id-> "FILES", name-> "Files", icon-> "engine:/images/ui/folder.svg", section-> RailSection::BOTTOM),
+              RailTool(id-> "CAMERA", name-> "Camera preview", icon-> "engine:/images/ui/camera.svg",
+                       section-> RailSection::BOTTOM),
+              RailTool(id-> "SETTINGS", name-> "Project settings", icon-> "engine:/images/ui/settings.svg",
+                       section-> RailSection::BOTTOM, foot-> true)]
+    }
+
+    /**
+     * @returns: the tools of the right rail: the inspector on top, the signals and the history of the changes below
+     * */
+    pub fn rightTools()-> [RailTool] {
+        copy [RailTool(id-> "INSPECTOR", name-> "Inspector", icon-> "engine:/images/ui/inspector.svg"),
+              RailTool(id-> "SIGNALS", name-> "Signals", icon-> "engine:/images/ui/signals.svg", section-> RailSection::BOTTOM),
+              RailTool(id-> "HISTORY", name-> "History of the changes", icon-> "engine:/images/ui/history.svg",
+                       section-> RailSection::BOTTOM)]
+    }
+
+    /**
+     * @returns: the slot of a section in its dock, 0 for the top one
+     * */
+    pub fn slotOf(section: RailSection)-> usize {
+        if section == RailSection::TOP { 0us } else { 1us }
+    }
+
+    /**
+     * Make a widget present, or absent, taking no room
+     * */
+    pub fn setPresent(dmut w: &Widget, present: bool) {
+        let mut classes: [[c8]] = [];
+        for c in w.getClasses() if c != ABSENT { classes ~= [c]; }
+        if !present { classes ~= [ABSENT]; }
+        w:.setClasses(classes);
+    }
+}
