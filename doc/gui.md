@@ -953,6 +953,17 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 - **Parts:** `header` (states `hover`, `pressed`), `marker` (states `hover`, `pressed`)
 - **Properties:** none
 
+### `DockRail`
+
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string
+- **Default attribute:** none
+- **Children:** none
+- **Attributes of the children:** none
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`
+- **States:** `hover`, `focus`, `pressed`
+- **Parts:** none
+- **Properties:** `direction`: row or column; `gap`: a length in px
+
 ### `Dropdown`
 
 - **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `items`: strings separated by commas; `selected`: an integer of 0 or more
