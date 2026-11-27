@@ -1,0 +1,138 @@
+in trash;
+
+use std::{conv, env, fs};
+use std::time;
+use std::time::date;
+
+// The layout of the date an entry was trashed at, in the local time, as the trash specification writes it
+def DELETION_DATE = "%Y-%m-%dT%H:%M:%S";
+
+/**
+ * @returns: the trash of the user, Trash under its data directory ($XDG_DATA_HOME, ~/.local/share without it)
+ * */
+pub fn userTrash()-> [c8] {
+    let data = unsafe { env::getVar("XDG_DATA_HOME") };
+    if data != "" { return data ~ "/Trash"; }
+
+    let home = unsafe { env::getVar("HOME") };
+    home ~ "/.local/share/Trash"
+}
+
+/**
+ * Move a file or a directory to a trash, as the file managers do (the trash specification of freedesktop.org): the entry
+ * goes to the directory files/ of the trash under a name free there, a file of info/ telling where it came from and when
+ * it was trashed, so that a file manager puts it back
+ * @params:
+ *    - path: the absolute path of the entry
+ *    - trash: the directory of the trash, the trash of the user when empty
+ * @returns: the path of the entry in the trash
+ * @info: an entry on another file system than the trash is copied to it, then removed
+ * @throws:
+ *    - &FsError: if the trash cannot be created, or the entry moved to it, the entry staying where it is
+ * */
+pub fn moveToTrash(path: [c8], trash: [c8] = "")-> [c8]
+    throws FsError
+{
+    let root = Path(if trash == "" { userTrash() } else { trash });
+    let files = root.push("files");
+    let info = root.push("info");
+    if !isDir(files) { createDir(files, recursive-> true); }
+    if !isDir(info) { createDir(info, recursive-> true); }
+
+    let name = freeTrashName(files.toStr(), info.toStr(), Path(path).file());
+    let infoFile = info.push(name ~ ".trashinfo");
+    writeFile(infoFile, trashInfo(path, DateTime(Instant::now()).format(fmt-> DELETION_DATE)));
+    {
+        moveEntry(Path(path), files.push(name));
+    } catch {
+        err: &FsError => {
+            removeFile(infoFile);
+            throw err;
+        }
+    }
+
+    files.push(name).toStr()
+}
+
+/**
+ * @returns: the content of the file telling where an entry of a trash came from and when it was trashed
+ * @params:
+ *    - path: the absolute path the entry had
+ *    - date: the date it was trashed at, 2026-11-27T18:04:11
+ * */
+pub fn trashInfo(path: [c8], date: [c8])-> [c8] {
+    "[Trash Info]\nPath=" ~ percentEncoded(path) ~ "\nDeletionDate=" ~ date ~ "\n"
+}
+
+/**
+ * @returns: a path whose bytes other than the letters, the digits, '-', '.', '_', '~' and '/' are written %XX, as a URL
+ * writes them
+ * */
+pub fn percentEncoded(path: [c8])-> [c8] {
+    let digits = "0123456789ABCDEF";
+    let mut result: [c8] = "";
+    for c in path {
+        let b = cast!u8(c);
+        let kept = (c >= 'a'c8 && c <= 'z'c8) || (c >= 'A'c8 && c <= 'Z'c8) || (c >= '0'c8 && c <= '9'c8)
+            || c == '-'c8 || c == '.'c8 || c == '_'c8 || c == '~'c8 || c == '/'c8;
+        if kept {
+            result = result ~ [c];
+        } else {
+            result = result ~ ['%'c8, digits[cast!usize(b >> 4u8)], digits[cast!usize(b & 15u8)]];
+        }
+    }
+
+    result
+}
+
+/**
+ * @returns: the name an entry takes in a trash, its own when neither the trash nor its information have it, else its
+ * stem followed by _2, _3... before its extension
+ * @params:
+ *    - files: the directory the entries of the trash are in
+ *    - info: the directory their information is in
+ *    - name: the name of the entry
+ * */
+pub fn freeTrashName(files: [c8], info: [c8], name: [c8])-> [c8] {
+    let stem = Path(name).stripExtension().toStr();
+    let ext = Path(name).extension();
+    let mut candidate = name;
+    let mut n = 2us;
+    while exists(Path(files).push(candidate), followLink-> false) || exists(Path(info).push(candidate ~ ".trashinfo")) {
+        candidate = stem ~ "_" ~ to![c8](n) ~ (if ext == "" { "" } else { "." ~ ext });
+        n += 1us;
+    }
+
+    candidate
+}
+
+/**
+ * Move a file or a directory, copied then removed when it cannot be renamed there (another file system)
+ * @throws:
+ *    - &FsError: if it cannot be moved, a partial copy removed
+ * */
+fn moveEntry(from: Path, to: Path)
+    throws FsError
+{
+    {
+        rename(from, to);
+        return;
+    } catch {
+        _: &FsError => {}
+    }
+
+    {
+        if isDir(from, followLink-> false) {
+            copyDir(from, to, recursive-> true, create-> true);
+        } else {
+            copyFile(from, to);
+        }
+    } catch {
+        err: &FsError => {
+            if isDir(to, followLink-> false) { removeDir(to, recursive-> true); } else if exists(to, followLink-> false) { removeFile(to); }
+            throw err;
+        }
+    }
+
+    if isDir(from, followLink-> false) { removeDir(from, recursive-> true); } else { removeFile(from); }
+}
