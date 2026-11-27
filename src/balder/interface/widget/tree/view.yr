@@ -1,14 +1,14 @@
 in view;
 
 use balder::core::dispose;
-use balder::core::application::signal;
+use balder::core::application::{input, signal};
 use balder::interface::loader::registry::schema;
 use balder::interface::style;
 use balder::interface::style::{kinds, property};
 use balder::interface::widget::{image, marker};
 use balder::interface::widget::list::rows_view;
-use balder::interface::widget::text::label;
-use balder::interface::widget::tree::{drag, dragging, drop, expansion, model};
+use balder::interface::widget::text::{input, label};
+use balder::interface::widget::tree::{drag, dragging, drop, edit, expansion, model};
 use balder::math::vector;
 
 use std::time;
@@ -28,6 +28,9 @@ def EXPAND_DELAY = 0.6;
 
 // The distance from the cursor to the icon of the rows dragged out of a tree, right and down, in pixels
 def GHOST_OFFSET = 14.0f;
+
+// The narrowest the field editing the text of a row gets, in pixels
+def EDIT_MIN_WIDTH = 48.0f;
 
 /**
  * The icon of a row of a tree view, between its marker and its text: an image drawing the background and the border of
@@ -71,6 +74,60 @@ class TreeDragIcon over Image {
     {
         self:.setOwnerPart("ghost");
         self:.hide();
+    }
+}
+
+/**
+ * The field the text of a row of a tree view is edited in, over the text of the row: an input text of the class
+ * tree-edit, Escape cancelling the edit, Enter giving the focus back to the tree
+ * */
+class TreeRowInput over InputText {
+
+    // True once Escape was pressed, the text typed being dropped as the field loses the focus
+    pub let mut cancelled: bool = false;
+
+    // The tree whose row is edited
+    let dmut _tree: &Widget;
+
+    // Called with the text typed once the field loses the focus
+    let _done: dg ([c8])-> void;
+
+    /**
+     * @params:
+     *    - tree: the tree whose row is edited, focused again once the text is validated
+     *    - done: called with the text typed once the field loses the focus, cancelled or not
+     * */
+    pub self (dmut manager: &WidgetManager, dmut tree: &Widget, done: dg ([c8])-> void)
+        with super(alias manager, "")
+        , _tree = alias tree
+        , _done = done
+    {
+        self:.setClasses(copy ["tree-edit"]);
+        self:.hide();
+    }
+
+    pub over onLoseFocus(mut self) {
+        self.__super__:.onLoseFocus();
+        self._done(self.getText());
+    }
+
+    /**
+     * Escape cancels the edit, the field losing the focus once it is released
+     * */
+    pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
+        if key == SDLK_ESCAPE {
+            self.cancelled = true;
+            return true;
+        }
+
+        self.__super__:.onKeyPressed(key, mods)
+    }
+
+    /**
+     * Enter, and the release of Escape, give the focus back to the tree, the field losing it
+     * */
+    pub over onTextValidate(mut self, _: KeyInfo) {
+        self._manager:.setFocus((alias self._tree)?);
     }
 }
 
@@ -298,6 +355,9 @@ class TreeRow over Label {
  * A right click on a row selects it alone unless it is selected, then emits `on-context` with its path, [] for a click
  * below the rows, the application opening its menu; the keys the tree does not use are emitted by keyPressed (F2
  * renaming the node...).
+ *
+ * The code edits the text of a row in place (editNode): a field of the class `tree-edit` over its text, Enter or a
+ * click elsewhere emitting `on-edit` with the text typed (TreeEdit), Escape cancelling it.
  * ====
  * */
 pub class TreeView over RowsView {
@@ -366,12 +426,22 @@ pub class TreeView over RowsView {
         let mut _ghostImage: [c8] = "";
     }
 
+    prot { // editing
+
+        // The field the text of a row is edited in, created by the first edit
+        let dmut _input: (&TreeRowInput)? = none;
+
+        // The node whose row is edited, none while no row is
+        let mut _editing: ([usize])? = none;
+    }
+
     prot { // signals
         let dmut _selected: (&Signal!{[[usize]]})? = none;
         let dmut _activated: (&Signal!{[usize]})? = none;
         let dmut _dropped: (&Signal!{TreeDrop})? = none;
         let dmut _draggedOut: (&Signal!{TreeDrag})? = none;
         let dmut _context: (&Signal!{[usize]})? = none;
+        let dmut _edited: (&Signal!{TreeEdit})? = none;
         let dmut _keyPressed: (&Signal!{SDL_Keycode, SDL_Keymod})? = none;
     }
 
@@ -608,6 +678,65 @@ pub class TreeView over RowsView {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ===================================          EDITING          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Edit the text of the row of a node in place, in a field over it focused, its ancestors expanded and the row
+     * scrolled to; on-edit gives the text once validated, Escape cancelling it; a row edited already is cancelled
+     * @params:
+     *    - node: the path of the node
+     *    - text: the text the field starts with
+     *    - from: the start of the part of the text selected, in bytes
+     *    - to: the end of the part selected, past the text being its end
+     * */
+    pub fn editNode(mut self, node: [usize], text: [c8], from: usize = 0us, to: usize = usize::max) {
+        if node.len == 0us { return; }
+
+        self:.cancelEdit();
+        self:.expandNode(node[0us .. node.len - 1us]);
+        let row = if let Ok(r) = self._expansion.rowOf(node) { r } else { return; };
+        self:.scrollToRow(row);
+
+        let dmut field = if let Ok(dmut i) = alias self._input { alias i } else {
+            let dmut i = copy TreeRowInput(alias self._manager, alias self, &self:.onEditValidated);
+            if self._attached { i:.onAttach((self)?); }
+            self._input = (alias i)?;
+            alias i
+        };
+
+        self._editing = (node)?;
+        field.cancelled = false;
+        field:.restyle(deep-> true);
+        field:.setText(text);
+        self:.placeInput();
+        self._manager:.setFocus((alias field)?);
+        field:.selectText(from, to);
+    }
+
+    /**
+     * Cancel the edit of a row, the text typed dropped, the tree taking the focus back
+     * */
+    pub fn cancelEdit(mut self) {
+        if !self._editing.hasValue { return; }
+
+        if let Ok(dmut i) = alias self._input { i.cancelled = true; }
+        self._manager:.setFocus((alias self)?);
+        self:.stopEditing();
+    }
+
+    /**
+     * @returns: true iif the text of a row is edited
+     * */
+    pub fn isEditing(self)-> bool {
+        self._editing.hasValue
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * ====================================          SIGNALS          =====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -687,6 +816,20 @@ pub class TreeView over RowsView {
     }
 
     /**
+     * @returns: the signal emitted with the node whose row was edited in place and the text typed, once validated
+     * */
+    pub fn edited(mut self)-> dmut &Signal!{TreeEdit} {
+        if let Ok(dmut s) = alias self._edited {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{TreeEdit} ();
+        self._edited = (alias s)?;
+
+        alias s
+    }
+
+    /**
      * @returns: the signal emitted with the keys pressed on the tree that it does not use (F2, Delete...), the
      * application giving them a meaning
      * */
@@ -724,10 +867,14 @@ pub class TreeView over RowsView {
         self.__super__:.onUpdateScissors();
         let (sciPos, sciSize) = self.getRowsScissors();
         self._dropLine:.setScissors(sciPos, sciSize);
+        if let Ok(dmut i) = alias self._input { i:.setScissors(sciPos, sciSize); }
     }
 
     pub over getMaxDepth(self)-> u32 {
-        if self._dragging { max(self.__super__.getMaxDepth(), self._dropLine.getMaxDepth()) } else { self.__super__.getMaxDepth() }
+        let mut depth = self.__super__.getMaxDepth();
+        if self._dragging { depth = max(depth, self._dropLine.getMaxDepth()); }
+        if let Ok(i) = self._input && self._editing.hasValue { depth = max(depth, i.getMaxDepth()); }
+        depth
     }
 
     prot over createRow(mut self)-> dmut &Widget {
@@ -766,6 +913,7 @@ pub class TreeView over RowsView {
      * */
     prot over onRowsPlaced(mut self) {
         self:.placeDropLine();
+        self:.placeInput();
     }
 
     /**
@@ -812,6 +960,14 @@ pub class TreeView over RowsView {
      * without Ctrl nor Shift, it selects it alone once released only, so that they are dragged together
      * */
     pub over onClick(mut self, pos: vec2, button: u8)-> dmut (&Widget)? {
+        if let Ok(dmut i) = alias self._input && self._editing.hasValue {
+            let at = self._absoluteFullPosition + pos * self._absoluteFullSize;
+            let from = i.getAbsolutePosition(), size = i.getAbsoluteSize();
+            if at.x >= from.x && at.y >= from.y && at.x < from.x + size.x && at.y < from.y + size.y {
+                return i:.onClick((at - from) / size, button);
+            }
+        }
+
         self._pressed = none;
         self._selectOnRelease = none;
         if button == SDL_BUTTON_RIGHT {
@@ -991,12 +1147,14 @@ pub class TreeView over RowsView {
         self.__super__:.onAttach(parent);
         self._dropLine:.onAttach((self)?);
         self._ghost:.onAttach((self)?);
+        if let Ok(dmut i) = alias self._input { i:.onAttach((self)?); }
     }
 
     over onHide(mut self) {
         self.__super__:.onHide();
         self._dropLine:.hide();
         self._ghost:.hide();
+        if let Ok(dmut i) = alias self._input { i:.hide(); }
     }
 
     impl Disposable {
@@ -1010,6 +1168,7 @@ pub class TreeView over RowsView {
             self._iconProbe:.dispose();
             self._dropLine:.dispose();
             self._ghost:.dispose();
+            if let Ok(dmut i) = alias self._input { i:.dispose(); }
             self.__super__:.dispose();
         }
     }
@@ -1252,6 +1411,55 @@ pub class TreeView over RowsView {
             s:.emit(node);
         }
     }
+
+    /**
+     * The field of the row edited lost the focus: on-edit gives the text typed, unless Escape cancelled it
+     * */
+    fn onEditValidated(mut self, text: [c8]) {
+        let node = if let Ok(n) = self._editing { n } else { return; };
+        let cancelled = if let Ok(i) = self._input { i.cancelled } else { true };
+        self:.stopEditing();
+        if cancelled { return; }
+
+        if let Ok(dmut s) = alias self._edited {
+            s:.emit(TreeEdit(node-> node, text-> text));
+        }
+    }
+
+    /**
+     * Stop editing a row, its field hidden
+     * */
+    fn stopEditing(mut self) {
+        self._editing = none;
+        if let Ok(dmut i) = alias self._input { i:.hide(); }
+    }
+
+    /**
+     * Place the field of the row edited over the text of the row, as wide as the rows from there, following the rows as
+     * they scroll; an edit whose node is no longer shown is cancelled
+     * */
+    fn placeInput(mut self) {
+        let node = if let Ok(n) = self._editing { n } else { return; };
+        let row = if let Ok(r) = self._expansion.rowOf(node) { r } else {
+            self:.cancelEdit();
+            return;
+        };
+
+        let start = TreeView::textOffset(node.len - 1us, self._indent, self._markerWidth, self._iconWidth) - self._offsetX;
+        let top = cast!f64(cast!u64(row)) * cast!f64(self._rowHeight) - self._offset;
+        let pos = self._absolutePosition + makeVec2(start, self._headerHeight + cast!f32(top));
+        let width = max(EDIT_MIN_WIDTH, self._rowsWidth - start);
+
+        let mut depth = self._depth + 1;
+        for r in self._rows { depth = max(depth, r.getMaxDepth()); }
+
+        if let Ok(dmut i) = alias self._input {
+            i:.setSize(pos, makeVec2(width, self._rowHeight), depth + 1, self._absoluteSize);
+            let (sciPos, sciSize) = self.getRowsScissors();
+            i:.setScissors(sciPos, sciSize);
+            if self.isDrawn() { i:.show(); } else { i:.hide(); }
+        }
+    }
 }
 
 /**
@@ -1273,7 +1481,8 @@ pub mod TreeView {
                                           copy Emitter!{&TreeView, [usize]}("on-activate", |dmut t|-> dmut &Signal!{[usize]} => alias t:.activated()),
                                           copy Emitter!{&TreeView, TreeDrop}("on-drop", |dmut t|-> dmut &Signal!{TreeDrop} => alias t:.dropped()),
                                           copy Emitter!{&TreeView, TreeDrag}("on-drag-out", |dmut t|-> dmut &Signal!{TreeDrag} => alias t:.draggedOut()),
-                                          copy Emitter!{&TreeView, [usize]}("on-context", |dmut t|-> dmut &Signal!{[usize]} => alias t:.context())],
+                                          copy Emitter!{&TreeView, [usize]}("on-context", |dmut t|-> dmut &Signal!{[usize]} => alias t:.context()),
+                                          copy Emitter!{&TreeView, TreeEdit}("on-edit", |dmut t|-> dmut &Signal!{TreeEdit} => alias t:.edited())],
                           parts-> copy ["row", "marker", "icon", "drop", "ghost", "scrollbar"],
                           partStates-> copy ["row" => copy ["hover", "selected", "current", "drop", "marked"],
                                              "marker" => copy ["hover", "selected", "current", "expanded", "marked"],
