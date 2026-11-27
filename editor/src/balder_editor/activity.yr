@@ -2,6 +2,7 @@ in activity;
 
 mod ::add_menu;
 mod ::edit_menu;
+mod ::documents;
 mod ::editor_context;
 mod ::file_choice;
 mod ::gizmo_menu;
@@ -11,11 +12,8 @@ use balder::core::{_, application::_};
 use balder::interface::dialog;
 use balder::interface::widget::button::push;
 use balder::interface::widget::layout::d3scene;
-use balder::interface::widget::tab_bar::{bar, tab_move};
-use balder::interface::widget::text::label;
 use balder::interface::widget::tree::view;
-use balder::math::vector;
-use balder::scene::{description::_, editable};
+use balder::scene::{description, editable};
 use balder::scene::asset::{assets, material_asset};
 use balder::scene::edit::property_edit;
 use balder::scene::node;
@@ -26,9 +24,8 @@ use balder::scene::node::node3D::camera::flight;
 use balder::scene::property::value;
 use balder::utils::{log, path};
 
-use balder_editor::{arguments, build_error_dialog, connections_panel, dock_rails, document, editor, hulls_panel, inspector_panel, manager, material_document, material_panel, material_preview, material_slots_panel, outline_panel, scene_document, viewport, viewport_bars};
-use balder_editor::activity::{add_menu, edit_menu, editor_context, file_choice, gizmo_menu, view_menu};
-use balder_editor::command;
+use balder_editor::{arguments, build_error_dialog, connections_panel, dock_rails, document, hulls_panel, inspector_panel, manager, material_document, material_panel, material_preview, material_slots_panel, outline_panel, scene_document, viewport, viewport_bars};
+use balder_editor::activity::{add_menu, documents, edit_menu, editor_context, file_choice, gizmo_menu, view_menu};
 use balder_editor::command::{open, property};
 use balder_editor::project;
 use balder_editor::project::{game_build, game_library, recent};
@@ -46,24 +43,8 @@ def SCENE_EXTENSION = "scene";
 // The extension of the material files
 def MATERIAL_EXTENSION = "material";
 
-// The menus of the top row that act on the scene, absent while a material is shown
-def SCENE_MENUS = ["BAR/ADD", "BAR/VIEW", "BAR/GIZMO"];
-
-// The rails of the docks, absent with the docks while a material is shown
-def RAILS = ["BODY/LEFT_RAIL", "BODY/RIGHT_RAIL"];
-
 // The tool of the inspector, shown before Ctrl+F opens its filter
 def INSPECTOR_TOOL = "INSPECTOR";
-
-// The class of a widget taking no room (see inspector.style)
-def ABSENT = "absent";
-
-// The path of the tabs of the documents, on the top row
-def DOCUMENTS = "BAR/DOCUMENTS";
-
-// The colour seen where nothing is drawn while the scene has no environment, a grey (linear, exposed and tone mapped
-// with the scene)
-def BACKGROUND = makeVec3(0.07f, 0.07f, 0.075f);
 
 // The class of an item of a menu with nothing to do, greyed (see editor.style)
 def IDLE = "idle";
@@ -155,9 +136,6 @@ pub class EditorActivity over Activity {
     // made with the interface (see ctx)
     let dmut _ctx: (&EditorContext)? = none;
 
-    // The label telling the file of the scene and whether it has unsaved changes
-    let dmut _document: (&Label)? = none;
-
     // The scene files, the dialogs of the scenes starting from the directory of the one chosen last
     let dmut _scenes: &FileChoice = copy FileChoice(copy [SCENE_EXTENSION], "scenes");
 
@@ -166,11 +144,8 @@ pub class EditorActivity over Activity {
     let dmut _edit: (&EditMenu)? = none;
     let dmut _view: (&ViewMenu)? = none;
 
-    // The documents opened, in the order of their tabs, the scene shown being the document of the editor
-    let dmut _documents: [&Document] = [];
-
-    // The tabs of the documents, once the interface is loaded
-    let dmut _tabs: (&TabBar)? = none;
+    // The documents opened, a tab each, once the activity is started
+    let dmut _docs: (&Documents)? = none;
 
     // The material editor, and the panel of the materials of the mesh inspected, once the interface is loaded
     let dmut _materials: (&MaterialPanel)? = none;
@@ -188,10 +163,6 @@ pub class EditorActivity over Activity {
     let mut _materialChoice: MaterialChoice = MaterialChoice::OPEN;
     let mut _slotPart: usize = 0us;
     let mut _browsedMap: [c8] = "";
-
-    // The speeds of the flights of the viewport in the scene files closed, by their path, a scene opened again flown at
-    // the speed it was
-    let dmut _flightPaces: [[c8] => f32] = copy [];
 
     // What to do once the unsaved changes are saved or discarded
     let mut _pending: Pending = Pending::NOTHING;
@@ -243,10 +214,6 @@ pub class EditorActivity over Activity {
         self:.slot("scene::manager", &self:.onManagerClicked);
         self:.slot("scene::quit", &self:.onQuitClicked);
         self:.slot("game::compile", &self:.onCompileClicked);
-        self:.slot("documents::select", &self:.onTabSelected);
-        self:.slot("documents::close", &self:.onTabClosed);
-        self:.slot("documents::move", &self:.onTabMoved);
-        self:.slot("documents::new", &self:.onTabAdded);
 
         let dmut add = copy AddMenu(alias ctx);
         self:.behavior("add", alias add);
@@ -278,6 +245,10 @@ pub class EditorActivity over Activity {
         self._view = (alias view)?;
         let dmut gizmo = copy GizmoMenu(alias ctx);
         self:.behavior("gizmo", alias gizmo);
+        let dmut docs = copy Documents(alias ctx, alias edit, alias view, alias materials);
+        self:.behavior("documents", alias docs);
+        docs:.closeAsked():.connect(&self:.onCloseAsked);
+        self._docs = (alias docs)?;
 
         self.gui:.getRegistry():.register(EditorViewport::schema());
         self.gui:.getRegistry():.register(MaterialPreview::schema());
@@ -291,23 +262,9 @@ pub class EditorActivity over Activity {
         }
 
         ctx:.bind();
-        if let Ok(dmut l: &Label) = self.gui:.find("BODY/FOOT/DOCUMENT") {
-            self._document = (alias l)?;
-        }
-
-        if let Ok(dmut b: &TabBar) = self.gui:.find(DOCUMENTS) {
-            self._tabs = (alias b)?;
-        }
-
         if let Ok(dmut w: &Scene3DLayout) = self.gui:.find("BODY/MAIN/VIEW") {
             if let Ok(dmut s: &EditableScene) = alias w:.getScene() {
-                s.background = BACKGROUND;
-                let dmut first = copy SceneDocument();
-                self:.addDocument(alias first);
-                let dmut e = copy SceneEditor(alias s, alias first);
-                e:.edited():.connect(self.box, &self:.onEdited);
-                self.ctx.editor = (alias e)?;
-                self:.showTabs();
+                docs:.bind(alias s);
             }
         }
 
@@ -370,6 +327,7 @@ pub class EditorActivity over Activity {
      * the main scene, or a new scene; the library is built afterwards when it is not up to date
      * */
     fn openProject(mut self) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         let directory = getProjectPath().toStr();
         {
             let dmut project = copy Project::open(directory);
@@ -388,8 +346,8 @@ pub class EditorActivity over Activity {
         let (notice, toBuild) = self:.findLibrary(directory);
         // the first document is a new scene, which the first scene opened takes the place of
         let scene = self:.firstScene(recent.sceneOf(directory));
-        if scene.len != 0us { self:.openScene(scene); }
-        self:.showDocument();
+        if scene.len != 0us { docs:.openScene(scene); }
+        docs:.showDocument();
 
         if notice.len != 0us { self.ctx:.notify(notice); }
         if toBuild { self:.compile(); }
@@ -625,10 +583,11 @@ pub class EditorActivity over Activity {
      * stay unsaved, and so does a scene that lost what the classes no longer declare
      * */
     fn reload(mut self) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         let library = if let Ok(b) = self._build { b.library } else { return; };
         let dmut e = if let Ok(dmut e) = alias self.ctx.editor { alias e } else { return; };
 
-        let dmut scenes = alias self:.scenes();
+        let dmut scenes = alias docs:.scenes();
         let mut contents: [[c8]] = [];
         {
             for dmut d in alias scenes {
@@ -650,7 +609,7 @@ pub class EditorActivity over Activity {
         let mut unsaved: [bool] = [];
         for d in scenes { unsaved ~= [d.unsaved]; }
 
-        self:.dropNodes();
+        docs:.dropNodes();
         let mut status = self:.loadLibrary(library);
         for i, dmut d in alias scenes {
             {
@@ -682,7 +641,7 @@ pub class EditorActivity over Activity {
         }
 
         // the materials local to the scenes rebuilt are new assets of the same paths
-        for dmut d in alias self._documents if let dmut m: &MaterialDocument = alias d {
+        for dmut d in alias docs:.documents() if let dmut m: &MaterialDocument = alias d {
             if m.isLocal {
                 if let Ok(dmut a) = alias Assets::cachedMaterial(m.path) {
                     let dmut scene = alias m.scene;
@@ -691,24 +650,8 @@ pub class EditorActivity over Activity {
             }
         }
 
-        if let Ok(dmut p) = alias self._materials && self.ctx.material.hasValue { p:.refresh(); }
-        self:.showDocument();
-        if let Ok(dmut menu) = alias self._edit { menu:.showHistory(); }
+        docs:.refresh();
         self.ctx:.notify(status);
-    }
-
-    /**
-     * Drop the nodes of every document, the histories naming them dropped with them, so that no node of a class of the
-     * library of the game outlives it
-     * */
-    fn dropNodes(mut self) {
-        let dmut e = if let Ok(dmut e) = alias self.ctx.editor { alias e } else { return; };
-        for dmut d in alias self:.scenes() if !(d is e.document) {
-            d:.replaceParked(none, d.unsaved);
-        }
-
-        let nodes: [NodeDescription] = [];
-        self.ctx:.run(copy OpenCommand(copy SceneDescription(nodes), self:.documentName()));
     }
 
     /**
@@ -749,7 +692,8 @@ pub class EditorActivity over Activity {
      */
 
     fn onNewClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.newScene(); }
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
+        if b == SDL_BUTTON_LEFT { docs:.newScene(); }
     }
 
     fn onOpenClicked(mut self, b: u8) {
@@ -791,6 +735,7 @@ pub class EditorActivity over Activity {
      * inspector, or closes it
      * */
     fn onKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
         if !ctrl || self.ctx.isAsking() { return; }
 
@@ -804,15 +749,15 @@ pub class EditorActivity over Activity {
         } else if key == SDLK_S {
             self:.save();
         } else if key == SDLK_N && !shift {
-            self:.newScene();
+            docs:.newScene();
         } else if key == SDLK_O && !shift {
             self:.chooseScene();
         } else if key == SDLK_W && !shift {
             self:.closeShown();
         } else if (key == SDLK_TAB && !shift) || key == SDLK_PAGEDOWN {
-            self:.showNeighbour(true);
+            docs:.showNeighbour(true);
         } else if key == SDLK_TAB || key == SDLK_PAGEUP {
-            self:.showNeighbour(false);
+            docs:.showNeighbour(false);
         } else if key == SDLK_E && !shift {
             if let Ok(dmut a) = alias self._add { a:.openAddMenu(); }
         } else if key == SDLK_R && !shift {
@@ -845,56 +790,6 @@ pub class EditorActivity over Activity {
         }
     }
 
-    /**
-     * Open a new scene, blank, in a tab of its own, saved in a file of its own
-     * */
-    fn newScene(mut self) {
-        let dmut d = copy SceneDocument();
-        self:.addDocument(alias d);
-        self:.switchDocument(alias d);
-        self.ctx:.setStatus("New scene");
-    }
-
-    /**
-     * Open a scene file, in the tab showing it when it is open, in place of the scene shown when it is a new scene
-     * never changed, in a tab of its own otherwise
-     * */
-    fn openScene(mut self, path: [c8]) {
-        let opened = qualifiedPath(path);
-        for dmut d in alias self._documents if d.path == opened {
-            self:.switchDocument(alias d);
-            self.ctx:.setStatus(f"${d.name} is open");
-            return;
-        }
-
-        let dmut e = if let Ok(dmut e) = alias self.ctx.editor { alias e } else { return; };
-        {
-            let description = copy SceneDescription::fromFile(path);
-            if !e.document.isBlank {
-                let dmut d = copy SceneDocument();
-                self:.addDocument(alias d);
-                self:.switchDocument(alias d);
-            }
-
-            if self.ctx:.run(copy OpenCommand(description, Path(path).file())) {
-                let dmut d = alias e.document;
-                d.path = opened;
-                if let Ok(p) = self._flightPaces[opened] {
-                    d.flightPace = p;
-                    if let Ok(dmut v) = alias self.ctx.viewport { v.flightPace = p; }
-                }
-
-                self.ctx:.keepEdited(opened);
-                self:.showDocument();
-            }
-        } catch {
-            err: &BalderError => {
-                log::error #("Editor", "Failed to open the scene", err);
-                self.ctx:.setStatus(err.msg);
-            }
-        }
-    }
-
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -904,177 +799,23 @@ pub class EditorActivity over Activity {
      */
 
     /**
-     * A tab is clicked: its document is shown
-     * */
-    fn onTabSelected(mut self, index: usize) {
-        if index < self._documents.len {
-            self:.switchDocument(alias self._documents[index]);
-        }
-    }
-
-    /**
-     * The cross of a tab, or the middle button, asks to close its document
-     * */
-    fn onTabClosed(mut self, index: usize) {
-        if index < self._documents.len && !self.ctx.isAsking() {
-            self:.requestClose(alias self._documents[index]);
-        }
-    }
-
-    /**
-     * A tab is dragged to another place: its document follows it
-     * */
-    fn onTabMoved(mut self, moved: TabMove) {
-        if moved.from >= self._documents.len || moved.to >= self._documents.len { return; }
-
-        let dmut d = alias self._documents[moved.from];
-        let dmut rest: [&Document] = [];
-        for i, dmut x in alias self._documents if i != moved.from {
-            rest ~= [alias x];
-        }
-
-        let dmut order: [&Document] = [];
-        for i, dmut x in alias rest {
-            if i == moved.to { order ~= [alias d]; }
-            order ~= [alias x];
-        }
-
-        if moved.to == rest.len { order ~= [alias d]; }
-        self._documents = alias order;
-    }
-
-    /**
-     * The + after the tabs opens a new scene
-     * */
-    fn onTabAdded(mut self) {
-        self:.newScene();
-    }
-
-    /**
-     * Put a document after the others, in a tab of its own
-     * */
-    fn addDocument(mut self, dmut d: &Document) {
-        self._documents ~= [alias d];
-        if let Ok(dmut t) = alias self._tabs {
-            t:.addTab(d.title, unsaved-> d.unsaved);
-        }
-    }
-
-    /**
-     * Show a document in the viewport, the document shown kept as it is left: its nodes out of the scene, its
-     * selection, and the eye of the editor camera, which takes the one the document shown had (the camera looked
-     * through left first); a document whose nodes were dropped meanwhile builds them again
-     * */
-    fn switchDocument(mut self, dmut document: &Document) {
-        if let dmut m: &MaterialDocument = alias document {
-            self:.showMaterial(alias m);
-            return;
-        }
-
-        let dmut d = if let dmut s: &SceneDocument = alias document { alias s } else { return; };
-        self:.leaveMaterial();
-        self:.enterScene(alias d);
-        self.ctx:.keepEdited(d.path);
-        if let Ok(dmut menu) = alias self._view { menu:.showThrough(); }
-        self:.showDocument();
-        if let Ok(dmut menu) = alias self._edit { menu:.showHistory(); }
-    }
-
-    /**
-     * Put the nodes of a scene in the viewport, the scene of the editor kept as it is left (see switchDocument), the
-     * panels shown left as they are
-     * */
-    fn enterScene(mut self, dmut d: &SceneDocument) {
-        let dmut e = if let Ok(dmut e) = alias self.ctx.editor { alias e } else { return; };
-        if d is e.document { return; }
-
-        if let Ok(dmut v) = alias self.ctx.viewport {
-            if v.lookedThrough.hasValue { v:.lookThrough(none); }
-            e.document:.keepView(v.orbit, v.flightPace);
-        }
-
-        e:.switchTo(alias d);
-        if let Ok(dmut v) = alias self.ctx.viewport {
-            v.orbit = d.orbit;
-            v.flightPace = d.flightPace;
-        }
-
-        if let Ok(rebuilt) = d:.takeDescription() {
-            self.ctx:.run(copy OpenCommand(rebuilt._0, d.name));
-            if rebuilt._1 { e:.markUnsaved(); }
-        }
-    }
-
-    /**
-     * Show a material in place of the panels of the scene, the scene of a material local to it put in the viewport,
-     * the menus acting on the scene absent
-     * */
-    fn showMaterial(mut self, dmut m: &MaterialDocument) {
-        if let Ok(dmut s) = alias m.scene {
-            self:.enterScene(alias s);
-        }
-
-        self.ctx.material = (alias m)?;
-        if let Ok(dmut p) = alias self._materials {
-            p:.show((alias m)?, alias self:.scenes());
-        }
-
-        for menu in SCENE_MENUS { self:.setPresent(menu, false); }
-        if let Ok(dmut d) = alias self.ctx.docks { d:.setMaximized(false); }
-        if let Ok(dmut b) = alias self.ctx.bars { b:.showMaximized(); }
-        for rail in RAILS { self:.setPresent(rail, false); }
-
-        self:.showDocument();
-        if let Ok(dmut menu) = alias self._edit { menu:.showHistory(); }
-    }
-
-    /**
-     * Show the panels of the scene again in place of the material shown, the menus acting on the scene with them
-     * */
-    fn leaveMaterial(mut self) {
-        if !self.ctx.material.hasValue { return; }
-
-        self.ctx.material = none;
-        if let Ok(dmut p) = alias self._materials {
-            p:.show(none, alias self:.scenes());
-        }
-
-        for menu in SCENE_MENUS { self:.setPresent(menu, true); }
-        for rail in RAILS { self:.setPresent(rail, true); }
-    }
-
-    /**
-     * Make a widget present, or absent, taking no room
-     * */
-    fn setPresent(mut self, path: [c8], present: bool) {
-        if let Ok(dmut w) = alias self.gui:.find(path) {
-            let mut classes: [[c8]] = [];
-            for c in w.getClasses() if c != ABSENT { classes ~= [c]; }
-            if !present { classes ~= [ABSENT]; }
-            w:.setClasses(classes);
-        }
-    }
-
-    /**
-     * Show the tab after the one shown, or the one before it, going round
-     * */
-    fn showNeighbour(mut self, next: bool) {
-        let count = self._documents.len;
-        if count < 2us { return; }
-
-        let i = self:.shownIndex();
-        let to = if next { (i + 1us) % count } else { (i + count - 1us) % count };
-        self:.switchDocument(alias self._documents[to]);
-    }
-
-    /**
      * Close the document shown, asking first about its unsaved changes
      * */
     fn closeShown(mut self) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         if self.ctx.isAsking() { return; }
 
-        if let Ok(dmut d) = alias self:.shownDocument() {
+        if let Ok(dmut d) = alias docs:.shownDocument() {
             self:.requestClose(alias d);
+        }
+    }
+
+    /**
+     * The tab of a document asks to close it
+     * */
+    fn onCloseAsked(mut self, index: usize) {
+        if let Ok(dmut docs) = alias self._docs {
+            self:.requestClose(alias docs:.documents()[index]);
         }
     }
 
@@ -1082,135 +823,15 @@ pub class EditorActivity over Activity {
      * Close a document, shown first and asked about when it has unsaved changes: saved, discarded, or kept open
      * */
     fn requestClose(mut self, dmut d: &Document) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         if !d.unsaved {
-            self:.closeDocument(alias d);
+            docs:.closeDocument(alias d);
             return;
         }
 
-        self:.switchDocument(alias d);
+        docs:.switchDocument(alias d);
         self._closing = (alias d)?;
         self:.askAbout(d, Pending::CLOSE);
-    }
-
-    /**
-     * Close a document for good, its nodes dropped: the document after it is shown when it was shown, or the one before
-     * it when it was the last, a new scene when it was the only one
-     * */
-    fn closeDocument(mut self, dmut d: &Document) {
-        let dmut e = if let Ok(dmut e) = alias self.ctx.editor { alias e } else { return; };
-
-        // the materials local to a scene close with it, their changes being its own
-        if let s: &SceneDocument = d {
-            let dmut locals: [&Document] = [];
-            for dmut x in alias self._documents if let m: &MaterialDocument = x {
-                if let Ok(ms) = m.scene && ms is s { locals ~= [alias x]; }
-            }
-
-            for dmut l in alias locals { self:.closeDocument(alias l); }
-        }
-
-        let mut index = 0us;
-        for i, x in self._documents if x is d { index = i; }
-        let shown = self:.shownIndex() == index;
-
-        // the changes of a material discarded, the meshes drawing it drawing it as it was saved
-        if let dmut m: &MaterialDocument = alias d {
-            if m.unsaved { m:.discard(alias e.scene); }
-        }
-
-        // the editor keeps a scene in the viewport: the nearest other one, a new one when there is none
-        if d is e.document {
-            let dmut other: (&SceneDocument)? = none;
-            let mut distance = usize::max;
-            for i, dmut x in alias self._documents if let dmut s: &SceneDocument = alias x {
-                let away = if i > index { i - index } else { index - i };
-                if !(s is d) && away < distance {
-                    distance = away;
-                    other = (alias s)?;
-                }
-            }
-
-            if !other.hasValue {
-                let dmut n = copy SceneDocument();
-                self:.addDocument(alias n);
-                other = (alias n)?;
-            }
-
-            if let Ok(dmut o) = alias other { self:.enterScene(alias o); }
-        }
-
-        // the tab after it is shown, or the one before it when it was the last
-        if shown && self._documents.len > 1us {
-            let next = if index + 1us < self._documents.len { index + 1us } else { index - 1us };
-            self:.switchDocument(alias self._documents[next]);
-        }
-
-        if let dmut s: &SceneDocument = alias d {
-            if s.path.len != 0us { self._flightPaces[s.path] = s.flightPace; }
-            s:.replaceParked(none, false);
-        }
-
-        let dmut kept: [&Document] = [];
-        for dmut x in alias self._documents if !(x is d) {
-            kept ~= [alias x];
-        }
-
-        self._documents = alias kept;
-        if let Ok(dmut t) = alias self._tabs { t:.removeTab(index); }
-        self:.showTabs();
-        self.ctx:.setStatus(f"Closed ${d.name}");
-    }
-
-    /**
-     * Write the title of each document on its tab, a dot on those with unsaved changes, the tab of the document shown
-     * selected
-     * */
-    fn showTabs(mut self) {
-        let shown = self:.shownIndex();
-        if let Ok(dmut t) = alias self._tabs {
-            for i, d in self._documents {
-                t:.setTitle(i, d.title);
-                t:.setUnsaved(i, d.unsaved);
-            }
-
-            t:.select((shown)?);
-        }
-    }
-
-    /**
-     * @returns: the document shown, a material or the scene of the editor, none before there is one
-     * */
-    fn shownDocument(mut self)-> dmut (&Document)? {
-        if let Ok(dmut m) = alias self.ctx.material { return (alias m)?; }
-        if let Ok(dmut e) = alias self.ctx.editor { return (alias e.document)?; }
-        none
-    }
-
-    /**
-     * @returns: the scenes opened, in the order of their tabs
-     * */
-    fn scenes(mut self)-> dmut [&SceneDocument] {
-        let dmut res: [&SceneDocument] = [];
-        for dmut d in alias self._documents if let dmut s: &SceneDocument = alias d {
-            res ~= [alias s];
-        }
-
-        alias res
-    }
-
-    /**
-     * @returns: the index of the document shown among the documents, 0 before there is one
-     * */
-    fn shownIndex(mut self)-> usize {
-        if let Ok(m) = self.ctx.material {
-            for i, d in self._documents if d is m { return i; }
-        }
-
-        if let Ok(e) = self.ctx.editor {
-            for i, d in self._documents if d is e.document { return i; }
-        }
-
-        0us
     }
 
     /*!
@@ -1226,11 +847,12 @@ pub class EditorActivity over Activity {
      * changes of each document in turn, shown as it is asked about: saved, discarded, or kept, nothing done
      * */
     fn ask(mut self, then: Pending) {
-        for dmut d in alias self._documents if d.unsaved {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
+        for dmut d in alias docs:.documents() if d.unsaved {
             let mut discarded = false;
             for x in self._discarded if x is d { discarded = true; }
             if !discarded {
-                self:.switchDocument(alias d);
+                docs:.switchDocument(alias d);
                 self:.askAbout(d, then);
                 return;
             }
@@ -1283,13 +905,14 @@ pub class EditorActivity over Activity {
      * Discard the unsaved changes of the document shown, then do what was waiting for them
      * */
     fn discard(mut self) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         let then = self._pending;
         if then == Pending::CLOSE {
             self:.proceed(then);
             return;
         }
 
-        if let Ok(dmut d) = alias self:.shownDocument() {
+        if let Ok(dmut d) = alias docs:.shownDocument() {
             self._discarded ~= [alias d];
         }
 
@@ -1301,12 +924,13 @@ pub class EditorActivity over Activity {
      * about the next document before quitting or going back to the project manager, done once none is left
      * */
     fn proceed(mut self, then: Pending) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         self._pending = Pending::NOTHING;
         match then {
             Pending::CLOSE => {
                 if let Ok(dmut d) = alias self._closing {
                     self._closing = none;
-                    self:.closeDocument(alias d);
+                    docs:.closeDocument(alias d);
                 }
             }
             Pending::QUIT    => { self:.ask(then); }
@@ -1320,6 +944,7 @@ pub class EditorActivity over Activity {
      * closed; not while the library is being built, the build going on
      * */
     fn openManager(mut self) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         if let Ok(dmut b) = alias self._build && b:.isRunning() {
             self.ctx:.setStatus(f"The library of ${self.ctx.projectName()} is being built: back to the project manager once it is");
             return;
@@ -1327,12 +952,12 @@ pub class EditorActivity over Activity {
 
         // the materials of the cache keep the values of their files
         if let Ok(dmut e) = alias self.ctx.editor {
-            for dmut d in alias self._documents if let dmut m: &MaterialDocument = alias d {
+            for dmut d in alias docs:.documents() if let dmut m: &MaterialDocument = alias d {
                 if m.unsaved { m:.discard(alias e.scene); }
             }
         }
 
-        self:.dropNodes();
+        docs:.dropNodes();
         GameLibrary::unload();
         {
             self.app:.open!{&ProjectManagerActivity}(copy BalderConfig(editorFile(MANAGER_CONFIG)));
@@ -1355,19 +980,21 @@ pub class EditorActivity over Activity {
     }
 
     fn onSceneChosen(mut self, path: ([c8])?) {
-        if let Ok(p) = path { self:.openScene(qualifiedPath(p)); }
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
+        if let Ok(p) = path { docs:.openScene(qualifiedPath(p)); }
     }
 
     /**
      * Save the scene shown in its file, asking for one when it has none, then do what was waiting for the save
      * */
     fn save(mut self) {
+        let docs = if let Ok(x) = self._docs { x } else { return; };
         if let Ok(dmut m) = alias self.ctx.material && !m.isLocal {
             if self:.saveMaterial(alias m) { self:.proceed(self._pending); }
             return;
         }
 
-        let path = self:.shownPath();
+        let path = docs.shownPath();
         if path.len == 0us {
             self:.saveAs();
         } else if self:.write(path) {
@@ -1379,12 +1006,13 @@ pub class EditorActivity over Activity {
      * Ask for the file to save the scene shown in, then save it there
      * */
     fn saveAs(mut self) {
+        let docs = if let Ok(x) = self._docs { x } else { return; };
         if let Ok(m) = self.ctx.material && !m.isLocal {
             self:.chooseMaterialFile(MaterialChoice::SAVE_AS, "Save the material in another file", Document::stem(m.path));
             return;
         }
 
-        let path = self:.shownPath();
+        let path = docs.shownPath();
         let name = if path.len == 0us { "scene." ~ SCENE_EXTENSION } else { Path(path).file() };
         self.ctx:.choose(alias self._scenes, FileDialogMode::SAVE, "Save the scene", &self:.onSaveChosen, name-> name);
     }
@@ -1411,6 +1039,7 @@ pub class EditorActivity over Activity {
      * @returns: true iif the file is written, the status bar telling why it is not
      * */
     fn write(mut self, path: [c8])-> bool {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return false; };
         let dmut e = if let Ok(dmut e) = alias self.ctx.editor { alias e } else { return false; };
         {
             let dmut scene = alias e.scene;
@@ -1427,7 +1056,7 @@ pub class EditorActivity over Activity {
             }
         }
 
-        for dmut d in alias self._documents if d.path == path && !(d is e.document) {
+        for dmut d in alias docs:.documents() if d.path == path && !(d is e.document) {
             d.path = "";
         }
 
@@ -1435,7 +1064,7 @@ pub class EditorActivity over Activity {
         shown.path = path;
         e:.markSaved();
         self.ctx:.keepEdited(path);
-        self:.showDocument();
+        docs:.showDocument();
 
         let file = Path(path).file();
         if let Ok(name) = self:.addToProject(path) {
@@ -1445,50 +1074,6 @@ pub class EditorActivity over Activity {
         }
 
         true
-    }
-
-    /**
-     * Show the file of the scene shown and whether it has unsaved changes, in the title of the window, on its tab and
-     * on the right of the status bar
-     * */
-    fn showDocument(mut self) {
-        let unsaved = self:.unsaved();
-        let name = self:.documentName();
-        let mark = if unsaved { "*" } else { "" };
-        let project = if let Ok(p) = self.ctx.project { p.name } else { "no project" };
-        self.window:.setName(f"${name}${mark} - ${project} - Balder editor");
-
-        let path = if let Ok(m) = self.ctx.material { m.path } else { self:.shownPath() };
-        if let Ok(dmut l) = alias self._document {
-            let file = if path.len == 0us { "New scene, not saved yet" } else { path };
-            l:.setText(if unsaved { file ~ " — unsaved changes" } else { file });
-        }
-
-        self:.showTabs();
-    }
-
-    /**
-     * @returns: true iif the scene shown has changes not saved, its history not being where it was at the last save
-     * */
-    fn unsaved(mut self)-> bool {
-        if let Ok(m) = self.ctx.material && !m.isLocal { return m.unsaved; }
-        if let Ok(e) = self.ctx.editor { e.unsaved } else { false }
-    }
-
-    /**
-     * @returns: the name of the scene shown, the name of its file, or 'the new scene'
-     * */
-    fn documentName(mut self)-> [c8] {
-        if let Ok(m) = self.ctx.material { return m.name; }
-        if let Ok(e) = self.ctx.editor { e.document.name } else { "the new scene" }
-    }
-
-    /**
-     * @returns: the file of the scene of the editor, the scene shown or the scene of the local material shown, empty for a
-     * new scene
-     * */
-    fn shownPath(mut self)-> [c8] {
-        if let Ok(e) = self.ctx.editor { e.document.path } else { "" }
     }
 
     /*!
@@ -1574,9 +1159,10 @@ pub class EditorActivity over Activity {
      *    - mesh: the mesh it is opened from, drawn in its preview, empty for none
      * */
     fn openMaterial(mut self, path: [c8], mesh: [c8]) {
-        for dmut d in alias self._documents if let dmut m: &MaterialDocument = alias d {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
+        for dmut d in alias docs:.documents() if let dmut m: &MaterialDocument = alias d {
             if m.path == path {
-                self:.switchDocument(alias m);
+                docs:.switchDocument(alias m);
                 self.ctx:.setStatus(f"${m.name} is open");
                 return;
             }
@@ -1591,8 +1177,8 @@ pub class EditorActivity over Activity {
             }
 
             let dmut d = copy MaterialDocument(alias asset, scene-> alias scene, mesh-> mesh);
-            self:.addDocument(alias d);
-            self:.switchDocument(alias d);
+            docs:.addDocument(alias d);
+            docs:.switchDocument(alias d);
             self.ctx:.setStatus(if d.isReadOnly { f"Opened ${d.name}, read only: extract it to a file to change it" } else { f"Opened ${d.name}" });
         } catch {
             err: &BalderError => {
@@ -1607,6 +1193,7 @@ pub class EditorActivity over Activity {
      * @returns: true iif the file is written, the status bar telling why it is not
      * */
     fn saveMaterial(mut self, dmut m: &MaterialDocument)-> bool {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return false; };
         if m.isReadOnly {
             self.ctx:.setStatus("This material is read only: Extract to a file makes a copy that can be changed and saved");
             self._pending = Pending::NOTHING;
@@ -1628,7 +1215,7 @@ pub class EditorActivity over Activity {
             }
         }
 
-        self:.showDocument();
+        docs:.showDocument();
         self.ctx:.setStatus(f"Saved ${m.name}");
         true
     }
@@ -1721,10 +1308,7 @@ pub class EditorActivity over Activity {
      * Write the material shown again in its tab, in the panels and in the title, once its document changed of material
      * */
     fn refreshMaterial(mut self) {
-        if let Ok(dmut p) = alias self._materials { p:.refresh(); }
-        self:.showTabs();
-        self:.showDocument();
-        if let Ok(dmut menu) = alias self._edit { menu:.showHistory(); }
+        if let Ok(dmut docs) = alias self._docs { docs:.refresh(); }
     }
 
     /**
@@ -1732,6 +1316,7 @@ pub class EditorActivity over Activity {
      * whether it has unsaved changes
      * */
     fn onMaterialEdited(mut self) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         if let Ok(m) = self.ctx.material {
             if m.isLocal {
                 if let Ok(e) = self.ctx.editor { self.ctx:.setStatus(e.change); }
@@ -1740,8 +1325,7 @@ pub class EditorActivity over Activity {
             }
         }
 
-        self:.showDocument();
-        if let Ok(dmut menu) = alias self._edit { menu:.showHistory(); }
+        docs:.showDocument();
     }
 
     /**
@@ -1803,10 +1387,11 @@ pub class EditorActivity over Activity {
      * A node drawing the material shown is picked: its scene is shown, the node selected
      * */
     fn onUserPicked(mut self, index: usize) {
+        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
         let dmut panel = if let Ok(dmut p) = alias self._materials { alias p } else { return; };
         let dmut user = if let Ok(dmut u) = alias panel:.userAt(index) { alias u } else { return; };
 
-        self:.switchDocument(alias user.scene);
+        docs:.switchDocument(alias user.scene);
         if let Ok(dmut e) = alias self.ctx.editor {
             let dmut selection = alias e.scene.selection;
             selection:.clear();
@@ -1824,26 +1409,4 @@ pub class EditorActivity over Activity {
      * ====================================================================================================
      */
 
-    /**
-     * Tell in the status bar the last change of the scene, executed, undone or redone, whether the scene has unsaved
-     * changes, and in the Edit menu the changes to undo and to redo
-     * */
-    fn onEdited(mut self, _: &EditCommand) {
-        if let Ok(e) = self.ctx.editor {
-            self.ctx:.setStatus(e.change);
-        }
-
-        // the camera looked through removed, or replaced by a camera of the other projection
-        if let Ok(dmut v) = alias self.ctx.viewport {
-            if v:.checkLookedThrough() { if let Ok(dmut menu) = alias self._view { menu:.showThrough(); } }
-        }
-
-        // a change of the local material shown, or of the nodes drawing the material shown
-        if self.ctx.material.hasValue {
-            if let Ok(dmut p) = alias self._materials { p:.refresh(); }
-        }
-
-        self:.showDocument();
-        if let Ok(dmut menu) = alias self._edit { menu:.showHistory(); }
-    }
 }
