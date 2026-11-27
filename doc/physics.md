@@ -490,15 +490,17 @@ surfaces at most. The `CharacterSettings`:
 | `snapDistance` | 0.3 m | how far below a character that was on the floor and does not go up it is put back on the ground, walking down a slope or a stair |
 | `skin` | 0.01 m | the distance kept from the surfaces |
 | `coyoteTime` | 0.15 s | the time the character can still jump once it walked off the floor (`canJump`, spent by `jumped`) |
-| `pushMass` | 40 kg | the mass the character pushes the dynamic bodies it walks into with |
+| `pushMass` | 40 kg | the mass the character pushes the dynamic bodies it walks into with, never past its own speed |
 | `maxSlides`, `depenetrations` | 4, 4 | the surfaces slid along and the passes out of the bodies at most in a move |
 
 After the motion, the floor is looked for a skin and a little more under the capsule (`onFloor`, `floorNormal`,
 `floorBody`); `onWall` and `onCeiling` tell what else the move met. The velocity given back has lost what the walls
 stopped and, on the floor, its fall; a floor does not turn it up a slope, so the next move is not taken for a jump.
-The dynamic bodies met across the up direction are pushed by an impulse at the point met, the speed of the character
-against them times the smaller of `pushMass` and their mass; the solver never pushes the character back, its body
-being kinematic.
+The dynamic bodies met across the up direction are pushed once a move, by an impulse at the first point met: the speed
+of the character against a body beyond the speed the body already has that way, times the smaller of `pushMass` and its
+mass. A body lighter than `pushMass` walked into tick after tick moves at the speed of the character, never faster; a
+heavier one gains the momentum of `pushMass` at each tick, up to that speed. The solver never pushes the character
+back, its body being kinematic.
 
 ## The debug view
 
@@ -601,7 +603,5 @@ and the scene files, and read from the quaternion once it is set as one (`orient
 ## Not done yet
 
 - the joints in the scene files and in the editor;
-- the convex decomposition of the models at the export of a project (BAL-138), the editor no longer decomposing them;
-- the play mode of the editor, simulating the scene edited (BAL-134).
-- an example walking a character through a level.
+- the convex decomposition of the models at the export of a project (BAL-138), the editor no longer decomposing them.
 

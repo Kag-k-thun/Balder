@@ -253,6 +253,41 @@ connections without them being made. The actors built in code connect their sign
 `lever.pressed:.connect(alias box, &door:.open)`, or give a node its connections (`node.connections = …`) before
 building, as the scene files do.
 
+## Ticks
+
+An actor runs code at each tick of its scene by asking for its ticks (`self.ticked = true`, in its constructor) and
+overriding `onTick (mut self, delta: Duration)`: it moves, reads the keyboard, emits its signals. The editor ticks the
+actors only while the scene is played (see *Playing* in `doc/editor.md`), the nodes of the editor ticking still: an
+actor placed in a scene does nothing until Play, and Stop puts it back where it was placed.
+
+```
+#[actor ("spinner", category-> "Gameplay")]
+pub class Spinner over Node3D {
+
+    #[export (degrees-> true)]
+    pub let mut speed: f32 = 1.0f;
+
+    pub self (name: [c8], dmut parent: &Node)
+        with super(name, alias parent)
+    {
+        self.ticked = true;
+    }
+
+    pub over onEnter(mut self, dmut _: &Scene) {}
+    pub over onExit(mut self, dmut _: &Scene) {}
+
+    pub over onTick(mut self, delta: Duration) {
+        let r = self.rotation;
+        self.rotation = makeVec3(r.x, r.y + self.speed * cast!f32(delta.allMicros) / 1_000_000.0f, r.z);
+    }
+}
+```
+
+An actor can be over a built-in class of Balder rather than over `Node3D`, keeping what the built-in class does: the
+player of the *Third person* template is over `CharacterBody3D` (its capsule, its controller and its body entering the
+physics of the scene as any character), moved by `moveAndSlide` at each tick. Its scene file holds the properties of the
+actor class only, the built-in ones taking their defaults.
+
 ## Inheritance
 
 An actor class over another actor class has the properties, the signals and the slots of the other one, then its own:
