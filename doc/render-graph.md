@@ -187,8 +187,14 @@ flowchart LR
 
 The `debugView` of a camera (`DebugView`) shows what its g-buffer holds instead of the materials lit: a colour per
 triangle, per cluster or per level of detail, written in the g-buffer by the shaders of the materials and lit from the
-eye by the composition, or one channel of the materials alone, unlit, written by the composition (the base colour, the roughness or the metalness in grey, the normals bent by
-their maps, the occlusion of the maps, the emitted light), as the preview of the material editor shows them.
+eye by the composition; the edges of the triangles (`WIREFRAME`, 4), the shaders writing the colour of each triangle as
+for `TRIANGLES` and the composition drawing an edge, light, on a texel whose right or lower neighbour holds another
+colour or whose neighbours see the background (the silhouettes), the faces a flat grey lit from the eye, so that only
+the edges seen are drawn, the hidden ones left out (the g-buffer holds the nearest triangle only); or one channel of
+the materials alone, unlit, written by the composition (the base colour, the roughness or the metalness in grey, the
+normals bent by their maps, the occlusion of the maps, the emitted light), as the preview of the material editor shows
+them. The views of the channels start from 5 (`FIRST_CHANNEL_VIEW` of the shaders of the materials and of the
+composition), those before it showing the geometry.
 
 ## Skinning
 
