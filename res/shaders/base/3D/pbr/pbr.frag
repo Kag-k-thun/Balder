@@ -72,8 +72,11 @@ layout (std430, set = 0, binding = 7) readonly buffer Materials {
 const uint OUTLINED = 0x80000000u;
 
 // The first debug view of a channel of the materials (see DebugView), shaded by the composition from the materials
-const uint FIRST_CHANNEL_VIEW = 4u;
+const uint FIRST_CHANNEL_VIEW = 5u;
 
+// The debug view of the edges of the triangles, the g-buffer holding the colour of each triangle as for TRIANGLES, the
+// composition drawing the edges where it changes
+const uint WIREFRAME_VIEW = 4u;
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -176,7 +179,7 @@ vec3 hashColor (uint h) {
  */
 vec3 debugColor () {
     uint word = inDebug.y, cluster = inDebug.z, primitive = uint (gl_PrimitiveID);
-    if (inDebug.x == 1u) {
+    if (inDebug.x == 1u || inDebug.x == WIREFRAME_VIEW) {
         uint id = cluster == NO_CLUSTER ? primitive : hash (cluster) + primitive;
         return hashColor (hash (word * 0x9e3779b9u + id));
     }
