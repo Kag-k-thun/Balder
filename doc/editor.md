@@ -5,7 +5,8 @@ project: it opens on the project manager, then the editor window shows the outli
 the files of the project, its viewport in the middle and the inspector of the node selected on the right, under a top row and above a status bar.
 The top row holds the logo, the menus (Scene, Add, Edit, View, and Gizmo: Select, Translate, Rotate and Scale, Q, W, E
 and R, as the tools of the toolbar of the viewport), a seam, the tabs of the scenes opened (see the
-documents below), then Compile, and Play, Pause and Stop, idle until the play mode (BAL-134). The window reads as one:
+documents below), then Compile, the camera the game is played through, and Play, Pause, Step and Stop (see *Playing*
+below). The window reads as one:
 no space between its panels but a seam of a pixel (`$edge`), the space inside the rows and never around them, bars and
 rows of 22 to 32 pixels (the top row 32, the items of the menus 24 with their shortcut right-aligned and muted, the
 rows of the outline 22, the headers of the sections of the inspector 24, the status bar 22), square panels and corners
@@ -24,7 +25,7 @@ target/bin/balder-editor --engine-dir path/to/balder           # run from elsewh
 | `editor/src` | the sources, the library `balder_editor` (the target `balder-editor` of `gyllir.toml`, built as `libBalderEditor.a`), its entry `runEditor` |
 | `editor/bin` | the `main` of the editor, the target `editor` (built as `balder-editor`, `exports = true`) |
 | `editor/ui` | the `.gui` and the `.style` files of its interface |
-| `editor/templates` | the templates a new project starts from (`empty`) |
+| `editor/templates` | the templates a new project starts from (`empty`, `third_person`) |
 | `editor/editor.toml`, `editor/manager.toml` | the configurations of the window of the editor and of the project manager |
 
 ## Projects
@@ -75,8 +76,11 @@ module of a game.
 - **The project manager** (`ProjectManagerActivity`) is the first window: the projects opened last, their names, their
   folders and when they were opened, the one opened last first (a project whose `project.toml` is gone listed as
   missing). A double click, Enter or *Open* opens one in the editor window, the manager closing. *New project…* asks
-  for a name and a location, and creates the project in a new folder of the location named after it (`My Game` in
-  `my_game`) from the template `editor/templates/empty` (`ProjectTemplate`: `{{name}}`, `{{package}}` and
+  for a template, a name and a location, and creates the project in a new folder of the location named after it (`My
+  Game` in `my_game`) from the template chosen (`ProjectTemplate`): *Empty* (`editor/templates/empty`, a ground, a cube
+  and a sphere, an empty library) or *Third person* (`editor/templates/third_person`, an actor class `Player` over
+  `CharacterBody3D` walking, running and jumping with its camera under it, a stair of crates up to a platform, a ramp,
+  a tall crate and a crate pushed around), the dialog telling what each holds. A template has `{{name}}`, `{{package}}` and
   `{{compiler}}` filled in the names and the contents of its files, a name starting with `_` starting with a dot, the
   scenes given ids of their own); *Import…* opens the folder of a project; *Remove from the list* forgets one, its
   files staying. The list is kept in `$XDG_CONFIG_HOME/balder/projects.toml` (`~/.config/balder/projects.toml`,
@@ -101,6 +105,34 @@ module of a game.
   becoming its main scene; a scene saved elsewhere is not one of its scenes. The title tells the scene and the project.
   *Scene → Back to the project manager* closes the editor for the manager, asking first about the unsaved changes, and
   closes the library of the game (not while it is being built).
+
+## Playing
+
+The scene shown is played in the viewport (`PlayBar`, mounted as `play`; `SceneEditor::play`), from the buttons on the
+right of the top row or the keys of the window: **Play** (F5) runs a copy of the scene, its nodes described as its file
+would save them and built again in their place (the materials local to the file staying those of the scene edited),
+the nodes edited parked by the document as when another tab is shown; **Pause** (F7) makes the game wait, **Play**
+(*Resume*) going on; **Step** (F6) plays one tick of the game paused (`EditableScene::step`); **Stop** (F8) drops the
+copy and puts the nodes edited back as they were, with the nodes they had selected, whatever the game moved, spawned or
+destroyed. While the scene is not played, its game does not run: its physics is not simulated and its actors are not
+ticked (`EditableScene::ticks`: the nodes of no actor class are, the gizmos and the icons of the editor among them);
+played, its actors tick and its physics steps (`EditableScene.playing`).
+
+The choice before Play names the camera the game is played through, kept by each document (`PlayCamera`):
+
+| Choice | The viewport shows |
+|---|---|
+| Active camera | the active camera of the scene (the camera `active: true`, else its first camera), the cameras the game makes active followed |
+| a camera of the scene | that camera, by its id, whichever camera the game makes active |
+| Editor camera | the game from the eye of the viewport, its controls moving it as they do |
+
+Through a camera of the scene, the viewport leaves its controls (the keys and the moves of the mouse going to the game)
+and its overlays out (the grid, the icons, the colliders, the axes of the view); through the editor camera they stay. In
+both, a click selects nothing and the gizmo draws no handle. A scene without a camera is played through the editor
+camera. The outline shows the nodes played. The scene cannot change while it is played: a command is refused, the
+status bar telling to stop the game first, undo and redo do nothing; *Save* writes the nodes edited, not the nodes
+played; showing another tab, closing the scene, compiling the library of the game or going back to the project manager
+stops the game first.
 
 ## Documents
 

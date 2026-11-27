@@ -322,7 +322,8 @@ Image "res:/images/logo.png";
   graphemes that fit with `…` after them, a space before the cut left out (`Inner…`, not `Inner …`), the ellipsis
   alone when no grapheme fits. The text of the label is kept whole (`getText`), only its drawing is cut; a wrapped
   text, or one of several lines, is clipped.
-- **A dropdown opens its list in its menu layout**, as a menu button its popup, so it works only inside a `MenuLayout`.
+- **A dropdown opens its list in its menu layout**, as a menu button its popup, so it works only inside a `MenuLayout`
+  (an [overlay](#dialogs-and-overlays) being one, its dropdowns and menu buttons open over it).
   The list is its `::popup`, at least as wide as the dropdown, its items its `::item` in the states `:hover` and
   `:selected`. It opens under the dropdown, or above it when its items do not fit under it and there is more room above,
   at most as high as the room on that side and as the `max-height` of `::popup`. Higher items are scrolled with the
@@ -514,7 +515,8 @@ fn onClearClicked (mut self, button: u8) {
   under it keep being drawn and ticked but receive nothing: the top overlay takes the mouse, a click on the backdrop
   goes to no widget, and Tab moves the focus among its widgets. The slots of the dialog run in the thread of the
   caller. `WidgetManager.openOverlay (widget)` and `closeOverlay (overlay)` open and close one for any widget, and its
-  `on-dismiss` is emitted by Escape.
+  `on-dismiss` is emitted by Escape. An overlay is the content of a `MenuLayout` of its own, the lists of its dropdowns
+  and the popups of its menu buttons opening over it.
 - **`DialogMode::WINDOW` shows it in a window of its own**, opened by the application with the configuration of the
   dialog (`res:/dialog/*.toml`), its title given to the dialog (`title->`); the other windows keep their input. Its
   slots run in the thread of that window, its answer in the thread of the caller as well.
