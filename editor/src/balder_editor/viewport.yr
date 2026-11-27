@@ -1,12 +1,14 @@
 in viewport;
 
 use balder_editor::{ground_grid, orbit};
+use balder_editor::command::projection;
 use balder::core::application::signal;
 use balder::interface::loader::registry::schema;
 use balder::interface::widget::layout::d3scene::gizmo;
 use balder::math::{_, bounds};
 use balder::scene;
 use balder::scene::{debug, edit};
+use balder::scene::gizmo::{axis_view, view_gizmo};
 use balder::scene::node::node3D;
 use balder::scene::node::node3D::{camera, transform};
 use balder::scene::node::node3D::camera::flight;
@@ -22,6 +24,11 @@ use ::sdl3::{keyboard, keycode, mouse, scancode};
  * */
 pub def CAMERA_NODE = "__editor_camera__";
 
+// The orthographic camera of the editor, drawing the axis views, and the orientation gizmo of the view, under the root
+// of the scene
+pub def ORTHO_NODE = "__editor_ortho__";
+def VIEW_GIZMO_NODE = "__view_gizmo__";
+
 // The layer of the debug lines of the scene the grid of the ground is drawn in
 def GRID_LAYER = "__grid__";
 
@@ -34,6 +41,11 @@ def PAN_SPEED = 1.2f;
 // The turn of the eye flying for a move of the mouse across the whole viewport, in radian
 def LOOK_SPEED = 4.0f;
 
+// The field of view of the cameras of the editor, in degrees, and their planes, in metres, those of a new editor
+def DEFAULT_FOV = 60.0f;
+def DEFAULT_NEAR = 0.1f;
+def DEFAULT_FAR = 2000.0f;
+
 /**
  * The viewport of the editor: a gizmo moving the nodes selected (see SceneGizmo), the icons of the nodes without
  * geometry (see NodeIcons), the grid of the ground in metres (see GroundGrid) and the camera of the editor, turning
@@ -44,6 +56,13 @@ def LOOK_SPEED = 4.0f;
  * @info: the camera of the editor draws the scene in place of its active camera (see Scene::setViewCamera), which the
  * icons only mark; the viewport looks through a camera of the scene instead (see lookThrough), the controls then moving
  * that camera, each move emitted by piloted to be recorded as a change of its transform (see pilotEdit)
+ * @info: the camera of the editor is a perspective camera or an orthographic one (see projection), the orthographic one
+ * standing half its far plane back from the point looked at, so that nothing between the eye and the screen is cut,
+ * and seeing there what the perspective one sees; the keys
+ * 7, 1 and 3 of the numpad look along the axes of the world, Ctrl from the other side, orthographically (see
+ * alignView), orbiting giving back the projection the view had. The orientation gizmo in the top right corner of the
+ * image (see ViewGizmo) looks along the end clicked, and orbits the eye when dragged; viewChanged tells each change of
+ * the view
  * */
 pub class EditorViewport over SceneGizmo {
 
@@ -91,6 +110,31 @@ pub class EditorViewport over SceneGizmo {
     // it looks through
     //
     let mut _display: DebugView = DebugView::NONE;
+
+    // The orthographic camera of the editor, drawing the axis views and the orthographic projection of the view
+    let dmut _ortho: (&OrthoCamera)? = none;
+
+    // True while the camera of the editor draws through its orthographic projection
+    let mut _orthographic: bool = false;
+
+    // The axis view the eye looks along, none once it orbits away
+    let mut _axis: (AxisView)? = none;
+
+    // The projection the camera of the editor had before the axis view, given back when the eye orbits away
+    let mut _orthographicBefore: bool = false;
+
+    // The orientation gizmo in the top right corner of the image, created with the scene
+    let dmut _viewGizmo: (&ViewGizmo)? = none;
+
+    // While the left button is held on the orientation gizmo: the end pressed (none on the disc), and true once the drag
+    // orbited the eye
+    let mut _onViewGizmo: bool = false;
+    let mut _pressedEnd: (AxisView)? = none;
+    let mut _orbitedOnGizmo: bool = false;
+
+    // The signal emitted when the view changed: its camera, its projection, its field, its planes, its axis view or the
+    // eye
+    let dmut _viewChanged: (&Signal!{()})? = none;
 
     /*!
      * ====================================================================================================
@@ -211,6 +255,9 @@ pub class EditorViewport over SceneGizmo {
         if let Ok(dmut c) = alias self._camera {
             c.debugView = view;
         }
+        if let Ok(dmut o) = alias self._ortho {
+            o.debugView = view;
+        }
         if let Ok(dmut c) = alias self._through {
             c.debugView = view;
         }
@@ -238,20 +285,234 @@ pub class EditorViewport over SceneGizmo {
     }
 
     /**
-     * Create the camera of the editor under the root of the scene, once it is created, the scene drawn through it in
-     * place of its active camera
+     * Create the cameras of the editor and the orientation gizmo under the root of the scene, once it is created, the
+     * scene drawn through the perspective camera in place of its active camera
      * */
     pub over onSceneCreated(mut self, dmut scene: &Scene) {
         self.__super__:.onSceneCreated(alias scene);
 
         let dmut cam = copy PerspectiveCamera(CAMERA_NODE, alias scene:.getRootNode());
-        cam.fov = 60.0f;
-        cam.far = 2000.0f;
+        cam.fov = DEFAULT_FOV;
+        cam.far = DEFAULT_FAR;
         cam.debugView = self._display;
 
-        scene:.setViewCamera(alias cam);
+        let dmut ortho = copy OrthoCamera(ORTHO_NODE, alias scene:.getRootNode());
+        ortho.far = DEFAULT_FAR;
+        ortho.debugView = self._display;
+
+        let dmut axes = copy ViewGizmo(VIEW_GIZMO_NODE, alias scene:.getRootNode());
+
         self._camera = (alias cam)?;
+        self._ortho = (alias ortho)?;
+        self._viewGizmo = (alias axes)?;
+        self:.useOwnCamera();
         self:.placeCamera();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          PROJECTION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the projection of the camera drawing the view: the camera of the scene looked through, or the camera of
+     * the editor
+     * */
+    @field
+    pub fn projection(self)-> CameraProjection {
+        if let Ok(c) = self._through { return c.projection(); }
+        if self._orthographic { CameraProjection::ORTHOGRAPHIC } else { CameraProjection::PERSPECTIVE }
+    }
+
+    /**
+     * Draw the view through the perspective camera of the editor or through its orthographic one, the eye kept, the
+     * axis view left; a camera of the scene looked through keeps its projection (see ProjectionCommand)
+     * */
+    @field
+    pub fn projection(mut self, projection: CameraProjection) {
+        if self._through.hasValue { return; }
+
+        self._axis = none;
+        self:.useOrthographic(projection == CameraProjection::ORTHOGRAPHIC);
+    }
+
+    /**
+     * @returns: the field of view of the perspective camera of the editor, in degrees
+     * */
+    @field
+    pub fn fov(self)-> f32 {
+        if let Ok(c) = self._camera { c.fov } else { DEFAULT_FOV }
+    }
+
+    /**
+     * Change the field of view of the perspective camera of the editor, in degrees, the orthographic one seeing at the
+     * point looked at what it sees there
+     * */
+    @field
+    pub fn fov(mut self, fov: f32) {
+        if let Ok(dmut c) = alias self._camera { c.fov = fov; }
+        self:.placeCamera();
+    }
+
+    /**
+     * @returns: the height of the view of the orthographic camera of the editor, in metres: what the perspective one
+     * sees at the point looked at
+     * */
+    @field
+    pub fn viewSize(self)-> f32 {
+        framedSize(self.fov, self._orbit.distance)
+    }
+
+    /**
+     * Change the height of the view of the orthographic camera of the editor, the eye coming closer to the point looked
+     * at or going farther, so that the perspective camera sees the same there
+     * */
+    @field
+    pub fn viewSize(mut self, size: f32) {
+        if size <= 0.0f { return; }
+
+        self._orbit.distance = size / (2.0f * math::tan(radian(self.fov) / 2.0f));
+        self:.placeCamera();
+    }
+
+    /**
+     * @returns: the near plane of the cameras of the editor, in metres
+     * */
+    @field
+    pub fn nearPlane(self)-> f32 {
+        if let Ok(c) = self._camera { c.near } else { DEFAULT_NEAR }
+    }
+
+    /**
+     * Move the near plane of the cameras of the editor, the far plane past it (see Camera::checkPlanes)
+     * */
+    @field
+    pub fn nearPlane(mut self, near: f32) {
+        if let Ok(dmut c) = alias self._camera { c.near = near; }
+        if let Ok(dmut o) = alias self._ortho { o.near = near; }
+        self:.placeCamera();
+    }
+
+    /**
+     * @returns: the far plane of the cameras of the editor, in metres
+     * */
+    @field
+    pub fn farPlane(self)-> f32 {
+        if let Ok(c) = self._camera { c.far } else { DEFAULT_FAR }
+    }
+
+    /**
+     * Move the far plane of the cameras of the editor, the orthographic one standing half of it back from the point
+     * looked at
+     * */
+    @field
+    pub fn farPlane(mut self, far: f32) {
+        if let Ok(dmut c) = alias self._camera { c.far = far; }
+        if let Ok(dmut o) = alias self._ortho { o.far = far; }
+        self:.placeCamera();
+    }
+
+    /**
+     * @returns: the axis view the eye looks along, none once it orbited away
+     * */
+    @field
+    pub fn axisView(self)-> (AxisView)? {
+        self._axis
+    }
+
+    /**
+     * Look along an axis of the world from a side of the point looked at, at the same distance, through the
+     * orthographic camera of the editor; looking through a camera of the scene, that camera turns, its projection kept
+     * @info: orbiting the eye (the middle button, the disc of the orientation gizmo, a flight) leaves the axis view, the
+     * projection the view had before it given back (see leaveAxisView); panning and zooming keep it
+     * */
+    pub fn alignView(mut self, view: AxisView) {
+        self:.land();
+        self:.beginPilot();
+        if !self._axis.hasValue { self._orthographicBefore = self._orthographic; }
+
+        self._axis = view?;
+        self._orbit:.along(sideOf(view));
+        if self._through.hasValue {
+            self:.placeCamera();
+        } else {
+            self:.useOrthographic(true);
+        }
+
+        self:.endPilot();
+    }
+
+    /**
+     * Look through the perspective camera of the editor again, from the eye it has at first, its field of view and its
+     * planes those of a new editor
+     * */
+    pub fn resetCamera(mut self) {
+        self:.lookThrough(none);
+        self._axis = none;
+        self._orbit = OrbitView();
+        self.fov = DEFAULT_FOV;
+        self.nearPlane = DEFAULT_NEAR;
+        self.farPlane = DEFAULT_FAR;
+        self:.useOrthographic(false);
+    }
+
+    /**
+     * @returns: the signal emitted when the view changed: its camera, its projection, its field, its planes, its axis
+     * view or the eye
+     * */
+    pub fn viewChanged(mut self)-> dmut &Signal!{()} {
+        if let Ok(dmut s) = alias self._viewChanged {
+            return alias s;
+        }
+
+        let dmut s = copy Signal!{()} ();
+        self._viewChanged = (alias s)?;
+
+        alias s
+    }
+
+    /**
+     * Leave the axis view before the eye orbits away from it, the camera of the editor taking back the projection it
+     * had before it
+     * */
+    fn leaveAxisView(mut self) {
+        if !self._axis.hasValue { return; }
+
+        self._axis = none;
+        if !self._through.hasValue {
+            self:.useOrthographic(self._orthographicBefore);
+        }
+    }
+
+    /**
+     * Draw through the orthographic camera of the editor or through its perspective one, unless the view looks through
+     * a camera of the scene
+     * */
+    fn useOrthographic(mut self, on: bool) {
+        self._orthographic = on;
+        if !self._through.hasValue { self:.useOwnCamera(); }
+        self:.placeCamera();
+    }
+
+    /**
+     * Draw the scene through the camera of the editor of the projection in use, in place of its active camera
+     * */
+    fn useOwnCamera(mut self) {
+        let dmut scene = if let Ok(dmut s) = alias self:.getScene() { alias s } else { return; };
+        if self._orthographic {
+            if let Ok(dmut o) = alias self._ortho { scene:.setViewCamera(alias o); }
+        } else if let Ok(dmut c) = alias self._camera {
+            scene:.setViewCamera(alias c);
+        }
+    }
+
+    fn emitViewChanged(mut self) {
+        if let Ok(dmut s) = alias self._viewChanged {
+            s:.emit();
+        }
     }
 
     /*!
@@ -277,6 +538,7 @@ pub class EditorViewport over SceneGizmo {
     pub fn lookThrough(mut self, dmut cam: (&Camera)?) {
         self:.land();
         self:.endPilot();
+        self:.leaveAxisView();
 
         let dmut scene = if let Ok(dmut s) = alias self:.getScene() { alias s } else { return; };
 
@@ -294,12 +556,11 @@ pub class EditorViewport over SceneGizmo {
         } else if self._through.hasValue {
             self._through = none;
             self._orbit = self._ownOrbit;
-            if let Ok(dmut own) = alias self._camera {
-                scene:.setViewCamera(alias own);
-            }
-
+            self:.useOwnCamera();
             self:.placeCamera();
         }
+
+        self:.emitViewChanged();
     }
 
     /**
@@ -401,16 +662,25 @@ pub class EditorViewport over SceneGizmo {
 
     /**
      * Place the camera at the eye, looking at the point it turns around: the camera looked through, in the space of its
-     * parent, or the camera of the editor
+     * parent, or the camera of the editor, the orthographic one half its far plane back, so that nothing between the eye
+     * and the screen is cut, seeing at that point what the perspective one sees there
      * */
     fn placeCamera(mut self) {
         if let Ok(dmut c) = alias self._through {
             self._orbit.applyUnder(alias c);
+        } else if self._orthographic {
+            if let Ok(dmut o) = alias self._ortho {
+                let mut back = self._orbit;
+                back.distance = o.far / 2.0f;
+                back.applyTo(alias o);
+                o.size = framedSize(self.fov, self._orbit.distance);
+            }
         } else if let Ok(dmut cam) = alias self._camera {
             self._orbit.applyTo(alias cam);
         }
 
         self:.drawGrid();
+        self:.emitViewChanged();
     }
 
     /**
@@ -450,6 +720,7 @@ pub class EditorViewport over SceneGizmo {
      * Start flying: the mouse is captured, its moves turning the eye
      * */
     fn takeOff(mut self) {
+        self:.leaveAxisView();
         self:.beginPilot();
         self._flying = true;
         self._flight:.stop();
@@ -501,9 +772,14 @@ pub class EditorViewport over SceneGizmo {
      */
 
     /**
-     * The right button takes off, the eye flying while it is held
+     * A press of the left button on the orientation gizmo is kept for it, picking nothing; the right button takes off,
+     * the eye flying while it is held
      * */
     pub over onClick(mut self, pos: vec2, button: u8)-> dmut(&Widget)? {
+        if button == SDL_BUTTON_LEFT && self:.pressViewGizmo(pos) {
+            return (alias self)?;
+        }
+
         if button == SDL_BUTTON_RIGHT {
             self:.takeOff();
         }
@@ -512,10 +788,41 @@ pub class EditorViewport over SceneGizmo {
     }
 
     /**
+     * Releasing the left button pressed on the orientation gizmo looks along the end pressed, unless the drag orbited
+     * the eye
+     * */
+    pub over onClickEnd(mut self, button: u8)-> dmut(&Widget)? {
+        if button == SDL_BUTTON_LEFT && self._onViewGizmo {
+            self._onViewGizmo = false;
+            if self._orbitedOnGizmo {
+                self:.endPilot();
+            } else if let Ok(v) = self._pressedEnd {
+                self:.alignView(v);
+            }
+
+            return (alias self)?;
+        }
+
+        self.__super__:.onClickEnd(button)
+    }
+
+    /**
      * The middle button turns the eye around the point it looks at, slides it with Shift; the right button turns the
-     * eye flying; the left button drags the gizmo
+     * eye flying; the left button dragged on the orientation gizmo turns the eye, and drags the transform gizmo elsewhere
      * */
     pub over onSliding(mut self, pos: vec2, speed: vec2, button: u8) {
+        if button == SDL_BUTTON_LEFT && self._onViewGizmo {
+            if !self._orbitedOnGizmo {
+                self._orbitedOnGizmo = true;
+                self:.leaveAxisView();
+                self:.beginPilot();
+            }
+
+            self._orbit:.orbit(speed.x * ORBIT_SPEED, speed.y * ORBIT_SPEED);
+            self:.placeCamera();
+            return;
+        }
+
         if button == SDL_BUTTON_RIGHT && self._flying {
             self._orbit:.look(speed.x * LOOK_SPEED, speed.y * LOOK_SPEED);
             self:.placeCamera();
@@ -531,6 +838,7 @@ pub class EditorViewport over SceneGizmo {
         if (SDL_GetModState() & SDL_KMOD_SHIFT) != 0u16 {
             self._orbit:.pan(speed.x * PAN_SPEED, speed.y * PAN_SPEED);
         } else {
+            self:.leaveAxisView();
             self._orbit:.orbit(speed.x * ORBIT_SPEED, speed.y * ORBIT_SPEED);
         }
 
@@ -548,6 +856,37 @@ pub class EditorViewport over SceneGizmo {
         }
 
         self.__super__:.onSlidingEnd(button);
+    }
+
+    /**
+     * The disc of the orientation gizmo is ringed while the cursor is over it
+     * */
+    pub over onHover(mut self, pos: vec2)-> dmut(&Widget)? {
+        if let Ok(dmut g) = alias self._viewGizmo {
+            g.hovered = if let Ok(pixel) = self.renderPixel(pos) { g:.covers(pixel) } else { false };
+        }
+
+        self.__super__:.onHover(pos)
+    }
+
+    pub over onLoseHoverFocus(mut self) {
+        if let Ok(dmut g) = alias self._viewGizmo { g.hovered = false; }
+        self.__super__:.onLoseHoverFocus();
+    }
+
+    /**
+     * Keep a press of the left button on the orientation gizmo for it, with the end under the cursor
+     * @returns: true iif the cursor is on the disc of the gizmo
+     * */
+    fn pressViewGizmo(mut self, pos: vec2)-> bool {
+        let pixel = if let Ok(p) = self.renderPixel(pos) { p } else { return false; };
+        let dmut g = if let Ok(dmut g) = alias self._viewGizmo { alias g } else { return false; };
+        if !g:.covers(pixel) { return false; }
+
+        self._onViewGizmo = true;
+        self._pressedEnd = g:.endAt(pixel);
+        self._orbitedOnGizmo = false;
+        true
     }
 
     /**
@@ -601,12 +940,18 @@ pub class EditorViewport over SceneGizmo {
      */
 
     /**
-     * The keys the gizmo does not use are emitted by keyPressed; flying, the eye takes them all
+     * The keys 7, 1 and 3 of the numpad look along the axes, Ctrl from the other side; the keys the gizmo does not use
+     * are emitted by keyPressed; flying, the eye takes them all
      * */
     pub over onKeyPressed(mut self, key: SDL_Keycode, mods: SDL_Keymod)-> bool {
         if self._flying { return true; }
         if self.__super__:.onKeyPressed(key, mods) { return true; }
         if key == SDLK_ESCAPE || key == SDLK_TAB { return false; }
+
+        if let Ok(view) = EditorViewport::axisOfKey(key, (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16) {
+            self:.alignView(view);
+            return true;
+        }
 
         if let Ok(dmut s) = alias self._keyPressed {
             s:.emit(key, mods);
@@ -658,5 +1003,23 @@ pub mod EditorViewport {
                               v.showsIcons = true;
                               alias v
                           })
+    }
+
+    /**
+     * @returns: the axis view of a key of the numpad, 7 the top, 1 the front and 3 the right, Ctrl (or Command) from
+     * the other side, none for another key
+     * */
+    pub fn axisOfKey(key: SDL_Keycode, ctrl: bool)-> (AxisView)? {
+        let view = if key == SDLK_KP_7 {
+            AxisView::TOP
+        } else if key == SDLK_KP_1 {
+            AxisView::FRONT
+        } else if key == SDLK_KP_3 {
+            AxisView::RIGHT
+        } else {
+            return none;
+        };
+
+        (if ctrl { oppositeOf(view) } else { view })?
     }
 }

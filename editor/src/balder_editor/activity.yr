@@ -7,15 +7,15 @@ use balder::interface::widget::layout::{d3scene, linear};
 use balder::interface::widget::tab_bar::{bar, tab_move};
 use balder::interface::widget::text::label;
 use balder::interface::widget::tree::view;
-use balder::math::vector;
-use balder::scene::{description::_, editable};
+use balder::math::{utils, vector};
+use balder::scene::{description::_, edit, editable};
 use balder::scene::actors::node_classes;
 use balder::scene::asset::{assets, material_asset, mesh_asset};
 use balder::scene::edit::property_edit;
 use balder::scene::node;
 use balder::scene::node::node3D;
 use balder::scene::node::node3D::{light, marker, mesh_instance, path, path_point, volume_shape};
-use balder::scene::node::node3D::camera;
+use balder::scene::node::node3D::{camera, transform};
 use balder::scene::node::node3D::camera::flight;
 use balder::scene::property::value;
 use balder::utils::{log, path};
@@ -54,9 +54,6 @@ def ABSENT = "absent";
 // The paths of the items of the Edit menu undoing and redoing the changes
 def UNDO_ITEM = "BAR/EDIT/UNDO";
 def REDO_ITEM = "BAR/EDIT/REDO";
-
-// The path of the item of the View menu looking through the camera selected, or through the camera of the editor again
-def THROUGH_ITEM = "BAR/VIEW/THROUGH";
 
 // The path of the tabs of the documents, on the top row
 def DOCUMENTS = "BAR/DOCUMENTS";
@@ -294,6 +291,7 @@ pub class EditorActivity over Activity {
         self:.slot("view::icons", &self:.onIconsClicked);
         self:.slot("view::grid", &self:.onGridClicked);
         self:.slot("view::through", &self:.onThroughClicked);
+        self:.slot("view::align", &self:.onAlignClicked);
         self:.slot("gizmo::select", &self:.onSelectClicked);
         self:.slot("gizmo::translate", &self:.onTranslateClicked);
         self:.slot("gizmo::rotate", &self:.onRotateClicked);
@@ -2416,41 +2414,63 @@ pub class EditorActivity over Activity {
 
     /**
      * Look through the camera selected last, or through the camera of the editor again when the viewport looks through
-     * a camera of the scene
+     * a camera of the scene (the View menu)
      * */
-    fn onThroughClicked(mut self, b: u8) {
-        if b != SDL_BUTTON_LEFT { return; }
+    fn onThroughClicked(mut self, button: u8) {
+        if button != SDL_BUTTON_LEFT { return; }
 
-        let dmut v = if let Ok(dmut v) = alias self._viewport { alias v } else { return; };
-        if v.lookedThrough.hasValue {
-            v:.lookThrough(none);
-            self:.setStatus("Looking through the editor camera");
-        } else {
+        let through = if let Ok(v) = self._viewport { v.lookedThrough.hasValue } else { return; };
+        let dmut chosen: (&Camera)? = none;
+        if !through {
             let dmut nodes = alias self:.selectedNodes();
-            let dmut chosen: (&Camera)? = none;
             if nodes.len != 0us {
                 if let dmut c: &Camera = alias nodes[$ - 1us] { chosen = (alias c)?; }
             }
 
-            if let Ok(dmut c) = alias chosen {
-                v:.lookThrough((alias c)?);
-                self:.setStatus("Looking through " ~ c.name.file());
-            } else {
+            if !chosen.hasValue {
                 self:.setStatus("Select a camera to look through");
+                return;
             }
         }
 
-        self:.showThrough();
+        if let Ok(dmut bars) = alias self._bars { bars:.lookThrough(alias chosen); }
     }
 
     /**
-     * Name in the item of the View menu the camera it looks through next
+     * Name the camera looked through in the chip, the camera menu and the View menu
      * */
     fn showThrough(mut self) {
-        let through = if let Ok(v) = self._viewport { v.lookedThrough.hasValue } else { false };
-        if let Ok(dmut item: &PushButton) = self.gui:.find(THROUGH_ITEM) {
-            item:.setText(if through { "Look through the editor camera" } else { "Look through the camera selected" });
+        if let Ok(dmut b) = alias self._bars { b:.showCamera(); }
+    }
+
+    fn onAlignClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.alignSelection(); }
+    }
+
+    /**
+     * Turn the nodes selected as the view looks, their +Z toward the eye, a camera also moved to the eye, so that it
+     * sees what the view sees (the camera menu, Ctrl+Alt+M), the change recorded as one command
+     * */
+    fn alignSelection(mut self) {
+        let orbit = if let Ok(v) = self._viewport { v.orbit } else { return; };
+        let eye = orbit.eye();
+        let back = eye - orbit.target;
+        if back.length() == 0.0f { return; }
+
+        let turn = facing(back.normalized(), orbit.up()).matrix();
+        let mut edits: [TransformEdit] = [];
+        for dmut n in alias self:.selectedNodes() {
+            let at = if let _: &Camera = n { eye } else { (n.transformation * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz };
+            let local = NodeTransform::inParent(translation(at) * turn, n.parentTransformation);
+            edits ~= [TransformEdit(alias n, NodeTransform(local.position, local.rotation, n.scale))];
         }
+
+        if edits.len == 0us {
+            self:.setStatus("Select the nodes to align with the view");
+            return;
+        }
+
+        self:.run(copy TransformCommand(edits));
     }
 
     /**
@@ -2526,15 +2546,18 @@ pub class EditorActivity over Activity {
 
     /**
      * The keys the viewport takes besides those of the gizmo: Delete removes the nodes selected, Ctrl+D copies them, F
-     * looks at them, Shift+Space maximizes the viewport, or restores the docks
+     * looks at them, Ctrl+Alt+M aligns them with the view, Shift+Space maximizes the viewport, or restores the docks
      * */
     fn onViewportKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
         let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
         let shift = (mods & SDL_KMOD_SHIFT) != 0u16;
+        let alt = (mods & SDL_KMOD_ALT) != 0u16;
         if key == SDLK_DELETE || key == SDLK_BACKSPACE {
             self:.deleteSelection();
         } else if key == SDLK_D && ctrl {
             self:.duplicateSelection();
+        } else if key == SDLK_M && ctrl && alt {
+            self:.alignSelection();
         } else if key == SDLK_F && !ctrl {
             self:.frameSelection();
         } else if key == SDLK_SPACE && shift && !ctrl {

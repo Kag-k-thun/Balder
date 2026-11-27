@@ -186,8 +186,8 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
     and through a camera of the scene looked through, the status bar telling the one chosen;
   - *Overlays*, a menu of boxes showing or hiding the grid, the icons, the colliders of the bodies and the convex hulls,
     the same state as *View → Hide the grid* and *Hide the icons* and the box of the hulls panel, each following the
-    others. The colliders are drawn with the icons only: hiding the icons hides them too, and hiding the colliders
-    leaves the icons;
+    others. The menu stays open while its boxes are checked. The colliders are drawn with the icons only: hiding the
+    icons hides them too, and hiding the colliders leaves the icons;
   - *Maximize* (Shift+Space) maximizes the viewport, the docks and their rails out of the way, what they show kept, and
     restores them as they were; its icon and its name tell what it does next. Ctrl+F (the filter of the inspector)
     restores the docks to show the inspector, and so does a material shown.
@@ -195,6 +195,34 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   of the node, then the node, its icon before its name, separated by chevrons. A click on a parent selects it, a click
   on the scene clears the selection. On the right, the position of the node in the world (`x 1.00 · y 0.00 · z
   -2.50`, metres with two decimals), following its moves; a rename or a move in the outline writes the path again.
+- **Camera of the view**: over the top left corner of the viewport, ⋮ and a chip telling the projection of the view
+  and its angle or its size (*Perspective · 60°*, *Orthographic · 12.4 m*) open the camera menu (`ViewportBars`):
+  - *View through* lists the editor camera and the cameras of the scene, the one chosen drawing the view, as *View →
+    Look through the camera selected* does;
+  - the projection, Perspective or Orthographic, then the field of view (degrees) and the size (the height of the view,
+    metres), the one the other projection reads greyed in place; near and far, a far plane before the near one told in
+    the status bar and written back. The editor camera switches between its two cameras (`__editor_camera__`,
+    `__editor_ortho__`), the orthographic one seeing at the point looked at what the perspective one sees there, so a
+    switch keeps the scale. A camera of the scene looked through is changed by commands, as the inspector changes it,
+    each drag of a field undone in one step; a change of its projection replaces it (`ProjectionCommand`), the view
+    looking through the replacement;
+  - *Align the view*: Top, Front, Right, Bottom, Back and Left (see *Axis views*);
+  - *Frame the selection* (F), *Align the selection with the view* (Ctrl+Alt+M: the nodes selected turned as the view
+    looks, their +Z toward the eye, a camera also moved to the eye so that it sees what the viewport sees, one change
+    undone as any other) and *Reset the camera* (the editor camera as it is at first, perspective, 60°, looked through
+    again).
+- **Axis views**: 7, 1 and 3 of the numpad look from the top (+Y), the front (+Z) and the right (+X) of the point the
+  camera looks at, Ctrl from the other side, through the orthographic editor camera; the image mirroring X, the right
+  view shows the side on the left of the front view. Orbiting (the middle button, a drag on the orientation gizmo, a
+  flight) leaves the axis view, the view taking back the projection it had; panning and zooming keep it. The
+  orthographic camera stands half its far plane back from the point it looks at, so that nothing between the eye and
+  the screen is cut; its near plane is then far behind the eye, and the view reaches half the far plane past the point.
+  Looking through a camera of the scene, an axis view turns that camera, recorded as any move of it, its
+  projection kept.
+- **Orientation gizmo**: in the top right corner, the axes of the world as the camera sees them (`ViewGizmo`), X red,
+  Y green, Z blue, the disc ringed under the cursor. A click on an end looks along its axis from that side, the hollow
+  end from the other side; a drag on the disc orbits the camera. The axis view the view looks along is named under it
+  (*Top · 7*).
 - **Flight**: holding the right button flies the camera, the mouse captured turning it where it stands, W, A, S and D
   moving it forward, to the left, back and to the right, E and Q up and down, Shift four times faster, the wheel
   changing its speed. The keys are read by their place on the keyboard (Z, Q, S and D on an AZERTY one), and taken by
@@ -211,7 +239,8 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   all times too (`debug_view::drawCollider`), in the colours of the debug view of the physics: grey a static body, blue
   a kinematic one or a character, orange a dynamic one, yellow a trigger, fainter until the body is selected; a body
   without a mesh under it, and a character, have an icon of their own. *View → Hide the icons* hides them all, the
-  wireframes, the curves and the colliders with them, and shows them again.
+  wireframes, the curves and the colliders with them, and shows them again; *Overlays → Colliders* hides the colliders
+  alone.
 - **Cameras**: a scene holds any number of cameras (`PerspectiveCamera`, `OrthoCamera`), one of them active, the one
   the game draws the scene through (`Scene::getActiveCamera`, `setActiveCamera`): the first camera entering the scene,
   and when the active one leaves, the first of the others. The editor draws the viewport through its own camera
@@ -220,7 +249,8 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   *View → Look through the camera selected* draws the viewport through a camera of the scene instead: the middle
   button, the wheel, the flight and F then move that camera, each move recorded as a change of its transform, undone as
   any other, until *View → Look through the editor camera*, or until the camera leaves the scene (removed, or replaced
-  by a camera of the other projection), the editor camera taking back the eye it had.
+  by a camera of the other projection), the editor camera taking back the eye it had. The camera menu of the viewport
+  chooses the camera looked through too, and edits it (see *Camera of the view*).
 - **Nodes without a mesh**: an *empty* (`Empty3D`) only places the nodes under it. A *marker* (`Marker3D`) is an empty
   with a purpose (a spawn point, a waypoint, a socket, or none given) and tags, the game looking it up by its name
   (`Marker3D::find`), its tags (`tagged`) or its purpose (`ofPurpose`) under a node. A *path* (`Path3D`) is a curve,

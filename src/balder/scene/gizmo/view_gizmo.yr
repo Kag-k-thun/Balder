@@ -1,0 +1,261 @@
+in view_gizmo;
+
+mod ::utils;
+
+use balder::math::vector;
+use balder::scene::gizmo::{axis_end, axis_view, view};
+use balder::scene::node;
+use balder::scene::node::node3D::camera;
+use balder::scene::utils::post::gizmo;
+use balder::scene::utils::post::gizmo::shape;
+use balder::utils::log;
+
+use std::time;
+
+/**
+ * The name of the effect drawing the gizmo in the post-process chain of a scene
+ * */
+def AXES_EFFECT = "axes";
+
+/**
+ * The orientation gizmo of a view: the axes of the world as the camera of the scene sees them, in the top right corner
+ * of its image, X red, Y green and Z blue, as the handles of the transform gizmo
+ * @info:
+ * =====
+ * The gizmo is a node of the scene, spawned under its root by the viewport showing it. While it is in a scene, an effect
+ * of its post-process chain (a GizmoEffect named axes, after the others) draws it at each tick from the camera the scene
+ * is seen through: a disc, ringed while the cursor is over it (see hovered), and the six ends of the axes, a positive
+ * end a disc with the letter of its axis at the end of a shaft from the centre, a negative end hollow, the ends pointing
+ * at the eye drawn over the others. Its size is in pixels on screen whatever the resolution of the image. A viewport
+ * asks for the end under the cursor (endAt), for the axis view it gives, and whether the cursor is on the disc (covers),
+ * to orbit the eye on a drag.
+ * ====
+ * */
+pub class ViewGizmo over Node {
+
+    // The effect of the post-process chain drawing the gizmo, while it is in a scene
+    let dmut _effect: (&GizmoEffect)? = none;
+
+    // True while the cursor is over the disc, ringed
+    let mut _hovered: bool = false;
+
+    /**
+     * @params:
+     *    - name: the name of the node, reserved (__…__) so that the scene files and the outline leave it out
+     *    - parent: the node it goes under, the root of the scene
+     * */
+    pub self (name: [c8], dmut parent: &Node)
+        with super(name, alias parent)
+    {
+        // the axes follow the camera at each tick
+        self.ticked = true;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCENE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Draw the gizmo by the effect of the post-process chain of the scene, added after the other effects the first time
+     * a gizmo of a view enters it, over the icons and the transform gizmo
+     * */
+    pub over onEnter(mut self, dmut scene: &Scene) {
+        let dmut chain = scene:.getPostChain();
+        if let Ok(dmut e: &GizmoEffect) = alias chain:.get(AXES_EFFECT) {
+            chain:.enable(AXES_EFFECT, true);
+            self._effect = (alias e)?;
+            return;
+        }
+
+        let dmut effect = copy GizmoEffect(name-> AXES_EFFECT);
+        {
+            chain:.add(alias effect);
+            self._effect = (alias effect)?;
+        } catch {
+            err => {
+                log::error #("ViewGizmo", "Failed to draw the axes of the view", err);
+            }
+        }
+    }
+
+    /**
+     * Stop drawing the gizmo, the effect of the post-process chain skipped
+     * */
+    pub over onExit(mut self, dmut scene: &Scene) {
+        if let Ok(dmut e) = alias self._effect {
+            e:.setShapes([]);
+        }
+
+        self._effect = none;
+        scene:.getPostChain():.enable(AXES_EFFECT, false);
+    }
+
+    /**
+     * Give the effect the shapes of the axes as the camera of the scene sees them
+     * */
+    pub over onTick(mut self, delta: Duration) {
+        if let Ok(dmut e) = alias self._effect {
+            if let Ok(dmut scene) = alias self:.getScene() {
+                if let Ok(view) = viewOf(alias scene) {
+                    e:.setShapes(self.shapes(view, utils::Corner(scene)), texelAspect-> view.texelAspect);
+                } else {
+                    e:.setShapes([]);
+                }
+            }
+        }
+
+        self.__super__:.onTick(delta);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GET/SET          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the disc is ringed, the cursor over it
+     * */
+    @field
+    pub fn hovered(self)-> bool {
+        self._hovered
+    }
+
+    /**
+     * Ring the disc, the cursor over it, or leave it plain, from the next tick
+     * */
+    @field
+    pub fn hovered(mut self, hovered: bool) {
+        self._hovered = hovered;
+    }
+
+    /**
+     * @returns: the axis view of the end of an axis under a point of the image, the end closest to the eye first, none
+     * when the point is on no end or the scene has no camera
+     * @params:
+     *    - pixel: the point, in texels of the image from its top left corner
+     * */
+    pub fn endAt(mut self, pixel: vec2)-> (AxisView)? {
+        let dmut scene = if let Ok(dmut s) = alias self:.getScene() { alias s } else { return none; };
+        let corner = utils::Corner(scene);
+        if let Ok(view) = viewOf(alias scene) {
+            return ViewGizmo::endUnder(ViewGizmo::ends(view.camera), (pixel - corner.centre) / corner.scale);
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif a point of the image is on the disc of the gizmo
+     * @params:
+     *    - pixel: the point, in texels of the image from its top left corner
+     * */
+    pub fn covers(mut self, pixel: vec2)-> bool {
+        if let Ok(dmut scene) = alias self:.getScene() {
+            let corner = utils::Corner(scene);
+            return ((pixel - corner.centre) / corner.scale).length() <= utils::DISC_RADIUS;
+        }
+
+        false
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SHAPES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the shapes of the gizmo seen by a view, in texels of its image: the disc, its rim while hovered, then
+     * the ends of the axes, those pointing away from the eye first
+     * */
+    fn shapes(self, view: GizmoView, corner: utils::Corner)-> [GizmoShape] {
+        let dmut ends = copy ViewGizmo::ends(view.camera);
+        std::algorithm::sorting::sort(alias ends, |a, b| => { a.toward < b.toward });
+
+        let mut local: [GizmoShape] = copy [GizmoShape::ring(vec2(), 0.0f, 2.0f * utils::DISC_RADIUS, utils::DISC)];
+        if self._hovered {
+            local ~= [GizmoShape::ring(vec2(), utils::DISC_RADIUS, 1.0f, utils::RIM)];
+        }
+
+        for e in ends {
+            let color = utils::colorOf(e.view);
+            if isPositive(e.view) {
+                local ~= [GizmoShape(vec2(), e.offset, utils::SHAFT, color),
+                          GizmoShape::ring(e.offset, 0.0f, 2.0f * utils::END_RADIUS, color)];
+                local ~= utils::letterOf(e.view, e.offset);
+            } else {
+                local ~= [GizmoShape::ring(e.offset, 0.0f, 2.0f * utils::BACK_RADIUS, utils::HOLLOW),
+                          GizmoShape::ring(e.offset, utils::BACK_RADIUS - 0.75f, 1.5f, color)];
+            }
+        }
+
+        let mut placed: [GizmoShape] = [];
+        for s in local {
+            placed ~= [s.placed(corner.centre, corner.scale, utils::WHITE)];
+        }
+
+        placed
+    }
+
+}
+
+/**
+ * The ends of the axes on an orientation gizmo, and the one under the cursor
+ * */
+pub mod ViewGizmo {
+
+    /**
+     * @returns: the six ends of the axes of the world as a camera sees them, in the order of AXIS_VIEWS
+     * */
+    pub fn ends(cam: &Camera)-> [AxisEnd] {
+        let w = cam.transformation;
+        ViewGizmo::endsOf(makeVec3(w.a1, w.b1, w.c1).normalized(),
+                          makeVec3(w.a2, w.b2, w.c2).normalized(),
+                          makeVec3(w.a3, w.b3, w.c3).normalized())
+    }
+
+    /**
+     * @returns: the six ends of the axes of the world seen by a camera of axes x, y and z in the world, in the order of
+     * AXIS_VIEWS; the image mirrors x and its rows go down (see Camera::computeView), so an end along d is drawn at
+     * (-x.d, -y.d) from the centre, and points toward the eye by z.d
+     * */
+    pub fn endsOf(x: vec3, y: vec3, z: vec3)-> [AxisEnd] {
+        let mut ends: [AxisEnd] = [];
+        for v in AXIS_VIEWS {
+            let d = sideOf(v);
+            ends ~= [AxisEnd(view-> v, offset-> makeVec2(-x.dot(d), -y.dot(d)) * utils::ARM, toward-> z.dot(d))];
+        }
+
+        ends
+    }
+
+    /**
+     * @returns: the view of the end under a point, the end pointing closest to the eye first, a positive end within its
+     * disc, a negative one within its ring, none off the ends
+     * @params:
+     *    - ends: the ends of the axes (see ends)
+     *    - offset: the point from the centre of the gizmo, in pixels on screen, y going down
+     * */
+    pub fn endUnder(ends: [AxisEnd], offset: vec2)-> (AxisView)? {
+        let mut found: (AxisView)? = none;
+        let mut nearest = -2.0f;
+        for e in ends {
+            let radius = if isPositive(e.view) { utils::END_RADIUS } else { utils::BACK_RADIUS };
+            if (offset - e.offset).length() <= radius && e.toward > nearest {
+                found = e.view?;
+                nearest = e.toward;
+            }
+        }
+
+        found
+    }
+}

@@ -7,14 +7,19 @@ use balder::interface::style;
 use balder::interface::loader::registry::behavior;
 use balder::interface::widget;
 use balder::interface::widget::{box, text::_};
-use balder::interface::widget::button::{check, dropdown, icon, push};
+use balder::interface::widget::button::{check, dropdown, icon, menu, push, radio};
 use balder::interface::widget::layout::linear;
-use balder::scene::gizmo::{mode, space};
+use balder::interface::widget::range::slider;
+use balder::scene::edit::property_edit;
+use balder::scene::gizmo::{axis_view, mode, space};
+use balder::scene::node;
 use balder::scene::node::node3D;
 use balder::scene::node::node3D::camera;
+use balder::scene::property::value;
 use balder::utils::log;
 
 use balder_editor::{arguments, command, dock_rails, editor, hulls_panel, outline, viewport};
+use balder_editor::command::{projection, property};
 
 use std::conv;
 
@@ -44,6 +49,15 @@ def RESTORE_ICON = "engine:/images/ui/restore.svg";
 
 // The degrees in a radian, the steps of the rotations being typed in degrees
 def DEGREES = 57.29578f;
+
+// The camera of the view over the scene: the chip opening its menu (the fields of the menu are under it), the name of
+// the axis view under the orientation gizmo, and the item of the View menu looking through a camera
+def CHIP = "BODY/MAIN/VIEW_CAMERA/CHIP";
+def AXIS_LABEL = "BODY/MAIN/VIEW_AXIS";
+def THROUGH_ITEM = "BAR/VIEW/THROUGH";
+
+// The class of a row of the camera menu the projection in use does not read
+def IDLE = "idle";
 
 /**
  * The bars over the viewport of the editor, mounted under the behavior 'viewport': the toolbar of the gizmo, the
@@ -82,6 +96,16 @@ pub class ViewportBars over Behavior {
     // The nodes of the crumbs, from the first under the root of the scene to the node selected last
     let dmut _path: [&Node3D] = [];
 
+    // The cameras of the scene the view can look through, in the order of the list of the camera menu, after the
+    // camera of the editor
+    let dmut _cameras: [&Camera] = [];
+
+    // What the chip, the fields of the camera menu and the name of the axis view were written from last, written again
+    // only when it changes (the view changes at each move of the eye)
+    let mut _chipText: [c8] = "";
+    let mut _fieldsText: [c8] = "";
+    let mut _axisText: [c8] = "";
+
     /**
      * @params:
      *    - gui: the interface holding the bars
@@ -101,6 +125,15 @@ pub class ViewportBars over Behavior {
         self:.slot("overlay", &self:.onOverlay);
         self:.slot("maximize", &self:.onMaximize);
         self:.slot("crumb", &self:.onCrumb);
+        self:.slot("camera", &self:.onCameraMenu);
+        self:.slot("through", &self:.onThrough);
+        self:.slot("projection", &self:.onProjection);
+        self:.slot("fov", &self:.onFov);
+        self:.slot("size", &self:.onSize);
+        self:.slot("near", &self:.onNear);
+        self:.slot("far", &self:.onFar);
+        self:.slot("align", &self:.onAlign);
+        self:.slot("reset", &self:.onReset);
     }
 
     /**
@@ -110,9 +143,10 @@ pub class ViewportBars over Behavior {
     pub fn bind(mut self, dmut viewport: &EditorViewport, dmut editor: &SceneEditor, dmut hulls: &HullsPanel,
                 dmut docks: (&DockRails)?) {
         viewport:.toolChanged():.connect(alias self._box, &self:.showTool);
+        viewport:.viewChanged():.connect(alias self._box, &self:.showCamera);
         hulls:.shownChanged():.connect(alias self._box, &self:.onHullsShown);
         editor:.edited():.connect(alias self._box, &self:.onEdited);
-        editor:.switched():.connect(alias self._box, &self:.onSelectionChanged);
+        editor:.switched():.connect(alias self._box, &self:.onSwitched);
 
         let dmut scene = alias editor.scene;
         let dmut selection = alias scene.selection;
@@ -137,6 +171,7 @@ pub class ViewportBars over Behavior {
         self:.showOverlays();
         self:.showMaximized();
         self:.onSelectionChanged();
+        self:.showCameras();
     }
 
     /*!
@@ -241,7 +276,6 @@ pub class ViewportBars over Behavior {
             }
 
             v.snap = s;
-            log::info #("Probe", f"onSnap ${kind} ${on}: translating ${v.snap.translating} step ${v.snap.translation}");
         }
     }
 
@@ -418,6 +452,317 @@ pub class ViewportBars over Behavior {
     /*!
      * ====================================================================================================
      * ====================================================================================================
+     * ======================================          CAMERA          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Look through a camera of the scene, the controls of the viewport moving it, or through the camera of the editor
+     * again (none): the camera menu, the View menu
+     * */
+    pub fn lookThrough(mut self, dmut cam: (&Camera)?) {
+        if let Ok(dmut v) = alias self._viewport { v:.lookThrough(alias cam); }
+
+        let name = if let Ok(c) = cam { c.name.file() } else { "the editor camera" };
+        self._status(f"Looking through ${name}");
+        self:.showCamera();
+    }
+
+    /**
+     * List the cameras of the scene in the camera menu, after the camera of the editor
+     * */
+    fn showCameras(mut self) {
+        let dmut cameras: [&Camera] = [];
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            ViewportBars::gatherCameras(alias scene:.getRootNode(), ref cameras);
+        }
+
+        self._cameras = alias cameras;
+        let mut items: [[c8]] = copy ["Editor camera"];
+        for c in self._cameras { items ~= [c.name.file()]; }
+
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(CHIP ~ "/THROUGH") {
+            d:.setItems(items);
+        }
+
+        // the list was rebuilt, its choice is written again
+        self._fieldsText = "";
+        self:.showCamera();
+    }
+
+    /**
+     * Write the camera of the view: the chip, the fields of the camera menu, the name of the axis view and the item of
+     * the View menu, each only when it changed
+     * */
+    pub fn showCamera(mut self) {
+        let v = if let Ok(v) = self._viewport { v } else { return; };
+        let ortho = v.projection == CameraProjection::ORTHOGRAPHIC;
+        let (fov, size, near, far) = if let Ok(c) = v.lookedThrough {
+            (Camera::fovOf(c), Camera::sizeOf(c), c.near, c.far)
+        } else {
+            (v.fov, v.viewSize, v.nearPlane, v.farPlane)
+        };
+
+        let degrees = to![c8] (fov, prec-> 0u32);
+        let metres = to![c8] (size, prec-> 1u32);
+        let chip = if ortho { f"Orthographic · ${metres} m" } else { f"Perspective · ${degrees}°" };
+        if chip != self._chipText {
+            self._chipText = chip;
+            if let Ok(dmut b: &MenuButton) = self._gui:.find(CHIP) { b:.setText(chip); }
+        }
+
+        let through = if let Ok(i) = self.throughIndex() { i + 1us } else { 0us };
+        let fields = f"${fov} ${size} ${near} ${far} ${ortho} ${through} ${self._cameras.len}";
+        if fields != self._fieldsText {
+            self._fieldsText = fields;
+            self:.writeFields(ortho, fov, size, near, far, through);
+        }
+
+        let axis = if let Ok(a) = v.axisView {
+            let name = nameOf(a), key = keyOf(a);
+            f"${name} · ${key}"
+        } else { "" };
+
+        if axis != self._axisText {
+            self._axisText = axis;
+            if let Ok(dmut l: &Label) = self._gui:.find(AXIS_LABEL) {
+                l:.setText(axis);
+                DockRails::setPresent(alias l, axis.len != 0us);
+            }
+        }
+
+        if let Ok(dmut item: &PushButton) = self._gui:.find(THROUGH_ITEM) {
+            item:.setText(if through != 0us { "Look through the editor camera" } else { "Look through the camera selected" });
+        }
+    }
+
+    /**
+     * Write the fields of the camera menu, the field the projection does not read greyed
+     * */
+    fn writeFields(mut self, ortho: bool, fov: f32, size: f32, near: f32, far: f32, through: usize) {
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(CHIP ~ "/THROUGH") { d:.setSelected(through); }
+        if let Ok(e) = self._editor {
+            let scene = e.document.name;
+            if let Ok(dmut l: &Label) = self._gui:.find(CHIP ~ "/SCENE") { l:.setText(f"view of ${scene}"); }
+        }
+
+        if let Ok(dmut r: &RadioButton) = self._gui:.find(CHIP ~ "/PROJECTION/PERSPECTIVE") { r:.setChecked(!ortho); }
+        if let Ok(dmut r: &RadioButton) = self._gui:.find(CHIP ~ "/PROJECTION/ORTHOGRAPHIC") { r:.setChecked(ortho); }
+
+        let degrees = to![c8] (fov, prec-> 0u32);
+        if let Ok(dmut s: &Slider) = self._gui:.find(CHIP ~ "/FOV/VALUE") { s:.setValue(fov); }
+        if let Ok(dmut l: &Label) = self._gui:.find(CHIP ~ "/FOV/TEXT") { l:.setText(f"${degrees}°"); }
+        if let Ok(dmut s: &SpinBox) = self._gui:.find(CHIP ~ "/SIZE/VALUE") { s:.setValue(size); }
+        if let Ok(dmut s: &SpinBox) = self._gui:.find(CHIP ~ "/NEAR") { s:.setValue(near); }
+        if let Ok(dmut s: &SpinBox) = self._gui:.find(CHIP ~ "/FAR") { s:.setValue(far); }
+
+        self:.markIdle(CHIP ~ "/FOV", ortho);
+        self:.markIdle(CHIP ~ "/SIZE", !ortho);
+    }
+
+    /**
+     * Grey a row of the camera menu, or write it in its colours again
+     * */
+    fn markIdle(mut self, path: [c8], idle: bool) {
+        if let Ok(dmut w) = alias self._gui:.find(path) {
+            let mut classes: [[c8]] = [];
+            for c in w.getClasses() if c != IDLE { classes ~= [c]; }
+            if idle { classes ~= [IDLE]; }
+            w:.setClasses(classes);
+        }
+    }
+
+    /**
+     * @returns: the place of the camera looked through among the cameras of the scene, none while the view looks
+     * through the camera of the editor, or through a camera not listed yet
+     * */
+    fn throughIndex(self)-> (usize)? {
+        let through = if let Ok(v) = self._viewport { v.lookedThrough } else { return none; };
+        if let Ok(t) = through {
+            for i, c in self._cameras if c is t { return i?; }
+        }
+
+        none
+    }
+
+    /**
+     * Change the scene through the editor, telling in the status bar why the change failed
+     * @returns: true iif the scene changed
+     * */
+    fn run(mut self, dmut command: &EditCommand)-> bool {
+        if let Ok(dmut e) = alias self._editor {
+            {
+                return e:.execute(alias command);
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "The change of the camera failed", err);
+                    self._status(err.msg);
+                }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * Give a property of the camera looked through a value, through a command, the steps of one field merged into one
+     * (see PropertyCommand); a value it refuses is written back
+     * */
+    fn editCamera(mut self, index: usize, name: [c8], after: PropertyValue) {
+        let dmut cam = alias self._cameras[index];
+        if let Ok(p) = Camera::schema().property(name) {
+            let before = p.get(alias cam);
+            if !(after == before) {
+                self:.run(copy PropertyCommand(copy [PropertyEdit(alias cam, p, before, after)], field-> f"camera ${name}"));
+            }
+        }
+
+        self._fieldsText = "";
+        self:.showCamera();
+    }
+
+    /**
+     * ⋮ opens the camera menu of its chip
+     * */
+    fn onCameraMenu(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+        if let Ok(dmut m: &MenuButton) = self._gui:.find(CHIP) { m:.open(); }
+    }
+
+    /**
+     * The view looks through the camera chosen in the list, the camera of the editor first
+     * */
+    fn onThrough(mut self, index: usize) {
+        if index == 0us {
+            self:.lookThrough(none);
+        } else if index - 1us < self._cameras.len {
+            self:.lookThrough((alias self._cameras[index - 1us])?);
+        }
+    }
+
+    /**
+     * The view draws in perspective or orthographically: the camera of the editor switches, a camera of the scene looked
+     * through is replaced by one of the other projection, looked through in its place
+     * */
+    fn onProjection(mut self, kind: [c8], on: bool) {
+        if !on { return; }
+
+        let projection = if kind == "ORTHOGRAPHIC" { CameraProjection::ORTHOGRAPHIC } else { CameraProjection::PERSPECTIVE };
+        let through = if let Ok(v) = self._viewport { v.lookedThrough.hasValue } else { return; };
+        if !through {
+            if let Ok(dmut v) = alias self._viewport { v.projection = projection; }
+            return;
+        }
+
+        let i = if let Ok(i) = self.throughIndex() { i } else { return; };
+        if !self:.run(copy ProjectionCommand(alias self._cameras[i], projection)) { return; }
+
+        // the replacement is selected by the command
+        let dmut replacement: (&Camera)? = none;
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            let dmut nodes = alias selection.nodes;
+            if nodes.len != 0us {
+                if let dmut c: &Camera = alias nodes[$ - 1us] { replacement = (alias c)?; }
+            }
+        }
+
+        self:.showCameras();
+        if replacement.hasValue { self:.lookThrough(alias replacement); }
+    }
+
+    /**
+     * The field of view chosen, read in perspective only, the slider of an orthographic view written back
+     * */
+    fn onFov(mut self, fov: f32) {
+        let dmut v = if let Ok(dmut v) = alias self._viewport { alias v } else { return; };
+        if v.projection != CameraProjection::PERSPECTIVE {
+            self._fieldsText = "";
+            self:.showCamera();
+        } else if v.lookedThrough.hasValue {
+            if let Ok(i) = self.throughIndex() { self:.editCamera(i, "fov", PropertyValue::number(fov)); }
+        } else {
+            v.fov = fov;
+        }
+    }
+
+    /**
+     * The height of the view typed, read orthographically only
+     * */
+    fn onSize(mut self, size: f32) {
+        let dmut v = if let Ok(dmut v) = alias self._viewport { alias v } else { return; };
+        if v.projection != CameraProjection::ORTHOGRAPHIC {
+            self._fieldsText = "";
+            self:.showCamera();
+        } else if v.lookedThrough.hasValue {
+            if let Ok(i) = self.throughIndex() { self:.editCamera(i, "size", PropertyValue::number(size)); }
+        } else {
+            v.viewSize = size;
+        }
+    }
+
+    fn onNear(mut self, near: f32) {
+        let far = if let Ok(v) = self._viewport { v.farPlane } else { return; };
+        self:.setPlanes("near", near, far);
+    }
+
+    fn onFar(mut self, far: f32) {
+        let near = if let Ok(v) = self._viewport { v.nearPlane } else { return; };
+        self:.setPlanes("far", near, far);
+    }
+
+    /**
+     * Move a plane of the camera drawing the view, the planes a camera refuses told in the status bar and written back
+     * @params:
+     *    - name: near or far, the plane typed
+     * */
+    fn setPlanes(mut self, name: [c8], near: f32, far: f32) {
+        let dmut v = if let Ok(dmut v) = alias self._viewport { alias v } else { return; };
+        if v.lookedThrough.hasValue {
+            let value = if name == "near" { near } else { far };
+            if let Ok(i) = self.throughIndex() { self:.editCamera(i, name, PropertyValue::number(value)); }
+            return;
+        }
+
+        let refused = Camera::checkPlanes(near, far);
+        if refused.len != 0us {
+            self._status(refused);
+            self._fieldsText = "";
+            self:.showCamera();
+            return;
+        }
+
+        if name == "near" { v.nearPlane = near; } else { v.farPlane = far; }
+    }
+
+    /**
+     * Look along an axis of the world, by the name of its view
+     * */
+    fn onAlign(mut self, name: [c8], b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        for view in AXIS_VIEWS if nameOf(view) == name {
+            if let Ok(dmut v) = alias self._viewport { v:.alignView(view); }
+            return;
+        }
+    }
+
+    /**
+     * The camera of the editor as it is at first, looked through again
+     * */
+    fn onReset(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        if let Ok(dmut v) = alias self._viewport { v:.resetCamera(); }
+        self._status("Looking through the editor camera, as it is at first");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
      * =======================================          PATH          =====================================
      * ====================================================================================================
      * ====================================================================================================
@@ -448,10 +793,19 @@ pub class ViewportBars over Behavior {
     }
 
     /**
-     * A change of the scene may have renamed or moved a node of the path: it is written again
+     * A change of the scene may have renamed or moved a node of the path, or added, removed or renamed a camera
      * */
     fn onEdited(mut self, _: &EditCommand) {
         self:.showPath();
+        self:.showCameras();
+    }
+
+    /**
+     * Another document is shown: its selection, its cameras and its name
+     * */
+    fn onSwitched(mut self) {
+        self:.onSelectionChanged();
+        self:.showCameras();
     }
 
     /**
@@ -566,6 +920,16 @@ pub mod ViewportBars {
         }
 
         path ~= [alias node];
+    }
+
+    /**
+     * Put in a list the cameras under a node, but those of the editor (named __…__, see isReservedName), in their order
+     * */
+    pub fn gatherCameras(dmut node: &Node, ref dmut cameras: [&Camera]) {
+        for dmut c in alias node:.getChildrenInOrder() if !isReservedName(c.name.file()) {
+            if let dmut cam: &Camera = alias c { cameras ~= [alias cam]; }
+            ViewportBars::gatherCameras(alias c, ref cameras);
+        }
     }
 
     /**
