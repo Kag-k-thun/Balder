@@ -1,0 +1,861 @@
+in files_panel;
+
+use balder_editor::{arguments, material_slots_panel, outline_panel};
+use balder_editor::activity::{documents, editor_context, material_documents};
+use balder_editor::command::{add, property};
+use balder_editor::files::{file_kind, project_files};
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface::dialog;
+use balder::interface::dialog::file::utils;
+use balder::interface::loader::registry::behaviors;
+use balder::interface::widget::button::menu;
+use balder::interface::widget::layout::d3scene;
+use balder::interface::widget::text::label;
+use balder::interface::widget::tree::{drag, edit, file_node, files, view};
+use balder::math::vector;
+use balder::scene::asset::{assets, material_asset};
+use balder::scene::description::_;
+use balder::scene::edit::property_edit;
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::mesh_instance;
+use balder::scene::property::value;
+use balder::utils::{log, path, trash, watcher};
+
+use std::{conv, fs, uuid};
+
+use ::sdl3::{clipboard, keycode, mouse};
+
+// The panel, its tree, the footer telling the file selected, and the menu of the files
+def PANEL = "BODY/MAIN/FILES";
+def TREE = "BODY/MAIN/FILES/TREE";
+def FOOT = "BODY/MAIN/FILES/FOOT";
+def MENU = "BODY/MAIN/FILES/MENU";
+
+// The viewport the files are dropped on
+def VIEW = "BODY/MAIN/VIEW";
+
+// The footer while no file is selected
+def FOOT_HINT = "Drag into the viewport or onto a node";
+
+// The kinds menu: the files a scene places, or every file
+def PLACEABLE = 0us;
+
+/**
+ * The folders expanded and the entries selected in the tree, by their absolute paths, kept while the files shown change
+ * */
+@data
+record TreeState {
+    pub let expanded: [[c8]] = [];
+    pub let selected: [[c8]] = [];
+}
+
+/**
+ * The Files panel, the files of the res/ directory of the project in a tree, mounted under the behavior 'files'
+ * @info:
+ * =====
+ * The tree (FileTreeModel) shows the folders first then the files, each by name, kept up to date by a file watcher
+ * (FileWatcher::watchTree), the scene shown in bold. The kinds menu of its head shows the files a scene places (the
+ * models, the scenes, the materials and the textures, see FileKinds) or every file, and the filter the names holding
+ * a text, the folders holding them expanded; the footer tells the path and the size of the file selected last.
+ *
+ * A file is added to the scene shown by Enter (or a double click), by Add to the scene, or by a drag: onto the
+ * viewport it goes under the cursor, onto a row of the outline under the node of the row (see addFile). The menu of a
+ * file (a right click) opens a scene or a material in a tab, renames it in place (F2), duplicates it (Ctrl+D), moves
+ * it to the trash once confirmed (Delete, the files naming it told), copies its path and shows it in the file
+ * manager; New folder creates a folder named in place.
+ * ====
+ * */
+#[behavior]
+pub class FilesPanel over Behavior {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The documents opened, a scene or a material opened in a tab, the scene shown marked
+    let dmut _docs: &Documents;
+    let dmut _materials: &MaterialDocuments;
+
+    // The outline, its rows taking the files dropped on them
+    let dmut _outline: &OutlinePanel;
+
+    // The files of the project the tree shows, and the watcher reading them again as they change
+    let dmut _model: &FileTreeModel = copy FileTreeModel();
+    let dmut _watcher: &FileWatcher = copy FileWatcher();
+
+    // The tree, and the footer, once bound
+    let dmut _tree: (&TreeView)? = none;
+    let dmut _foot: (&Label)? = none;
+
+    // The files the menu opened acts on, their absolute paths, and the folder New folder creates a folder in
+    let mut _menuFiles: [[c8]] = [];
+    let mut _menuFolder: [c8] = "";
+
+    // The absolute path of the entry renamed in place, empty while none is
+    let mut _renaming: [c8] = "";
+
+    // The absolute paths of the entries to move to the trash, once the dialog asking about them is answered
+    let mut _trashing: [[c8]] = [];
+
+    /**
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     *    - docs: the documents opened, a scene opened in a tab of its own
+     *    - materials: the materials opened, a material opened in a tab of its own
+     *    - outline: the outline, its rows taking the files dropped on them
+     * */
+    pub self (dmut ctx: &EditorContext, dmut docs: &Documents, dmut materials: &MaterialDocuments, dmut outline: &OutlinePanel)
+        with _ctx = alias ctx
+        , _docs = alias docs
+        , _materials = alias materials
+        , _outline = alias outline
+    {}
+
+    /**
+     * Show the files of the res/ directory of the project in the tree, once the interface is loaded, watched for their
+     * changes, the scene shown marked
+     * */
+    pub fn bind(mut self) {
+        let root = ressourcePath().toStr();
+        self._model:.setIconOf(&self:.iconOf);
+        self._model:.setKinds(FileKinds::placeable());
+        self._model:.setRoot(root);
+
+        if let Ok(dmut t: &TreeView) = self._ctx.gui:.find(TREE) {
+            t:.setModel(alias self._model);
+            t:.keyPressed():.connect(alias self._ctx.box, &self:.onKey);
+            self._tree = (alias t)?;
+        }
+
+        if let Ok(dmut l: &Label) = self._ctx.gui:.find(FOOT) {
+            self._foot = (alias l)?;
+        }
+
+        self._watcher:.treeChanged():.connect(alias self._ctx.box, &self:.onTreeChanged);
+        self._watcher:.watchTree(root);
+        self._docs:.shown():.connect(&self:.onShown);
+        self:.showFoot();
+    }
+
+    /**
+     * Stop watching the files, the editor closing
+     * */
+    pub fn close(mut self) {
+        self._watcher:.dispose();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The kinds menu: the files a scene places, or every file
+     * */
+    #[slot (name-> "kinds")]
+    fn onKinds(mut self, index: usize) {
+        let kept = self.treeState();
+        self._model:.setKinds(if index == PLACEABLE { FileKinds::placeable() } else { [] });
+        self:.restoreTree(kept);
+    }
+
+    /**
+     * A key typed in the filter keeps the names holding its text, the folders holding them expanded
+     * */
+    #[slot (name-> "filter")]
+    fn onFilter(mut self, text: [c8]) {
+        self._model:.setFilter(text);
+        if text.len != 0us { self:.expandAll(); }
+        self:.showFoot();
+    }
+
+    #[slot (name-> "picked")]
+    fn onPicked(mut self, _: [[usize]]) {
+        self:.showFoot();
+    }
+
+    /**
+     * Enter on a file, or a double click, adds it to the scene; Enter on a folder expands it, or collapses it
+     * */
+    #[slot (name-> "activated")]
+    fn onActivated(mut self, node: [usize]) {
+        let f = if let Ok(f) = self._model.fileAt(node) { f } else { return; };
+        if f.isDirectory {
+            if let Ok(dmut t) = alias self._tree {
+                if t.isExpanded(node) { t:.collapseNode(node); } else { t:.expandNode(node); }
+            }
+
+            return;
+        }
+
+        self:.addFiles(copy [f], none, none);
+    }
+
+    /**
+     * Files dragged out of the tree: over the outline, the row under the cursor is marked; released over the viewport
+     * they are added under the cursor, over a row of the outline under its node
+     * */
+    #[slot (name-> "dragged")]
+    fn onDragged(mut self, drag: TreeDrag) {
+        let mut dragged: [&FileNode] = [];
+        for n in drag.nodes if let Ok(f) = self._model.fileAt(n) && !f.isDirectory {
+            dragged ~= [f];
+        }
+
+        if !drag.outside || dragged.len == 0us {
+            self._outline:.showDropAt(none);
+            return;
+        }
+
+        let pixel = self:.viewPixel(drag.at);
+        if !drag.released {
+            self._outline:.showDropAt(if pixel.hasValue { none } else { (drag.at)? });
+            return;
+        }
+
+        self._outline:.showDropAt(none);
+        if let Ok(p) = pixel {
+            self:.addFiles(dragged, none, (p)?);
+        } else if let Ok(dmut n) = alias self._outline:.nodeAt(drag.at) {
+            self:.addFiles(dragged, (alias n)?, none);
+        }
+    }
+
+    /**
+     * A right click opens the menu of the files selected, of the folder they are in, or of res/ below the rows
+     * @params:
+     *    - node: the node right clicked, selected, [] below the rows
+     * */
+    #[slot (name-> "context")]
+    fn onContext(mut self, node: [usize]) {
+        let root = self._model.getRoot();
+        self._menuFiles = if node.len == 0us { [] } else { copy [f.path for f in self.selectedFiles()] };
+        self._menuFolder = root;
+        if let Ok(f) = self._model.fileAt(node) {
+            self._menuFolder = if f.isDirectory { f.path } else { Path(f.path).parent().toStr() };
+        }
+
+        let one = self._menuFiles.len == 1us;
+        let first = if one { FileKinds::kindOf(Path(self._menuFiles[0]).file(), isDir(Path(self._menuFiles[0]))) } else { FileKind::OTHER };
+        let mut placeable = false;
+        for p in self._menuFiles if FileKinds::kindOf(Path(p).file(), isDir(Path(p))) !in [FileKind::FOLDER, FileKind::OTHER] {
+            placeable = true;
+        }
+
+        self:.setIdle("ADD", !placeable);
+        self:.setIdle("OPEN", first != FileKind::SCENE && first != FileKind::MATERIAL);
+        self:.setIdle("RENAME", !one);
+        self:.setIdle("DUPLICATE", self._menuFiles.len == 0us);
+        self:.setIdle("DELETE", self._menuFiles.len == 0us);
+        self:.setIdle("COPY", self._menuFiles.len == 0us);
+
+        if let Ok(dmut menu: &MenuButton) = self._ctx.gui:.find(MENU) {
+            let at = self._ctx.gui.getMousePosition();
+            menu:.openMenuAt(at.x, at.y);
+        }
+    }
+
+    /**
+     * The keys of the tree: F2 renames the file selected, Ctrl+D duplicates the files selected, Delete moves them to
+     * the trash once confirmed
+     * */
+    fn onKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
+        let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
+        let paths = copy [f.path for f in self.selectedFiles()];
+        if key == SDLK_F2 && paths.len == 1us {
+            self:.startRename(paths[0]);
+        } else if key == SDLK_D && ctrl {
+            self:.duplicate(paths);
+        } else if key == SDLK_DELETE && !ctrl {
+            self:.askTrash(paths);
+        }
+    }
+
+    #[slot (name-> "add")]
+    fn onAddClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let mut chosen: [&FileNode] = [];
+        for f in self.selectedFiles() if f.path in self._menuFiles && !f.isDirectory { chosen ~= [f]; }
+        self:.addFiles(chosen, none, none);
+    }
+
+    #[slot (name-> "open")]
+    fn onOpenClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT || self._menuFiles.len != 1us { return; }
+
+        let path = self._menuFiles[0];
+        match FileKinds::kindOf(Path(path).file(), false) {
+            FileKind::SCENE    => { self._docs:.openScene(qualifiedPath(path)); }
+            FileKind::MATERIAL => { self._materials:.openMaterial(qualifiedPath(path), ""); }
+            _ => {
+                self._ctx:.setStatus(f"${Path(path).file()} does not open in a tab: a scene or a material does");
+            }
+        }
+    }
+
+    #[slot (name-> "rename")]
+    fn onRenameClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT && self._menuFiles.len == 1us { self:.startRename(self._menuFiles[0]); }
+    }
+
+    #[slot (name-> "duplicate")]
+    fn onDuplicateClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.duplicate(self._menuFiles); }
+    }
+
+    #[slot (name-> "delete")]
+    fn onDeleteClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.askTrash(self._menuFiles); }
+    }
+
+    /**
+     * Copy the paths res:/… of the files of the menu, one a line
+     * */
+    #[slot (name-> "copy-path")]
+    fn onCopyClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT || self._menuFiles.len == 0us { return; }
+
+        let mut text = "";
+        for i, p in self._menuFiles {
+            text = text ~ (if i == 0us { "" } else { "\n" }) ~ qualifiedPath(p);
+        }
+
+        SDL_SetClipboardText(text.toStringZ());
+        self._ctx:.setStatus(f"Copied ${text}");
+    }
+
+    /**
+     * Show the file of the menu in the file manager, or the folder it was opened over
+     * */
+    #[slot (name-> "show")]
+    fn onShowClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let path = if self._menuFiles.len != 0us { self._menuFiles[0] } else { self._menuFolder };
+        if !showInFileManager(path) {
+            self._ctx:.setStatus("No file manager could be started");
+        }
+    }
+
+    /**
+     * Create a folder in the folder of the file selected (the folder selected itself), or in the folder the menu was
+     * opened over, then name it in place
+     * */
+    #[slot (name-> "new-folder")]
+    fn onNewFolderClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let mut dir = self._model.getRoot();
+        let selected = self.selectedFiles();
+        if self._menuFolder.len != 0us {
+            dir = self._menuFolder;
+        } else if selected.len != 0us {
+            let last = selected[$ - 1us];
+            dir = if last.isDirectory { last.path } else { Path(last.path).parent().toStr() };
+        }
+
+        self._menuFolder = "";
+        {
+            let folder = newFolder(dir);
+            self:.reload();
+            self:.startRename(folder);
+        } catch {
+            err: &BalderError => { self._ctx:.setStatus(err.msg); }
+        }
+    }
+
+    /**
+     * The name typed in place: the entry renamed is renamed, the documents of its files following it
+     * */
+    #[slot (name-> "named")]
+    fn onNamed(mut self, edit: TreeEdit) {
+        let path = self._renaming;
+        self._renaming = "";
+        if path.len == 0us { return; }
+
+        {
+            let renamed = renameEntry(path, edit.text);
+            if renamed == path { return; }
+
+            self:.followRename(path, renamed);
+            self:.reload();
+            self:.select(copy [renamed]);
+
+            let users = usersOf(copy [renamed]);
+            let mut told = f"Renamed ${qualifiedPath(path)} to ${Path(renamed).file()}";
+            if users.len != 0us {
+                let who = namesOf(users);
+                told = told ~ f": ${who} still name its old path";
+            }
+
+            self._ctx:.setStatus(told);
+        } catch {
+            err: &BalderError => { self._ctx:.setStatus(err.msg); }
+        }
+    }
+
+    /**
+     * The dialog asking to move files to the trash is answered: they are moved there once accepted
+     * */
+    fn onTrashAnswered(mut self, accepted: bool) {
+        self._ctx:.answered();
+        let paths = self._trashing;
+        self._trashing = [];
+        if !accepted { return; }
+
+        let mut moved = 0us;
+        for p in paths {
+            {
+                moveToTrash(p);
+                moved += 1us;
+            } catch {
+                err: &FsError => {
+                    log::error #("Editor", f"${p} was not moved to the trash", err);
+                    self._ctx:.setStatus(f"${Path(p).file()} was not moved to the trash: ${err.msg}");
+                }
+            }
+        }
+
+        self:.reload();
+        if moved == paths.len {
+            self._ctx:.setStatus(if moved == 1us { f"Moved ${Path(paths[0]).file()} to the trash" } else { f"Moved ${moved} files to the trash" });
+        }
+    }
+
+    /**
+     * The files of the project changed: the tree reads them again
+     * */
+    fn onTreeChanged(mut self, _: [c8]) {
+        self:.reload();
+    }
+
+    /**
+     * The document shown is told: its scene file is marked
+     * */
+    fn onShown(mut self, path: [c8]) {
+        self._model:.setMarked(if path.len == 0us { "" } else { projectPath(path).toStr() });
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          ADD          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add files to the scene shown, each its own way (see addFile)
+     * @params:
+     *    - under: the node they go under, none for the root of the scene
+     *    - pixel: the pixel of the viewport they were dropped on, none for the surface seen at its centre
+     * */
+    fn addFiles(mut self, chosen: [&FileNode], dmut under: (&Node3D)?, pixel: (vec2)?) {
+        if self._ctx.material.hasValue {
+            self._ctx:.setStatus("Show a scene to add files to it");
+            return;
+        }
+
+        for f in chosen {
+            self:.addFile(f, alias under, pixel);
+        }
+    }
+
+    /**
+     * Add a file to the scene shown: a model as a mesh node of its mesh, a scene as its nodes under an empty named after
+     * it, a material given to a mesh, a texture as the base colour map of a material local to the scene given to a mesh
+     * @params:
+     *    - under: the node a model or a scene goes under, at its origin, or the mesh a material goes on (each part),
+     *             none for the root of the scene
+     *    - pixel: the pixel of the viewport the file was dropped on, a model or a scene going on the surface seen there,
+     *             a material on the part seen there; none for the surface seen at the centre of the viewport, or the
+     *             mesh nodes selected
+     * */
+    fn addFile(mut self, f: &FileNode, dmut under: (&Node3D)?, pixel: (vec2)?) {
+        let kind = FileKinds::kindOf(f.name, f.isDirectory);
+        let path = qualifiedPath(f.path);
+        match kind {
+            FileKind::MODEL => {
+                let mut d = NodeDescription(Path(f.name).stripExtension().toStr(), NodeKind::MESH);
+                d:.set("mesh", PropertyValue::asset(path));
+                self:.addNode(d, alias under, pixel);
+            }
+            FileKind::SCENE => {
+                if let Ok(d) = self:.sceneNode(path) { self:.addNode(d, alias under, pixel); }
+            }
+            FileKind::MATERIAL => { self:.giveMaterial(path, false, alias under, pixel); }
+            FileKind::TEXTURE  => { self:.giveMaterial(path, true, alias under, pixel); }
+            _ => {
+                self._ctx:.setStatus(f"${f.name} is not a file a scene places: a model, a scene, a material or a texture is");
+            }
+        }
+    }
+
+    /**
+     * Add a node, under the root of the scene on the surface seen at a pixel of the viewport (its centre without one),
+     * or under another node at its origin
+     * */
+    fn addNode(mut self, description: NodeDescription, dmut under: (&Node3D)?, pixel: (vec2)?) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        let lookedAt = if let Ok(v) = self._ctx.viewport { v.orbit.target } else { vec3() };
+
+        let mut d = description;
+        if let Ok(dmut n) = alias under {
+            self._ctx:.run(copy AddCommand(d, alias n));
+            return;
+        }
+
+        let at = if let Ok(p) = pixel { e:.placementAt(p, lookedAt) } else { e:.placement(lookedAt) };
+        d:.set("position", PropertyValue::vector(at));
+
+        let dmut scene = alias e.scene;
+        self._ctx:.run(copy AddCommand(d, alias scene:.getRootNode()));
+    }
+
+    /**
+     * @returns: the nodes of a scene file under an empty named after it, their ids and those of the materials local to
+     * the file new, the materials registered; none for the scene shown itself or a file that cannot be read, the status
+     * bar telling why
+     * */
+    fn sceneNode(mut self, path: [c8])-> (NodeDescription)? {
+        if path == self._docs.shownPath() {
+            self._ctx:.setStatus(f"${Path(path).file()} is the scene shown: a scene is not added into itself");
+            return none;
+        }
+
+        {
+            let description = SceneDescription::fromFile(path).withoutIds();
+            for m in description.materials {
+                Assets::register(alias copy MaterialAsset::fromValues(m.path, m.name, m.values()));
+            }
+
+            let mut d = NodeDescription(Path(path).stripExtension().file(), NodeKind::EMPTY);
+            d.children = description.nodes;
+            return d?;
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", f"Failed to read the scene ${path}", err);
+                self._ctx:.setStatus(err.msg);
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Give a material to the part of the mesh seen at a pixel of the viewport, to every part of a mesh node, or to every
+     * part of the mesh nodes selected, in one change; a texture is the base colour map of a material local to the scene
+     * made for each part, from the material it had
+     * @params:
+     *    - path: the path of the material, or of the texture
+     *    - texture: true for a texture
+     *    - under: the mesh node dropped on in the outline, none without
+     *    - pixel: the pixel of the viewport dropped on, none without
+     * */
+    fn giveMaterial(mut self, path: [c8], texture: bool, dmut under: (&Node3D)?, pixel: (vec2)?) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        let name = Path(path).file();
+
+        let dmut meshes: [&MeshInstance3D] = [];
+        let mut parts: [(usize)?] = [];
+        if let Ok(p) = pixel {
+            if let Ok((dmut m, part)) = alias e:.partAt(p) {
+                meshes ~= [alias m];
+                parts ~= [(part)?];
+            }
+        } else if let Ok(dmut n) = alias under {
+            if let dmut m: &MeshInstance3D = alias n {
+                meshes ~= [alias m];
+                parts ~= [none];
+            } else {
+                self._ctx:.setStatus(f"${name} goes on a mesh node: ${n.name.file()} is not one");
+                return;
+            }
+        } else {
+            for dmut n in alias self._ctx:.selectedNodes() if let dmut m: &MeshInstance3D = alias n {
+                meshes ~= [alias m];
+                parts ~= [none];
+            }
+        }
+
+        if meshes.len == 0us {
+            self._ctx:.setStatus(if pixel.hasValue { f"Drop ${name} on a mesh to give it to its part" } else { f"Select the mesh nodes to give ${name} to" });
+            return;
+        }
+
+        let mut edits: [PropertyEdit] = [];
+        for i, dmut m in alias meshes {
+            let edit = if texture { self.texturedEdit(alias m, parts[i], path) } else { MaterialSlotsPanel::slotEdit(alias m, parts[i], path) };
+            if let Ok(x) = edit { edits ~= [x]; }
+        }
+
+        if edits.len == 0us { return; }
+
+        {
+            e:.execute(copy PropertyCommand(edits));
+        } catch {
+            err: &BalderError => { self._ctx:.setStatus(err.msg); }
+        }
+    }
+
+    /**
+     * @returns: the change of the materials of a mesh node drawing a part, or each part, with a material local to the
+     * scene made from the material it had, a texture as its base colour map
+     * @params:
+     *    - part: the index of the part, none for every part
+     *    - texture: the path of the texture
+     * */
+    fn texturedEdit(self, dmut mesh: &MeshInstance3D, part: (usize)?, texture: [c8])-> (PropertyEdit)? {
+        let stem = Path(texture).stripExtension().file();
+        let mut changes: [(usize, [c8])] = [];
+        for i in 0us .. mesh.mesh.subMeshes.len {
+            if let Ok(p) = part && p != i { continue; }
+
+            let from = mesh.materialOf(i);
+            let dmut local = MaterialAsset::local(v4(), stem, values-> from.values());
+            local:.setValue("base-color-map", PropertyValue::asset(texture));
+            Assets::register(alias local);
+            changes ~= [(i, local.path)];
+        }
+
+        MaterialSlotsPanel::slotsEdit(alias mesh, changes)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FILES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Name an entry in place, its name selected without its extension
+     * */
+    fn startRename(mut self, path: [c8]) {
+        let dmut t = if let Ok(dmut t) = alias self._tree { alias t } else { return; };
+        let node = if let Ok(n) = self._model.nodeOf(path) { n } else { return; };
+
+        let name = Path(path).file();
+        let ext = Path(name).extension();
+        let stem = if isDir(Path(path)) || ext == "" { name.len } else { name.len - ext.len - 1us };
+        self._renaming = path;
+        t:.editNode(node, name, from-> 0us, to-> stem);
+    }
+
+    /**
+     * Copy entries beside them, the copies selected
+     * */
+    fn duplicate(mut self, paths: [[c8]]) {
+        if paths.len == 0us { return; }
+
+        let mut copies: [[c8]] = [];
+        {
+            for p in paths { copies ~= [duplicateEntry(p)]; }
+        } catch {
+            err: &BalderError => { self._ctx:.setStatus(err.msg); }
+        }
+
+        self:.reload();
+        self:.select(copies);
+        if copies.len == 1us { self._ctx:.setStatus(f"Duplicated as ${Path(copies[0]).file()}"); }
+        else if copies.len > 1us { self._ctx:.setStatus(f"Duplicated ${copies.len} files"); }
+    }
+
+    /**
+     * Ask whether to move entries to the trash, telling the scene files and the material files naming them
+     * */
+    fn askTrash(mut self, paths: [[c8]]) {
+        if paths.len == 0us || self._ctx.isAsking() { return; }
+
+        let what = if paths.len == 1us { Path(paths[0]).file() } else { f"these ${paths.len} files" };
+        let users = usersOf(paths);
+        let mut question = f"Move ${what} to the trash?";
+        if users.len != 0us {
+            let who = namesOf(users);
+            question = question ~ f" ${who} name them and will miss them.";
+        }
+
+        self._trashing = paths;
+        let dmut d = copy ConfirmDialog(question, accept-> "Move to the trash", title-> "Delete");
+        d:.answered():.connect(alias self._ctx.box, &self:.onTrashAnswered);
+        self._ctx:.openDialog(alias d);
+    }
+
+    /**
+     * The documents of an entry renamed take its new path, those of the files under a folder renamed too
+     * @params:
+     *    - from: the absolute path the entry had
+     *    - to: the absolute path it has
+     * */
+    fn followRename(mut self, from: [c8], to: [c8]) {
+        let old = qualifiedPath(from);
+        let new = qualifiedPath(to);
+        let mut moved = false;
+        for dmut d in alias self._docs:.documents() {
+            let p = d.path;
+            if p == old {
+                d.path = new;
+                moved = true;
+            } else if p.len > old.len && p[0us .. old.len] == old && p[old.len] == '/' {
+                d.path = new ~ p[old.len .. $];
+                moved = true;
+            }
+        }
+
+        if moved { self._docs:.showDocument(); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          TREE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read the files again, the folders expanded and the files selected staying so
+     * */
+    fn reload(mut self) {
+        let kept = self.treeState();
+        self._model:.reload();
+        self:.restoreTree(kept);
+    }
+
+    /**
+     * @returns: the folders expanded and the entries selected, by their absolute paths, before the files shown change
+     * */
+    fn treeState(self)-> TreeState {
+        let mut expanded: [[c8]] = [];
+        if let Ok(t) = self._tree {
+            for d in self._model.directories() if t.isExpanded(d) {
+                if let Ok(f) = self._model.fileAt(d) { expanded ~= [f.path]; }
+            }
+        }
+
+        TreeState(expanded-> expanded, selected-> copy [f.path for f in self.selectedFiles()])
+    }
+
+    /**
+     * Expand the folders and select the entries that were, once the files shown changed, every folder expanded while
+     * the filter has a text
+     * */
+    fn restoreTree(mut self, kept: TreeState) {
+        if let Ok(dmut t) = alias self._tree {
+            for d in self._model.directories() {
+                let want = if let Ok(f) = self._model.fileAt(d) { f.path in kept.expanded } else { false };
+                if want && !t.isExpanded(d) {
+                    t:.expandNode(d);
+                } else if !want && t.isExpanded(d) {
+                    t:.collapseNode(d);
+                }
+            }
+        }
+
+        if self._model.getFilter().len != 0us { self:.expandAll(); }
+        self:.select(kept.selected);
+    }
+
+    /**
+     * Select some entries, their folders expanded
+     * @params:
+     *    - paths: the absolute paths of the entries, those not shown left out
+     * */
+    fn select(mut self, paths: [[c8]]) {
+        let mut nodes: [[usize]] = [];
+        for p in paths if let Ok(n) = self._model.nodeOf(p) { nodes ~= [n]; }
+        if let Ok(dmut t) = alias self._tree { t:.setSelected(nodes); }
+        self:.showFoot();
+    }
+
+    /**
+     * Expand every folder shown
+     * */
+    fn expandAll(mut self) {
+        if let Ok(dmut t) = alias self._tree {
+            for d in self._model.directories() { t:.expandNode(d); }
+        }
+    }
+
+    /**
+     * Tell in the footer the path and the size of the file selected last, or the number of entries of a folder
+     * */
+    fn showFoot(mut self) {
+        let selected = self.selectedFiles();
+        let text = if selected.len == 0us { FOOT_HINT } else {
+            let f = selected[$ - 1us];
+            let path = qualifiedPath(f.path);
+            if f.isDirectory { f"${path} · ${entriesOf(f)}" } else { f"${path} · ${sizeText(f.size)}" }
+        };
+
+        if let Ok(dmut l) = alias self._foot { l:.setText(text); }
+    }
+
+    /**
+     * @returns: the entries of the rows selected, in the order of the rows
+     * */
+    fn selectedFiles(self)-> [&FileNode] {
+        let mut result: [&FileNode] = [];
+        if let Ok(t) = self._tree {
+            for n in t.getSelected() if let Ok(f) = self._model.fileAt(n) { result ~= [f]; }
+        }
+
+        result
+    }
+
+    /**
+     * @returns: the pixel of the image of the viewport under a point of the window, none off the image, or while a
+     * material is shown
+     * @params:
+     *    - at: the point, in the layout pixels from the top left corner of the window
+     * */
+    fn viewPixel(mut self, at: vec2)-> (vec2)? {
+        if self._ctx.material.hasValue { return none; }
+        if let Ok(w: &Scene3DLayout) = self._ctx.gui:.find(VIEW) {
+            return w.renderPixel(at);
+        }
+
+        none
+    }
+
+    /**
+     * Make an item of the menu of the files idle, or not
+     * */
+    fn setIdle(mut self, item: [c8], idle: bool) {
+        if let Ok(dmut w) = alias self._ctx.gui:.find(MENU ~ "/" ~ item) {
+            w:.setClasses(if idle { copy ["item", "idle"] } else { copy ["item"] });
+        }
+    }
+
+    /**
+     * @returns: the image of the icon of an entry, by its kind
+     * */
+    fn iconOf(mut self, f: &FileNode)-> [c8] {
+        editorFile(f"ui/icons/files/${FileKinds::iconOf(FileKinds::kindOf(f.name, f.isDirectory))}.svg")
+    }
+}
+
+/**
+ * @returns: the number of entries of a folder, in words
+ * */
+fn entriesOf(f: &FileNode)-> [c8] {
+    let n = f.children.len;
+    if n == 0us { "empty" } else if n == 1us { "1 entry" } else { to![c8](n) ~ " entries" }
+}
+
+/**
+ * @returns: the names of some files, the first two and how many others
+ * @params:
+ *    - paths: the paths of the files, res:/…
+ * */
+fn namesOf(paths: [[c8]])-> [c8] {
+    if paths.len == 1us { return Path(paths[0]).file(); }
+    if paths.len == 2us { return Path(paths[0]).file() ~ " and " ~ Path(paths[1]).file(); }
+
+    Path(paths[0]).file() ~ ", " ~ Path(paths[1]).file() ~ " and " ~ to![c8](paths.len - 2us) ~ " other files"
+}

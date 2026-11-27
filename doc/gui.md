@@ -376,6 +376,28 @@ Image "res:/images/logo.png";
   go under, their place among its children (the paths and the place counted before the drop), whether they were
   dropped on the row of the parent, and the modifiers held; the model decides what the drop does
   (`fn dropped (mut self, drop: TreeDrop)`).
+- **A tree view `drag-out: true` drags its selected rows out of it**, onto another widget (the files of a project into
+  a scene). Each move of the cursor emits `on-drag-out` with a `TreeDrag`: the nodes dragged, the cursor in the layout
+  pixels of the window, whether it is out of the tree, and whether the drag ended, released or cancelled (Escape, the
+  focus lost: never out of the tree then); the receiver marks the place under the cursor while it is out, and takes the
+  nodes released there. While they are dragged, the icon of the first of them (`TreeModel::icon`) follows the cursor,
+  drawn over the other widgets in the part `::ghost`, and the cursor is a hand. A tree both `draggable` and `drag-out`
+  drops its rows inside it as well. A widget receiving the
+  drag of something else over a tree finds the node under the cursor (`nodeAt`) and marks its row in the state `:drop`
+  (`showDropOn`).
+- **The rows of a tree view are marked, edited and right clicked.** The model marks the nodes to tell apart
+  (`TreeModel::marked`, the file opened...), their rows, markers and icons taking the state `:marked`. A right click on
+  a row selects it alone, unless it is selected, then emits `on-context` with its path (`[]` below the rows), the
+  application opening its menu (`MenuButton::openMenuAt`). `editNode` edits the text of a row in place, in an
+  `InputText` of the class `tree-edit` over its text, focused, a part of the text selected (`InputText::selectText`, a
+  name without its extension): Enter or a click elsewhere emits `on-edit` with a `TreeEdit` (the node and the text
+  typed), Escape cancels it. The keys the tree does not use (F2, Delete...) are emitted by `keyPressed`.
+- **A `FileTreeModel` shows the files of a directory** and of the directories under it: the directories first, then the
+  files, each by name, the entries starting with a dot left out. It reads the whole tree (`setRoot`, `reload` once the
+  files change, `FileWatcher::watchTree` telling when), keeps the files of some extensions (`setKinds`) and the names
+  holding a text (`setFilter`, a directory kept while it holds one, or while its own name holds the text), marks a file
+  (`setMarked`) and gives the entries the icons a function tells (`setIconOf`). Its nodes change with the files and the
+  filters: the application keeps the absolute paths of the entries (`fileAt`) and finds their nodes again (`nodeOf`).
 - **A table view shows the rows of a model in columns**, under their headers. `setModel` takes a class over
   `TableModel`, whose `len`, `columns`, `header (column)` and `text (row, column)` the table reads on demand, for the
   rows shown only (`TextTableModel` holds the headers and the texts of the cells). The headers are its `::header`, in
@@ -1333,13 +1355,13 @@ The attributes of a type are set in the block of a node, `max-length: 64;`, its 
 
 ### `TreeView`
 
-- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `multiple`: true or false; `draggable`: true or false
+- **Attributes:** `tab-index`: an integer; `tooltip`: a string; `tooltip-shortcut`: a string; `multiple`: true or false; `draggable`: true or false; `drag-out`: true or false
 - **Default attribute:** none
 - **Children:** none
 - **Attributes of the children:** none
-- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([[usize]]), `on-activate` ([usize]), `on-drop` (balder::interface::widget::tree::drop::TreeDrop)
+- **Signals:** `on-click` (u8), `on-focus`, `on-blur`, `on-select` ([[usize]]), `on-activate` ([usize]), `on-drop` (balder::interface::widget::tree::drop::TreeDrop), `on-drag-out` (balder::interface::widget::tree::drag::TreeDrag), `on-context` ([usize]), `on-edit` (balder::interface::widget::tree::edit::TreeEdit)
 - **States:** `hover`, `focus`, `pressed`
-- **Parts:** `row` (states `hover`, `selected`, `current`, `drop`), `marker` (states `hover`, `selected`, `current`, `expanded`), `icon` (states `hover`, `selected`, `current`), `drop`, `scrollbar` (states `hover`, `pressed`)
+- **Parts:** `row` (states `hover`, `selected`, `current`, `drop`, `marked`), `marker` (states `hover`, `selected`, `current`, `expanded`, `marked`), `icon` (states `hover`, `selected`, `current`, `marked`), `drop`, `ghost`, `scrollbar` (states `hover`, `pressed`)
 - **Properties:** `indent`: a length in px
 
 ## Style properties

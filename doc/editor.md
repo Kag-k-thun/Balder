@@ -1,8 +1,8 @@
 # The editor
 
 The editor of Balder lives in `editor/`, beside the library, as the start of a game engine editor. It edits a
-project: it opens on the project manager, then the editor window shows the outline of the scene on the left, its
-viewport in the middle and the inspector of the node selected on the right, under a top row and above a status bar.
+project: it opens on the project manager, then the editor window shows the outline of the scene on the left, over
+the files of the project, its viewport in the middle and the inspector of the node selected on the right, under a top row and above a status bar.
 The top row holds the logo, the menus (Scene, Add, Edit, View, and Gizmo: Select, Translate, Rotate and Scale, Q, W, E
 and R, as the tools of the toolbar of the viewport), a seam, the tabs of the scenes opened (see the
 documents below), then Compile, and Play, Pause and Stop, idle until the play mode (BAL-134). The window reads as one:
@@ -285,6 +285,32 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   goes neither under itself nor under a node under it (the meshes drawing the parts of a mesh node are its own, and
   hidden: a node dropped on a mesh node goes under it as under any other), and a
   node named as a child of its new parent takes a free name (`cube_2`).
+- **Files**: under the outline, the files of the `res/` of the project in a tree (`FilesPanel`, a `FileTreeModel`), the
+  folders first then the files, each by name and after the icon of its kind (`editor/ui/icons/files`: the models blue,
+  the materials purple, the textures yellow, the scenes and the other files grey), the scene shown in the colour of
+  the focus. A watcher of the directories of `res/` reads them again as files are written, created, renamed or removed,
+  by the editor or another program, the folders expanded and the files selected staying so. The kinds menu of its head
+  shows the files a scene places (*Placeable*: the models, the scenes, the materials and the textures) or *Every file*;
+  the filter keeps the names holding its text, whatever the case of their letters, the folders holding them expanded.
+  The footer tells the path and the size of the file selected last (`res:/models/table.glb · 412 KB`), or the entries
+  of a folder.
+  - *Adding*: Enter, a double click, or *Add to the scene* adds the files selected to the scene shown; a file dragged
+    onto the viewport goes under the cursor, onto a row of the outline under the node of the row (the row marked while
+    the file is over it), each a change undone as any other; the icon of the file follows the cursor while it is
+    dragged, the cursor a hand. A model is a mesh node of its mesh, on the surface seen
+    there (the ground, or the depth of the point looked at, where nothing is seen); a scene file is its nodes, copied
+    under an empty named after it, with new ids and the materials local to it (a scene has no instances of another
+    yet, and is not added into itself); a material goes on the part of the mesh under the cursor, on every part of a
+    mesh node of the outline, or of the mesh nodes selected; a texture is the base colour map of a material local to
+    the scene made from the material of each of those parts, as Godot does.
+  - *Menu*: a right click opens the menu of the files selected: *Add to the scene*, *Open in a tab* (a scene or a
+    material), *Rename* (F2, in place, the name selected without its extension, Escape cancelling; the tabs of the
+    files renamed follow them, the status bar telling the files still naming their old path), *Duplicate* (Ctrl+D,
+    beside it, `crate_2.obj`), *Delete* (Delete: once confirmed, moved to the trash of the desktop, as Godot does, the
+    question telling the scene files and the material files naming them), *New folder* (in the folder right clicked,
+    named in place), *Copy the path* (`res:/…`) and *Show in the file manager* (selected in its folder). The button
+    beside the filter creates a folder too. The convex hulls of a model are shown by its mesh node (see below), not by
+    its file.
 - **Inspector**: a head telling the node selected last, its icon beside its name, edited in place (applied when
   Enter is pressed), over its kind (*Nothing selected* when no node is), then a section for each group of the
   properties its class declares (see the property schemas below), refreshed as the gizmo moves it: *Transform* for

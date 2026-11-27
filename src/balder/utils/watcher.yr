@@ -23,6 +23,18 @@ def IN_CLOEXEC = 0o2000000;
 def IN_CLOSE_WRITE = 0x8u32;
 def IN_MOVED_TO = 0x80u32;
 
+// The events watched in the directories of a tree besides: an entry renamed out of it, created or removed in it
+def IN_MOVED_FROM = 0x40u32;
+def IN_CREATE = 0x100u32;
+def IN_DELETE = 0x200u32;
+
+// The flags of the events read: a directory watched no longer is (removed), the entry of the event is a directory
+def IN_IGNORED = 0x8000u32;
+def IN_ISDIR = 0x40000000u32;
+
+// The flag of a watch adding its events to those a directory is already watched for
+def IN_MASK_ADD = 0x20000000u32;
+
 // The size of the header of an inotify event, before its name: wd, mask, cookie and len
 def EVENT_HEADER = 16us;
 
@@ -37,8 +49,12 @@ def EVENT_BUFFER = 4096us;
  * renamed over it replaces the file, and a watch on the file itself would be lost with it. A write closed or a rename
  * into the directory of a watched file emits changed, the events of the other files of the directory being dropped.
  *
- * A thread waits for the events from the first file watched until dispose; changed is emitted from it, its slots
- * running in the thread of the emitter they are connected with.
+ * A tree is watched in each of its directories (watchTree): an entry created, removed, renamed or written in one of
+ * them emits treeChanged with the tree, once for the events read together, and a directory created or renamed into it
+ * is watched as well, the entries whose name starts with a dot being left out.
+ *
+ * A thread waits for the events from the first file watched until dispose; changed and treeChanged are emitted from it,
+ * their slots running in the thread of the emitter they are connected with.
  * ====
  * @example:
  * ```
@@ -52,6 +68,9 @@ pub class FileWatcher {
 
     // Emitted with the path of a file watched, as it was added, when it was written or replaced
     let dmut _changed: &Signal!{[c8]} = copy Signal!{[c8]} ();
+
+    // Emitted with the path of a tree watched, as it was added, when an entry changed in one of its directories
+    let dmut _treeChanged: &Signal!{[c8]} = copy Signal!{[c8]} ();
 
     // The inotify instance, -1 until a file is watched, or when it cannot be created
     let mut _fd: i32 = -1;
@@ -75,6 +94,9 @@ pub class FileWatcher {
     // The paths of the files watched as they were added, by their path in the directory watched
     let mut _files: [[c8] => mut [c8]] = copy [];
 
+    // The paths of the trees watched as they were added, by the watch descriptor of each of their directories
+    let mut _trees: [i32 => mut [c8]] = copy [];
+
     /**
      * Create a watcher watching no file
      * */
@@ -86,6 +108,14 @@ pub class FileWatcher {
      * */
     pub fn changed(mut self)-> dmut &Signal!{[c8]} {
         alias self._changed
+    }
+
+    /**
+     * @returns: the signal emitted with the path of a tree watched, as it was added, when an entry was created, removed,
+     * renamed or written in one of its directories, from the thread of the watcher
+     * */
+    pub fn treeChanged(mut self)-> dmut &Signal!{[c8]} {
+        alias self._treeChanged
     }
 
     /**
@@ -113,6 +143,49 @@ pub class FileWatcher {
             }
 
             self._files[key] = path;
+        }
+    }
+
+    /**
+     * Watch a tree, a directory and the directories under it, the directories created in it afterwards being watched as
+     * they are created
+     * @params:
+     *    - path: the path of the directory, qualified (res:/) or not
+     * @info: a directory that cannot be watched is never reported
+     * */
+    pub fn watchTree(mut self, path: [c8]) {
+        let complete = projectPath(path).toStr();
+        atomic self {
+            if self._fd == -1 && !self:.start() { return; }
+            self:.watchDirectories(complete, path);
+        }
+    }
+
+    /**
+     * Watch a directory of a tree and the directories under it, those whose name starts with a dot left out, the
+     * directories already watched for the tree being kept
+     * @params:
+     *    - dir: the absolute path of the directory
+     *    - tree: the path of the tree, as it was added
+     * */
+    fn watchDirectories(mut self, dir: [c8], tree: [c8]) {
+        let wd = inotify_add_watch(self._fd, dir.toStringZ(), IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE | IN_MASK_ADD);
+        if wd == -1 { return; }
+        if let Ok(t) = self._trees[wd] && t == tree { return; }
+
+        self._watches[dir] = wd;
+        self._dirs[wd] = dir;
+        self._trees[wd] = tree;
+
+        {
+            for e in readDir(Path(dir)) {
+                let name = e.path.file();
+                if name.len != 0us && name[0us] != '.' && isDir(e.path, followLink-> false) {
+                    self:.watchDirectories(e.path.toStr(), tree);
+                }
+            }
+        } catch {
+            _ => {}
         }
     }
 
@@ -156,19 +229,26 @@ pub class FileWatcher {
             if epoll_wait(self._epoll, &event, 1, -1) > 0 {
                 if event.data.fd != self._fd { break; }
 
-                for f in self:.drain() {
+                let (files, trees) = self:.drain();
+                for f in files {
                     self._changed:.emit(f);
+                }
+
+                for t in trees {
+                    self._treeChanged:.emit(t);
                 }
             }
         }
     }
 
     /**
-     * Read the events pending, without blocking
-     * @returns: the files watched they report, each one once, as they were added
+     * Read the events pending, without blocking, a directory created in a tree being watched as well, and a directory
+     * removed forgotten
+     * @returns: the files watched they report and the trees they changed, each one once, as they were added
      * */
-    fn drain(mut self)-> [[c8]] {
+    fn drain(mut self)-> ([[c8]], [[c8]]) {
         let mut result: [[c8]] = [];
+        let mut trees: [[c8]] = [];
         let dmut buf = copy [0u8; EVENT_BUFFER];
         loop {
             let n = read(self._fd, cast!{*void}(alias buf.ptr), buf.len);
@@ -178,11 +258,25 @@ pub class FileWatcher {
                 let mut i = 0us;
                 while i + EVENT_HEADER <= cast!usize(n) {
                     let wd = cast!i32(FileWatcher::u32At(buf, i));
+                    let mask = FileWatcher::u32At(buf, i + 4us);
                     let len = cast!usize(FileWatcher::u32At(buf, i + 12us));
                     if let Ok(dir) = self._dirs[wd] {
-                        let key = dir ~ "/" ~ FileWatcher::nameAt(buf, i + EVENT_HEADER, len);
+                        let name = FileWatcher::nameAt(buf, i + EVENT_HEADER, len);
+                        let key = dir ~ "/" ~ name;
                         if let Ok(path) = self._files[key] && path !in result {
                             result ~= [path];
+                        }
+
+                        if let Ok(tree) = self._trees[wd] {
+                            if (mask & IN_IGNORED) != 0u32 {
+                                self:.forget(wd);
+                            } else if name.len != 0us && name[0us] != '.' {
+                                if (mask & IN_ISDIR) != 0u32 && (mask & (IN_CREATE | IN_MOVED_TO)) != 0u32 {
+                                    self:.watchDirectories(key, tree);
+                                }
+
+                                if tree !in trees { trees ~= [tree]; }
+                            }
                         }
                     }
 
@@ -191,7 +285,19 @@ pub class FileWatcher {
             }
         }
 
-        result
+        (result, trees)
+    }
+
+    /**
+     * Forget a directory no longer watched, removed
+     * */
+    fn forget(mut self, wd: i32) {
+        if let Ok(dir) = self._dirs[wd] {
+            self._watches:.remove(dir);
+        }
+
+        self._dirs:.remove(wd);
+        self._trees:.remove(wd);
     }
 
     /**
@@ -208,6 +314,7 @@ pub class FileWatcher {
         self._dirs = copy [];
         self._watches = copy [];
         self._files = copy [];
+        self._trees = copy [];
     }
 
     impl Disposable {

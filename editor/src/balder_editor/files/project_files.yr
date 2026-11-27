@@ -1,0 +1,215 @@
+in project_files;
+
+use balder::core::error;
+use balder::utils::{log, path};
+
+use std::{concurrency, conv, fs};
+
+// The name of a folder created in the Files panel before it is named
+def NEW_FOLDER = "new_folder";
+
+// The extensions of the files naming the other files of a project: the scene files and the material files
+def NAMING_FILES = ["scene", "material"];
+
+/**
+ * The processes showing the files in the file manager, kept so that they are not collected while they run
+ * */
+lazy dmut __SHOWN__: [&SubProcess] = [];
+
+/**
+ * @returns: a name no entry of a directory has, the name given when it is free, or its stem followed by the first free
+ * number before its extension (crate.obj, crate_2.obj, crate_3.obj...)
+ * @params:
+ *    - directory: the absolute path of the directory
+ *    - name: the name wanted
+ * */
+pub fn freeFileName(directory: [c8], name: [c8])-> [c8] {
+    if !exists(Path(directory).push(name), followLink-> false) { return name; }
+
+    let ext = Path(name).extension();
+    let stem = baseName(if ext == "" { name } else { name[0us .. name.len - ext.len - 1us] });
+    let suffix = if ext == "" { "" } else { "." ~ ext };
+    let mut i = 2us;
+    while exists(Path(directory).push(stem ~ "_" ~ to![c8](i) ~ suffix), followLink-> false) {
+        i += 1us;
+    }
+
+    stem ~ "_" ~ to![c8](i) ~ suffix
+}
+
+/**
+ * Copy a file, or a directory and its files, beside it under a free name (see freeFileName)
+ * @returns: the absolute path of the copy
+ * @throws:
+ *    - &BalderError: if the entry cannot be copied
+ * */
+pub fn duplicateEntry(path: [c8])-> [c8]
+    throws BalderError
+{
+    let from = Path(path);
+    let to = from.parent().push(freeFileName(from.parent().toStr(), from.file()));
+    {
+        if isDir(from) {
+            copyDir(from, to, recursive-> true, create-> true);
+        } else {
+            copyFile(from, to);
+        }
+    } catch {
+        err: &FsError => {
+            throw copy BalderError(f"${from.file()} was not copied: ${err.msg}");
+        }
+    }
+
+    to.toStr()
+}
+
+/**
+ * Rename a file or a directory in its directory
+ * @returns: the absolute path of the entry renamed, the same for the name it had
+ * @throws:
+ *    - &BalderError: if the name is not a name (empty, holding a /, starting with a dot, hidden from the panel), if
+ *                    another entry has it, or if the entry cannot be renamed
+ * */
+pub fn renameEntry(path: [c8], name: [c8])-> [c8]
+    throws BalderError
+{
+    let from = Path(path);
+    if name == from.file() { return path; }
+    if name.len == 0us { throw copy BalderError("A file needs a name"); }
+    if name[0us] == '.' { throw copy BalderError(f"${name} would be hidden: a name starts with another character than a dot"); }
+    for c in name if c == '/' { throw copy BalderError(f"${name} is not a name: it holds a /"); }
+
+    let to = from.parent().push(name);
+    if exists(to, followLink-> false) { throw copy BalderError(f"There is a ${name} in that folder already"); }
+    {
+        rename(from, to);
+    } catch {
+        err: &FsError => {
+            throw copy BalderError(f"${from.file()} was not renamed: ${err.msg}");
+        }
+    }
+
+    to.toStr()
+}
+
+/**
+ * Create a folder in a directory, named new_folder, or new_folder_2... when taken
+ * @returns: the absolute path of the folder
+ * @throws:
+ *    - &BalderError: if the folder cannot be created
+ * */
+pub fn newFolder(directory: [c8])-> [c8]
+    throws BalderError
+{
+    let folder = Path(directory).push(freeFileName(directory, NEW_FOLDER));
+    {
+        createDir(folder);
+    } catch {
+        err: &FsError => {
+            throw copy BalderError(f"No folder created in ${qualifiedPath(directory)}: ${err.msg}");
+        }
+    }
+
+    folder.toStr()
+}
+
+/**
+ * @returns: the scene files and the material files of the project naming some files or the files under some folders, by
+ * their paths res:/…, those among the entries themselves left out
+ * @params:
+ *    - paths: the absolute paths of the files and of the folders
+ * */
+pub fn usersOf(paths: [[c8]])-> [[c8]] {
+    let named = copy [qualifiedPath(p) for p in paths];
+    let mut users: [[c8]] = [];
+    {
+        for e in walkDir(ressourcePath()) if e.kind == FsEntryKind::FILE && e.path.extension() in NAMING_FILES {
+            let file = e.path.toStr();
+            if isUnder(file, paths) { continue; }
+
+            let content = readFile(e.path);
+            for n in named if namesIn(content, n) {
+                users ~= [qualifiedPath(file)];
+                break;
+            }
+        }
+    } catch {
+        err: &FsError => {
+            log::warn #("Editor", "The files of the project were not all read", err);
+        }
+    }
+
+    users
+}
+
+/**
+ * Show a file in the file manager of the desktop, selected in its folder (org.freedesktop.FileManager1), or open its
+ * folder (xdg-open) when no file manager answers
+ * @returns: false when neither can be started
+ * */
+pub fn showInFileManager(path: [c8])-> bool {
+    let uri = "file://" ~ path;
+    let folder = if isDir(Path(path)) { path } else { Path(path).parent().toStr() };
+    {
+        let script = "dbus-send --session --print-reply --dest=org.freedesktop.FileManager1 --type=method_call "
+            ~ "/org/freedesktop/FileManager1 org.freedesktop.FileManager1.ShowItems array:string:\"$1\" string:\"\" "
+            ~ "> /dev/null 2>&1 || exec xdg-open \"$2\"";
+        let dmut p = copy SubProcess("sh", copy ["-c", script, "sh", uri, folder]);
+        p:.start(redirect-> false);
+        __SHOWN__ ~= [alias p];
+    } catch {
+        err => {
+            log::warn #("Editor", "The file manager was not started", err);
+            return false;
+        }
+    }
+
+    true
+}
+
+/**
+ * @returns: true iif a file is one of some entries, or under one of them
+ * */
+fn isUnder(file: [c8], paths: [[c8]])-> bool {
+    for p in paths {
+        if file == p { return true; }
+        if file.len > p.len && file[0us .. p.len] == p && file[p.len] == '/' { return true; }
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the content of a file names a path between quotes, or a path under it (a folder)
+ * @params:
+ *    - path: the path, res:/…
+ * */
+fn namesIn(content: [c8], path: [c8])-> bool {
+    let exact = "\"" ~ path ~ "\"";
+    let under = "\"" ~ path ~ "/";
+    holds(content, exact) || holds(content, under)
+}
+
+/**
+ * @returns: true iif a text holds another one
+ * */
+fn holds(text: [c8], part: [c8])-> bool {
+    if part.len > text.len { return false; }
+    for i in 0us .. text.len - part.len + 1us {
+        if text[i .. i + part.len] == part { return true; }
+    }
+
+    false
+}
+
+/**
+ * @returns: a name without the number it ends with after an underscore, crate for crate_3
+ * */
+fn baseName(name: [c8])-> [c8] {
+    let mut end = name.len;
+    while end > 0us && name[end - 1us] >= '0'c8 && name[end - 1us] <= '9'c8 {
+        end -= 1us;
+    }
+
+    if end > 1us && end < name.len && name[end - 1us] == '_' { name[0us .. end - 1us] } else { name }
+}
