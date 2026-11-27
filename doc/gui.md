@@ -326,6 +326,11 @@ Image "res:/images/logo.png";
   wheel or the `::scrollbar` (8 pixels wide unless its style sets a width), shown only then, in the states `:hover`
   under the cursor and `:pressed` while dragged. The selected item is scrolled to when the list opens. `on-change` gives
   the index of the item the user selected.
+- **A click on a button of an open menu closes the menus, a toggle keeps them open.** A `PushButton` or an `IconButton`
+  in a menu is an item: its action done, every menu closes (`Widget.closesMenuOnClick`). A `CheckBox` or a
+  `RadioButton` switches a state in place, so its menu stays open and several of its toggles are switched at once; a
+  `MenuButton` opens a menu and keeps the menus open too. Another widget opens the menu of a menu button by
+  `MenuButton.open`, as a click on the button would (the ⋮ beside the camera chip of the editor).
 - **A list view shows the items of a model given by the code**, a .gui having no loops: `setModel` takes a class over
   `ListModel`, whose `len` and `text (index)` the list reads on demand (`TextListModel` holds a list of texts), and a
   model whose items change calls `changed`, the lists showing it reading it again. Only the rows shown exist, recycled
@@ -589,7 +594,10 @@ if let Ok (dmut scene : &EditableScene) = alias scene3D:.getScene () {
 - **The cursor is mapped to the resolution the scene renders at**: the image is drawn over the square of the larger side
   of the widget, centred on it, so `Scene3DLayout.renderPixel (cursor)` gives the pixel of the image under a position
   of the window, from its top left corner, `none` off the image. `Scene.pick (pixel)` picks from a pixel, and
-  `Scene.rayThroughPixel (pixel)` gives the ray the camera sees through it, from its near plane to its far plane.
+  `Scene.rayThroughPixel (pixel)` gives the ray the camera sees through it, from the first depth drawn to its far
+  plane: Vulkan draws from a depth of 0, the near plane of an orthographic camera (`ortho` writes its depths in
+  [0, 1]) and twice the near plane of a perspective one (`perspective` maps its near plane to -1, the depths before 0
+  clipped).
 - **The instances are told apart by their triangles**: the ray goes down the hierarchy of the world boxes the culling
   uses, the closest box first, and each instance whose box it enters tells where the ray hits it
   (`VisualInstance3D.raycast (ray)`); the closest hit gives the instance, and the boxes entered past it are skipped. A
@@ -739,6 +747,26 @@ if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
   the radii of the rings (`GizmoShape::ring`) are in heights of a texel and the distances are taken on screen, so a line
   keeps its width whatever its direction and a ring is round when the square enclosing it is square on screen
   (`GizmoShape.placed` with a scale divided by the aspect along x).
+
+### The orientation gizmo
+
+- **A `ViewGizmo` draws the axes of the world as the camera of the view sees them**, in the top right corner of the
+  image: a disc, ringed while `hovered`, and the six ends of the axes in the colours of the handles of the gizmo (X red,
+  Y green, Z blue), a positive end a disc with the letter of its axis at the end of a shaft from the centre, a negative
+  end hollow, the ends pointing at the eye drawn over the others. It is a node of the scene, spawned under its root by
+  the overlay showing it (the viewport of the editor names it `__view_gizmo__`), drawn by a `GizmoEffect` of its own
+  (`axes`, after the others) from the camera the scene is seen through, at each tick.
+- **It is sized in pixels on screen**, whatever the resolution of the image: a disc of 40 pixels 12 pixels from the
+  corner, the texels a pixel covers taken from the aspect of the scene on screen (`Scene::setAspect`).
+- **An end gives an axis view**: `endAt` gives the `AxisView` of the end under a point of the image, the end closest to
+  the eye first, and `covers` tells whether the point is on the disc, for a drag orbiting the eye. The ends are computed
+  by `ViewGizmo::ends` (`endsOf` from the axes of a camera, `endUnder` for the end under a point), testable without a
+  scene. An end along d is drawn at (-x·d, -y·d) from the centre, x and y the axes of the camera, as the view matrix
+  mirrors x and the rows go down.
+- **`AxisView` names the six views along the axes**, by the side of the scene the eye stands on (`sideOf`): Top (+Y),
+  Bottom, Front (+Z, the front of a glTF model), Back, Right (+X) and Left. The image mirroring X, the right view shows
+  the side on the left of the front view. `oppositeOf`, `nameOf`, `keyOf` (7, 1 and 3 of the numpad, Ctrl for the
+  other side), `isPositive` and `axisOf` describe them, `AXIS_VIEWS` lists them.
 
 ## The style file
 
