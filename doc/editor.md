@@ -3,7 +3,8 @@
 The editor of Balder lives in `editor/`, beside the library, as the start of a game engine editor. It edits a
 project: it opens on the project manager, then the editor window shows the outline of the scene on the left, its
 viewport in the middle and the inspector of the node selected on the right, under a top row and above a status bar.
-The top row holds the logo, the menus (Scene, Add, Edit, View, Gizmo), a seam, the tabs of the scenes opened (see the
+The top row holds the logo, the menus (Scene, Add, Edit, View, and Gizmo: Select, Translate, Rotate and Scale, Q, W, E
+and R, as the tools of the toolbar of the viewport), a seam, the tabs of the scenes opened (see the
 documents below), then Compile, and Play, Pause and Stop, idle until the play mode (BAL-134). The window reads as one:
 no space between its panels but a seam of a pixel (`$edge`), the space inside the rows and never around them, bars and
 rows of 22 to 32 pixels (the top row 32, the items of the menus 24 with their shortcut right-aligned and muted, the
@@ -170,8 +171,30 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   *View → Hide the grid* hides it. Where nothing is drawn, a scene without an environment shows a grey.
 - **Viewport**: a click selects the node under the cursor (Ctrl toggles it), the middle button turns the camera around
   the point it looks at, Shift and the middle button slide it, the wheel brings it closer. Once clicked, the viewport
-  takes the keys W, E and R (translate, rotate, scale, the key of the mode in use switching between the world and the
-  local axes), Delete, Ctrl+D (duplicate) and F (look at the selection, or at the whole scene).
+  takes the keys Q, W, E and R (select, translate, rotate, scale, the key of the mode in use switching between the world
+  and the local axes), Delete, Ctrl+D (duplicate) and F (look at the selection, or at the whole scene).
+- **Viewport toolbar**: a bar over the viewport (`ViewportBars`, `editor/ui/viewport.gui`) holds, from the left:
+  - the tools of the gizmo, Select (Q: no handles, a click selecting only), Move (W), Rotate (E) and Scale (R), one
+    checked at a time, and the space it moves along (World or Local); the keys and the Gizmo menu check the tool they
+    choose;
+  - the snapping, a toggle and a step per kind of change: the moves (metres), the rotations (degrees) and the scales
+    (the factor), each step typed or rolled by the wheel (from 0.05, by 0.05, up to 100 m, 180° and 10), 0.5 m, 15° and
+    0.1 by default. A kind switched on snaps without a key, Ctrl moving, turning or scaling freely; a kind switched off
+    snaps only while Ctrl is held. A face of a volume moves by the step of the moves;
+  - on the right, the display: Lit (the materials lit), Unlit (their base colour) and Wireframe (the edges of the
+    triangles seen, over a flat grey, see the debug views of `doc/render-graph.md`), through the camera of the editor
+    and through a camera of the scene looked through, the status bar telling the one chosen;
+  - *Overlays*, a menu of boxes showing or hiding the grid, the icons, the colliders of the bodies and the convex hulls,
+    the same state as *View → Hide the grid* and *Hide the icons* and the box of the hulls panel, each following the
+    others. The colliders are drawn with the icons only: hiding the icons hides them too, and hiding the colliders
+    leaves the icons;
+  - *Maximize* (Shift+Space) maximizes the viewport, the docks and their rails out of the way, what they show kept, and
+    restores them as they were; its icon and its name tell what it does next. Ctrl+F (the filter of the inspector)
+    restores the docks to show the inspector, and so does a material shown.
+- **Path bar**: a bar under the toolbar tells the path of the node selected last: the name of the scene, the parents
+  of the node, then the node, its icon before its name, separated by chevrons. A click on a parent selects it, a click
+  on the scene clears the selection. On the right, the position of the node in the world (`x 1.00 · y 0.00 · z
+  -2.50`, metres with two decimals), following its moves; a rename or a move in the outline writes the path again.
 - **Flight**: holding the right button flies the camera, the mouse captured turning it where it stands, W, A, S and D
   moving it forward, to the left, back and to the right, E and Q up and down, Shift four times faster, the wheel
   changing its speed. The keys are read by their place on the keyboard (Z, Q, S and D on an AZERTY one), and taken by

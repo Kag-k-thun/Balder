@@ -31,6 +31,10 @@ layout (location = 4) out vec4 emissive;
 // The motion of the fragment since the frame before, in texture coordinates, the jitter of the projection left out
 layout (location = 5) out vec2 velocity;
 
+// The first debug view of a channel of the materials, and the view of the edges of the triangles (see DebugView)
+const uint FIRST_CHANNEL_VIEW = 5u;
+const uint WIREFRAME_VIEW = 4u;
+
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
  */
@@ -107,7 +111,7 @@ vec3 hashColor (uint h) {
  */
 vec3 debugColor () {
     uint word = inDebug.y, cluster = inDebug.z, primitive = uint (gl_PrimitiveID);
-    if (inDebug.x == 1u) {
+    if (inDebug.x == 1u || inDebug.x == WIREFRAME_VIEW) {
         uint id = cluster == NO_CLUSTER ? primitive : hash (cluster) + primitive;
         return hashColor (hash (word * 0x9e3779b9u + id));
     }
@@ -133,7 +137,7 @@ void main() {
     emissive = vec4 (1.0);
     // the debug views of the geometry show a flat colour, the composition lighting it from the eye, the views of the
     // channels of the materials (from 4, see DebugView) shaded by the composition from the materials
-    if (inDebug.x != 0u && inDebug.x < 4u) {
+    if (inDebug.x != 0u && inDebug.x < FIRST_CHANNEL_VIEW) {
         albedo = vec4 (debugColor (), 1.0);
         surface = vec2 (0.0, 1.0);
         emissive = vec4 (0.0);

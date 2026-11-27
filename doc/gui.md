@@ -615,6 +615,7 @@ Scene3D #scene { resolution: 1280 720; editable: true;
 
 ```
 picker.showsIcons = false;                       // hides them all, true shows them again
+picker.showsColliders = false;                   // hides the colliders of the bodies, the icons still shown
 ```
 
 - **`icons: true` draws the nodes without geometry as icons**: the lights, the cameras, the empties, the markers, the
@@ -649,6 +650,9 @@ picker.showsIcons = false;                       // hides them all, true shows t
   (`debug_view::drawCollider`), in the colours of the debug view of the physics by their settings
   (`debug_view::colorOfSettings`: grey static, blue kinematic, orange dynamic, yellow a trigger), fainter until their
   body is selected; the layer is drawn again only once a body moved, changed or was selected, and cleared with the icons.
+  `picker.showsColliders = false` leaves them out while the icons stay, their layer cleared, and true draws them again
+  from the next tick; the picker keeps the choice and gives it to each `NodeIcons` it spawns (`NodeIcons.showsColliders`,
+  its twin).
 - **The icons are drawn as the gizmo is**, by a `GizmoEffect` of their own (`icons`), placed before the gizmo in the
   chain so the gizmo is drawn over them. It draws 1024 shapes at most: past them the wires are left out first, then the
   guides, then the icons farthest from the eye.
@@ -665,8 +669,11 @@ Scene3D #scene { resolution: 1280 720; editable: true;
 if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
     gizmo.mode = GizmoMode::ROTATE;              // TRANSLATE, ROTATE, SCALE
     gizmo.space = GizmoSpace::LOCAL;             // WORLD, LOCAL
-    gizmo.snap = GizmoSnap (translation-> 0.25f, angle-> radian (10.0f), scale-> 0.1f);
+    gizmo.snap = GizmoSnap (translation-> 0.25f, angle-> radian (10.0f), scale-> 0.1f,
+                            rotating-> true);    // the rotations snap without a key, Ctrl turning freely
+    gizmo.showsHandles = false;                  // the select tool (Q): no handles, a click selecting only
     gizmo:.transformed ():.connect (self.box, &self:.onTransformed);   // read gizmo.edits there
+    gizmo:.toolChanged ():.connect (self.box, &self:.onToolChanged);   // a key changed the tool, the mode or the space
 }
 ```
 
@@ -675,7 +682,8 @@ if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
   `hovered`).
 - **The gizmo is a node of the scene, there only while nodes are selected**: when the selection gets a node, the
   `SceneGizmo` spawns a `TransformGizmo` under the root of the scene (named `__gizmo__`) moving the nodes selected, and
-  disposes it when the selection empties. A scene with nothing selected holds no gizmo, and draws none. The overlay
+  disposes it when the selection empties or the handles are hidden (`showsHandles`, below). A scene with nothing
+  selected holds no gizmo, and draws none. The overlay
   keeps the mode, the space, the size and the snapping between two gizmos, and `gizmo.gizmo` gives the one spawned,
   `none` while there is none.
 - **Three modes**: translate (arrows along the axes, squares in the planes between them), rotate (rings about the axes,
@@ -683,11 +691,20 @@ if let Ok (dmut gizmo : &SceneGizmo) = self.gui:.find ("scene/gizmo") {
   centre scaling every axis, the cursor moving right or up growing them). A click gives the gizmo the focus: `W`, `E`
   and `R` then switch to each mode, the key of the mode in use switching between the world and the local space.
   Escape cancels a drag, the nodes taking back their transforms.
+- **The select tool hides the handles**: `gizmo.showsHandles = false` (or `Q`) disposes the gizmo, a drag under way
+  cancelled, while the selection stays, a click picking and selecting only; true spawns it again over the selection.
+  `W`, `E` and `R` show the handles again in their mode (the key of the mode in use switching the space only while they
+  are shown). `toolChanged` is emitted when a key changed the tool, the mode or the space, so that a toolbar showing
+  them follows; setting them from the code emits nothing.
 - **The drag follows the ray through the cursor**: projected on the axis grabbed, on the plane of the square grabbed,
   or turning about the ring grabbed (on the plane facing the eye when the ring is seen edge on). The change from the
   grab is given to every node selected, those under another node selected moving with it: the same translation in the
-  world, the same rotation and the same factors of scale about the origin of each. Ctrl (or Command) snaps it to the
-  steps of `gizmo.snap`, 0.5 world units along each axis, 15° and a tenth of the scale by default.
+  world, the same rotation and the same factors of scale about the origin of each.
+- **Snapping, per kind of change**: a change snaps to the steps of `gizmo.snap` (`GizmoSnap`), 0.5 world units along
+  each axis, 15° and a tenth of the scale by default. Each kind is switched on or off on its own (`translating`,
+  `rotating`, `scaling`, all off by default): a kind switched on snaps without a key, Ctrl (or Command) held moving
+  freely, and a kind switched off snaps only while Ctrl is held, the modifier inverting the toggle
+  (`GizmoSnap::snaps (snap, mode, face, modifier)`). A face of a volume snaps as a translation, whatever the mode.
 - **A volume selected alone shows the squares of its faces**, and so does a body of a box, a sphere, a capsule or a
   cylinder, on the faces of its collider (`TransformGizmo.faceAt`, `GizmoHandle::FACE`, `VolumeEdit::shapeOf`), picked
   before the handles of the gizmo, within 7 texels of their centre, the one closest to the eye winning. A face dragged

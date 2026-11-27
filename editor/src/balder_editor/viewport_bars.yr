@@ -1,0 +1,580 @@
+in viewport_bars;
+
+use balder::core::error;
+use balder::core::application::signal;
+use balder::interface;
+use balder::interface::style;
+use balder::interface::loader::registry::behavior;
+use balder::interface::widget;
+use balder::interface::widget::{box, text::_};
+use balder::interface::widget::button::{check, dropdown, icon, push};
+use balder::interface::widget::layout::linear;
+use balder::scene::gizmo::{mode, space};
+use balder::scene::node::node3D;
+use balder::scene::node::node3D::camera;
+use balder::utils::log;
+
+use balder_editor::{arguments, command, dock_rails, editor, hulls_panel, outline, viewport};
+
+use std::conv;
+
+use ::sdl3::mouse;
+
+// The toolbar over the viewport, the crumbs and the position of the bar of the path under it
+def TOOLS = "BODY/MAIN/TOOLS";
+def CRUMBS = "BODY/MAIN/PATH/CRUMBS";
+def POSITION = "BODY/MAIN/PATH/POSITION";
+
+// The items of the View menu switching the icons and the grid, and the step of the grid in the status bar
+def ICONS_ITEM = "BAR/VIEW/ICONS";
+def GRID_ITEM = "BAR/VIEW/GRID";
+def GRID_LABEL = "BODY/FOOT/GRID";
+
+// The tools of the transform group, and the overlays of the Overlays menu, by the ids of their widgets
+def TOOL_IDS = ["SELECT", "MOVE", "ROTATE", "SCALE"];
+def OVERLAYS = ["GRID", "ICONS", "COLLIDERS", "HULLS"];
+
+// The display modes in the order of their dropdown, and what the status bar tells when one is chosen
+def DISPLAY_VIEWS = [DebugView::NONE, DebugView::BASE_COLOR, DebugView::WIREFRAME];
+def DISPLAY_TOLD = ["Showing the scene lit", "Showing the base colours, unlit", "Showing the edges of the triangles"];
+
+// The icons of the button maximising the viewport, and restoring the docks
+def MAXIMIZE_ICON = "engine:/images/ui/maximize.svg";
+def RESTORE_ICON = "engine:/images/ui/restore.svg";
+
+// The degrees in a radian, the steps of the rotations being typed in degrees
+def DEGREES = 57.29578f;
+
+/**
+ * The bars over the viewport of the editor, mounted under the behavior 'viewport': the toolbar of the gizmo, the
+ * snapping, the display and the overlays, and the bar of the path of the selection
+ * @info:
+ * =====
+ * The toolbar holds the tools of the gizmo (Select, Move, Rotate, Scale: Q, W, E, R), the axes it moves along (World,
+ * Local), a toggle and a step per kind of change snapped (see GizmoSnap::snaps), the display mode (Lit, Unlit,
+ * Wireframe, see EditorViewport::display), the overlays (the grid, the icons, the colliders, the convex hulls) and the
+ * button maximising the viewport (Shift+Space, see DockRails::setMaximized). The keys of the gizmo, the View and Gizmo
+ * menus and the box of the hulls panel go through the same state, the bars writing it back each time (see showTool,
+ * showOverlays). The path bar tells the scene, the parents and the node selected last, each crumb selecting its node
+ * (the scene clearing the selection), and the position of the node in the world, following its moves.
+ * ====
+ * */
+pub class ViewportBars over Behavior {
+
+    // The interface holding the bars
+    let dmut _gui: &WidgetManager;
+
+    // The mailbox the slots of the selection, the moves and the keys are emitted in
+    let dmut _box: &SlotEmitter;
+
+    // What the status bar tells
+    let _status: dg ([c8])-> void;
+
+    // The viewport, the editor of the scene, the panel of the hulls and the docks, once bound
+    let dmut _viewport: (&EditorViewport)? = none;
+    let dmut _editor: (&SceneEditor)? = none;
+    let dmut _hulls: (&HullsPanel)? = none;
+    let dmut _docks: (&DockRails)? = none;
+
+    // The node selected last, whose path is shown, none when nothing is selected
+    let dmut _node: (&Node3D)? = none;
+
+    // The nodes of the crumbs, from the first under the root of the scene to the node selected last
+    let dmut _path: [&Node3D] = [];
+
+    /**
+     * @params:
+     *    - gui: the interface holding the bars
+     *    - box: the mailbox the slots of the selection, the moves and the keys are emitted in
+     *    - status: what tells a message in the status bar
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, status: dg ([c8])-> void)
+        with _gui = alias gui
+        , _box = alias box
+        , _status = status
+    {
+        self:.slot("tool", &self:.onTool);
+        self:.slot("space", &self:.onSpace);
+        self:.slot("snap", &self:.onSnap);
+        self:.slot("step", &self:.onStep);
+        self:.slot("display", &self:.onDisplay);
+        self:.slot("overlay", &self:.onOverlay);
+        self:.slot("maximize", &self:.onMaximize);
+        self:.slot("crumb", &self:.onCrumb);
+    }
+
+    /**
+     * Follow the viewport, the selection of the scene and the hulls, once the interface is loaded, the bars written
+     * from them
+     * */
+    pub fn bind(mut self, dmut viewport: &EditorViewport, dmut editor: &SceneEditor, dmut hulls: &HullsPanel,
+                dmut docks: (&DockRails)?) {
+        viewport:.toolChanged():.connect(alias self._box, &self:.showTool);
+        hulls:.shownChanged():.connect(alias self._box, &self:.onHullsShown);
+        editor:.edited():.connect(alias self._box, &self:.onEdited);
+        editor:.switched():.connect(alias self._box, &self:.onSelectionChanged);
+
+        let dmut scene = alias editor.scene;
+        let dmut selection = alias scene.selection;
+        selection:.changed():.connect(alias self._box, &self:.onSelectionChanged);
+
+        self._viewport = (alias viewport)?;
+        self._editor = (alias editor)?;
+        self._hulls = (alias hulls)?;
+        self._docks = alias docks;
+
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(TOOLS ~ "/SPACE") {
+            d:.setItems(copy ["World", "Local"]);
+        }
+
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(TOOLS ~ "/DISPLAY") {
+            d:.setItems(copy ["Lit", "Unlit", "Wireframe"]);
+            d:.setSelected(0us);
+        }
+
+        self:.showTool();
+        self:.showSnap();
+        self:.showOverlays();
+        self:.showMaximized();
+        self:.onSelectionChanged();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          TOOLS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Use a tool of the gizmo: SELECT hides its handles, MOVE, ROTATE and SCALE show them in their mode (the toolbar,
+     * the Gizmo menu)
+     * */
+    pub fn useTool(mut self, tool: [c8]) {
+        if let Ok(dmut v) = alias self._viewport {
+            if tool == "SELECT" {
+                v.showsHandles = false;
+            } else {
+                v.mode = if tool == "ROTATE" {
+                    GizmoMode::ROTATE
+                } else if tool == "SCALE" {
+                    GizmoMode::SCALE
+                } else {
+                    GizmoMode::TRANSLATE
+                };
+
+                v.showsHandles = true;
+            }
+        }
+
+        self:.showTool();
+    }
+
+    /**
+     * Check the button of the tool in use and choose the space of the gizmo in its dropdown
+     * */
+    fn showTool(mut self) {
+        let (tool, world) = if let Ok(v) = self._viewport {
+            let t = if !v.showsHandles {
+                "SELECT"
+            } else if v.mode == GizmoMode::ROTATE {
+                "ROTATE"
+            } else if v.mode == GizmoMode::SCALE {
+                "SCALE"
+            } else {
+                "MOVE"
+            };
+
+            (t, v.space == GizmoSpace::WORLD)
+        } else { return; };
+
+        for id in TOOL_IDS {
+            if let Ok(dmut b: &IconButton) = self._gui:.find(TOOLS ~ "/TRANSFORM/" ~ id) {
+                b:.setChecked(id == tool);
+            }
+        }
+
+        if let Ok(dmut d: &Dropdown) = self._gui:.find(TOOLS ~ "/SPACE") {
+            d:.setSelected(if world { 0us } else { 1us });
+        }
+    }
+
+    /**
+     * A button of the transform group checked uses its tool, the one unchecked by it doing nothing
+     * */
+    fn onTool(mut self, tool: [c8], checked: bool) {
+        if checked { self:.useTool(tool); }
+    }
+
+    /**
+     * The gizmo moves along the axes of the world (0) or of its node (1)
+     * */
+    fn onSpace(mut self, index: usize) {
+        if let Ok(dmut v) = alias self._viewport {
+            v.space = if index == 0us { GizmoSpace::WORLD } else { GizmoSpace::LOCAL };
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SNAPPING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A kind of change switched on snaps without a key, switched off only with Ctrl
+     * @params:
+     *    - kind: TRANSLATION, ANGLE or FACTOR, bound by the .gui file
+     * */
+    fn onSnap(mut self, kind: [c8], on: bool) {
+        if let Ok(dmut v) = alias self._viewport {
+            let mut s = v.snap;
+            if kind == "TRANSLATION" {
+                s.translating = on;
+            } else if kind == "ANGLE" {
+                s.rotating = on;
+            } else {
+                s.scaling = on;
+            }
+
+            v.snap = s;
+            log::info #("Probe", f"onSnap ${kind} ${on}: translating ${v.snap.translating} step ${v.snap.translation}");
+        }
+    }
+
+    /**
+     * The step of a kind of change typed or rolled: metres, degrees, or the factor of a scale
+     * */
+    fn onStep(mut self, kind: [c8], value: f32) {
+        if let Ok(dmut v) = alias self._viewport {
+            let mut s = v.snap;
+            if kind == "TRANSLATION" {
+                s.translation = value;
+            } else if kind == "ANGLE" {
+                s.angle = value / DEGREES;
+            } else {
+                s.scale = value;
+            }
+
+            v.snap = s;
+        }
+    }
+
+    /**
+     * Write the toggles and the steps of the snapping of the gizmo in their fields
+     * */
+    fn showSnap(mut self) {
+        let s = if let Ok(v) = self._viewport { v.snap } else { return; };
+        self:.showStep("TRANSLATION", s.translating, s.translation);
+        self:.showStep("ANGLE", s.rotating, s.angle * DEGREES);
+        self:.showStep("FACTOR", s.scaling, s.scale);
+    }
+
+    fn showStep(mut self, kind: [c8], on: bool, value: f32) {
+        if let Ok(dmut b: &IconButton) = self._gui:.find(TOOLS ~ "/SNAP/" ~ kind ~ "/ON") {
+            b:.setChecked(on);
+        }
+
+        if let Ok(dmut s: &SpinBox) = self._gui:.find(TOOLS ~ "/SNAP/" ~ kind ~ "/STEP") {
+            s:.setValue(value);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          DISPLAY AND OVERLAYS          =============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The viewport shows the scene lit, unlit or in wireframe, in the order of the dropdown
+     * */
+    fn onDisplay(mut self, index: usize) {
+        if index >= DISPLAY_VIEWS.len { return; }
+
+        if let Ok(dmut v) = alias self._viewport {
+            v.display = DISPLAY_VIEWS[index];
+            self._status(DISPLAY_TOLD[index]);
+        }
+    }
+
+    /**
+     * Show an overlay of the viewport, or hide it: GRID, ICONS, COLLIDERS or HULLS
+     * */
+    pub fn setOverlay(mut self, overlay: [c8], shown: bool) {
+        let dmut v = if let Ok(dmut v) = alias self._viewport { alias v } else { return; };
+        if overlay == "GRID" {
+            v.showsGrid = shown;
+            if !shown {
+                if let Ok(dmut l: &Label) = self._gui:.find(GRID_LABEL) { l:.setText(""); }
+            }
+        } else if overlay == "ICONS" {
+            v.showsIcons = shown;
+        } else if overlay == "COLLIDERS" {
+            v.showsColliders = shown;
+        } else if let Ok(dmut h) = alias self._hulls {
+            h.showsHulls = shown;
+        }
+
+        self:.showOverlays();
+        let verb = if shown { "Showing" } else { "Hiding" };
+        self._status(f"${verb} the ${ViewportBars::nameOf(overlay)}");
+    }
+
+    /**
+     * Show an overlay hidden, or hide it (the View menu)
+     * */
+    pub fn toggleOverlay(mut self, overlay: [c8]) {
+        self:.setOverlay(overlay, !self.isShown(overlay));
+    }
+
+    /**
+     * @returns: true iif an overlay is shown
+     * */
+    fn isShown(self, overlay: [c8])-> bool {
+        if overlay == "HULLS" {
+            if let Ok(h) = self._hulls { return h.showsHulls; }
+            return false;
+        }
+
+        if let Ok(v) = self._viewport {
+            if overlay == "GRID" { return v.showsGrid; }
+            if overlay == "ICONS" { return v.showsIcons; }
+            return v.showsColliders;
+        }
+
+        false
+    }
+
+    /**
+     * Check the boxes of the overlays shown, and name in the View menu what its items do next
+     * */
+    fn showOverlays(mut self) {
+        for overlay in OVERLAYS {
+            if let Ok(dmut c: &CheckBox) = self._gui:.find(TOOLS ~ "/OVERLAYS/" ~ overlay) {
+                c:.setChecked(self.isShown(overlay));
+            }
+        }
+
+        if let Ok(dmut item: &PushButton) = self._gui:.find(ICONS_ITEM) {
+            item:.setText(if self.isShown("ICONS") { "Hide the icons" } else { "Show the icons" });
+        }
+
+        if let Ok(dmut item: &PushButton) = self._gui:.find(GRID_ITEM) {
+            item:.setText(if self.isShown("GRID") { "Hide the grid" } else { "Show the grid" });
+        }
+    }
+
+    fn onOverlay(mut self, overlay: [c8], shown: bool) {
+        self:.setOverlay(overlay, shown);
+    }
+
+    /**
+     * The box of the hulls panel showed or hid them
+     * */
+    fn onHullsShown(mut self, _: bool) {
+        self:.showOverlays();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          MAXIMIZE          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Maximize the viewport, or restore the docks (the button, Shift+Space)
+     * */
+    pub fn toggleMaximized(mut self) {
+        if let Ok(dmut d) = alias self._docks {
+            d:.setMaximized(!d.maximized);
+        }
+
+        self:.showMaximized();
+    }
+
+    /**
+     * Give the button maximising the viewport the icon and the name of what it does next
+     * */
+    pub fn showMaximized(mut self) {
+        let maximized = if let Ok(d) = self._docks { d.maximized } else { false };
+        if let Ok(dmut b: &IconButton) = self._gui:.find(TOOLS ~ "/MAXIMIZE") {
+            b:.setIcon(if maximized { RESTORE_ICON } else { MAXIMIZE_ICON });
+            b:.setName(if maximized { "Restore the docks" } else { "Maximize the viewport" });
+        }
+    }
+
+    fn onMaximize(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.toggleMaximized(); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =======================================          PATH          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Follow the node selected last, its position written each time it moves
+     * */
+    fn onSelectionChanged(mut self) {
+        let dmut node: (&Node3D)? = none;
+        if let Ok(dmut e) = alias self._editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            let dmut nodes = alias selection.nodes;
+            if nodes.len != 0us { node = (alias nodes[$ - 1us])?; }
+        }
+
+        if let Ok(dmut old) = alias self._node {
+            old:.transformationChanged():.disconnect(&self:.showPosition);
+        }
+
+        if let Ok(dmut n) = alias node {
+            n:.transformationChanged():.connect(alias self._box, &self:.showPosition);
+        }
+
+        self._node = alias node;
+        self:.showPath();
+    }
+
+    /**
+     * A change of the scene may have renamed or moved a node of the path: it is written again
+     * */
+    fn onEdited(mut self, _: &EditCommand) {
+        self:.showPath();
+    }
+
+    /**
+     * Write the crumbs of the path: the scene, the parents of the node selected last, then the node with its icon
+     * */
+    fn showPath(mut self) {
+        let dmut path: [&Node3D] = [];
+        if let Ok(dmut n) = alias self._node {
+            ViewportBars::gatherPath(alias n, ref path);
+        }
+
+        self._path = alias path;
+        let scene = if let Ok(e) = self._editor { e.document.name } else { "" };
+
+        self._gui:.holdLayout();
+        {
+            if let Ok(dmut l: &LinearLayout) = self._gui:.find(CRUMBS) {
+                l:.removeChilds();
+            }
+
+            let crumbs = WidgetManager::quoted("SCENE");
+            self._gui:.instantiate("Crumb", scene, parent-> CRUMBS, id-> "SCENE",
+                                   attributes-> f"on-click: viewport::crumb(${crumbs});");
+            for i, n in self._path {
+                self._gui:.instantiate("CrumbSeam", parent-> CRUMBS, id-> f"S${i}");
+                if i + 1us == self._path.len {
+                    self._gui:.instantiate("CrumbNode", n.name.file(), parent-> CRUMBS, id-> "NODE");
+                } else {
+                    let quoted = WidgetManager::quoted(f"${i}");
+                    self._gui:.instantiate("Crumb", n.name.file(), parent-> CRUMBS, id-> f"C${i}",
+                                           attributes-> f"on-click: viewport::crumb(${quoted});");
+                }
+            }
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to show the path of the selection", err);
+            }
+        }
+
+        self._gui:.releaseLayout();
+
+        if let Ok(n) = self._node {
+            self:.setIcon(CRUMBS ~ "/NODE/ICON", editorFile(f"ui/icons/${iconOf(n)}.svg"));
+        }
+
+        self:.showPosition();
+    }
+
+    /**
+     * Write the position of the node selected last in the world, metres with two decimals
+     * */
+    fn showPosition(mut self) {
+        let text = if let Ok(n) = self._node {
+            let w = n.transformation;
+            let x = to![c8] (w.a4, prec-> 2u32), y = to![c8] (w.b4, prec-> 2u32), z = to![c8] (w.c4, prec-> 2u32);
+            f"x ${x} · y ${y} · z ${z}"
+        } else { "" };
+
+        if let Ok(dmut l: &Label) = self._gui:.find(POSITION) {
+            l:.setText(text);
+        }
+    }
+
+    /**
+     * A crumb clicked selects its node, the scene clearing the selection
+     * @params:
+     *    - index: the place of the node in the path, or SCENE, bound when the crumb was instantiated
+     * */
+    fn onCrumb(mut self, index: [c8], b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut e = if let Ok(dmut e) = alias self._editor { alias e } else { return; };
+        let dmut scene = alias e.scene;
+        let dmut selection = alias scene.selection;
+        if index == "SCENE" {
+            selection:.clear();
+            return;
+        }
+
+        for i, dmut n in alias self._path if f"${i}" == index {
+            selection:.select(alias n);
+            return;
+        }
+    }
+
+    /**
+     * Give a box an image, set over the style as its inline style
+     * */
+    fn setIcon(mut self, path: [c8], image: [c8]) {
+        if let Ok(dmut b: &Box) = self._gui:.find(path) {
+            let dmut iconed = copy Style();
+            iconed:.merge(b.getInlineStyle());
+            iconed.backgroundImage = (true, image);
+            b:.setInlineStyle(iconed);
+        }
+    }
+}
+
+/**
+ * The path of a node and the names of the overlays
+ * */
+@companion
+pub mod ViewportBars {
+
+    /**
+     * Put a node in a path after its parents, the root of the scene left out
+     * */
+    pub fn gatherPath(dmut node: &Node3D, ref dmut path: [&Node3D]) {
+        let dmut parent = alias node:.getParent();
+        if let Ok(dmut p: &Node3D) = alias parent {
+            if p:.getParent().hasValue { ViewportBars::gatherPath(alias p, ref path); }
+        }
+
+        path ~= [alias node];
+    }
+
+    /**
+     * @returns: the name of an overlay, as the status bar tells it
+     * */
+    pub fn nameOf(overlay: [c8])-> [c8] {
+        if overlay == "GRID" { return "grid"; }
+        if overlay == "ICONS" { return "icons"; }
+        if overlay == "COLLIDERS" { return "colliders"; }
+        "convex hulls"
+    }
+}
