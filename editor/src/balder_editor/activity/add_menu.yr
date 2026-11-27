@@ -1,0 +1,414 @@
+in add_menu;
+
+use balder_editor::activity::{editor_context, file_choice};
+use balder_editor::command::{add, projection, wrap};
+
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface;
+use balder::interface::dialog;
+use balder::interface::loader::registry::behaviors;
+use balder::interface::widget::button::menu;
+use balder::interface::widget::layout::linear;
+use balder::math::vector;
+use balder::scene::description::_;
+use balder::scene::actors::node_classes;
+use balder::scene::asset::mesh_asset;
+use balder::scene::node;
+use balder::scene::node::node3D::{camera, path, path_point};
+use balder::scene::property::value;
+use balder::utils::{log, path};
+
+use std::fs;
+
+use ::sdl3::mouse;
+
+// The path of the Add menu, opened under the cursor by Ctrl+E
+def ADD_MENU = "BAR/ADD";
+
+// The path of the group of the Add menu holding the submenus of the categories of the actor classes
+def ACTORS_GROUP = "BAR/ADD/ACTORS";
+
+/**
+ * The Add menu of the editor, mounted under the behavior 'add': the nodes added under the root of the scene shown, on
+ * the surface seen at the centre of the viewport (add::node, from a table of presets, the models of add::model, the
+ * paths of add::path), the cameras where the eye of the viewport stands (add::camera), the nodes of the actor classes
+ * the library of the game registers (add::actor, listed by listActorClasses), a point inserted in the path selected
+ * (add::path-point), and the nodes selected wrapped in physics bodies (add::wrap); every add is one command of the
+ * history of the scene
+ * */
+#[behavior]
+pub class AddMenu over Behavior {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The models, the dialog adding a model starting from the directory of the one chosen last
+    let dmut _models: &FileChoice = copy FileChoice(copy ["gltf", "glb", "obj", "fbx", "dae", "ply", "stl"], "models");
+
+    /**
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     * */
+    pub self (dmut ctx: &EditorContext)
+        with _ctx = alias ctx
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          MENU          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Open the Add menu under the cursor, the menus open closed; not while a material is shown
+     * */
+    pub fn openAddMenu(mut self) {
+        if self._ctx.material.hasValue { return; }
+        if let Ok(dmut menu: &MenuButton) = self._ctx.gui:.find(ADD_MENU) {
+            let at = self._ctx.gui.getMousePosition();
+            menu:.openMenuAt(at.x, at.y);
+        }
+    }
+
+    /**
+     * List the actor classes the program registers in the Add menu, in place of those listed: a submenu per category in
+     * the order of their first class, the classes of a category in the order of their registration; the Add menu has
+     * none of them when the program registers no actor class (no library of a game loaded)
+     * */
+    pub fn listActorClasses(mut self) {
+        let classes = actorClasses();
+        let mut categories: [[c8]] = [];
+        for c in classes {
+            let mut known = false;
+            for k in categories if k == c.category { known = true; }
+            if !known { categories ~= [c.category]; }
+        }
+
+        let dmut gui = alias self._ctx.gui;
+        gui:.holdLayout();
+        {
+            if let Ok(dmut group: &LinearLayout) = alias gui:.find(ACTORS_GROUP) {
+                group:.removeChilds();
+                group:.setClasses(if categories.len == 0us { copy ["actors", "absent"] } else { copy ["actors"] });
+            }
+
+            for i, category in categories {
+                let id = f"C${i}";
+                gui:.instantiate("ActorCategory", category ~ " ▸", parent-> ACTORS_GROUP, id-> id);
+                for j, c in classes if c.category == category {
+                    gui:.instantiate("ActorItem", c.label, parent-> ACTORS_GROUP ~ "/" ~ id ~ "/LIST", id-> f"A${j}",
+                                     attributes-> f"on-click: add::actor(${WidgetManager::quoted(c.name)});");
+                }
+            }
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to list the actor classes in the Add menu", err);
+            }
+        }
+
+        gui:.releaseLayout();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add the node of a preset (see presets), logging when there is none of that name
+     * @params:
+     *    - key: the name of the preset, as the .gui file gives it (add::node("cube"))
+     * */
+    #[slot (name-> "node")]
+    fn onAddNode(mut self, key: [c8], b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        for p in presets() if p.key == key {
+            let mut d = NodeDescription(p.name, p.kind);
+            for pv in p.properties { d:.set(pv._0, pv._1); }
+            self:.add(d, lift-> p.lift);
+            return;
+        }
+
+        log::error #("Editor", f"The Add menu has no node '${key}'");
+    }
+
+    /**
+     * Add a node of an actor class, its properties holding their defaults
+     * @params:
+     *    - className: the type of the class in the scene files
+     * */
+    #[slot (name-> "actor")]
+    fn onAddActor(mut self, className: [c8], b: u8) {
+        if b == SDL_BUTTON_LEFT {
+            self:.add(NodeDescription::actor(className, className), lift-> 0.0f);
+        }
+    }
+
+    /**
+     * Add a camera of a projection under the root of the scene, where the eye of the viewport stands, looking where it
+     * looks, an orthographic camera seeing at the point looked at what the viewport sees there
+     * @params:
+     *    - projection: "perspective" or "orthographic", as the .gui file gives it
+     * */
+    #[slot (name-> "camera")]
+    fn onAddCamera(mut self, projection: [c8], b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let orbit = if let Ok(v) = self._ctx.viewport { v.orbit } else { return; };
+        let eye = orbit.eye();
+        let back = eye - orbit.target;
+        if back.length() == 0.0f { return; }
+
+        let fov = 60.0f;
+        let mut d = NodeDescription("camera", NodeKind::CAMERA);
+        let orthographic = projection == "orthographic";
+        d:.set("projection", PropertyValue::choice(if orthographic { "orthographic" } else { "perspective" }));
+        d:.set("position", PropertyValue::vector(eye));
+        d:.set("rotation", PropertyValue::vector(facing(back.normalized(), makeVec3(0.0f, 1.0f, 0.0f)).euler()));
+        d:.set("fov", PropertyValue::number(fov));
+        d:.set("size", PropertyValue::number(framedSize(fov, back.length())));
+
+        if let Ok(dmut e) = alias self._ctx.editor {
+            let dmut scene = alias e.scene;
+            self._ctx:.run(copy AddCommand(d, alias scene:.getRootNode()));
+        }
+    }
+
+    /**
+     * Add a mesh node drawing a model file, chosen in a dialog
+     * */
+    #[slot (name-> "model")]
+    fn onAddModel(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+        self._ctx:.choose(alias self._models, FileDialogMode::OPEN, "Add a model", &self:.onModelChosen);
+    }
+
+    fn onModelChosen(mut self, path: ([c8])?) {
+        if let Ok(p) = path {
+            let mut model = NodeDescription(Path(p).stripExtension().file(), NodeKind::MESH);
+            model:.set("mesh", PropertyValue::asset(qualifiedPath(p)));
+            self:.add(model, lift-> 0.0f);
+        }
+    }
+
+    /**
+     * Add a path of three points, a curve from the left to the right bending away from the eye
+     * */
+    #[slot (name-> "path")]
+    fn onAddPath(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let mut path = NodeDescription("path", NodeKind::PATH);
+        let places = [makeVec3(-2.0f, 0.0f, 0.0f), makeVec3(0.0f, 0.0f, -1.5f), makeVec3(2.0f, 0.0f, 0.0f)];
+        for i, at in places {
+            let mut point = NodeDescription(if i == 0us { "point" } else { f"point_${i + 1us}" }, NodeKind::PATH_POINT);
+            point:.set("position", PropertyValue::vector(at));
+            path.children ~= [point];
+        }
+
+        self:.add(path, lift-> 0.5f);
+    }
+
+    /**
+     * Insert a point in the path selected after its last point, or in the path of the point selected right after it
+     * (see insertedPoint), the status bar telling when no path is selected
+     * */
+    #[slot (name-> "path-point")]
+    fn onAddPathPoint(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut nodes = alias self._ctx:.selectedNodes();
+        if nodes.len != 0us {
+            let dmut last = alias nodes[$ - 1us];
+            if let dmut p: &Path3D = alias last {
+                self:.insertPoint(alias p, none);
+                return;
+            }
+
+            if let dmut point: &PathPoint3D = alias last {
+                if let Ok(dmut parent) = alias point:.getParent() {
+                    if let dmut p: &Path3D = alias parent {
+                        self:.insertPoint(alias p, point.index?);
+                        return;
+                    }
+                }
+            }
+        }
+
+        self._ctx:.setStatus("Select a path, or a point of a path, to insert a point in it");
+    }
+
+    /**
+     * Wrap each node selected in a physics body of a shape fitted to it (see WrapCommand), the status bar telling when
+     * none is selected
+     * */
+    #[slot (name-> "wrap")]
+    fn onWrapClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let dmut nodes = alias self._ctx:.selectedNodes();
+        if nodes.len == 0us {
+            self._ctx:.setStatus("Select the nodes to put in physics bodies");
+            return;
+        }
+
+        if !self._ctx:.run(copy WrapCommand(alias nodes)) {
+            self._ctx:.setStatus("No node selected goes in a body: a body or a character is one already");
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          ADD          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Insert a point in a path after one of its points, halfway to the next one, or a step past the last one
+     * @params:
+     *    - after: the place among the children of the path of the point the new one follows, none for its last point
+     * */
+    fn insertPoint(mut self, dmut path: &Path3D, after: (usize)?) {
+        let points = path.points();
+        let mut i = if points.len == 0us { 0us } else { points.len - 1us };
+        if let Ok(a) = after {
+            for k, p in points if p.index == a { i = k; }
+        }
+
+        let mut d = NodeDescription("point", NodeKind::PATH_POINT);
+        let mut at = LAST_PLACE;
+        if points.len != 0us {
+            let from = points[i];
+            d:.set("position", PropertyValue::vector(insertedPoint(points, i, path.closed)));
+            d:.set("rotation", PropertyValue::vector(from.rotation));
+            d:.set("scale", PropertyValue::vector(from.scale));
+            at = from.index + 1us;
+        }
+
+        self._ctx:.run(copy AddCommand(d, alias path, at-> at));
+    }
+
+    /**
+     * Add a node under the root of the scene, on the surface seen at the centre of the viewport, or at the point the
+     * camera looks at when there is none
+     * @params:
+     *    - lift: the height of the node above that point (a light hanging over it...)
+     * */
+    fn add(mut self, description: NodeDescription, lift: f32) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        let lookedAt = if let Ok(v) = self._ctx.viewport { v.orbit.target } else { vec3() };
+
+        let mut d = description;
+        d:.set("position", PropertyValue::vector(e:.placement(lookedAt) + makeVec3(0.0f, lift, 0.0f)));
+
+        let dmut scene = alias e.scene;
+        self._ctx:.run(copy AddCommand(d, alias scene:.getRootNode()));
+    }
+}
+
+/**
+ * A node the Add menu adds as it is (see add::node): its name, its kind and the properties it is given, standing on the
+ * surface seen at the centre of the viewport
+ * */
+@data
+record NodePreset {
+
+    // The parameter of the slot add::node adding it
+    pub let key: [c8] = "";
+
+    // The name of the node added
+    pub let name: [c8] = "";
+
+    // The kind of the node added
+    pub let kind: NodeKind = NodeKind::EMPTY;
+
+    // The properties the node is given, their other properties holding their defaults
+    pub let properties: [([c8], PropertyValue)] = [];
+
+    // The height of the node above the surface seen (the half height of a volume, a light hanging over it...)
+    pub let lift: f32 = 0.0f;
+}
+
+/**
+ * @returns: the nodes add::node adds, by the parameter the .gui file gives it: the built-in meshes (with the default
+ * material), the empty node, the markers of each purpose, the volumes of each shape, the physics bodies and the lights
+ * */
+fn presets()-> [NodePreset] {
+    let character = NodeDescription("character", NodeKind::CHARACTER);
+
+    copy [NodePreset(key-> "cube", name-> "cube", kind-> NodeKind::MESH, properties-> meshOf(MeshAsset::CUBE)),
+          NodePreset(key-> "sphere", name-> "sphere", kind-> NodeKind::MESH, properties-> meshOf(MeshAsset::SPHERE)),
+          NodePreset(key-> "plane", name-> "plane", kind-> NodeKind::MESH, properties-> meshOf(MeshAsset::PLANE)),
+          NodePreset(key-> "empty", name-> "empty", kind-> NodeKind::EMPTY),
+          NodePreset(key-> "marker", name-> "marker", kind-> NodeKind::MARKER,
+                     properties-> choiceOf("purpose", "generic")),
+          NodePreset(key-> "spawn", name-> "spawn", kind-> NodeKind::MARKER, properties-> choiceOf("purpose", "spawn")),
+          NodePreset(key-> "waypoint", name-> "waypoint", kind-> NodeKind::MARKER,
+                     properties-> choiceOf("purpose", "waypoint")),
+          NodePreset(key-> "socket", name-> "socket", kind-> NodeKind::MARKER,
+                     properties-> choiceOf("purpose", "socket")),
+          NodePreset(key-> "box-volume", name-> "box", kind-> NodeKind::VOLUME, properties-> choiceOf("shape", "box"),
+                     lift-> 0.5f),
+          NodePreset(key-> "sphere-volume", name-> "sphere_volume", kind-> NodeKind::VOLUME,
+                     properties-> choiceOf("shape", "sphere"), lift-> 0.5f),
+          NodePreset(key-> "capsule-volume", name-> "capsule", kind-> NodeKind::VOLUME,
+                     properties-> choiceOf("shape", "capsule"), lift-> 1.0f),
+          NodePreset(key-> "body", name-> "body", kind-> NodeKind::BODY, lift-> 0.5f),
+          NodePreset(key-> "character", name-> "character", kind-> NodeKind::CHARACTER,
+                     lift-> character.value("height").number / 2.0f),
+          NodePreset(key-> "direction", name-> "sun", kind-> NodeKind::LIGHT, lift-> 3.0f,
+                     properties-> copy [("direction", PropertyValue::vector(makeVec3(-0.3f, -1.0f, -0.2f)))]),
+          NodePreset(key-> "point", name-> "lamp", kind-> NodeKind::LIGHT, lift-> 2.0f,
+                     properties-> copy [("light", PropertyValue::choice("point")),
+                                        ("intensity", PropertyValue::number(5.0f)),
+                                        ("range", PropertyValue::number(8.0f))]),
+          NodePreset(key-> "spot", name-> "spot", kind-> NodeKind::LIGHT, lift-> 4.0f,
+                     properties-> copy [("light", PropertyValue::choice("spot")),
+                                        ("intensity", PropertyValue::number(25.0f)),
+                                        ("range", PropertyValue::number(15.0f))])]
+}
+
+/**
+ * @returns: the properties of a mesh node drawing a mesh
+ * @params:
+ *    - path: the path of the mesh (MeshAsset::CUBE...)
+ * */
+fn meshOf(path: [c8])-> [([c8], PropertyValue)] {
+    copy [("mesh", PropertyValue::asset(path))]
+}
+
+/**
+ * @returns: the properties of a node choosing a value of one of its choices (the purpose of a marker...)
+ * */
+fn choiceOf(name: [c8], value: [c8])-> [([c8], PropertyValue)] {
+    copy [(name, PropertyValue::choice(value))]
+}
+
+/**
+ * @returns: where a point inserted in a path after one of its points goes, in the space of the path: halfway to the next
+ * point, to the first one past the last point of a closed path; a step past the last point of an open path, the step
+ * from the point before it, one unit along X for a path of one point
+ * @params:
+ *    - points: the points of the path, in their order
+ *    - i: the index among them of the point the new one follows
+ * */
+fn insertedPoint(points: [&PathPoint3D], i: usize, closed: bool)-> vec3 {
+    let p = points[i].position;
+    if i + 1us < points.len {
+        return (p + points[i + 1us].position) / 2.0f;
+    }
+
+    if points.len < 2us { return p + makeVec3(1.0f, 0.0f, 0.0f); }
+    if closed { return (p + points[0].position) / 2.0f; }
+
+    p + (p - points[i - 1us].position)
+}
