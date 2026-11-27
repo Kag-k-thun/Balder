@@ -1,10 +1,10 @@
 in editor;
 
-use balder_editor::{command, history, scene_document};
+use balder_editor::{command, history, naming, scene_document};
 use balder::core::application::signal;
 use balder::core::error;
 use balder::math::vector;
-use balder::scene::editable;
+use balder::scene::{description, editable};
 use balder::scene::node;
 use balder::scene::node::node3D::{body, body_shape, mesh_instance};
 
@@ -22,6 +22,14 @@ use balder::scene::node::node3D::{body, body_shape, mesh_instance};
  * whether it has unsaved changes. After each change, the bodies of a compound shape take again the volumes under them
  * (see refitCompounds).
  * ====
+ * @info:
+ * =====
+ * The scene shown is played on a copy of its nodes (see play): its own nodes leave the scene, parked by its document as
+ * when another document is shown, and the copy built from their description takes their place, its actors ticked and
+ * its physics simulated, until stop drops it and puts them back as they were, whatever the game did to the copy. The
+ * scene does not change while it is played: execute refuses the commands, undo and redo do nothing, and showing
+ * another document stops the game first.
+ * ====
  * */
 pub class SceneEditor {
 
@@ -37,8 +45,12 @@ pub class SceneEditor {
     // The document shown, whose nodes are in the scene, the history being its own
     let dmut _document: &SceneDocument;
 
-    // The signal emitted when another document is shown
+    // The signal emitted when another document is shown, and when the nodes of the scene are replaced by the nodes
+    // played, or put back
     let dmut _switched: &Signal!{()} = copy Signal!{()} ();
+
+    // True while the scene shown is played, its nodes parked by its document and a copy of them in the scene
+    let mut _played: bool = false;
 
     /**
      * @params:
@@ -91,6 +103,7 @@ pub class SceneEditor {
     pub fn switchTo(mut self, dmut document: &SceneDocument) {
         if document is self._document { return; }
 
+        self:.stop();
         self._document:.park(alias self._scene);
         document:.unpark(alias self._scene);
         self._document = alias document;
@@ -99,7 +112,8 @@ pub class SceneEditor {
     }
 
     /**
-     * @returns: the signal emitted when another document is shown, its nodes in the scene
+     * @returns: the signal emitted when another document is shown, its nodes in the scene, and when the nodes of the
+     * scene shown are replaced by the nodes played, or put back (see play)
      * */
     pub fn switched(mut self)-> dmut &Signal!{()} {
         alias self._switched
@@ -123,6 +137,7 @@ pub class SceneEditor {
     pub fn execute(mut self, dmut command: &EditCommand)-> bool
         throws BalderError
     {
+        if self._played { throw copy BalderError(SceneEditor::PLAYED); }
         if command.startsHistory() {
             // the nodes the commands before name are replaced, even when the command fails half way
             self._history:.clear();
@@ -144,9 +159,10 @@ pub class SceneEditor {
 
     /**
      * Revert the last command applied, edited being emitted with it
-     * @returns: true iif a command was undone, false when there is none to undo
+     * @returns: true iif a command was undone, false when there is none to undo or while the scene is played
      * */
     pub fn undo(mut self)-> bool {
+        if self._played { return false; }
         let dmut command = if let Ok(dmut c) = alias self._history:.back() { alias c } else { return false; };
         command:.revert(alias self._scene);
 
@@ -158,13 +174,15 @@ pub class SceneEditor {
 
     /**
      * Apply again the last command undone, edited being emitted with it
-     * @returns: true iif a command was redone, false when there is none to redo, or when it changed nothing
+     * @returns: true iif a command was redone, false when there is none to redo, when it changed nothing, or while the
+     * scene is played
      * @throws:
      *    - &BalderError: if the change cannot be made again (a model whose file is gone...), the command staying undone
      * */
     pub fn redo(mut self)-> bool
         throws BalderError
     {
+        if self._played { return false; }
         let dmut command = if let Ok(dmut c) = alias self._history:.next() { alias c } else { return false; };
         if !command:.apply(alias self._scene) { return false; }
 
@@ -227,6 +245,118 @@ pub class SceneEditor {
      * */
     pub fn edited(mut self)-> dmut &Signal!{&EditCommand} {
         alias self._edited
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          PLAYING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif the scene shown is played, a copy of its nodes in the scene (see play)
+     * */
+    @field
+    pub fn played(self)-> bool {
+        self._played
+    }
+
+    /**
+     * @returns: true iif the scene shown is played but paused, its actors and its physics waiting
+     * */
+    @field
+    pub fn paused(self)-> bool {
+        self._played && !self._scene.playing
+    }
+
+    /**
+     * @returns: the node the nodes of the scene shown hang from: the root of the scene, or the root its document parks
+     * them under while it is played, the nodes of the scene being the nodes played
+     * */
+    pub fn editedRoot(mut self)-> dmut &Node {
+        if self._played { return alias self._document:.parkedRoot(); }
+        alias self._scene:.getRootNode()
+    }
+
+    /**
+     * Play the scene shown: its nodes leave the scene, parked by its document with the nodes it has selected, and a
+     * copy of them built from their description takes their place, its actors ticked and its physics simulated from the
+     * next tick; switched is emitted
+     * @returns: the nodes played, under the root of the scene, in order
+     * @throws:
+     *    - &BalderError: if the nodes cannot be described or built, the scene staying as it is
+     * */
+    pub fn play(mut self)-> dmut [&Node3D]
+        throws BalderError
+    {
+        if self._played { throw copy BalderError("The scene is played already"); }
+
+        // the materials local to the file stay those of the cache, the nodes played drawing with the nodes edited
+        let edited = copy SceneDescription(alias self._scene:.getRootNode());
+        let copied = copy SceneDescription(edited.nodes);
+
+        self._document:.park(alias self._scene);
+        let dmut built: [&Node3D] = [];
+        {
+            built = alias copied.build(alias self._scene:.getRootNode());
+        } catch {
+            err: &BalderError => {
+                self:.dropPlayed();
+                self._document:.unpark(alias self._scene);
+                throw err;
+            }
+        }
+
+        self._played = true;
+        self._scene.playing = true;
+        self._switched:.emit();
+        alias built
+    }
+
+    /**
+     * Pause the game played, its actors and its physics waiting, or play it again
+     * */
+    pub fn pause(mut self, paused: bool) {
+        if self._played { self._scene.playing = !paused; }
+    }
+
+    /**
+     * Play the game paused for one tick, its actors ticked and its physics stepped once
+     * */
+    pub fn step(mut self) {
+        if self.paused { self._scene:.step(); }
+    }
+
+    /**
+     * Stop playing the scene shown: the nodes played are dropped, whatever the game did to them, and the nodes of the
+     * scene put back as they were left, with the nodes they had selected; switched is emitted
+     * */
+    pub fn stop(mut self) {
+        if !self._played { return; }
+
+        self._scene.playing = false;
+        self._played = false;
+        self:.dropPlayed();
+        self._document:.unpark(alias self._scene);
+        self._switched:.emit();
+    }
+
+    /**
+     * Drop the nodes under the root of the scene, the nodes of the editor staying
+     * */
+    fn dropPlayed(mut self) {
+        let dmut selection = alias self._scene.selection;
+        selection:.clear();
+
+        let dmut root = alias self._scene:.getRootNode();
+        let dmut played: [&Node] = [];
+        for dmut n in alias root:.getChildrenInOrder() if !isEditorNode(n) {
+            played ~= [alias n];
+        }
+
+        for dmut n in alias played { n:.dispose(); }
     }
 
     /*!
@@ -315,5 +445,13 @@ pub class SceneEditor {
             }
         }
     }
+
+}
+
+@companion
+pub mod SceneEditor {
+
+    // What the status bar tells of a change asked while the scene is played
+    pub def PLAYED = "The scene is played: stop the game to change it";
 
 }

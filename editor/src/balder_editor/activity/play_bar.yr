@@ -1,0 +1,327 @@
+in play_bar;
+
+use balder_editor::{editor, naming, play_camera, viewport_bars};
+use balder_editor::activity::{documents, editor_context};
+
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface::loader::registry::behaviors;
+use balder::interface::widget::button::{dropdown, push};
+use balder::scene::node::node3D::camera;
+use balder::utils::log;
+
+use std::uuid;
+
+use ::sdl3::mouse;
+
+// The buttons of the top row playing, pausing, stepping and stopping the game, and the camera it is played through
+def PLAY_BUTTON = "BAR/PLAY";
+def PAUSE_BUTTON = "BAR/PAUSE";
+def STEP_BUTTON = "BAR/STEP";
+def STOP_BUTTON = "BAR/STOP";
+def CAMERA_CHOICE = "BAR/PLAY_CAMERA";
+
+// The class of a button with nothing to do
+def IDLE = "idle";
+
+// The first item of the cameras the game is played through, and the last one
+def ACTIVE_ITEM = "Active camera";
+def EDITOR_ITEM = "Editor camera";
+
+/**
+ * The play buttons of the top row, mounted under the behavior 'play': Play runs the game of the scene shown in the
+ * viewport, a copy of its nodes, Pause makes it wait and Play goes on, Step plays one tick of the game paused, Stop
+ * puts the scene back as it was edited (see SceneEditor::play); before them, the camera the game is played through,
+ * the active camera of the scene, one of its cameras, or the camera of the editor, chosen by each document
+ * @info:
+ * =====
+ * Played through a camera of the scene, the viewport follows it and leaves its controls and its overlays out; through
+ * its active camera, the cameras the game makes active are followed; through the camera of the editor, the game is
+ * watched from the eye of the viewport, which moves as it does (see EditorViewport::watchGame). The scene cannot be
+ * changed while it is played; showing another document, closing it, reloading the library of the game or going back
+ * to the project manager stops the game first. The keys F5 (play, go on), F6 (step), F7 (pause) and F8 (stop) work
+ * anywhere in the window.
+ * ====
+ * */
+#[behavior]
+pub class PlayBar over Behavior {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The documents opened, each choosing the camera its scene is played through
+    let dmut _docs: &Documents;
+
+    // The cameras of the scene shown listed in the choice of the camera, after the active camera, in order
+    let mut _cameras: [Uuid] = [];
+
+    /**
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     *    - docs: the documents opened
+     * */
+    pub self (dmut ctx: &EditorContext, dmut docs: &Documents)
+        with _ctx = alias ctx
+        , _docs = alias docs
+    {}
+
+    /**
+     * Follow the documents shown and the games played, once the interface is loaded
+     * */
+    pub fn bind(mut self) {
+        self._docs:.shown():.connect(&self:.onShown);
+        if let Ok(dmut e) = alias self._ctx.editor {
+            e:.switched():.connect(alias self._ctx.box, &self:.show);
+        }
+
+        self:.show();
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    #[slot (name-> "play")]
+    fn onPlayClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.play(); }
+    }
+
+    #[slot (name-> "pause")]
+    fn onPauseClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.pause(); }
+    }
+
+    #[slot (name-> "step")]
+    fn onStepClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.step(); }
+    }
+
+    #[slot (name-> "stop")]
+    fn onStopClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.stop(); }
+    }
+
+    /**
+     * A camera is chosen: the scene shown is played through it from its next play, or from now on while it is played
+     */
+    #[slot (name-> "camera")]
+    fn onCameraChosen(mut self, index: usize) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        let dmut d = alias e.document;
+        d.playCamera = if index == 0us {
+            PlayCamera(view-> PlayView::ACTIVE)
+        } else if index <= self._cameras.len {
+            PlayCamera(view-> PlayView::CAMERA, camera-> self._cameras[index - 1us])
+        } else {
+            PlayCamera(view-> PlayView::EDITOR)
+        };
+
+        if e.played {
+            let through = self:.watch();
+            self._ctx:.setStatus(f"Playing ${d.name} through ${through}");
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          GAME          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Play the scene shown through the camera its document chose, or go on playing it when it is paused
+     * */
+    pub fn play(mut self) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        if self._ctx.material.hasValue {
+            self._ctx:.setStatus("Show a scene to play it");
+            return;
+        }
+
+        if e.paused {
+            e:.pause(false);
+            self:.show();
+            self._ctx:.setStatus(f"Playing ${e.document.name}");
+            return;
+        }
+
+        if e.played { return; }
+
+        {
+            e:.play();
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to play the scene", err);
+                self._ctx:.setStatus(f"The scene cannot be played: ${err.msg}");
+                return;
+            }
+        }
+
+        let through = self:.watch();
+        self:.show();
+        self._ctx:.setStatus(f"Playing ${e.document.name} through ${through}, F8 stops it");
+    }
+
+    /**
+     * Pause the game played, its actors and its physics waiting, or go on playing it when it is paused
+     * */
+    pub fn pause(mut self) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        if !e.played { return; }
+
+        let paused = !e.paused;
+        e:.pause(paused);
+        self:.show();
+        self._ctx:.setStatus(if paused { "Paused: F6 plays one tick, F5 goes on" } else { "Playing" });
+    }
+
+    /**
+     * Play one tick of the game paused
+     * */
+    pub fn step(mut self) {
+        if let Ok(dmut e) = alias self._ctx.editor && e.paused {
+            e:.step();
+            self._ctx:.setStatus("Played one tick");
+        }
+    }
+
+    /**
+     * Stop the game played, the scene shown as it was edited
+     * */
+    pub fn stop(mut self) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        if !e.played { return; }
+
+        if let Ok(dmut v) = alias self._ctx.viewport { v:.stopWatching(); }
+        e:.stop();
+        self._ctx:.setStatus(f"Stopped playing ${e.document.name}");
+    }
+
+    /**
+     * Show the game played in the viewport through the camera the document chose, the active camera when the camera
+     * chosen is not in the scene, the camera of the editor when the scene has none
+     * @returns: the camera, as the status bar names it
+     * */
+    fn watch(mut self)-> [c8] {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return ""; };
+        let dmut v = if let Ok(dmut v) = alias self._ctx.viewport { alias v } else { return ""; };
+        let chosen = e.document.playCamera;
+        if chosen.view == PlayView::EDITOR {
+            v:.watchGame(none, fromEditor-> true);
+            return "the editor camera";
+        }
+
+        let dmut scene = alias e.scene;
+        let dmut cameras: [&Camera] = [];
+        ViewportBars::gatherCameras(alias scene:.getRootNode(), ref cameras);
+        if chosen.view == PlayView::CAMERA {
+            for dmut c in alias cameras if c.guid == chosen.camera {
+                v:.watchGame((alias c)?, fromEditor-> false);
+                return f"the camera ${c.name.file()}";
+            }
+        }
+
+        if cameras.len == 0us {
+            v:.watchGame(none, fromEditor-> true);
+            return "the editor camera, the scene having no camera";
+        }
+
+        // the cameras of the editor entering the scene first, the active camera is one of them unless the scene names
+        // one of its own
+        let mut active = false;
+        if let Ok(a) = scene:.getActiveCamera() && !isEditorNode(a) { active = true; }
+        if !active { scene:.setActiveCamera(alias cameras[0]); }
+
+        v:.watchGame(none, fromEditor-> false);
+        "its active camera"
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SHOWING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * A document is told: the cameras of its scene listed, the buttons showing whether it is played
+     * */
+    fn onShown(mut self, _: [c8]) {
+        self:.show();
+    }
+
+    /**
+     * Show whether the scene shown is played, paused, or edited on the play buttons, the viewport showing the scene
+     * edited again once the game stopped, and list the cameras of the scene in the choice of the camera, the one its
+     * document chose selected
+     * */
+    pub fn show(mut self) {
+        let e = if let Ok(e) = self._ctx.editor { e } else { return; };
+        let played = e.played;
+        let paused = e.paused;
+        if !played {
+            if let Ok(dmut v) = alias self._ctx.viewport { v:.stopWatching(); }
+        }
+
+        if let Ok(dmut b: &PushButton) = self._ctx.gui:.find(PLAY_BUTTON) {
+            let idle = played && !paused;
+            b:.setClasses(if idle { copy ["play", IDLE] } else { copy ["play"] });
+            b:.setText(if paused { "Resume" } else if played { "Playing" } else { "Play" });
+        }
+
+        self:.setIdle(PAUSE_BUTTON, !played);
+        self:.setIdle(STEP_BUTTON, !paused);
+        self:.setIdle(STOP_BUTTON, !played);
+        self:.listCameras();
+    }
+
+    /**
+     * List the cameras of the scene shown in the choice of the camera, after its active camera and before the camera of
+     * the editor, the one its document chose selected (the active camera when it is no longer in the scene)
+     * */
+    fn listCameras(mut self) {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        let dmut d = if let Ok(dmut d: &Dropdown) = self._ctx.gui:.find(CAMERA_CHOICE) { alias d } else { return; };
+
+        let dmut scene = alias e.scene;
+        let dmut cameras: [&Camera] = [];
+        ViewportBars::gatherCameras(alias scene:.getRootNode(), ref cameras);
+
+        let chosen = e.document.playCamera;
+        let mut items: [[c8]] = copy [ACTIVE_ITEM];
+        let mut ids: [Uuid] = [];
+        let mut selected = 0us;
+        for c in cameras {
+            ids ~= [c.guid];
+            items ~= [c.name.file()];
+            if chosen.view == PlayView::CAMERA && c.guid == chosen.camera { selected = ids.len; }
+        }
+
+        items ~= [EDITOR_ITEM];
+        if chosen.view == PlayView::EDITOR { selected = items.len - 1us; }
+
+        self._cameras = ids;
+        if d.getItems() != items { d:.setItems(items); }
+        if d.getSelected() != (selected)? { d:.setSelected(selected); }
+    }
+
+    /**
+     * Make a button of the top row idle, or not
+     * */
+    fn setIdle(mut self, path: [c8], idle: bool) {
+        if let Ok(dmut w) = alias self._ctx.gui:.find(path) {
+            let mut classes: [[c8]] = [];
+            for c in w.getClasses() if c != IDLE { classes ~= [c]; }
+            if idle { classes ~= [IDLE]; }
+            w:.setClasses(classes);
+        }
+    }
+
+}
