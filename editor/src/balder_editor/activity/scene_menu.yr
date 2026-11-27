@@ -1,0 +1,425 @@
+in scene_menu;
+
+use balder_editor::document;
+use balder_editor::activity::{documents, editor_context, file_choice, material_documents, pending, pending_close};
+
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface::dialog;
+use balder::interface::loader::registry::behaviors;
+use balder::scene::description;
+use balder::utils::{log, path};
+
+use std::fs;
+
+use ::sdl3::mouse;
+
+// The extension of the scene files
+def SCENE_EXTENSION = "scene";
+
+/**
+ * The Scene menu of the editor, mounted under the behavior 'scene': the scenes opened, saved and closed, the materials
+ * made and opened (see MaterialDocuments), the quitting and the going back to the project manager, the unsaved changes
+ * of the documents asked about first
+ * @info:
+ * =====
+ * A scene has unsaved changes while its history is not where it was at the last save (a change made, or undone). A new
+ * scene, blank, has no file yet: its first save asks for one; a scene saved under the res/ directory of the project
+ * joins its scenes, named after its file. Closing a document asks whether to save its changes first, or discard them,
+ * or do nothing; Quit and Back to the project manager ask about the unsaved changes of each document in turn, then
+ * tell what to do (see settled).
+ * ====
+ * */
+#[behavior]
+pub class SceneMenu over Behavior {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The documents opened
+    let dmut _docs: &Documents;
+
+    // The materials opened, saving the material files shown
+    let dmut _materials: &MaterialDocuments;
+
+    // The scene files, the dialogs of the scenes starting from the directory of the one chosen last
+    let dmut _scenes: &FileChoice = copy FileChoice(copy [SCENE_EXTENSION], "scenes");
+
+    // What waits for the unsaved changes to be saved or discarded
+    let dmut _pending: &PendingClose = copy PendingClose();
+
+    // Emitted with what to do once the unsaved changes of every document are saved or discarded, to quit or to go back
+    // to the project manager
+    let dmut _settled: &DirectSignal!{Pending} = copy DirectSignal!{Pending} ();
+
+    /**
+     * Follow the tabs asking to close their documents
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     *    - docs: the documents opened
+     *    - materials: the materials opened, saving the material files shown
+     * */
+    pub self (dmut ctx: &EditorContext, dmut docs: &Documents, dmut materials: &MaterialDocuments)
+        with _ctx = alias ctx
+        , _docs = alias docs
+        , _materials = alias materials
+    {
+        docs:.closeAsked():.connect(&self:.onCloseAsked);
+    }
+
+    /**
+     * @returns: the signal emitted with what to do once the unsaved changes of every document are saved or discarded,
+     * Pending::QUIT or Pending::MANAGER (see ask)
+     * */
+    pub fn settled(mut self)-> dmut &DirectSignal!{Pending} {
+        alias self._settled
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    #[slot (name-> "new")]
+    fn onNewClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self._docs:.newScene(); }
+    }
+
+    #[slot (name-> "open")]
+    fn onOpenClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.chooseScene(); }
+    }
+
+    #[slot (name-> "close")]
+    fn onCloseClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.closeShown(); }
+    }
+
+    #[slot (name-> "save")]
+    fn onSaveClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.save(); }
+    }
+
+    #[slot (name-> "save-as")]
+    fn onSaveAsClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.saveAs(); }
+    }
+
+    #[slot (name-> "new-material")]
+    fn onNewMaterialClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self._materials:.create(); }
+    }
+
+    #[slot (name-> "open-material")]
+    fn onOpenMaterialClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self._materials:.open(); }
+    }
+
+    #[slot (name-> "quit")]
+    fn onQuitClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.ask(Pending::QUIT); }
+    }
+
+    #[slot (name-> "manager")]
+    fn onManagerClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.ask(Pending::MANAGER); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCENES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Ask for the scene file to open (see Documents::openScene)
+     * */
+    pub fn chooseScene(mut self) {
+        self._ctx:.choose(alias self._scenes, FileDialogMode::OPEN, "Open a scene", &self:.onSceneChosen);
+    }
+
+    fn onSceneChosen(mut self, path: ([c8])?) {
+        if let Ok(p) = path { self._docs:.openScene(qualifiedPath(p)); }
+    }
+
+    /**
+     * Close the document shown, asking first about its unsaved changes
+     * */
+    pub fn closeShown(mut self) {
+        if self._ctx.isAsking() { return; }
+
+        if let Ok(dmut d) = alias self._docs:.shownDocument() {
+            self:.requestClose(alias d);
+        }
+    }
+
+    /**
+     * The tab of a document asks to close it
+     * */
+    fn onCloseAsked(mut self, index: usize) {
+        self:.requestClose(alias self._docs:.documents()[index]);
+    }
+
+    /**
+     * Close a document, shown first and asked about when it has unsaved changes: saved, discarded, or kept open
+     * */
+    fn requestClose(mut self, dmut d: &Document) {
+        if !d.unsaved {
+            self._docs:.closeDocument(alias d);
+            return;
+        }
+
+        self._docs:.switchDocument(alias d);
+        self._pending.closing = (alias d)?;
+        self:.askAbout(d, Pending::CLOSE);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SAVING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Save the document shown in its file, asking for one when it has none, then do what was waiting for the save
+     * */
+    pub fn save(mut self) {
+        if let Ok(dmut m) = alias self._ctx.material && !m.isLocal {
+            if self._materials:.save(alias m) {
+                self:.proceed(self._pending.then);
+            } else {
+                self._pending:.cancel();
+            }
+
+            return;
+        }
+
+        let path = self._docs.shownPath();
+        if path.len == 0us {
+            self:.saveAs();
+        } else if self:.write(path) {
+            self:.proceed(self._pending.then);
+        }
+    }
+
+    /**
+     * Ask for the file to save the document shown in, then save it there
+     * */
+    pub fn saveAs(mut self) {
+        if let Ok(m) = self._ctx.material && !m.isLocal {
+            let dmut files = alias self._materials:.files();
+            self._ctx:.choose(alias files, FileDialogMode::SAVE, "Save the material in another file",
+                              &self:.onMaterialSaveChosen, name-> files.withExtension(Document::stem(m.path)));
+            return;
+        }
+
+        let path = self._docs.shownPath();
+        let name = if path.len == 0us { "scene." ~ SCENE_EXTENSION } else { Path(path).file() };
+        self._ctx:.choose(alias self._scenes, FileDialogMode::SAVE, "Save the scene", &self:.onSaveChosen, name-> name);
+    }
+
+    /**
+     * The file to save the scene in is chosen, given the extension of the scene files when it has none, or the save is
+     * cancelled, and with it what was waiting for it
+     * */
+    fn onSaveChosen(mut self, path: ([c8])?) {
+        if let Ok(chosen) = path {
+            if self:.write(qualifiedPath(self._scenes.withExtension(chosen))) {
+                self:.proceed(self._pending.then);
+            }
+        } else {
+            self._pending:.cancel();
+        }
+    }
+
+    /**
+     * The file to save the material shown in is chosen, given the extension of the material files when it has none,
+     * the material edited from then on (see MaterialDocuments::saveAs), or the save is cancelled, and with it what was
+     * waiting for it
+     * */
+    fn onMaterialSaveChosen(mut self, path: ([c8])?) {
+        let chosen = if let Ok(c) = path { c } else {
+            self._pending:.cancel();
+            return;
+        };
+
+        {
+            if self._materials:.saveAs(qualifiedPath(self._materials:.files().withExtension(chosen))) {
+                self:.proceed(self._pending.then);
+            } else {
+                self._pending:.cancel();
+            }
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to use the material file", err);
+                self._ctx:.setStatus(err.msg);
+            }
+        }
+    }
+
+    /**
+     * Write the scene shown in a file, which becomes its file; a scene of another tab saved in that file before is no
+     * longer said to be in it
+     * @returns: true iif the file is written, the status bar telling why it is not
+     * */
+    fn write(mut self, path: [c8])-> bool {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return false; };
+        {
+            let dmut scene = alias e.scene;
+            let description = copy SceneDescription(alias scene:.getRootNode());
+            description.save(path);
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to save the scene", err);
+                self._ctx:.setStatus(err.msg);
+                self._pending:.cancel();
+                return false;
+            }
+        }
+
+        for dmut d in alias self._docs:.documents() if d.path == path && !(d is e.document) {
+            d.path = "";
+        }
+
+        let dmut shown = alias e.document;
+        shown.path = path;
+        e:.markSaved();
+        self._ctx:.keepEdited(path);
+        self._docs:.showDocument();
+
+        let file = Path(path).file();
+        if let Ok(name) = self:.addToProject(path) {
+            self._ctx:.setStatus(f"Saved ${file}, the scene '${name}' of the project");
+        } else {
+            self._ctx:.setStatus(f"Saved ${file}, outside the res/ folder of the project: not one of its scenes");
+        }
+
+        true
+    }
+
+    /**
+     * Put a scene saved in the scenes of the project, when it is under its res/ directory
+     * @returns: the name of the scene in the project, none when it is not under its res/ directory
+     * */
+    fn addToProject(mut self, path: [c8])-> ([c8])? {
+        if !CustomPathQualifiers::RESSOURCES.isPrefix(Path(path)) { return none; }
+
+        if let Ok(dmut p) = alias self._ctx.project {
+            if let Ok(name) = p.sceneNamed(path) { return name?; }
+
+            let name = p:.addScene(path);
+            {
+                p.save();
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "Failed to save the project", err);
+                    self._ctx:.setStatus(err.msg);
+                }
+            }
+
+            return name?;
+        }
+
+        none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          UNSAVED CHANGES          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Do something that drops the documents (quit, go back to the project manager), asking first about the unsaved
+     * changes of each document in turn, shown as it is asked about: saved, discarded, or kept, nothing done; told by
+     * settled once none is left
+     * */
+    pub fn ask(mut self, then: Pending) {
+        for dmut d in alias self._docs:.documents() if d.unsaved && !self._pending.isDiscarded(d) {
+            self._docs:.switchDocument(alias d);
+            self:.askAbout(d, then);
+            return;
+        }
+
+        self._pending.discarded = [];
+        if then == Pending::QUIT || then == Pending::MANAGER { self._settled:.emit(then); }
+    }
+
+    /**
+     * Ask whether to save the unsaved changes of a document before doing something, to discard them or to do nothing
+     * */
+    fn askAbout(mut self, d: &Document, then: Pending) {
+        self._pending.then = then;
+        let question = match then {
+            Pending::CLOSE   => { "before closing it?" }
+            Pending::MANAGER => { "before going back to the project manager?" }
+            _                => { "before quitting?" }
+        };
+
+        let dmut dialog = copy MessageDialog(f"Save the changes to ${d.name} ${question}", title-> "Unsaved changes",
+                                             yes-> "Save", no-> "Discard", cancel-> "Cancel");
+        dialog:.answered():.connect(alias self._ctx.box, &self:.onUnsavedAnswered);
+        self._ctx:.openDialog(alias dialog);
+    }
+
+    /**
+     * The unsaved changes of the document shown are saved (the pending action following the save), discarded, or kept,
+     * nothing done
+     * */
+    fn onUnsavedAnswered(mut self, status: MessageDialogStatus) {
+        self._ctx:.answered();
+        match status {
+            MessageDialogStatus::YES => { self:.save(); }
+            MessageDialogStatus::NO  => { self:.discard(); }
+            _ => {
+                self._pending:.cancel();
+                self._ctx:.setStatus("Kept the unsaved changes");
+            }
+        }
+    }
+
+    /**
+     * Discard the unsaved changes of the document shown, then do what was waiting for them
+     * */
+    fn discard(mut self) {
+        let then = self._pending.then;
+        if then == Pending::CLOSE {
+            self:.proceed(then);
+            return;
+        }
+
+        if let Ok(dmut d) = alias self._docs:.shownDocument() {
+            self._pending.discarded ~= [alias d];
+        }
+
+        self:.ask(then);
+    }
+
+    /**
+     * Do what was waiting for the unsaved changes to be saved or discarded: close the document asked about, or ask
+     * about the next document before quitting or going back to the project manager
+     * */
+    fn proceed(mut self, then: Pending) {
+        self._pending.then = Pending::NOTHING;
+        match then {
+            Pending::CLOSE => {
+                if let Ok(dmut d) = alias self._pending.closing {
+                    self._pending.closing = none;
+                    self._docs:.closeDocument(alias d);
+                }
+            }
+            Pending::QUIT    => { self:.ask(then); }
+            Pending::MANAGER => { self:.ask(then); }
+            _ => {}
+        }
+    }
+}

@@ -7,6 +7,9 @@ mod ::editor_context;
 mod ::file_choice;
 mod ::gizmo_menu;
 mod ::material_documents;
+mod ::pending;
+mod ::pending_close;
+mod ::scene_menu;
 mod ::view_menu;
 
 use balder::core::{_, application::_};
@@ -18,8 +21,8 @@ use balder::scene::{description, editable};
 use balder::scene::asset::assets;
 use balder::utils::{log, path};
 
-use balder_editor::{arguments, build_error_dialog, connections_panel, dock_rails, document, hulls_panel, inspector_panel, manager, material_document, material_panel, material_preview, material_slots_panel, outline_panel, viewport, viewport_bars};
-use balder_editor::activity::{add_menu, documents, edit_menu, editor_context, file_choice, gizmo_menu, material_documents, view_menu};
+use balder_editor::{arguments, build_error_dialog, connections_panel, dock_rails, hulls_panel, inspector_panel, manager, material_document, material_panel, material_preview, material_slots_panel, outline_panel, viewport, viewport_bars};
+use balder_editor::activity::{add_menu, documents, edit_menu, editor_context, gizmo_menu, material_documents, pending, scene_menu, view_menu};
 use balder_editor::command::open;
 use balder_editor::project;
 use balder_editor::project::{game_build, game_library, recent};
@@ -30,9 +33,6 @@ use ::sdl3::_;
 
 // The configuration of the window of the project manager, under the directory of the editor
 def MANAGER_CONFIG = "manager.toml";
-
-// The extension of the scene files
-def SCENE_EXTENSION = "scene";
 
 // The tool of the inspector, shown before Ctrl+F opens its filter
 def INSPECTOR_TOOL = "INSPECTOR";
@@ -48,15 +48,6 @@ def BUILD_ERROR_DIALOG = "ui/build_error.gui";
 
 // How often the status bar tells how far the build of the library of the game is, in milliseconds
 def BUILD_REFRESH = 250u64;
-
-/**
- * What the editor does once the unsaved changes of the documents are saved or discarded
- * */
-enum Pending : u8
-| NOTHING = 0u8
-| CLOSE   = 1u8 // close the document asked about
-| QUIT    = 2u8 // quit, every document saved or discarded
-| MANAGER = 3u8; // go back to the project manager, every document saved or discarded
 
 /**
  * The editor of Balder: the outline of the scene on the left, the viewport in the middle, the inspector of the node
@@ -115,9 +106,6 @@ pub class EditorActivity over Activity {
     // made with the interface (see ctx)
     let dmut _ctx: (&EditorContext)? = none;
 
-    // The scene files, the dialogs of the scenes starting from the directory of the one chosen last
-    let dmut _scenes: &FileChoice = copy FileChoice(copy [SCENE_EXTENSION], "scenes");
-
     // The Add menu, the Edit menu and the View menu, once the activity is started
     let dmut _add: (&AddMenu)? = none;
     let dmut _edit: (&EditMenu)? = none;
@@ -126,20 +114,11 @@ pub class EditorActivity over Activity {
     // The documents opened, a tab each, once the activity is started
     let dmut _docs: (&Documents)? = none;
 
-    // The materials opened, once the activity is started
-    let dmut _materialDocs: (&MaterialDocuments)? = none;
+    // The Scene menu, saving the documents and asking about their unsaved changes, once the activity is started
+    let dmut _sceneMenu: (&SceneMenu)? = none;
 
     // The inspector, its filter toggled by Ctrl+F, once the interface is loaded
     let dmut _inspector: (&InspectorPanel)? = none;
-
-    // What to do once the unsaved changes are saved or discarded
-    let mut _pending: Pending = Pending::NOTHING;
-
-    // The document a close waits for, its unsaved changes saved or discarded
-    let dmut _closing: (&Document)? = none;
-
-    // The documents whose unsaved changes were discarded while quitting, or going back to the project manager
-    let dmut _discarded: [&Document] = [];
 
     // The build of the library of the game of the project, none for a project declaring no shared target
     let dmut _build: (&GameBuild)? = none;
@@ -172,15 +151,6 @@ pub class EditorActivity over Activity {
         let dmut ctx = alias self.ctx;
 
         // the slots the 'on-…' attributes of editor.gui name: the menus, the outline and the inspector
-        self:.slot("scene::new", &self:.onNewClicked);
-        self:.slot("scene::open", &self:.onOpenClicked);
-        self:.slot("scene::save", &self:.onSaveClicked);
-        self:.slot("scene::save-as", &self:.onSaveAsClicked);
-        self:.slot("scene::close", &self:.onCloseClicked);
-        self:.slot("scene::new-material", &self:.onNewMaterialClicked);
-        self:.slot("scene::open-material", &self:.onOpenMaterialClicked);
-        self:.slot("scene::manager", &self:.onManagerClicked);
-        self:.slot("scene::quit", &self:.onQuitClicked);
         self:.slot("game::compile", &self:.onCompileClicked);
 
         let dmut add = copy AddMenu(alias ctx);
@@ -215,10 +185,12 @@ pub class EditorActivity over Activity {
         self:.behavior("gizmo", alias gizmo);
         let dmut docs = copy Documents(alias ctx, alias edit, alias view, alias materials);
         self:.behavior("documents", alias docs);
-        docs:.closeAsked():.connect(&self:.onCloseAsked);
         self._docs = (alias docs)?;
         let dmut materialDocs = copy MaterialDocuments(alias ctx, alias docs, alias materials, alias slots);
-        self._materialDocs = (alias materialDocs)?;
+        let dmut sceneMenu = copy SceneMenu(alias ctx, alias docs, alias materialDocs);
+        self:.behavior("scene", alias sceneMenu);
+        sceneMenu:.settled():.connect(&self:.onSettled);
+        self._sceneMenu = (alias sceneMenu)?;
 
         self.gui:.getRegistry():.register(EditorViewport::schema());
         self.gui:.getRegistry():.register(MaterialPreview::schema());
@@ -335,32 +307,6 @@ pub class EditorActivity over Activity {
         }
 
         ""
-    }
-
-    /**
-     * Put a scene saved in the scenes of the project, when it is under its res/ directory
-     * @returns: the name of the scene in the project, none when it is not under its res/ directory
-     * */
-    fn addToProject(mut self, path: [c8])-> ([c8])? {
-        if !CustomPathQualifiers::RESSOURCES.isPrefix(Path(path)) { return none; }
-
-        if let Ok(dmut p) = alias self.ctx.project {
-            if let Ok(name) = p.sceneNamed(path) { return name?; }
-
-            let name = p:.addScene(path);
-            {
-                p.save();
-            } catch {
-                err: &BalderError => {
-                    log::error #("Editor", "Failed to save the project", err);
-                    self.ctx:.setStatus(err.msg);
-                }
-            }
-
-            return name?;
-        }
-
-        none
     }
 
     /*!
@@ -652,40 +598,12 @@ pub class EditorActivity over Activity {
      * ====================================================================================================
      */
 
-    fn onNewClicked(mut self, b: u8) {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
-        if b == SDL_BUTTON_LEFT { docs:.newScene(); }
-    }
-
-    fn onOpenClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.chooseScene(); }
-    }
-
-    fn onCloseClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.closeShown(); }
-    }
-
-    fn onSaveClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.save(); }
-    }
-
-    fn onSaveAsClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.saveAs(); }
-    }
-
-    fn onQuitClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.ask(Pending::QUIT); }
-    }
-
-    fn onManagerClicked(mut self, b: u8) {
-        if b == SDL_BUTTON_LEFT { self:.ask(Pending::MANAGER); }
-    }
-
     /**
      * The window is closed
      * */
     fn onQuit(mut self) {
-        if !self.ctx.isAsking() { self:.ask(Pending::QUIT); }
+        if self.ctx.isAsking() { return; }
+        if let Ok(dmut m) = alias self._sceneMenu { m:.ask(Pending::QUIT); }
     }
 
     /**
@@ -697,6 +615,7 @@ pub class EditorActivity over Activity {
      * */
     fn onKey(mut self, key: SDL_Keycode, mods: SDL_Keymod) {
         let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
+        let dmut menu = if let Ok(dmut m) = alias self._sceneMenu { alias m } else { return; };
         let ctrl = (mods & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0u16;
         if !ctrl || self.ctx.isAsking() { return; }
 
@@ -706,15 +625,15 @@ pub class EditorActivity over Activity {
         } else if key == SDLK_Z {
             if let Ok(dmut e) = alias self._edit { e:.undo(); }
         } else if key == SDLK_S && shift {
-            self:.saveAs();
+            menu:.saveAs();
         } else if key == SDLK_S {
-            self:.save();
+            menu:.save();
         } else if key == SDLK_N && !shift {
             docs:.newScene();
         } else if key == SDLK_O && !shift {
-            self:.chooseScene();
+            menu:.chooseScene();
         } else if key == SDLK_W && !shift {
-            self:.closeShown();
+            menu:.closeShown();
         } else if (key == SDLK_TAB && !shift) || key == SDLK_PAGEDOWN {
             docs:.showNeighbour(true);
         } else if key == SDLK_TAB || key == SDLK_PAGEUP {
@@ -754,148 +673,18 @@ pub class EditorActivity over Activity {
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * ===================================          DOCUMENTS          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Close the document shown, asking first about its unsaved changes
-     * */
-    fn closeShown(mut self) {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
-        if self.ctx.isAsking() { return; }
-
-        if let Ok(dmut d) = alias docs:.shownDocument() {
-            self:.requestClose(alias d);
-        }
-    }
-
-    /**
-     * The tab of a document asks to close it
-     * */
-    fn onCloseAsked(mut self, index: usize) {
-        if let Ok(dmut docs) = alias self._docs {
-            self:.requestClose(alias docs:.documents()[index]);
-        }
-    }
-
-    /**
-     * Close a document, shown first and asked about when it has unsaved changes: saved, discarded, or kept open
-     * */
-    fn requestClose(mut self, dmut d: &Document) {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
-        if !d.unsaved {
-            docs:.closeDocument(alias d);
-            return;
-        }
-
-        docs:.switchDocument(alias d);
-        self._closing = (alias d)?;
-        self:.askAbout(d, Pending::CLOSE);
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
      * =====================================          SAVE          =======================================
      * ====================================================================================================
      * ====================================================================================================
      */
 
     /**
-     * Do something that drops the documents (quit, go back to the project manager), asking first about the unsaved
-     * changes of each document in turn, shown as it is asked about: saved, discarded, or kept, nothing done
+     * Every document is saved or discarded: quit, or go back to the project manager
      * */
-    fn ask(mut self, then: Pending) {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
-        for dmut d in alias docs:.documents() if d.unsaved {
-            let mut discarded = false;
-            for x in self._discarded if x is d { discarded = true; }
-            if !discarded {
-                docs:.switchDocument(alias d);
-                self:.askAbout(d, then);
-                return;
-            }
-        }
-
-        self._discarded = [];
+    fn onSettled(mut self, then: Pending) {
         match then {
             Pending::QUIT    => { self.app:.close(alias self); }
             Pending::MANAGER => { self:.openManager(); }
-            _ => {}
-        }
-    }
-
-    /**
-     * Ask whether to save the unsaved changes of a document before doing something, to discard them or to do nothing
-     * */
-    fn askAbout(mut self, d: &Document, then: Pending) {
-        self._pending = then;
-        let question = match then {
-            Pending::CLOSE   => { "before closing it?" }
-            Pending::MANAGER => { "before going back to the project manager?" }
-            _                => { "before quitting?" }
-        };
-
-        let dmut dialog = copy MessageDialog(f"Save the changes to ${d.name} ${question}", title-> "Unsaved changes",
-                                             yes-> "Save", no-> "Discard", cancel-> "Cancel");
-        dialog:.answered():.connect(self.box, &self:.onUnsavedAnswered);
-        self.ctx:.openDialog(alias dialog);
-    }
-
-    /**
-     * The unsaved changes of the document shown are saved (the pending action following the save), discarded, or kept,
-     * nothing done
-     * */
-    fn onUnsavedAnswered(mut self, status: MessageDialogStatus) {
-        self.ctx:.answered();
-        match status {
-            MessageDialogStatus::YES => { self:.save(); }
-            MessageDialogStatus::NO  => { self:.discard(); }
-            _ => {
-                self._pending = Pending::NOTHING;
-                self._closing = none;
-                self._discarded = [];
-                self.ctx:.setStatus("Kept the unsaved changes");
-            }
-        }
-    }
-
-    /**
-     * Discard the unsaved changes of the document shown, then do what was waiting for them
-     * */
-    fn discard(mut self) {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
-        let then = self._pending;
-        if then == Pending::CLOSE {
-            self:.proceed(then);
-            return;
-        }
-
-        if let Ok(dmut d) = alias docs:.shownDocument() {
-            self._discarded ~= [alias d];
-        }
-
-        self:.ask(then);
-    }
-
-    /**
-     * Do what was waiting for the unsaved changes to be saved or discarded: close the document asked about, or ask
-     * about the next document before quitting or going back to the project manager, done once none is left
-     * */
-    fn proceed(mut self, then: Pending) {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
-        self._pending = Pending::NOTHING;
-        match then {
-            Pending::CLOSE => {
-                if let Ok(dmut d) = alias self._closing {
-                    self._closing = none;
-                    docs:.closeDocument(alias d);
-                }
-            }
-            Pending::QUIT    => { self:.ask(then); }
-            Pending::MANAGER => { self:.ask(then); }
             _ => {}
         }
     }
@@ -932,176 +721,4 @@ pub class EditorActivity over Activity {
 
         self.app:.close(alias self);
     }
-
-    /**
-     * Ask for the scene file to open
-     * */
-    fn chooseScene(mut self) {
-        self.ctx:.choose(alias self._scenes, FileDialogMode::OPEN, "Open a scene", &self:.onSceneChosen);
-    }
-
-    fn onSceneChosen(mut self, path: ([c8])?) {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return; };
-        if let Ok(p) = path { docs:.openScene(qualifiedPath(p)); }
-    }
-
-    /**
-     * Save the scene shown in its file, asking for one when it has none, then do what was waiting for the save
-     * */
-    fn save(mut self) {
-        let docs = if let Ok(x) = self._docs { x } else { return; };
-        if let Ok(dmut m) = alias self.ctx.material && !m.isLocal {
-            if let Ok(dmut materials) = alias self._materialDocs && materials:.save(alias m) {
-                self:.proceed(self._pending);
-            } else {
-                self._pending = Pending::NOTHING;
-                self._closing = none;
-                self._discarded = [];
-            }
-
-            return;
-        }
-
-        let path = docs.shownPath();
-        if path.len == 0us {
-            self:.saveAs();
-        } else if self:.write(path) {
-            self:.proceed(self._pending);
-        }
-    }
-
-    /**
-     * Ask for the file to save the scene shown in, then save it there
-     * */
-    fn saveAs(mut self) {
-        let docs = if let Ok(x) = self._docs { x } else { return; };
-        if let Ok(m) = self.ctx.material && !m.isLocal {
-            if let Ok(dmut materials) = alias self._materialDocs {
-                let dmut files = alias materials:.files();
-                self.ctx:.choose(alias files, FileDialogMode::SAVE, "Save the material in another file",
-                                 &self:.onMaterialSaveChosen, name-> files.withExtension(Document::stem(m.path)));
-            }
-
-            return;
-        }
-
-        let path = docs.shownPath();
-        let name = if path.len == 0us { "scene." ~ SCENE_EXTENSION } else { Path(path).file() };
-        self.ctx:.choose(alias self._scenes, FileDialogMode::SAVE, "Save the scene", &self:.onSaveChosen, name-> name);
-    }
-
-    /**
-     * The file to save the scene in is chosen, given the extension of the scene files when it has none, or the save is
-     * cancelled, and with it what was waiting for it
-     * */
-    fn onSaveChosen(mut self, path: ([c8])?) {
-        if let Ok(chosen) = path {
-            if self:.write(qualifiedPath(self._scenes.withExtension(chosen))) {
-                self:.proceed(self._pending);
-            }
-        } else {
-            self._pending = Pending::NOTHING;
-            self._closing = none;
-            self._discarded = [];
-        }
-    }
-
-    /**
-     * The file to save the material shown in is chosen, given the extension of the material files when it has none,
-     * the material edited from then on (see MaterialDocuments::saveAs), or the save is cancelled, and with it what was
-     * waiting for it
-     * */
-    fn onMaterialSaveChosen(mut self, path: ([c8])?) {
-        let dmut materials = if let Ok(dmut m) = alias self._materialDocs { alias m } else { return; };
-        if let Ok(chosen) = path {
-            {
-                if materials:.saveAs(qualifiedPath(materials:.files().withExtension(chosen))) {
-                    self:.proceed(self._pending);
-                } else {
-                    self._pending = Pending::NOTHING;
-                    self._closing = none;
-                    self._discarded = [];
-                }
-            } catch {
-                err: &BalderError => {
-                    log::error #("Editor", "Failed to use the material file", err);
-                    self.ctx:.setStatus(err.msg);
-                }
-            }
-        } else {
-            self._pending = Pending::NOTHING;
-            self._closing = none;
-            self._discarded = [];
-        }
-    }
-
-    /**
-     * Write the scene shown in a file, which becomes its file; a scene of another tab saved in that file before is no
-     * longer said to be in it
-     * @returns: true iif the file is written, the status bar telling why it is not
-     * */
-    fn write(mut self, path: [c8])-> bool {
-        let dmut docs = if let Ok(dmut x) = alias self._docs { alias x } else { return false; };
-        let dmut e = if let Ok(dmut e) = alias self.ctx.editor { alias e } else { return false; };
-        {
-            let dmut scene = alias e.scene;
-            let description = copy SceneDescription(alias scene:.getRootNode());
-            description.save(path);
-        } catch {
-            err: &BalderError => {
-                log::error #("Editor", "Failed to save the scene", err);
-                self.ctx:.setStatus(err.msg);
-                self._pending = Pending::NOTHING;
-                self._closing = none;
-                self._discarded = [];
-                return false;
-            }
-        }
-
-        for dmut d in alias docs:.documents() if d.path == path && !(d is e.document) {
-            d.path = "";
-        }
-
-        let dmut shown = alias e.document;
-        shown.path = path;
-        e:.markSaved();
-        self.ctx:.keepEdited(path);
-        docs:.showDocument();
-
-        let file = Path(path).file();
-        if let Ok(name) = self:.addToProject(path) {
-            self.ctx:.setStatus(f"Saved ${file}, the scene '${name}' of the project");
-        } else {
-            self.ctx:.setStatus(f"Saved ${file}, outside the res/ folder of the project: not one of its scenes");
-        }
-
-        true
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ===================================          MATERIALS          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    fn onNewMaterialClicked(mut self, b: u8) {
-        if b != SDL_BUTTON_LEFT { return; }
-        if let Ok(dmut m) = alias self._materialDocs { m:.create(); }
-    }
-
-    fn onOpenMaterialClicked(mut self, b: u8) {
-        if b != SDL_BUTTON_LEFT { return; }
-        if let Ok(dmut m) = alias self._materialDocs { m:.open(); }
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ====================================          COMMANDS          ====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
 }
