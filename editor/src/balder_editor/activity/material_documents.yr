@@ -1,0 +1,425 @@
+in material_documents;
+
+use balder_editor::{document, material_document, material_panel, material_slots_panel, scene_document};
+use balder_editor::activity::{documents, editor_context, file_choice};
+use balder_editor::command::property;
+
+use balder::core::error;
+use balder::interface::dialog;
+use balder::scene::asset::{assets, material_asset};
+use balder::scene::edit::property_edit;
+use balder::scene::node;
+use balder::scene::node::node3D::mesh_instance;
+use balder::scene::property::value;
+use balder::utils::{log, path};
+
+use std::fs;
+
+// The extension of the material files
+def MATERIAL_EXTENSION = "material";
+
+/**
+ * The materials opened in the editor, a document each in a tab of its own (see Documents): a material file, new or
+ * opened, or the material of a part of the mesh inspected (the panel of its materials asking to edit it, to copy it
+ * in a file or to draw the part with a file), shown in the material editor, which asks for the images of its maps and
+ * the environment of its preview; a material read only is extracted to a file to be changed, the meshes of the scene
+ * drawing it drawing the copy
+ * @info: a material local to a scene file belongs to the scene it was opened from, its changes being changes of that
+ * scene, saved with it, closed with it
+ * */
+pub class MaterialDocuments {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The documents opened, the materials among them
+    let dmut _docs: &Documents;
+
+    // The material editor, and the panel of the materials of the mesh inspected
+    let dmut _materials: &MaterialPanel;
+    let dmut _slots: &MaterialSlotsPanel;
+
+    // The material files and the images of the maps, their dialogs starting from the directory of the one chosen last
+    let dmut _files: &FileChoice = copy FileChoice(copy [MATERIAL_EXTENSION], "materials");
+    let dmut _images: &FileChoice = copy FileChoice(copy ["png", "jpg", "jpeg", "tga", "bmp"], "textures");
+
+    // What the material file being chosen is for, the part of the mesh inspected it is for, and the entry of the map
+    // whose image is being chosen
+    let mut _choice: MaterialChoice = MaterialChoice::OPEN;
+    let mut _slotPart: usize = 0us;
+    let mut _browsedMap: [c8] = "";
+
+    /**
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     *    - docs: the documents opened, the materials among them
+     *    - materials: the material editor
+     *    - slots: the panel of the materials of the mesh inspected
+     * */
+    pub self (dmut ctx: &EditorContext, dmut docs: &Documents, dmut materials: &MaterialPanel,
+              dmut slots: &MaterialSlotsPanel)
+        with _ctx = alias ctx
+        , _docs = alias docs
+        , _materials = alias materials
+        , _slots = alias slots
+    {}
+
+    /**
+     * Follow what the material editor and the panel of the materials of the mesh inspected ask for
+     * */
+    pub fn bind(mut self) {
+        self._slots:.editAsked():.connect(alias self._ctx.box, &self:.onEditMaterial);
+        self._slots:.duplicateAsked():.connect(alias self._ctx.box, &self:.onDuplicateMaterial);
+        self._slots:.chooseAsked():.connect(alias self._ctx.box, &self:.onChooseMaterial);
+        self._materials:.edited():.connect(alias self._ctx.box, &self:.onMaterialEdited);
+        self._materials:.browseAsked():.connect(alias self._ctx.box, &self:.onBrowseMap);
+        self._materials:.extractAsked():.connect(alias self._ctx.box, &self:.onExtractMaterial);
+        self._materials:.environmentAsked():.connect(alias self._ctx.box, &self:.onChooseEnvironment);
+        self._materials:.userPicked():.connect(alias self._ctx.box, &self:.onUserPicked);
+    }
+
+    /**
+     * @returns: the material files, the dialogs starting from the directory of the one chosen last
+     * */
+    pub fn files(mut self)-> dmut &FileChoice {
+        alias self._files
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          OPENING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Ask for a material file to write, a new material then opened in a tab of its own
+     * */
+    pub fn create(mut self) {
+        self:.chooseFile(MaterialChoice::NEW, "New material", "material");
+    }
+
+    /**
+     * Ask for a material file to open in a tab of its own
+     * */
+    pub fn open(mut self) {
+        self:.chooseFile(MaterialChoice::OPEN, "Open a material", "");
+    }
+
+    /**
+     * Open a material in a tab of its own, or show its tab when it is open; a material local to a scene file belongs to
+     * the scene shown
+     * @params:
+     *    - path: the path of the material (see MaterialAsset)
+     *    - mesh: the mesh it is opened from, drawn in its preview, empty for none
+     * */
+    pub fn openMaterial(mut self, path: [c8], mesh: [c8]) {
+        for dmut d in alias self._docs:.documents() if let dmut m: &MaterialDocument = alias d {
+            if m.path == path {
+                self._docs:.switchDocument(alias m);
+                self._ctx:.setStatus(f"${m.name} is open");
+                return;
+            }
+        }
+
+        {
+            Assets::material(path);
+            let dmut asset = if let Ok(dmut a) = alias Assets::cachedMaterial(path) { alias a } else { return; };
+            let dmut scene: (&SceneDocument)? = none;
+            if asset.isLocal {
+                if let Ok(dmut e) = alias self._ctx.editor { scene = (alias e.document)?; }
+            }
+
+            let dmut d = copy MaterialDocument(alias asset, scene-> alias scene, mesh-> mesh);
+            self._docs:.addDocument(alias d);
+            self._docs:.switchDocument(alias d);
+            self._ctx:.setStatus(if d.isReadOnly { f"Opened ${d.name}, read only: extract it to a file to change it" } else { f"Opened ${d.name}" });
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to open the material", err);
+                self._ctx:.setStatus(err.msg);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SAVING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write the material of a file shown in its file
+     * @returns: true iif the file is written, the status bar telling why it is not
+     * */
+    pub fn save(mut self, dmut m: &MaterialDocument)-> bool {
+        if m.isReadOnly {
+            self._ctx:.setStatus("This material is read only: Extract to a file makes a copy that can be changed and saved");
+            return false;
+        }
+
+        {
+            m:.save();
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to save the material", err);
+                self._ctx:.setStatus(err.msg);
+                return false;
+            }
+        }
+
+        self._docs:.showDocument();
+        self._ctx:.setStatus(f"Saved ${m.name}");
+        true
+    }
+
+    /**
+     * Write the material of a file shown in another file, which the document edits from then on, the material of the
+     * file it was opened from keeping the values it was saved with
+     * @returns: true iif the file is written, the status bar telling why it is not
+     * */
+    pub fn saveAs(mut self, path: [c8])-> bool
+        throws BalderError
+    {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return false; };
+        let dmut m = if let Ok(dmut m) = alias self._ctx.material { alias m } else { return false; };
+        if path == m.path { return self:.save(alias m); }
+
+        m.material.duplicate(path, Document::stem(path)).save(path);
+        Assets::forget(path);
+        Assets::material(path);
+        let dmut copied = if let Ok(dmut c) = alias Assets::cachedMaterial(path) { alias c } else { return false; };
+
+        m:.discard(alias e.scene);
+        m:.retarget(alias copied);
+        self._docs:.refresh();
+        self._ctx:.setStatus(f"Saved ${m.name}, the material edited from now on");
+        true
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FILES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Ask for a material file, to open or to write, then do with it what it is chosen for (see onFileChosen)
+     * @params:
+     *    - choice: what the file is for
+     *    - title: the title of the dialog
+     *    - name: the name the dialog proposes for a file to write, without its extension, empty to open one
+     * */
+    fn chooseFile(mut self, choice: MaterialChoice, title: [c8], name: [c8]) {
+        self._choice = choice;
+        let opens = choice == MaterialChoice::OPEN || choice == MaterialChoice::CHOOSE;
+        self._ctx:.choose(alias self._files, if opens { FileDialogMode::OPEN } else { FileDialogMode::SAVE }, title,
+                          &self:.onFileChosen, name-> if opens { "" } else { name ~ "." ~ MATERIAL_EXTENSION });
+    }
+
+    /**
+     * The material file is chosen, given the extension of the material files when it has none, or the choice is
+     * cancelled
+     * */
+    fn onFileChosen(mut self, path: ([c8])?) {
+        let chosen = if let Ok(c) = path { c } else { return; };
+        let opens = self._choice == MaterialChoice::OPEN || self._choice == MaterialChoice::CHOOSE;
+        let p = qualifiedPath(if opens { chosen } else { self._files.withExtension(chosen) });
+
+        {
+            match self._choice {
+                MaterialChoice::NEW => {
+                    let blank = copy MaterialAsset(p, Document::stem(p));
+                    blank.save(p);
+                    Assets::forget(p);
+                    self:.openMaterial(p, "");
+                }
+                MaterialChoice::OPEN => { self:.openMaterial(p, ""); }
+                MaterialChoice::EXTRACT => { self:.extractTo(p); }
+                MaterialChoice::DUPLICATE => { self:.duplicateTo(p); }
+                MaterialChoice::CHOOSE => {
+                    Assets::material(p);
+                    self._slots:.setSlot(self._slotPart, p);
+                }
+            }
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to use the material file", err);
+                self._ctx:.setStatus(err.msg);
+            }
+        }
+    }
+
+    /**
+     * Copy the material read only shown in a file, which the document edits from then on, the mesh nodes of the scene
+     * shown drawing it drawing the copy through one change of the scene
+     * */
+    fn extractTo(mut self, path: [c8])
+        throws BalderError
+    {
+        let dmut e = if let Ok(dmut e) = alias self._ctx.editor { alias e } else { return; };
+        let dmut m = if let Ok(dmut m) = alias self._ctx.material { alias m } else { return; };
+        let source = m.material;
+
+        source.duplicate(path, Document::stem(path)).save(path);
+        Assets::forget(path);
+        Assets::material(path);
+        let dmut copied = if let Ok(dmut c) = alias Assets::cachedMaterial(path) { alias c } else { return; };
+
+        let property = if let Ok(p) = MeshInstance3D::schema().property("materials") { p } else { return; };
+        let mut edits: [PropertyEdit] = [];
+        let dmut nodes: [&Node] = [];
+        e.scene:.getRootNode():.getAllNodes(ref nodes);
+        for dmut n in alias nodes if let dmut mesh: &MeshInstance3D = alias n {
+            let current = MeshInstance3D::pathsOf(mesh.materials);
+            let mut paths: [[c8]] = [], mut changed = false;
+            for i in 0us .. mesh.mesh.subMeshes.len {
+                if mesh.materialOf(i) is source {
+                    paths ~= [path];
+                    changed = true;
+                } else {
+                    paths ~= [if i < current.len { current[i] } else { "" }];
+                }
+            }
+
+            if changed { edits ~= [PropertyEdit(alias mesh, property, PropertyValue::assets(paths))]; }
+        }
+
+        if edits.len != 0us { self._ctx:.run(copy PropertyCommand(edits)); }
+
+        m:.retarget(alias copied);
+        self._docs:.refresh();
+        self._ctx:.setStatus(f"Extracted to ${Path(path).file()}, drawing ${edits.len} nodes of the scene: its changes are saved in it");
+    }
+
+    /**
+     * Copy the material of the part of the mesh inspected asked about in a file, the part drawn with the copy, opened
+     * in a tab of its own
+     * */
+    fn duplicateTo(mut self, path: [c8])
+        throws BalderError
+    {
+        let (material, mesh) = if let Ok(m) = self._slots:.mesh() { (m.materialOf(self._slotPart), m.mesh.path) } else { return; };
+
+        material.duplicate(path, Document::stem(path)).save(path);
+        Assets::forget(path);
+        Assets::material(path);
+        if self._slots:.setSlot(self._slotPart, path) {
+            self:.openMaterial(path, mesh);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          PANELS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * The material shown changed, its change made, undone or redone: the status bar tells it, the tab and the title
+     * whether it has unsaved changes
+     * */
+    fn onMaterialEdited(mut self) {
+        if let Ok(m) = self._ctx.material {
+            if m.isLocal {
+                if let Ok(e) = self._ctx.editor { self._ctx:.setStatus(e.change); }
+            } else {
+                self._ctx:.setStatus(m.history.change);
+            }
+        }
+
+        self._docs:.showDocument();
+    }
+
+    /**
+     * The material of a part of the mesh inspected is to be edited in a tab of its own, its preview drawing the mesh
+     * */
+    fn onEditMaterial(mut self, part: usize) {
+        let (path, mesh) = if let Ok(m) = self._slots:.mesh() { (m.materialOf(part).path, m.mesh.path) } else { return; };
+        self:.openMaterial(path, mesh);
+    }
+
+    /**
+     * The material of a part of the mesh inspected is to be copied in a file to choose, drawing the part
+     * */
+    fn onDuplicateMaterial(mut self, part: usize) {
+        let name = if let Ok(m) = self._slots:.mesh() { m.materialOf(part).name } else { return; };
+        self._slotPart = part;
+        self:.chooseFile(MaterialChoice::DUPLICATE, "Duplicate the material to a file", name);
+    }
+
+    /**
+     * A part of the mesh inspected is to be drawn with a material file to choose
+     * */
+    fn onChooseMaterial(mut self, part: usize) {
+        self._slotPart = part;
+        self:.chooseFile(MaterialChoice::CHOOSE, "Draw the part with a material file", "");
+    }
+
+    /**
+     * The material read only shown is to be copied in a file to choose (see extractTo)
+     * */
+    fn onExtractMaterial(mut self) {
+        if let Ok(m) = self._ctx.material && m.isReadOnly {
+            self:.chooseFile(MaterialChoice::EXTRACT, "Extract the material to a file", m.material.name);
+        }
+    }
+
+    /**
+     * The image of a map of the material shown is to be chosen
+     * */
+    fn onBrowseMap(mut self, entry: [c8]) {
+        self._browsedMap = entry;
+        self._ctx:.choose(alias self._images, FileDialogMode::OPEN, "Choose the image of the map", &self:.onImageChosen);
+    }
+
+    fn onImageChosen(mut self, path: ([c8])?) {
+        if let Ok(p) = path { self._materials:.setMap(self._browsedMap, qualifiedPath(p)); }
+    }
+
+    /**
+     * The HDR map lighting the preview is to be chosen
+     * */
+    fn onChooseEnvironment(mut self) {
+        let dmut environments = copy FileChoice(copy ["hdr"], "environments");
+        self._ctx:.choose(alias environments, FileDialogMode::OPEN, "Light the preview by an HDR map",
+                          &self:.onEnvironmentChosen);
+    }
+
+    fn onEnvironmentChosen(mut self, path: ([c8])?) {
+        if let Ok(p) = path { self._materials:.setEnvironment(qualifiedPath(p)); }
+    }
+
+    /**
+     * A node drawing the material shown is picked: its scene is shown, the node selected
+     * */
+    fn onUserPicked(mut self, index: usize) {
+        let dmut user = if let Ok(dmut u) = alias self._materials:.userAt(index) { alias u } else { return; };
+
+        self._docs:.switchDocument(alias user.scene);
+        if let Ok(dmut e) = alias self._ctx.editor {
+            let dmut selection = alias e.scene.selection;
+            selection:.clear();
+            selection:.add(alias user.node);
+        }
+
+        self._ctx:.setStatus(f"Selected ${user.node.name.file()}, drawn with the material");
+    }
+}
+
+/**
+ * What a material file chosen in a dialog is for
+ * */
+enum MaterialChoice : u8
+| NEW       = 0u8 // a new material, written then opened
+| OPEN      = 1u8 // a material opened
+| EXTRACT   = 2u8 // a copy of the material read only shown, the meshes of the scene drawing it drawing the copy
+| DUPLICATE = 3u8 // a copy of the material of a part of the mesh inspected, drawing the part
+| CHOOSE    = 4u8; // the material drawing a part of the mesh inspected

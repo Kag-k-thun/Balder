@@ -1,0 +1,214 @@
+in edit_menu;
+
+use balder_editor::{material_panel, naming};
+use balder_editor::activity::editor_context;
+use balder_editor::command::{duplicate, remove};
+
+use balder::core::application::signal;
+use balder::core::error;
+use balder::interface::loader::registry::behaviors;
+use balder::interface::widget::button::push;
+use balder::scene::node::node3D;
+use balder::utils::log;
+
+use ::sdl3::mouse;
+
+// The paths of the items of the Edit menu undoing and redoing the changes
+def UNDO_ITEM = "BAR/EDIT/UNDO";
+def REDO_ITEM = "BAR/EDIT/REDO";
+
+// The class of an item of a menu with nothing to do, greyed (see editor.style)
+def IDLE = "idle";
+
+/**
+ * The Edit menu of the editor, mounted under the behavior 'edit': the changes of the document shown undone and redone
+ * (the changes of the scene, or of the material file shown, which has a history of its own), the nodes selected copied,
+ * removed and framed in the viewport
+ * @info: every change of the scene is a command run through the SceneEditor, which keeps it in the history of the
+ * document shown; the items Undo and Redo name the change they undo or redo (see showHistory), greyed when there is
+ * none
+ * */
+#[behavior]
+pub class EditMenu over Behavior {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The material editor, undoing the changes of the material file shown
+    let dmut _materials: &MaterialPanel;
+
+    /**
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     *    - materials: the material editor, undoing the changes of the material file shown
+     * */
+    pub self (dmut ctx: &EditorContext, dmut materials: &MaterialPanel)
+        with _ctx = alias ctx
+        , _materials = alias materials
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    #[slot (name-> "undo")]
+    fn onUndoClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.undo(); }
+    }
+
+    #[slot (name-> "redo")]
+    fn onRedoClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.redo(); }
+    }
+
+    #[slot (name-> "duplicate")]
+    fn onDuplicateClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.duplicateSelection(); }
+    }
+
+    #[slot (name-> "delete")]
+    fn onDeleteClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.deleteSelection(); }
+    }
+
+    #[slot (name-> "frame")]
+    fn onFrameClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.frameSelection(); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          EDIT          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Undo the last change of the document shown
+     * */
+    pub fn undo(mut self) {
+        if let Ok(m) = self._ctx.material && !m.isLocal {
+            if !self._materials:.undo() { self._ctx:.setStatus("Nothing to undo"); }
+            return;
+        }
+
+        if let Ok(dmut e) = alias self._ctx.editor {
+            if !e:.undo() { self._ctx:.setStatus("Nothing to undo"); }
+        }
+    }
+
+    /**
+     * Redo the last change undone of the document shown, telling in the status bar why it failed
+     * */
+    pub fn redo(mut self) {
+        if let Ok(m) = self._ctx.material && !m.isLocal {
+            if !self._materials:.redo() { self._ctx:.setStatus("Nothing to redo"); }
+            return;
+        }
+
+        if let Ok(dmut e) = alias self._ctx.editor {
+            {
+                if !e:.redo() { self._ctx:.setStatus("Nothing to redo"); }
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "The change could not be redone", err);
+                    self._ctx:.setStatus(err.msg);
+                }
+            }
+        }
+    }
+
+    /**
+     * Copy the nodes selected, the copies selected
+     * */
+    pub fn duplicateSelection(mut self) {
+        let dmut nodes = alias self._ctx:.selectedNodes();
+        if nodes.len != 0us {
+            self._ctx:.run(copy DuplicateCommand(alias nodes));
+        }
+    }
+
+    /**
+     * Remove the nodes selected from the scene
+     * */
+    pub fn deleteSelection(mut self) {
+        let dmut nodes = alias self._ctx:.selectedNodes();
+        if nodes.len != 0us {
+            self._ctx:.run(copy RemoveCommand(alias nodes));
+        }
+    }
+
+    /**
+     * Look at the nodes selected, or at every node of the scene when none is
+     * */
+    pub fn frameSelection(mut self) {
+        if self._ctx.material.hasValue { return; }
+        let dmut nodes = alias self._ctx:.selectedNodes();
+        if nodes.len == 0us {
+            if let Ok(dmut e) = alias self._ctx.editor {
+                let dmut scene = alias e.scene;
+                for _, dmut c in alias scene:.getRootNode():.getChilds() if let dmut n: &Node3D = alias c {
+                    if !isEditorNode(n) { nodes ~= [alias n]; }
+                }
+            }
+        }
+
+        if let Ok(dmut v) = alias self._ctx.viewport {
+            v:.frame(alias nodes);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          HISTORY          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Name in the items Undo and Redo of the Edit menu the changes they undo and redo, greying an item with nothing to do
+     * */
+    pub fn showHistory(mut self) {
+        if let Ok(m) = self._ctx.material && !m.isLocal {
+            let h = m.history;
+            self:.showHistoryItem(UNDO_ITEM, "Undo", if let Ok(c) = h.toUndo { c.describe() } else { "" }, "Ctrl+Z");
+            self:.showHistoryItem(REDO_ITEM, "Redo", if let Ok(c) = h.toRedo { c.describe() } else { "" }, "Ctrl+Shift+Z");
+            return;
+        }
+
+        let (undo, redo) = if let Ok(e) = self._ctx.editor {
+            (if let Ok(c) = e.toUndo { c.describe() } else { "" }, if let Ok(c) = e.toRedo { c.describe() } else { "" })
+        } else {
+            ("", "")
+        };
+
+        self:.showHistoryItem(UNDO_ITEM, "Undo", undo, "Ctrl+Z");
+        self:.showHistoryItem(REDO_ITEM, "Redo", redo, "Ctrl+Shift+Z");
+    }
+
+    /**
+     * Name in an item of the Edit menu the change it undoes or redoes, the item being greyed when there is none
+     * @params:
+     *    - action: Undo or Redo
+     *    - change: the change, empty when there is none
+     *    - keys: the shortcut of the item
+     * */
+    fn showHistoryItem(mut self, path: [c8], action: [c8], change: [c8], keys: [c8]) {
+        if let Ok(dmut item: &PushButton) = self._ctx.gui:.find(path) {
+            item:.setShortcut(keys);
+            if change.len == 0us {
+                item:.setText(action);
+                item:.setClasses(copy ["item", IDLE]);
+            } else {
+                item:.setText(f"${action}: ${change}");
+                item:.setClasses(copy ["item"]);
+            }
+        }
+    }
+}

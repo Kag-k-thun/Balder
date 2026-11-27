@@ -1,0 +1,271 @@
+in editor_context;
+
+use balder_editor::{command, dock_rails, editor, material_document, project, viewport, viewport_bars};
+use balder_editor::activity::file_choice;
+use balder_editor::project::recent;
+
+use balder::core::error;
+use balder::core::application::{signal, window};
+use balder::interface;
+use balder::interface::dialog;
+use balder::interface::widget::text::label;
+use balder::scene::node::node3D;
+use balder::utils::{log, path};
+
+use std::fs;
+
+// The path of the status bar
+def STATUS = "BODY/FOOT/STATUS";
+
+/**
+ * What the behaviors of the editor share, given to each of them by the activity, which none of them holds: the
+ * interface, the editor of the scene and its viewport once the interface is loaded, the project, the material shown,
+ * the status bar, and the dialogs asking something, one at a time
+ * */
+pub class EditorContext {
+
+    // The interface of the editor
+    pub let dmut gui: &WidgetManager;
+
+    // The mailbox the slots of the signals are emitted in, after the events that emitted them
+    pub let dmut box: &SlotEmitter;
+
+    // The window of the editor, titled after the document shown
+    pub let dmut window: &Window;
+
+    // The project edited, once read
+    pub let dmut project: (&Project)? = none;
+
+    // The editor of the scene, and its viewport, once the interface is loaded
+    pub let dmut editor: (&SceneEditor)? = none;
+    pub let dmut viewport: (&EditorViewport)? = none;
+
+    // The bars over the viewport, and the docks and their rails, once the interface is loaded
+    pub let dmut bars: (&ViewportBars)? = none;
+    pub let dmut docks: (&DockRails)? = none;
+
+    // The material shown in place of the panels of the scene, none while a scene is shown (see Documents)
+    pub let dmut material: (&MaterialDocument)? = none;
+
+    // The status bar, once the interface is loaded
+    let dmut _status: (&Label)? = none;
+
+    // What the status bar tells once the changes the editor made itself are told (see notify), empty for nothing, and
+    // true until the update after the one it was given at
+    let mut _notice: [c8] = "";
+    let mut _noticeWaits: bool = false;
+
+    // True while a dialog of the editor asks something, the keys saving the scene and the quitting waiting for its
+    // answer
+    let mut _asking: bool = false;
+
+    // The kind of file the dialog open asks for, and what is done with the file chosen (see choose)
+    let dmut _files: (&FileChoice)? = none;
+    let mut _chosen: (dg (([c8])?)-> void)? = none;
+
+    /**
+     * @params:
+     *    - gui: the interface of the editor
+     *    - box: the mailbox the slots of the signals are emitted in
+     *    - window: the window of the editor
+     * */
+    pub self (dmut gui: &WidgetManager, dmut box: &SlotEmitter, dmut window: &Window)
+        with gui = alias gui
+        , box = alias box
+        , window = alias window
+    {}
+
+    /**
+     * Find the status bar, once the interface is loaded
+     * */
+    pub fn bind(mut self) {
+        if let Ok(dmut l: &Label) = self.gui:.find(STATUS) {
+            self._status = (alias l)?;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          COMMANDS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Change the scene through the editor, telling in the status bar why the change failed
+     * @returns: true iif the scene changed
+     * */
+    pub fn run(mut self, dmut command: &EditCommand)-> bool {
+        if let Ok(dmut e) = alias self.editor {
+            {
+                return e:.execute(alias command);
+            } catch {
+                err: &BalderError => {
+                    log::error #("Editor", "The change failed", err);
+                    self:.setStatus(err.msg);
+                }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the nodes selected, in a list of their own, none while a material is shown
+     * */
+    pub fn selectedNodes(mut self)-> dmut [&Node3D] {
+        if self.material.hasValue { return []; }
+        let dmut nodes: [&Node3D] = [];
+        if let Ok(dmut e) = alias self.editor {
+            let dmut scene = alias e.scene;
+            let dmut selection = alias scene.selection;
+            for dmut n in alias selection.nodes {
+                nodes ~= [alias n];
+            }
+        }
+
+        alias nodes
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          PROJECT          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the name of the project, for the status bar
+     * */
+    pub fn projectName(self)-> [c8] {
+        if let Ok(p) = self.project { p.name } else { "the project" }
+    }
+
+    /**
+     * Keep the scene of the project edited last, the one the editor starts on next time
+     * */
+    pub fn keepEdited(mut self, path: [c8]) {
+        if path.len == 0us { return; }
+
+        let dmut recent = copy RecentProjects();
+        recent:.edited(getProjectPath().toStr(), path);
+        self:.saveRecent(recent);
+    }
+
+    /**
+     * Write the recent projects, logging why they cannot be
+     * */
+    pub fn saveRecent(mut self, recent: &RecentProjects) {
+        {
+            recent.save();
+        } catch {
+            err: &BalderError => {
+                log::error #("Editor", "Failed to save the recent projects", err);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          DIALOGS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Open a dialog over the editor, the editor asking something until its answer (see answered)
+     * */
+    pub fn openDialog(mut self, dmut d: &Dialog) {
+        {
+            d:.open(DialogMode::OVERLAY, alias self.gui);
+            self._asking = true;
+        } catch {
+            err => {
+                log::error #("Editor", "Failed to open the dialog", err);
+                self:.setStatus("The dialog could not be opened");
+            }
+        }
+    }
+
+    /**
+     * The dialog open is answered: the editor no longer asks anything
+     * */
+    pub fn answered(mut self) {
+        self._asking = false;
+    }
+
+    /**
+     * @returns: true iif a dialog of the editor asks something
+     * */
+    pub fn isAsking(self)-> bool {
+        self._asking
+    }
+
+    /**
+     * Ask for a file in a dialog over the editor, starting from the directory of the file of its kind chosen last, the
+     * directory of the file chosen kept for the next one
+     * @params:
+     *    - files: the kind of file asked for
+     *    - title: the title of the dialog
+     *    - then: called with the file chosen, none when the dialog is cancelled, once the editor no longer asks
+     *    - name: the name the dialog proposes for a file to write, empty to open one
+     * */
+    pub fn choose(mut self, dmut files: &FileChoice, mode: FileDialogMode, title: [c8], then: dg (([c8])?)-> void,
+                  name: [c8] = "") {
+        self._files = (alias files)?;
+        self._chosen = (then)?;
+        let dmut d = copy FileDialog(mode, directory-> files.directory, filters-> files.extensions, title-> title,
+                                     name-> name);
+        d:.answered():.connect(alias self.box, &self:.onChosen);
+        self:.openDialog(alias d);
+    }
+
+    fn onChosen(mut self, path: ([c8])?) {
+        self._asking = false;
+        if let Ok(p) = path {
+            if let Ok(dmut f) = alias self._files { f.directory = Path(p).parent().toStr(); }
+        }
+
+        if let Ok(then) = self._chosen { then(path); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          STATUS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Tell something in the status bar after the changes of the scene made meanwhile, which the editor tells as they
+     * are delivered, at the start of the next update (the opens of a reload)
+     * */
+    pub fn notify(mut self, msg: [c8]) {
+        self._notice = msg;
+        self._noticeWaits = true;
+    }
+
+    /**
+     * Tell in the status bar what notify was given, at the update after the one it was given at
+     * */
+    pub fn update(mut self) {
+        if self._notice.len == 0us { return; }
+
+        if self._noticeWaits {
+            self._noticeWaits = false;
+        } else {
+            self:.setStatus(self._notice);
+            self._notice = "";
+        }
+    }
+
+    pub fn setStatus(mut self, msg: [c8]) {
+        if let Ok(dmut status) = alias self._status {
+            status:.setText(msg);
+        }
+    }
+}
