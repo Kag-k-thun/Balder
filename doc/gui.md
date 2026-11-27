@@ -245,10 +245,13 @@ FieldRow #NAME "Name" { on-validate: form::name-set; }
   and `on-blur` when it gains and loses the focus; the others are listed under [Widget types](#widget-types).
 - **The slots are registered by the activity**: `Activity.slot (name, delegate)` records the types of the parameters
   of the delegate, which runs in the thread of the activity. The loader looks no slot up anywhere else.
-- **A behavior groups slots under a name.** A class over `Behavior` registers its slots in its constructor
-  (`self:.slot ("submit", &self:.onSubmit);`) and the activity mounts it with `Activity.behavior (name, behavior)`. A
+- **A behavior groups slots under a name.** A class over `Behavior` tagged `#[behavior]` tags its slots `#[slot]`,
+  private methods included, named by the tag or by the method in kebab case (`#[slot (name-> "submit")]` on
+  `fn onSubmit (mut self, button: u8)`), and the activity mounts it with `Activity.behavior (name, behavior)`, which
+  registers them; a dialog registers its own as it opens. A class over a behavior class has its slots, then its own. A
   slot name is then a path, `form::submit`, which is looked up only where it leads: `submit` does not find it.
-  `Activity.slot ("view::reset", …)` registers a slot by its path, the behaviors missing on the way being created.
+  `Activity.slot ("view::reset", …)` registers a slot by its path, the behaviors missing on the way being created, and
+  `Behavior.slot` a slot registered dynamically.
 - **A slot takes the bound arguments, then the payload.** `describe ("Label: …")` binds constants of the
   [value grammar](#values) (strings, numbers, `true` and `false`) to the first parameters of the slot, and the signal
   gives the last one. A slot binding every parameter suits a signal without payload. A parameter of a type no value
