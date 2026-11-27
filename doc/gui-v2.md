@@ -993,10 +993,10 @@ PushButton .entry "Label" {
 - **Slots are registered by the activity, under a name.** `Activity.slot (name, delegate)` records the delegate, and
   the loader connects it with the activity's `SlotEmitter`, so the handler still runs on the activity's thread, as with
   `connect (self.box, …)` today.
-- **Behaviors group slots under a path** (BAL-66). A class over `Behavior` registers its slots in its constructor and
-  the activity mounts it, `self:.behavior ("form", copy FormBehavior (…))`: `form::submit` is the slot `submit` of the
-  behavior `form`, a path the loader follows, and `self:.slot ("view::reset", …)` creates the behaviors missing on the
-  way.
+- **Behaviors group slots under a path** (BAL-66). A class over `Behavior` tagged `#[behavior]` declares its slots by
+  tagging its methods `#[slot]` (BAL-222, below), and the activity mounts it, `self:.behavior ("form", copy
+  FormBehavior (…))`: `form::submit` is the slot `submit` of the behavior `form`, a path the loader follows, and
+  `self:.slot ("view::reset", …)` creates the behaviors missing on the way.
 - **The connection is checked at load.** Registering a slot records the types of its parameters with `typeinfo`. A slot
   name that does not exist, or a slot whose parameters do not match the signal, is a load error naming the file, the
   line, the signal and the slot. It is not a button that silently does nothing.
@@ -1031,12 +1031,35 @@ For the forwarding above, `FieldRow` of [§8](#8-components) gains one parameter
 ### Why the code names its slots
 
 Writing `on-click: "gallery::GalleryActivity::onQuitClicked"` and letting the loader find the method would remove the
-registration lines. Ymir cannot do that today. A compiled program has no table of its methods to look a name up in at
-runtime. At compile time, the compiler exposes `__members__` and the names of enums, but cannot list the methods of a
-class. The registration is also where the parameter types are recorded for the check above.
+registration lines. Ymir cannot do that: a compiled program has no table of its methods to look a name up in at
+runtime. The registration is also where the parameter types are recorded for the check above.
 
-If the compiler later learns to list the methods of a class that carry an attribute, a `@{slot}` on the method could
-replace the `self:.slot (…)` line with no change to any `.gui`: the files only ever see names.
+Since Ymir 1.14 the compiler lists the methods of a class that carry a tag, so a behavior names its slots by tags
+instead of registration lines (BAL-222), with no change to any `.gui`, the files only ever seeing names:
+
+```
+#[behavior]
+class FormBehavior over Behavior {
+    pub self () {}
+
+    #[slot (name-> "submit")]
+    fn onSubmitClicked (mut self, button: u8) { … }
+
+    #[slot]                                     // the slot `name-set`, the method in kebab case
+    fn nameSet (mut self, text: [c8]) { … }
+}
+```
+
+- **`#[behavior]`** (`balder::interface::loader::registry::behaviors`) registers the class at the start of the program;
+  **`#[slot]`** (`balder::core::application::signal`) is the tag of the slots of the actors too. Private methods are
+  slots as well, with or without parameters.
+- **The slots are registered once the behavior is built**, when it is mounted (`Behavior::behavior`) or its dialog
+  opened, by `registerTaggedSlots`: the constructor of `Behavior` runs before the one of its class, when the behavior
+  is not of the class yet.
+- **A class over a behavior class has its slots**, then its own, a slot of its own replacing the one of the same name;
+  a tagged slot replaces the one of its name registered by hand.
+- **`self:.slot (…)` stays** for the slots registered dynamically, under a path (`form::submit`) or delegating to
+  another object, and for the slots of an activity, which is not a behavior.
 
 ### Grammar
 

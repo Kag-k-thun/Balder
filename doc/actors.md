@@ -126,7 +126,8 @@ What a class needs:
   classes: an actor overrides them, empty when it has nothing to do as it enters or leaves its scene.
 - **The constructor `self (name: [c8], dmut parent: &Node)`**, which builds the nodes of the scene files and of the
   editor; their properties are then given the values of the file, so the constructor sets nothing a property holds.
-- **The tags** of `balder::scene::actors::tags` in scope (`use balder::scene::actors::tags;`).
+- **The tags** in scope: `#[actor]`, `#[export]` and `#[emits]` of `balder::scene::actors::tags`, `#[slot]` of
+  `balder::core::application::signal` (`use balder::scene::actors::tags;`, `use balder::core::application::signal;`).
 - **A type** (`"door"`) of lowercase letters, digits and `-`, starting with a letter, that no other class has (a
   built-in kind, `mesh`, `light`…, or another actor class): a class refused is logged at the start (`Actor class
   'door' refused: …`) and left out.
