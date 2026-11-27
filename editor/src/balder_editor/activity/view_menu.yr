@@ -1,0 +1,183 @@
+in view_menu;
+
+use balder_editor::activity::editor_context;
+use balder_editor::command::transform;
+
+use balder::core::application::signal;
+use balder::interface::loader::registry::behaviors;
+use balder::interface::widget::text::label;
+use balder::math::{utils, vector};
+use balder::scene::edit;
+use balder::scene::node::node3D::{camera, transform};
+
+use ::sdl3::mouse;
+
+// The label of the status bar telling the step of the grid of the ground
+def GRID_LABEL = "BODY/FOOT/GRID";
+
+/**
+ * The View menu of the editor, mounted under the behavior 'view': the icons and the grid of the viewport hidden or
+ * shown, the viewport looking through the camera selected or through the camera of the editor again, the nodes
+ * selected aligned with the view; and the step of the grid of the ground told in the status bar
+ * @info: the viewport looks through a camera of the scene until View → Look through the editor camera, or until the
+ * camera leaves the scene, the moves of its controls moving the camera recorded as commands
+ * */
+#[behavior]
+pub class ViewMenu over Behavior {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The label telling the step of the grid of the ground, once bound
+    let dmut _gridLabel: (&Label)? = none;
+
+    /**
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     * */
+    pub self (dmut ctx: &EditorContext)
+        with _ctx = alias ctx
+    {}
+
+    /**
+     * Follow the viewport of the context, once the interface is loaded: its grid stepped, the camera looked through
+     * piloted
+     * */
+    pub fn bind(mut self) {
+        if let Ok(dmut l: &Label) = self._ctx.gui:.find(GRID_LABEL) {
+            self._gridLabel = (alias l)?;
+        }
+
+        if let Ok(dmut v) = alias self._ctx.viewport {
+            v:.gridStepped():.connect(alias self._ctx.box, &self:.onGridStepped);
+            v:.piloted():.connect(alias self._ctx.box, &self:.onPiloted);
+            if let Ok(step) = v.gridStep { self:.onGridStepped(step); }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Hide the icons of the nodes without geometry in the viewport, or show them
+     * */
+    #[slot (name-> "icons")]
+    fn onIconsClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+        if let Ok(dmut bars) = alias self._ctx.bars { bars:.toggleOverlay("ICONS"); }
+    }
+
+    /**
+     * Hide the grid of the ground in the viewport, or show it
+     * */
+    #[slot (name-> "grid")]
+    fn onGridClicked(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+        if let Ok(dmut bars) = alias self._ctx.bars { bars:.toggleOverlay("GRID"); }
+    }
+
+    /**
+     * Look through the camera selected last, or through the camera of the editor again when the viewport looks through
+     * a camera of the scene
+     * */
+    #[slot (name-> "through")]
+    fn onThroughClicked(mut self, button: u8) {
+        if button != SDL_BUTTON_LEFT { return; }
+
+        let through = if let Ok(v) = self._ctx.viewport { v.lookedThrough.hasValue } else { return; };
+        let dmut chosen: (&Camera)? = none;
+        if !through {
+            let dmut nodes = alias self._ctx:.selectedNodes();
+            if nodes.len != 0us {
+                if let dmut c: &Camera = alias nodes[$ - 1us] { chosen = (alias c)?; }
+            }
+
+            if !chosen.hasValue {
+                self._ctx:.setStatus("Select a camera to look through");
+                return;
+            }
+        }
+
+        if let Ok(dmut bars) = alias self._ctx.bars { bars:.lookThrough(alias chosen); }
+    }
+
+    #[slot (name-> "align")]
+    fn onAlignClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.alignSelection(); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          VIEW          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Turn the nodes selected as the view looks, their +Z toward the eye, a camera also moved to the eye, so that it
+     * sees what the view sees (the camera menu, Ctrl+Alt+M), the change recorded as one command
+     * */
+    pub fn alignSelection(mut self) {
+        let orbit = if let Ok(v) = self._ctx.viewport { v.orbit } else { return; };
+        let eye = orbit.eye();
+        let back = eye - orbit.target;
+        if back.length() == 0.0f { return; }
+
+        let turn = facing(back.normalized(), orbit.up()).matrix();
+        let mut edits: [TransformEdit] = [];
+        for dmut n in alias self._ctx:.selectedNodes() {
+            let at = if let _: &Camera = n { eye } else { (n.transformation * makeVec4(0.0f, 0.0f, 0.0f, 1.0f)).xyz };
+            let local = NodeTransform::inParent(translation(at) * turn, n.parentTransformation);
+            edits ~= [TransformEdit(alias n, NodeTransform(local.position, local.rotation, n.scale))];
+        }
+
+        if edits.len == 0us {
+            self._ctx:.setStatus("Select the nodes to align with the view");
+            return;
+        }
+
+        self._ctx:.run(copy TransformCommand(edits));
+    }
+
+    /**
+     * Name the camera looked through in the chip, the camera menu and the View menu
+     * */
+    pub fn showThrough(mut self) {
+        if let Ok(dmut b) = alias self._ctx.bars { b:.showCamera(); }
+    }
+
+    /**
+     * A move of the controls of the viewport moved the camera it looks through: the move is recorded as a command
+     * */
+    fn onPiloted(mut self) {
+        if let Ok(v) = self._ctx.viewport {
+            if let Ok(e) = v.pilotEdit {
+                self._ctx:.run(copy TransformCommand(copy [e], applied-> true));
+            }
+        }
+    }
+
+    /**
+     * Tell the step of the grid of the ground in the status bar, in metres
+     * */
+    fn onGridStepped(mut self, step: f32) {
+        if let Ok(dmut l) = alias self._gridLabel {
+            l:.setText(f"Grid: ${gridStepText(step)}");
+        }
+    }
+}
+
+/**
+ * @returns: the step of the grid, a power of ten in metres, as people read it: 10 cm, 1 m, 100 m, 1 km
+ * */
+fn gridStepText(step: f32)-> [c8] {
+    if step < 0.95f { return f"${cast!i32(step * 100.0f + 0.5f)} cm"; }
+    if step < 950.0f { return f"${cast!i32(step + 0.5f)} m"; }
+    f"${cast!i32(step / 1000.0f + 0.5f)} km"
+}
