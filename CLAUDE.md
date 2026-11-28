@@ -61,7 +61,9 @@ occlusion and its post-process chain; read it before touching a pass. In short:
 - **Shaders** are toml configs (`res/shaders/base/...`, `DefaultShaders`) naming SPIR-V files,
   the vertex entries (`VertexEntry`, interleaved floats in enum order), the descriptor sets and the
   push constants; `res/shaders/compile.sh` (glslc, the `shader_compile` command of `gyllir.toml`)
-  builds the `.spv` next to their sources, ignored by git. A raster shader describes its skinned
+  builds the `.spv` next to their sources, ignored by git, with `-DBALDER_DEBUG`: the debug views and
+  the outline of the editor are compiled under it only, both ends of a varying guarded together, the
+  export of a game compiling its shaders without it (`ShaderBuild`). A raster shader describes its skinned
   variant in a `[skin]` table. A shader struct mirrored on the CPU (`Object`, `Cluster`,
   `SkinWeightSlot`, push constants) changes on both sides at once.
 - **Locks.** The rendering thread takes the pipeline lock then the scene lock; never redraw the

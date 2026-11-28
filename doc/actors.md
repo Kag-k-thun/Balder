@@ -256,7 +256,7 @@ building, as the scene files do.
 ## Ticks
 
 An actor runs code at each tick of its scene by asking for its ticks (`self.ticked = true`, in its constructor) and
-overriding `onTick (mut self, delta: Duration)`: it moves, reads the keyboard, emits its signals. The editor ticks the
+overriding `onTick (mut self, delta: Duration)`: it moves, reads the input actions, emits its signals. The editor ticks the
 actors only while the scene is played (see *Playing* in `doc/editor.md`), the nodes of the editor ticking still: an
 actor placed in a scene does nothing until Play, and Stop puts it back where it was placed.
 
@@ -287,6 +287,41 @@ An actor can be over a built-in class of Balder rather than over `Node3D`, keepi
 player of the *Third person* template is over `CharacterBody3D` (its capsule, its controller and its body entering the
 physics of the scene as any character), moved by `moveAndSlide` at each tick. Its scene file holds the properties of the
 actor class only, the built-in ones taking their defaults.
+
+## Input
+
+An actor reads the input actions of the project (`[actions]` of `project.toml`, edited in *Project → Settings… →
+Input*) by their names, through the actions of its scene for this tick (`self:.actions()`, none outside a scene), never
+the keys themselves, so that the player rebinds them and a gamepad works as the keyboard does:
+
+```
+pub over onTick(mut self, delta: Duration) {
+    if let Ok(dmut a) = alias self:.actions() {
+        let front = a:.axis("back", "forward");    // -1 to 1, a key 1, a stick pushed as far as it is
+        let running = a:.held("run");               // a key held, or an axis past its dead zone
+        if a:.pressed("jump") { self:.jump(); }     // went down since the tick before, once
+        if a:.released("aim") { self:.stopAiming(); }
+        let trigger = a:.strength("shoot");          // 0 to 1
+    }
+}
+```
+
+A binding is `key:<name>` (the place of the key, named as SDL names it: `key:W` is Z on an AZERTY keyboard, `key:Left
+Shift`, `key:Space`), `mouse:left` (`middle`, `right`, `x1`, `x2`), `pad:<button>` (`pad:a` the south button,
+`pad:start`, `pad:dpup`, any gamepad) or `pad:<axis>+` / `pad:<axis>-` (`pad:lefty-` the left stick up,
+`pad:righttrigger+`). The devices are counted (`InputDevices`) and each scene copies them once a tick (`ActionState`),
+so a tap between two ticks still reads as pressed and released, and two scenes read the same press. A scene whose
+Scene3D has not the focus reads nothing. An unknown action reads as never acted, logged once.
+
+## Asking the runtime
+
+The game asks the program running it (the runtime, or the play mode of the editor) to play another scene of the project
+by its name in `[scenes]`, or to quit, both run at its next update, never inside a tick (`balder::game::requests`):
+
+```
+if self.reachedTheDoor { changeScene("level2"); }
+if a:.pressed("menu") { quitGame(); }
+```
 
 ## Inheritance
 

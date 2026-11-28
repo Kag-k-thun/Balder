@@ -196,6 +196,14 @@ normals bent by their maps, the occlusion of the maps, the emitted light), as th
 them. The views of the channels start from 5 (`FIRST_CHANNEL_VIEW` of the shaders of the materials and of the
 composition), those before it showing the geometry.
 
+The debug views, the mark of the cluster drawn the cull pass writes for them (`CLUSTER_DRAW`) and the outline of the
+objects selected (the search of `onOutline` in the composition) are compiled under `BALDER_DEBUG` only, both ends of the
+varying `inDebug`/`outDebug` guarded together. `res/shaders/compile.sh` compiles the dev build with it (`-DBALDER_DEBUG`,
+every `.spv` compiled again when the flags change, kept in `res/shaders/.flags`), so that the editor and the examples
+keep their views; the export of a game compiles the shaders it ships without it (`ShaderBuild`, see *Export* in
+`doc/editor.md`). The CPU side does not change: `Camera.debugView` stays a field the release shaders do not read, the
+`Outline` binding a binding the SPIR-V does not use, valid for its descriptor set layout.
+
 ## Skinning
 
 A mesh whose vertices are moved by the joints of a skeleton (a `Skin`, read by `MeshAsset::read` from a glTF or an

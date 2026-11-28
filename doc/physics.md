@@ -100,7 +100,7 @@ than asked or that hull holds less than the concavity. Each hull is kept in the 
 `maxVertices` by taking the vertex farthest out of the hull of those taken. `shape` gives the compound of the hulls.
 
 It is slow by nature (seconds to tens of seconds for a model of a few thousand triangles), so it runs offline, at
-import or in the editor, never at load: the hulls are saved next to the model file (`ConvexDecomposition::fileOf`,
+the export of a game or by the `decompose` tool, never at load: the hulls are saved next to the model file (`ConvexDecomposition::fileOf`,
 `mug.glb` giving `mug.hulls`), a toml holding the version of the format, the settings, the CRC-32 of the model file
 they were made from (`checksumOf`) and a `[[hull]]` table of the coordinates of the vertices of each hull. The game reads
 it (`MeshAsset.decomposition`, `ConvexDecomposition::fromFile`), a warning telling when the model file changed
@@ -111,8 +111,12 @@ let dmut mug = copy MeshInstance3D::fromFile("mug", alias body, "res:/models/mug
 body.shape = mug.decomposition().shape();
 ```
 
-The `decompose` tool (`tools/src/decompose`) decomposes a model at import, the export of a project will (BAL-138); the
-panel of the hulls of a model in the editor (see `doc/editor.md`) draws the hulls saved over the model:
+`ConvexDecomposition::ofModel` decomposes a model file, read again from its file (never the mesh of the cache, whose
+vertices a scene may have released), its checksum kept as the source of the hulls; `isUpToDate` tells whether the hulls
+saved next to a model were made from its file as it is. The export of a game decomposes again the models of its dynamic
+bodies shaped by their hulls whose file changed (see *Export* in `doc/editor.md`), the `decompose` tool
+(`tools/src/decompose`) any model; the panel of the hulls of a model in the editor draws the hulls saved over the
+model:
 
 ```
 cd tools && gyllir build decompose && cd ..
@@ -602,6 +606,5 @@ and the scene files, and read from the quaternion once it is set as one (`orient
 
 ## Not done yet
 
-- the joints in the scene files and in the editor;
-- the convex decomposition of the models at the export of a project (BAL-138), the editor no longer decomposing them.
+- the joints in the scene files and in the editor.
 
