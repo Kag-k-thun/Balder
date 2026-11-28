@@ -1,0 +1,441 @@
+in resource_set;
+
+use balder::core::error;
+use balder::game::{export_problem, project};
+use balder::scene::actors::node_classes;
+use balder::scene::asset::{material_asset, mesh_asset};
+use balder::scene::description;
+use balder::scene::description::{kind, node_description};
+use balder::scene::node::node3D::visual::primitive;
+use balder::scene::node::node3D::visual::material::maps;
+use balder::scene::physics::convex_decomposition;
+use balder::scene::property::kind;
+use balder::utils::path;
+
+use std::fs;
+use std::algorithm::sorting;
+use std::config;
+use std::config::json;
+
+/**
+ * The files a game uses, found from the scenes of its project: the files their nodes name (models, materials and the
+ * maps of both, the convex hulls saved next to the models), the files of the engine the runtime reads, and the
+ * [export] includes; with the problems found on the way (a file missing, a node of a class the library of the game
+ * does not declare), and the models of the dynamic bodies shaped by their hulls, which the export decomposes
+ * @info: the classes of the actors are those registered when the set is built: the library of the game is loaded
+ * first (see GameLibrary); the res:/ paths name the files of the project of the set, whatever the project the program
+ * runs (see sourceOf)
+ * @example:
+ * ```
+ * let files = copy ResourceSet(project);
+ * for p in files.problems { println(f"${p.scene}: ${p.node}: ${p.message}"); }
+ * for f in files.files { println(f._0, " named by ", f._1); }
+ * ```
+ * */
+pub class ResourceSet {
+
+    // The directory of the project, the one its res:/ paths name
+    let _root: [c8];
+
+    // The files and the directories used, by their paths (res:/…, engine:/…), with what named each first
+    let dmut _files: [[c8] => [c8]] = copy [];
+
+    // The models of the dynamic bodies shaped by their hulls, in the order they were found
+    let mut _bodies: [[c8]] = [];
+
+    // The problems found, in the order they were found
+    let mut _problems: [ExportProblem] = [];
+
+    // The models read already, their embedded materials and side files gathered
+    let dmut _models: [[c8] => ()] = copy [];
+
+    /**
+     * The files of a game, from the scenes of its project
+     * @params:
+     *    - project: the project, installed (see Project::install)
+     * */
+    pub self (project: &Project)
+        with _root = project.directory
+    {
+        for f in ResourceSet::RUNTIME_FILES {
+            self:.add(f, "the runtime", "", "");
+        }
+
+        for s in project.scenes {
+            if self:.add(s._1, f"the scene '${s._0}' of ${Project::FILE}", "", "") {
+                self:.scene(s._1);
+            }
+        }
+
+        for i in project.exportSettings.include {
+            self:.add(i, f"[export] include of ${Project::FILE}", "", "");
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the files and the directories used, their paths (res:/…, engine:/…) and what named each first, in the
+     * order of their paths
+     * */
+    @field
+    pub fn files(self)-> [([c8], [c8])] {
+        let dmut res: [([c8], [c8])] = [];
+        for path, by in self._files {
+            res ~= [(copy path, copy by)];
+        }
+
+        sort(alias res, |x, y| => { x._0 < y._0 });
+        res
+    }
+
+    /**
+     * @returns: the models of the dynamic bodies shaped by their hulls, the models the export decomposes
+     * */
+    @field
+    pub fn bodies(self)-> [[c8]] {
+        self._bodies
+    }
+
+    /**
+     * @returns: the problems found, in the order they were found
+     * */
+    @field
+    pub fn problems(self)-> [ExportProblem] {
+        self._problems
+    }
+
+    /**
+     * @returns: true iif a problem found is an error
+     * */
+    @field
+    pub fn hasErrors(self)-> bool {
+        for p in self._problems if p.error { return true; }
+        false
+    }
+
+    /**
+     * @returns: true iif a file or a directory is used
+     * @params:
+     *    - path: its path, res:/… or engine:/…
+     * */
+    pub fn holds(self, path: [c8])-> bool {
+        path in self._files
+    }
+
+    /**
+     * @returns: the file or the directory a path names: res:/… under the directory of the project (whatever the project
+     * the program runs), engine:/… and shaders:/… under the engine, another path as it is
+     * */
+    pub fn sourceOf(self, path: [c8])-> Path {
+        if startsWith(path, "res:/") { return Path(self._root).push("res").push(path["res:/".len .. $]); }
+        projectPath(path)
+    }
+
+    /**
+     * @returns: a path under the res/ directory of the project qualified by res:/ (normalized), another path as it is
+     * */
+    fn qualify(self, path: [c8])-> [c8] {
+        // a map a model names beside it may be ./white.png
+        let p = Path(path).normalize();
+        let res = Path(self._root).push("res");
+        if p.isAbsolute() && res.isPrefix(p) && !p.isPrefix(res) {
+            return "res:/" ~ p.removePrefix(res).toStr();
+        }
+
+        path
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GATHERING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Add a file or a directory used, an error when it does not exist or lies outside the project and the engine
+     * @params:
+     *    - path: its path, qualified (res:/…, engine:/…) or absolute under the project
+     *    - by: what names it
+     *    - scene: the scene where it is named, empty for none
+     *    - node: the node naming it, empty for none
+     * @returns: true iif the path is new and exists, its content to be gathered
+     * */
+    fn add(mut self, path: [c8], by: [c8], scene: [c8], node: [c8])-> bool {
+        let p = self.qualify(path);
+        if !ResourceSet::isShipped(p) {
+            self:.problem(f"${path} is outside the project, named by ${by}", scene, node);
+            return false;
+        }
+
+        if p in self._files { return false; }
+        if !exists(self.sourceOf(p)) {
+            self:.problem(f"missing file ${p}, named by ${by}", scene, node);
+            return false;
+        }
+
+        self._files[p] = dcopy by;
+        true
+    }
+
+    /**
+     * Gather the files of a scene file: its local materials, then its nodes
+     * */
+    fn scene(mut self, path: [c8]) {
+        {
+            let description = copy SceneDescription::fromFile(self.sourceOf(path).toStr());
+            for m in description.materials {
+                self:.material(m, f"the material '${m.name}'", path, "");
+            }
+
+            for n in description.nodes {
+                self:.node(n, path, "");
+            }
+        } catch {
+            err: &BalderError => {
+                self:.problem(err.msg, path, "");
+            }
+        }
+    }
+
+    /**
+     * Gather the files a node and the nodes under it name: the assets of their properties, the models of the dynamic
+     * bodies shaped by their hulls; an actor of a class the program does not know is an error
+     * @params:
+     *    - scene: the path of the scene file
+     *    - parent: the path of the parent of the node in the scene, empty at its root
+     * */
+    fn node(mut self, n: NodeDescription, scene: [c8], parent: [c8]) {
+        let at = if parent.len == 0us { n.name } else { parent ~ "/" ~ n.name };
+        if n.kind == NodeKind::ACTOR && !actorClass(n.className).hasValue {
+            self:.problem(f"unknown class '${n.className}', the library of the game declaring none of that name", scene, at);
+        }
+
+        for p in n.schema().properties if n.applies(p) {
+            if p.kind == PropertyKind::ASSET {
+                let v = n.value(p.name).text;
+                if v.len != 0us { self:.asset(v, p.asset, scene, at); }
+            } else if p.kind == PropertyKind::ASSETS {
+                for v in n.value(p.name).texts if v.len != 0us {
+                    self:.asset(v, p.asset, scene, at);
+                }
+            }
+        }
+
+        if n.value("shape").text == "hull" && n.value("motion").text == "dynamic" {
+            let model = self.qualify(n.value("model").text);
+            let mut known = model.len == 0us;
+            for b in self._bodies if b == model { known = true; }
+            if !known { self._bodies ~= [model]; }
+        }
+
+        for c in n.children {
+            self:.node(c, scene, at);
+        }
+    }
+
+    /**
+     * Gather an asset a node names: a built-in mesh, the default material and the materials local to a scene file are
+     * none, a material embedded in a model is its model
+     * @params:
+     *    - kind: the kind of the asset, "mesh" or "material" (NodeProperty.asset), another kind being a plain file
+     * */
+    fn asset(mut self, path: [c8], kind: [c8], scene: [c8], node: [c8]) {
+        if path == MaterialAsset::DEFAULT || MaterialAsset::isLocalPath(path) { return; }
+        if MeshAsset::primitiveOf(path) != Primitive::NONE { return; }
+
+        if let Ok(embedded) = MaterialAsset::modelOf(path) {
+            self:.model(embedded._0, f"its material ${path}", scene, node);
+            return;
+        }
+
+        if kind == "mesh" {
+            self:.model(path, "its model", scene, node);
+        } else if kind == "material" {
+            if self:.add(path, "its material", scene, node) {
+                {
+                    self:.material(MaterialAsset::read(self.sourceOf(path).toStr()), path, scene, node);
+                } catch {
+                    err: &BalderError => {
+                        self:.problem(err.msg, scene, node);
+                    }
+                }
+            }
+        } else {
+            self:.add(path, f"its ${kind}", scene, node);
+        }
+    }
+
+    /**
+     * Gather the maps of a material
+     * @params:
+     *    - by: what the material is, as the problems name it
+     * */
+    fn material(mut self, m: &MaterialAsset, by: [c8], scene: [c8], node: [c8]) {
+        for p in mapsOf(m.maps) {
+            self:.add(p, f"a map of ${by}", scene, node);
+        }
+    }
+
+    /**
+     * Gather a model file: the file, its convex hulls when they are saved, the maps of its embedded materials, and the
+     * files it reads beside it (the materials of an .obj, the buffers and images of a .gltf)
+     * */
+    fn model(mut self, path: [c8], by: [c8], scene: [c8], node: [c8]) {
+        let model = self.qualify(path);
+        if model in self._models { return; }
+        self._models[model] = ();
+
+        if !self:.add(model, by, scene, node) { return; }
+
+        let hulls = ConvexDecomposition::fileOf(model);
+        if isFile(self.sourceOf(hulls)) { self:.add(hulls, f"the hulls of ${model}", scene, node); }
+
+        {
+            let mesh = MeshAsset::read(self.sourceOf(model).toStr(), lods-> false);
+            for m in mesh.materials {
+                self:.material(m, m.path, scene, node);
+            }
+        } catch {
+            err: &BalderError => {
+                self:.problem(err.msg, scene, node);
+            }
+        }
+
+        let dir = Path(model).parent();
+        for f in sideFilesOf(self.sourceOf(model)) {
+            let name = if startsWith(f, "./") { f[2us .. $] } else { f };
+            self:.add(dir.push(name).toStr(), f"the model ${model}", scene, node);
+        }
+    }
+
+    /**
+     * Record a problem
+     * @params:
+     *    - error: true for an error, false for a warning
+     * */
+    fn problem(mut self, message: [c8], scene: [c8], node: [c8], error: bool = true) {
+        self._problems ~= [ExportProblem(error-> error, message-> message, scene-> scene, node-> node)];
+    }
+
+}
+
+/**
+ * The files every game ships
+ * */
+pub mod ResourceSet {
+
+    /**
+     * The files and directories of the engine the runtime reads whatever the game: its interface, the fonts, the images
+     * of the materials without maps, the colour grading tables, the tooltips and the dialogs (the shaders are compiled
+     * apart, see ShaderBuild)
+     * */
+    pub def RUNTIME_FILES = ["engine:/config/game.gui", "engine:/config/game.style", "engine:/fonts",
+                             "engine:/images/white.png", "engine:/images/flat_normal.png", "engine:/lut",
+                             "engine:/tooltip", "engine:/dialog"];
+
+    /**
+     * The directory of the files of the engine in the folder of an export, next to the runtime
+     * */
+    pub def ENGINE_DIR = "engine";
+
+    /**
+     * @returns: true iif a path is one an export can ship: a file of the project (res:/…) or of the engine (engine:/…)
+     * */
+    pub fn isShipped(path: [c8])-> bool {
+        startsWith(path, "res:/") || startsWith(path, "engine:/") || startsWith(path, "shaders:/")
+    }
+
+    /**
+     * @returns: where a file of the game goes in the folder of an export, as the runtime reads it from there (its
+     * project the folder, its engine the engine/ directory in it): res:/x in <folder>/res/x, engine:/x in
+     * <folder>/engine/res/x, shaders:/x in <folder>/engine/res/shaders/x
+     * @params:
+     *    - folder: the folder of the export
+     *    - path: the path of the file, res:/…, engine:/… or shaders:/…
+     * @throws:
+     *    - &BalderError: for a path of none of these
+     * */
+    pub fn exportedPath(folder: [c8], path: [c8])-> [c8]
+        throws BalderError
+    {
+        let root = Path(folder);
+        if startsWith(path, "res:/") { return root.push("res").push(path["res:/".len .. $]).toStr(); }
+        if startsWith(path, "engine:/") { return root.push(ENGINE_DIR).push("res").push(path["engine:/".len .. $]).toStr(); }
+        if startsWith(path, "shaders:/") {
+            return root.push(ENGINE_DIR).push("res/shaders").push(path["shaders:/".len .. $]).toStr();
+        }
+
+        throw copy BalderError(f"${path} is not a file of the project or of the engine");
+    }
+
+}
+
+/**
+ * @returns: true iif a text starts with another
+ * */
+fn startsWith(text: [c8], prefix: [c8])-> bool {
+    text.len >= prefix.len && text[0us .. prefix.len] == prefix
+}
+
+/**
+ * @returns: the paths of the maps of a material, those it has
+ * */
+fn mapsOf(m: MaterialMaps)-> [[c8]] {
+    let mut res: [[c8]] = [];
+    for p in [m.baseColor, m.metallicRoughness, m.normal, m.occlusion, m.emissive] if p.len != 0us {
+        res ~= [p];
+    }
+
+    res
+}
+
+/**
+ * @returns: the files a model file reads beside it, relative to its directory: the mtllib of an .obj, the buffers and
+ * images of a .gltf (not the data: URIs); none for another format, or a file that cannot be read
+ * */
+fn sideFilesOf(model: Path)-> [[c8]] {
+    let ext = model.extension();
+    let mut res: [[c8]] = [];
+    {
+        if ext == "obj" {
+            let text = readFile(model);
+            let mut start = 0us;
+            for i in 0us .. text.len + 1us {
+                if i == text.len || text[i] == '\n' {
+                    let line = text[start .. i];
+                    if startsWith(line, "mtllib ") {
+                        let mut end = line.len;
+                        while end > 7us && (line[end - 1us] == '\r' || line[end - 1us] == ' ') { end -= 1us; }
+                        res ~= [copy line[7us .. end]];
+                    }
+
+                    start = i + 1us;
+                }
+            }
+        } else if ext == "gltf" {
+            let cfg = json::parse(readFile(model));
+            for key in ["buffers", "images"] {
+                if let Ok(a: &Array) = cfg[key]? {
+                    for e in a[] {
+                        if let Ok(Str(value-> uri)) = e["uri"]? && !startsWith(uri, "data:") {
+                            res ~= [uri];
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        _ => {}
+    }
+
+    res
+}
