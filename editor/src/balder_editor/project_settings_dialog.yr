@@ -1,0 +1,541 @@
+in project_settings_dialog;
+
+use balder::core::error;
+use balder::core::application::input::{action, binding, device_state, input_devices};
+use balder::core::application::signal;
+use balder::game::{export_settings, project, render_settings};
+use balder::interface::dialog;
+use balder::interface::loader::registry::behaviors;
+use balder::interface::widget::button::{check, dropdown};
+use balder::interface::widget::list::{texts, view};
+use balder::interface::widget::text::{input, label, spin};
+use balder::scene::physics;
+
+use std::config;
+
+use ::sdl3::{mouse, scancode};
+
+/**
+ * The settings of a project in a dialog over the editor, its project.toml: its name, its main scene, the files its
+ * export ships as they are and how it decomposes the hulls (General), its window and the resolution it renders at
+ * (Window), and its input actions and their bindings (Input)
+ * @info:
+ * =====
+ * The fields edit a copy: OK writes them to the project and its project.toml, Cancel drops them (they are not undone
+ * as the changes of a scene are), and answered tells which. A binding is added by pressing what it reads once Add a
+ * binding… is clicked: the next key (by its place on the keyboard), mouse button, gamepad button, or gamepad axis
+ * pushed past half its range, Escape cancelling, the devices compared at each update (see update). The size of the
+ * window is written only when it is changed, the other entries of [window] kept as they are.
+ * ====
+ * */
+#[behavior]
+pub class ProjectSettingsDialog over Dialog {
+
+    // The project edited
+    let dmut _project: &Project;
+
+    // The input actions edited, and the one selected
+    let mut _actions: [InputAction] = [];
+    let mut _selected: (usize)? = none;
+
+    // True while the next input is taken as a binding of the action selected, the devices compared to their state when
+    // it started
+    let mut _capturing: bool = false;
+    let mut _base: DeviceState = DeviceState();
+
+    // True once the size of the window is changed, written then
+    let mut _sized: bool = false;
+
+    // The model of the list of the actions
+    let dmut _rows: &TextListModel = copy TextListModel();
+
+    // Emitted with true once the settings are written, false when the dialog is cancelled
+    let dmut _answered: &Signal!{bool} = copy Signal!{bool} ();
+
+    /**
+     * @params:
+     *    - guiFile: the .gui file of the dialog
+     *    - project: the project edited
+     * */
+    pub self (guiFile: [c8], dmut project: &Project)
+        with super(guiFile, "", "Project settings")
+        , _project = alias project
+    {}
+
+    /**
+     * @returns: the signal emitted with true once the settings are written, false when the dialog is cancelled
+     * */
+    pub fn answered(mut self)-> dmut &Signal!{bool} {
+        alias self._answered
+    }
+
+    /**
+     * Escape cancels the binding taken, or the dialog
+     * */
+    pub over dismiss(mut self) {
+        if self._capturing {
+            self:.stopCapture("No binding added");
+            return;
+        }
+
+        self:.answer(false);
+    }
+
+    prot over onShow(mut self) {
+        let p = self._project;
+        self:.setText("TABS/GENERAL/NAME", p.name);
+        let mut main = 0us;
+        let mut names: [[c8]] = [];
+        for i, s in p.scenes {
+            if s._0 == p.mainScene { main = i; }
+            names ~= [s._0];
+        }
+
+        if let Ok(dmut d: &Dropdown) = self:.find("TABS/GENERAL/MAIN_SCENE") {
+            d:.setItems(names);
+            if names.len != 0us { d:.setSelected(main); }
+        }
+
+        let export = p.exportSettings;
+        let mut include = "";
+        for i in export.include { include ~= (if include.len == 0us { "" } else { ", " }) ~ i; }
+        self:.setText("TABS/GENERAL/INCLUDE", include);
+        self:.setChecked("TABS/GENERAL/ARCHIVE", export.archive);
+        self:.setNumber("TABS/GENERAL/HULLS", cast!f32(export.decomposition.maxHulls));
+        self:.setNumber("TABS/GENERAL/VERTICES", cast!f32(export.decomposition.maxVertices));
+        self:.setNumber("TABS/GENERAL/CONCAVITY", export.decomposition.concavity);
+        self:.setNumber("TABS/GENERAL/RESOLUTION", cast!f32(export.decomposition.resolution));
+
+        let window = p.window;
+        self:.setText("TABS/WINDOW/TITLE", stringIn(window, "name", p.name));
+        let (wShare, wMin) = sizeIn(window, "width");
+        let (hShare, hMin) = sizeIn(window, "height");
+        self:.setNumber("TABS/WINDOW/WIDTH_SHARE", wShare);
+        self:.setNumber("TABS/WINDOW/WIDTH_MIN", wMin);
+        self:.setNumber("TABS/WINDOW/HEIGHT_SHARE", hShare);
+        self:.setNumber("TABS/WINDOW/HEIGHT_MIN", hMin);
+        self:.setChecked("TABS/WINDOW/RESIZABLE", boolIn(window, "resizable", true));
+        let (rw, rh) = p.render.resolution;
+        self:.setNumber("TABS/WINDOW/RENDER_W", cast!f32(rw));
+        self:.setNumber("TABS/WINDOW/RENDER_H", cast!f32(rh));
+        self._sized = false;
+
+        self._actions = p.actions;
+        if let Ok(dmut l: &ListView) = self:.find("TABS/INPUT/ACTIONS") {
+            l:.setModel(alias self._rows);
+        }
+
+        self:.showActions();
+        self:.focus("TABS/GENERAL/NAME");
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    #[slot (name-> "size")]
+    fn onSizeChanged(mut self, _: f32) {
+        self._sized = true;
+    }
+
+    #[slot (name-> "select-action")]
+    fn onActionSelected(mut self, rows: [usize]) {
+        self._selected = if rows.len != 0us && rows[0] < self._actions.len { (rows[0])? } else { none };
+        if let Ok(i) = self._selected {
+            self:.setText("TABS/INPUT/ACTION_NAME", self._actions[i].name);
+        }
+    }
+
+    #[slot (name-> "add-action")]
+    fn onAddAction(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+
+        let name = trimmed(self:.getText("TABS/INPUT/ACTION_NAME"));
+        if name.len == 0us {
+            self:.setError("Name the action first");
+            return;
+        }
+
+        for a in self._actions if a.name == name {
+            self:.setError(f"The game has an action '${name}' already");
+            return;
+        }
+
+        self._actions ~= [InputAction(name-> name)];
+        self._selected = (self._actions.len - 1us)?;
+        self:.setError("");
+        self:.showActions();
+    }
+
+    #[slot (name-> "remove-action")]
+    fn onRemoveAction(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+        let index = if let Ok(i) = self._selected { i } else { return; };
+
+        let mut kept: [InputAction] = [];
+        for i, a in self._actions if i != index { kept ~= [a]; }
+        self._actions = kept;
+        self._selected = none;
+        self:.showActions();
+    }
+
+    #[slot (name-> "add-binding")]
+    fn onAddBinding(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+        if !self._selected.hasValue {
+            self:.setNote("Select the action the binding goes to first");
+            return;
+        }
+
+        // the keys pressed now go to the list, never to the button again
+        self._base = inputDevices():.snapshot();
+        self._capturing = true;
+        self:.focus("TABS/INPUT/ACTIONS");
+        self:.setNote("Press a key or a mouse button, or push a gamepad button or stick… (Escape cancels)");
+    }
+
+    #[slot (name-> "remove-binding")]
+    fn onRemoveBinding(mut self, b: u8) {
+        if b != SDL_BUTTON_LEFT { return; }
+        let index = if let Ok(i) = self._selected { i } else { return; };
+        let bindings = self._actions[index].bindings;
+        if bindings.len == 0us { return; }
+
+        let mut a = self._actions[index];
+        a.bindings = bindings[0us .. $ - 1us];
+        self:.replaceAction(index, a);
+    }
+
+    #[slot (name-> "accept")]
+    fn onAcceptClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.apply(); }
+    }
+
+    #[slot (name-> "cancel")]
+    fn onCancelClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.answer(false); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          BINDINGS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Take the input pressed since Add a binding… was clicked as a binding of the action selected, while one is waited
+     * for: a key, a mouse button, a gamepad button, or the half of a gamepad axis pushed past half its range
+     * @info: called at each update of the editor while the dialog is open
+     * */
+    pub fn update(mut self) {
+        if !self._capturing { return; }
+
+        let now = inputDevices():.snapshot();
+        let base = self._base;
+        let mut found: (InputBinding)? = none;
+        for k in 0us .. NB_KEYS if now.keyDowns[k] != base.keyDowns[k] {
+            found = (InputBinding(InputDevice::KEY, cast!u32(k)))?;
+            break;
+        }
+
+        if !found.hasValue {
+            for m in 0us .. NB_MOUSE_BUTTONS if now.buttonDowns[m] != base.buttonDowns[m] {
+                found = (InputBinding(InputDevice::MOUSE, cast!u32(m)))?;
+                break;
+            }
+        }
+
+        if !found.hasValue {
+            for p in 0us .. NB_PAD_BUTTONS if now.padDowns[p] != base.padDowns[p] {
+                found = (InputBinding(InputDevice::PAD_BUTTON, cast!u32(p)))?;
+                break;
+            }
+        }
+
+        if !found.hasValue {
+            for h in 0us .. NB_PAD_HALVES if now.axes[h] > 0.5f && base.axes[h] <= 0.5f {
+                found = (InputBinding(InputDevice::PAD_AXIS, cast!u32(h / 2us), positive-> h % 2us == 0us))?;
+                break;
+            }
+        }
+
+        let binding = if let Ok(b) = found { b } else { return; };
+        if binding.device == InputDevice::KEY && binding.code == cast!u32(SDL_Scancode::SDL_SCANCODE_ESCAPE) {
+            self:.stopCapture("No binding added");
+            return;
+        }
+
+        let index = if let Ok(i) = self._selected { i } else {
+            self:.stopCapture("");
+            return;
+        };
+
+        let mut a = self._actions[index];
+        for b in a.bindings if b.text() == binding.text() {
+            self:.stopCapture(f"'${a.name}' reads ${binding.text()} already");
+            return;
+        }
+
+        a.bindings = a.bindings ~ [binding];
+        self:.replaceAction(index, a);
+        self:.stopCapture(f"'${a.name}' reads ${binding.text()} too");
+    }
+
+    /**
+     * Stop waiting for a binding
+     * @params:
+     *    - note: what the note under the list tells then
+     * */
+    fn stopCapture(mut self, note: [c8]) {
+        self._capturing = false;
+        self:.setNote(note);
+    }
+
+    /**
+     * Replace an action edited, the list showing it
+     * */
+    fn replaceAction(mut self, index: usize, a: InputAction) {
+        let mut actions: [InputAction] = [];
+        for i, x in self._actions {
+            actions ~= [if i == index { a } else { x }];
+        }
+
+        self._actions = actions;
+        self:.showActions();
+    }
+
+    /**
+     * Show the actions in the list, a row each, its name then its bindings
+     * */
+    fn showActions(mut self) {
+        let mut rows: [[c8]] = [];
+        for a in self._actions {
+            let mut row = a.name ~ ":";
+            for b in a.bindings { row ~= " " ~ b.text(); }
+            rows ~= [row];
+        }
+
+        self._rows:.setItems(rows);
+        if let Ok(dmut l: &ListView) = self:.find("TABS/INPUT/ACTIONS") {
+            l:.refresh();
+            if let Ok(i) = self._selected { l:.setSelected(copy [i]); }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          APPLY          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write the settings to the project and its project.toml, then close the dialog, or tell why they cannot be
+     * */
+    fn apply(mut self) {
+        let name = trimmed(self:.getText("TABS/GENERAL/NAME"));
+        if name.len == 0us {
+            self:.setError("The project needs a name");
+            return;
+        }
+
+        let mut main = self._project.mainScene;
+        if let Ok(d: &Dropdown) = self:.find("TABS/GENERAL/MAIN_SCENE") {
+            let scenes = self._project.scenes;
+            if let Ok(i) = d.getSelected() && i < scenes.len { main = scenes[i]._0; }
+        }
+
+        let mut include: [[c8]] = [];
+        for i in splitList(self:.getText("TABS/GENERAL/INCLUDE")) { include ~= [i]; }
+
+        let decomposition = DecompositionSettings(maxHulls-> cast!u32(self:.getNumber("TABS/GENERAL/HULLS")),
+                                                  maxVertices-> cast!u32(self:.getNumber("TABS/GENERAL/VERTICES")),
+                                                  concavity-> self:.getNumber("TABS/GENERAL/CONCAVITY"),
+                                                  resolution-> cast!u32(self:.getNumber("TABS/GENERAL/RESOLUTION")));
+
+        let dmut window = copy Dict();
+        if let old: &Dict = self._project.window {
+            for k, v in old[] { window[k] = v; }
+        }
+
+        window["name"] = self:.getText("TABS/WINDOW/TITLE").to!{&Config} ();
+        window["resizable"] = self:.isChecked("TABS/WINDOW/RESIZABLE").to!{&Config} ();
+        if self._sized {
+            window["width"] = sizeConfig(self._project.window, "width", self:.getNumber("TABS/WINDOW/WIDTH_SHARE"),
+                                         self:.getNumber("TABS/WINDOW/WIDTH_MIN"));
+            window["height"] = sizeConfig(self._project.window, "height", self:.getNumber("TABS/WINDOW/HEIGHT_SHARE"),
+                                          self:.getNumber("TABS/WINDOW/HEIGHT_MIN"));
+        }
+
+        let resolution = (cast!u32(self:.getNumber("TABS/WINDOW/RENDER_W")), cast!u32(self:.getNumber("TABS/WINDOW/RENDER_H")));
+
+        let dmut project = alias self._project;
+        project.name = name;
+        project.mainScene = main;
+        project.exportSettings = ExportSettings(include-> include, archive-> self:.isChecked("TABS/GENERAL/ARCHIVE"),
+                                                decomposition-> decomposition);
+        project.window = window;
+        project.render = RenderSettings(resolution-> resolution);
+        project.actions = self._actions;
+        {
+            project.save();
+        } catch {
+            err: &BalderError => {
+                self:.setError(err.msg);
+                return;
+            }
+        }
+
+        self:.answer(true);
+    }
+
+    /**
+     * Close the dialog then emit its answer, a dialog closed already answering nothing
+     * */
+    fn answer(mut self, saved: bool) {
+        if !self.isOpen { return; }
+
+        self._capturing = false;
+        self:.close();
+        self._answered:.emit(saved);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FIELDS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn getText(mut self, path: [c8])-> [c8] {
+        if let Ok(i: &InputText) = self:.find(path) { return i.getText(); }
+        ""
+    }
+
+    fn setText(mut self, path: [c8], text: [c8]) {
+        if let Ok(dmut i: &InputText) = self:.find(path) { i:.setText(text, moveCursor-> true); }
+    }
+
+    fn getNumber(mut self, path: [c8])-> f32 {
+        if let Ok(s: &SpinBox) = self:.find(path) { return s.getValue(); }
+        0.0f
+    }
+
+    fn setNumber(mut self, path: [c8], value: f32) {
+        if let Ok(dmut s: &SpinBox) = self:.find(path) { s:.setValue(value); }
+    }
+
+    fn isChecked(mut self, path: [c8])-> bool {
+        if let Ok(c: &CheckBox) = self:.find(path) { return c.isChecked(); }
+        false
+    }
+
+    fn setChecked(mut self, path: [c8], checked: bool) {
+        if let Ok(dmut c: &CheckBox) = self:.find(path) { c:.setChecked(checked); }
+    }
+
+    /**
+     * Tell under the list of the actions what the binding taken did
+     * */
+    fn setNote(mut self, text: [c8]) {
+        if let Ok(dmut l: &Label) = self:.find("TABS/INPUT/CAPTURE_NOTE") { l:.setText(text); }
+    }
+
+    /**
+     * Tell why the settings are not written
+     * */
+    fn setError(mut self, text: [c8]) {
+        if let Ok(dmut l: &Label) = self:.find("ERROR") { l:.setText(text); }
+    }
+
+}
+
+/**
+ * @returns: a text without the spaces around it
+ * */
+fn trimmed(text: [c8])-> [c8] {
+    let mut start = 0us;
+    let mut end = text.len;
+    while start < end && (text[start] == ' ' || text[start] == '\t') { start += 1us; }
+    while end > start && (text[end - 1us] == ' ' || text[end - 1us] == '\t') { end -= 1us; }
+    text[start .. end]
+}
+
+/**
+ * @returns: the items of a list typed separated by commas, trimmed, the empty ones left out
+ * */
+fn splitList(text: [c8])-> [[c8]] {
+    let mut res: [[c8]] = [];
+    let mut start = 0us;
+    for i in 0us .. text.len + 1us {
+        if i == text.len || text[i] == ',' {
+            let item = trimmed(text[start .. i]);
+            if item.len != 0us { res ~= [item]; }
+            start = i + 1us;
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the string of an entry of a table, a default when it has none
+ * */
+fn stringIn(table: &Config, key: [c8], default: [c8])-> [c8] {
+    if let Ok(Str(value-> s)) = table[key]? { return s; }
+    default
+}
+
+/**
+ * @returns: the boolean of an entry of a table, a default when it has none
+ * */
+fn boolIn(table: &Config, key: [c8], default: bool)-> bool {
+    if let Ok(Bool(value-> b)) = table[key]? { return b; }
+    default
+}
+
+/**
+ * @returns: a size of the window as the dialog shows it, the share of the screen in percent and the minimum in pixels:
+ * a pixel count N reads as the whole screen at least N, a table as its relative and its min; none reads as the defaults
+ * of BalderConfig, 80% of the screen
+ * */
+fn sizeIn(table: &Config, key: [c8])-> (f32, f32) {
+    if let Ok(entry) = table[key]? {
+        match entry {
+            Int(value-> n) => { return (100.0f, cast!f32(n)); }
+            d: &Dict => {
+                let mut share = 100.0f;
+                let mut min = 0.0f;
+                if let Ok(Float(value-> r)) = d["relative"]? { share = cast!f32(r * 100.0); }
+                if let Ok(Int(value-> m)) = d["min"]? { min = cast!f32(m); }
+                return (share, min);
+            }
+            _ => {}
+        }
+    }
+
+    (80.0f, 0.0f)
+}
+
+/**
+ * @returns: the entry of a size of the window, `{relative = share / 100, min = min}`, the other entries of the table
+ * it replaces kept (its max)
+ * */
+fn sizeConfig(table: &Config, key: [c8], share: f32, min: f32)-> &Config {
+    let dmut res = copy Dict();
+    if let Ok(old: &Dict) = table[key]? {
+        for k, v in old[] { res[k] = v; }
+    }
+
+    res["relative"] = (cast!f64(share) / 100.0).to!{&Config} ();
+    res["min"] = cast!i64(min).to!{&Config} ();
+    res
+}
