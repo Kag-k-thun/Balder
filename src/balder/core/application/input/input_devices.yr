@@ -1,0 +1,340 @@
+in input_devices;
+
+use balder::core::application::input::device_state;
+use balder::utils::log;
+
+use ::sdl3::gamepad;
+
+/**
+ * The number of gamepads read at once, a gamepad plugged in past them being ignored
+ * */
+pub def MAX_PADS = 8us;
+
+/**
+ * A gamepad read, what it holds and how far its axes are pushed, to merge the gamepads and to release what one held
+ * once removed
+ * */
+@data
+record PadSlot {
+
+    // True iif the slot holds a gamepad
+    pub let mut used: bool = false;
+
+    // The joystick instance id of the gamepad
+    pub let mut id: u32 = 0u32;
+
+    // The gamepad opened, null until it is (a gamepad driven without SDL, by the tests)
+    pub let dmut pad: *SDL_Gamepad = null;
+
+    // The buttons it holds, by SDL_GamepadButton
+    pub let dmut held: [bool ; NB_PAD_BUTTONS] = [false ; NB_PAD_BUTTONS];
+
+    // The strength of the halves of its axes (see DeviceState::halfOf)
+    pub let dmut axes: [f32 ; NB_PAD_HALVES] = [0.0f ; NB_PAD_HALVES];
+}
+
+/**
+ * What the input devices of the program do, counted for the input actions (see DeviceState): the input manager tells
+ * it the events of the keyboard, the mouse and the gamepads on the main thread, the scenes copy its state at each of
+ * their ticks on their activity threads
+ * @info: it knows nothing of the actions, a scene reads them in the copies it takes (see ActionState)
+ * */
+pub class InputDevices {
+
+    // What the devices did
+    let dmut _state: DeviceState = DeviceState();
+
+    // The gamepads read
+    let dmut _pads: [PadSlot ; MAX_PADS] = [PadSlot() ; MAX_PADS];
+
+    /**
+     * No device used
+     * */
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          KEYBOARD/MOUSE          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Count a key going down, unless it is held (a repeat)
+     * @params:
+     *    - code: the SDL_Scancode of the key
+     * */
+    pub fn keyDown(mut self, code: u32) {
+        let i = cast!usize(code);
+        if i >= NB_KEYS { return; }
+
+        atomic self {
+            if self._state.keyDowns[i] == self._state.keyUps[i] {
+                self._state.keyDowns[i] += 1u32;
+            }
+        }
+    }
+
+    /**
+     * Count a key going up, unless it is not held
+     * @params:
+     *    - code: the SDL_Scancode of the key
+     * */
+    pub fn keyUp(mut self, code: u32) {
+        let i = cast!usize(code);
+        if i >= NB_KEYS { return; }
+
+        atomic self {
+            if self._state.keyDowns[i] != self._state.keyUps[i] {
+                self._state.keyUps[i] += 1u32;
+            }
+        }
+    }
+
+    /**
+     * Count a mouse button going down, unless it is held
+     * @params:
+     *    - button: the SDL_BUTTON_* of the button
+     * */
+    pub fn buttonDown(mut self, button: u32) {
+        let i = cast!usize(button);
+        if i >= NB_MOUSE_BUTTONS { return; }
+
+        atomic self {
+            if self._state.buttonDowns[i] == self._state.buttonUps[i] {
+                self._state.buttonDowns[i] += 1u32;
+            }
+        }
+    }
+
+    /**
+     * Count a mouse button going up, unless it is not held
+     * @params:
+     *    - button: the SDL_BUTTON_* of the button
+     * */
+    pub fn buttonUp(mut self, button: u32) {
+        let i = cast!usize(button);
+        if i >= NB_MOUSE_BUTTONS { return; }
+
+        atomic self {
+            if self._state.buttonDowns[i] != self._state.buttonUps[i] {
+                self._state.buttonUps[i] += 1u32;
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          GAMEPADS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Open a gamepad plugged in, for SDL to send its events, in a free slot; a gamepad past MAX_PADS is ignored
+     * @params:
+     *    - id: the joystick instance id of the gamepad
+     * */
+    pub fn openPad(mut self, id: u32) {
+        atomic self {
+            if let Ok(s) = self:.slotOf(id) {
+                if self._pads[s].pad == null {
+                    let dmut pad = SDL_OpenGamepad(id);
+                    if pad == null {
+                        log::warn #("Input", "The gamepad", id, "could not be opened");
+                    }
+
+                    self._pads[s].pad = alias pad;
+                }
+            } else {
+                log::warn #("Input", MAX_PADS, "gamepads are already read, the gamepad", id, "is ignored");
+            }
+        }
+    }
+
+    /**
+     * Close a gamepad removed, releasing what it held, and free its slot
+     * @params:
+     *    - id: the joystick instance id of the gamepad
+     * */
+    pub fn closePad(mut self, id: u32) {
+        atomic self {
+            for s in 0us .. MAX_PADS {
+                if self._pads[s].used && self._pads[s].id == id {
+                    self:.closeSlot(s);
+                }
+            }
+        }
+    }
+
+    /**
+     * Count a gamepad button going down or up on a gamepad, unless it already is
+     * @params:
+     *    - id: the joystick instance id of the gamepad
+     *    - button: the SDL_GamepadButton
+     *    - down: true iif the button went down
+     * */
+    pub fn padButton(mut self, id: u32, button: u32, down: bool) {
+        let b = cast!usize(button);
+        if b >= NB_PAD_BUTTONS { return; }
+
+        atomic self {
+            if let Ok(s) = self:.slotOf(id) {
+                if self._pads[s].held[b] != down {
+                    self._pads[s].held[b] = down;
+                    if down {
+                        self._state.padHolding[b] += 1u8;
+                        self._state.padDowns[b] += 1u32;
+                    } else {
+                        self._state.padHolding[b] -= 1u8;
+                        self._state.padUps[b] += 1u32;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Move an axis of a gamepad, each half of the axis reading the furthest of the gamepads
+     * @params:
+     *    - id: the joystick instance id of the gamepad
+     *    - axis: the SDL_GamepadAxis
+     *    - value: the value of the axis, from -32768 to 32767 (0 to 32767 for a trigger)
+     * */
+    pub fn padAxis(mut self, id: u32, axis: u32, value: i16) {
+        let positive = DeviceState::halfOf(axis, true);
+        let negative = DeviceState::halfOf(axis, false);
+        if negative >= NB_PAD_HALVES { return; }
+
+        let v = cast!f32(cast!i32(value));
+        atomic self {
+            if let Ok(s) = self:.slotOf(id) {
+                self._pads[s].axes[positive] = if v > 0.0f { v / 32767.0f } else { 0.0f };
+                self._pads[s].axes[negative] = if v < 0.0f { -v / 32768.0f } else { 0.0f };
+                self:.mergeAxis(positive);
+                self:.mergeAxis(negative);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          STATE          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Release every input, the keys, the buttons and the axes: called when the window loses the focus, whose ups it
+     * no longer receives
+     * */
+    pub fn releaseAll(mut self) {
+        atomic self {
+            self._state = self._state.released();
+            for s in 0us .. MAX_PADS {
+                self._pads[s].held = [false ; NB_PAD_BUTTONS];
+                self._pads[s].axes = [0.0f ; NB_PAD_HALVES];
+            }
+        }
+    }
+
+    /**
+     * Close every gamepad opened, when the application quits
+     * */
+    pub fn closeAll(mut self) {
+        atomic self {
+            for s in 0us .. MAX_PADS {
+                if self._pads[s].used {
+                    self:.closeSlot(s);
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: a copy of what the devices did
+     * */
+    pub fn snapshot(mut self)-> DeviceState {
+        atomic self {
+            self._state
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          PRIVATES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the slot of a gamepad, a free slot taken for a gamepad not read yet, none when there is none
+     * */
+    fn slotOf(mut self, id: u32)-> (usize)? {
+        for s in 0us .. MAX_PADS {
+            if self._pads[s].used && self._pads[s].id == id { return (s)?; }
+        }
+
+        for s in 0us .. MAX_PADS {
+            if !self._pads[s].used {
+                self._pads[s].used = true;
+                self._pads[s].id = id;
+                return (s)?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Release what the gamepad of a slot held, close it and free the slot
+     * */
+    fn closeSlot(mut self, s: usize) {
+        for b in 0us .. NB_PAD_BUTTONS {
+            if self._pads[s].held[b] {
+                self._state.padHolding[b] -= 1u8;
+                self._state.padUps[b] += 1u32;
+            }
+        }
+
+        if self._pads[s].pad != null {
+            SDL_CloseGamepad(alias self._pads[s].pad);
+        }
+
+        self._pads[s] = PadSlot();
+        for h in 0us .. NB_PAD_HALVES {
+            self:.mergeAxis(h);
+        }
+    }
+
+    /**
+     * Read the half of an axis as the furthest of the gamepads
+     * */
+    fn mergeAxis(mut self, h: usize) {
+        let mut furthest = 0.0f;
+        for s in 0us .. MAX_PADS {
+            if self._pads[s].used && self._pads[s].axes[h] > furthest {
+                furthest = self._pads[s].axes[h];
+            }
+        }
+
+        self._state.axes[h] = furthest;
+    }
+
+}
+
+/**
+ * @returns: the input devices of the program
+ * */
+pub fn inputDevices()-> dmut &InputDevices {
+    alias __DEVICES__
+}
+
+/**
+ * The input devices of the program
+ * */
+lazy dmut __DEVICES__: &InputDevices = InputDevices();
