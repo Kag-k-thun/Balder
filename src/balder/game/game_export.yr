@@ -1,0 +1,436 @@
+in game_export;
+
+use balder::core::error;
+use balder::game::{export_report, export_step, game_library, logged_process, project, resource_set, shader_build};
+use balder::scene::physics::convex_decomposition;
+use balder::utils::{path, toml_file};
+
+use std::{fs, time};
+
+/**
+ * The export of a game: a folder holding everything it needs to run without the editor, the runtime renamed after it,
+ * its library and its project.toml, the files its scenes use, the files of the engine the runtime reads, and the
+ * shaders compiled for release, packed in a .tar.gz when the project asks for it:
+ * ```
+ * <output>/my_game/
+ *     my_game                  # balder-runtime, the folder of the game found next to it
+ *     project.toml             # the one of the project, naming the library: library = "lib/libmy_game.so"
+ *     lib/libmy_game.so        # the release build of the shared target of the project
+ *     res/…                    # the files of the project the scenes name, and the [export] includes
+ *     engine/res/…             # the files of the engine the runtime reads, and the shaders (see ShaderBuild)
+ * <output>/my_game-0.1.0-linux-x86_64.tar.gz
+ * ```
+ * @info:
+ * =====
+ * The export runs its steps in order, each told by its report (see ExportReport), and stops at the first that fails.
+ * The scenes are checked first: a missing file or an actor of a class the library does not declare is an error, and
+ * nothing is written. The classes are those registered, the library of the game being loaded first (the editor loads
+ * its dev build). The hulls of the dynamic bodies are decomposed again when their model changed, and saved in the
+ * project, next to their model. The library and the runtime are then built in release (the program the export runs in
+ * must have the sources of the engine, getEnginePath, to build the runtime), the files written in <folder>.partial,
+ * renamed at the end: a failed export leaves the last folder written as it was. The output of the builds and of the
+ * compilers goes to the log of the export, in the project (GameExport::LOG). An export cancelled through its report
+ * (ExportReport::cancel) stops at its next step or at the next piece of work of its step (a model decomposed, a shader
+ * compiled, a file copied), the build or the archive running cancelled with the compilers it started, and fails as
+ * any other.
+ * ====
+ * */
+pub class GameExport {
+
+    // The project exported
+    let _project: &Project;
+
+    // The directory the folder of the game is written in
+    let _output: [c8];
+
+    // How far the export is
+    let dmut _report: &ExportReport;
+
+    /**
+     * @params:
+     *    - project: the project, installed, the library of its game loaded (see Project::install, GameLibrary::load)
+     *    - output: the absolute path of the directory the folder of the game is written in
+     *    - report: told how far the export is
+     * */
+    pub self (project: &Project, output: [c8], dmut report: &ExportReport)
+        with _project = project
+        , _output = output
+        , _report = alias report
+    {}
+
+    /**
+     * Export the game, the report told of each step, of the problems found and of the end
+     * @returns: the folder written, or the archive when the project asks for one
+     * @throws:
+     *    - &BalderError: the step that failed, why; the problems are listed by the report, the output of a build or a
+     *                    compiler is in the log (GameExport::logOf)
+     * */
+    pub fn run(mut self)-> [c8]
+        throws BalderError
+    {
+        {
+            let res = self:.export();
+            self._report:.succeed(res);
+            return res;
+        } catch {
+            err: &BalderError => {
+                self._report:.fail(err.msg);
+                throw err;
+            }
+        }
+    }
+
+    /**
+     * Export the game as run does, its end told by the report only (see ExportReport::isFinished), for a thread of its
+     * own: `let th = spawn export:.runReported();`
+     * */
+    pub fn runReported(mut self) {
+        {
+            self:.run();
+        } catch {
+            _ => {}
+        }
+    }
+
+    /**
+     * The steps of the export
+     * */
+    fn export(mut self)-> [c8]
+        throws BalderError
+    {
+        let directory = self._project.directory;
+        let (package, _, gyllir) = GameLibrary::sharedTarget(directory);
+        let log = GameExport::logOf(directory);
+        {
+            makeDir(Path(log).parent());
+            writeFile(Path(log), f"The export of ${self._project.name}\n");
+        } catch {
+            err: &FsError => {
+                throw copy BalderError(f"The log of the export could not be written: ${reasonOf(err)}");
+            }
+        }
+
+        self._report:.begin(ExportStep::CHECK);
+        let files = copy ResourceSet(self._project);
+        self:.stopIfCancelled();
+        self._report:.addProblems(files.problems);
+        if files.hasErrors {
+            throw copy BalderError(f"The scenes of ${self._project.name} have errors: nothing was exported");
+        }
+
+        self:.decompose(files.bodies);
+
+        let folder = Path(self._output).push(package).toStr();
+        let staging = folder ~ ".partial";
+        {
+            if isDir(Path(staging)) { removeDir(Path(staging), recursive-> true); }
+            makeDir(Path(staging));
+        } catch {
+            err: &FsError => {
+                throw copy BalderError(f"${staging} could not be written: ${reasonOf(err)}");
+            }
+        }
+
+        {
+            self:.buildLibrary(staging, package, log);
+            self:.buildRuntime(staging, package, log);
+
+            // a config at a time, the report counting them; the stages they share are compiled once
+            let shaders = ShaderBuild::shipped();
+            let dmut build = copy ShaderBuild(staging, log);
+            self._report:.begin(ExportStep::SHADERS, total-> shaders.len);
+            for c in shaders {
+                self:.stopIfCancelled();
+                build:.compile(copy [c]);
+                self._report:.advance(c);
+            }
+
+            self:.write(staging, files);
+
+            if isDir(Path(folder)) { removeDir(Path(folder), recursive-> true); }
+            rename(Path(staging), Path(folder));
+        } catch {
+            err: &BalderError => {
+                self:.drop(staging);
+                throw err;
+            }
+            err: &FsError => {
+                self:.drop(staging);
+                throw copy BalderError(f"The folder of the game could not be written: ${reasonOf(err)}");
+            }
+        }
+
+        if !self._project.exportSettings.archive { return folder; }
+
+        self._report:.begin(ExportStep::ARCHIVE);
+        let mut version = toml_file::stringOf(gyllir, "version", Path(directory).push("gyllir.toml").toStr(), optional-> true);
+        if version.len == 0us { version = "0.0.0"; }
+
+        let archive = Path(self._output).push(f"${package}-${version}-linux-x86_64.tar.gz").toStr();
+        let mut code = 0;
+        {
+            code = self:.runLogged("tar", copy ["-C", self._output, "-czf", archive, package], log);
+        } catch {
+            err: &BalderError => {
+                // an archive cancelled is half written
+                {
+                    if isFile(Path(archive)) { removeFile(Path(archive)); }
+                } catch {
+                    _ => {}
+                }
+
+                throw err;
+            }
+        }
+
+        if code != 0 {
+            throw copy BalderError(f"The archive ${archive} could not be written, see ${log}");
+        }
+
+        archive
+    }
+
+    /**
+     * Decompose again the hulls of the dynamic bodies whose model changed since (see ConvexDecomposition::isUpToDate),
+     * with the settings they were decomposed with, those of the project for a model never decomposed
+     * @params:
+     *    - bodies: the models of the dynamic bodies shaped by their hulls
+     * */
+    fn decompose(mut self, bodies: [[c8]])
+        throws BalderError
+    {
+        self._report:.begin(ExportStep::DECOMPOSE, total-> bodies.len);
+        for model in bodies {
+            self:.stopIfCancelled();
+            if !ConvexDecomposition::isUpToDate(model) {
+                let file = ConvexDecomposition::fileOf(model);
+                let mut settings = self._project.exportSettings.decomposition;
+                {
+                    settings = ConvexDecomposition::fromFile(file).settings;
+                } catch {
+                    _ => {}
+                }
+
+                self._report:.working(model);
+                ConvexDecomposition::ofModel(model, settings-> settings).save(file);
+            }
+
+            self._report:.advance(model);
+        }
+    }
+
+    /**
+     * Build the library of the game in release, into the lib/ directory of the folder
+     * */
+    fn buildLibrary(mut self, staging: [c8], package: [c8], log: [c8])
+        throws BalderError
+    {
+        self._report:.begin(ExportStep::BUILD_LIBRARY);
+        let directory = self._project.directory;
+        let built = Path(staging).push(".library").toStr();
+        if self:.runLogged("gyllir", copy ["build", package, "--release", "-v", "--output-dir", built], log, cwd-> directory) != 0 {
+            throw copy BalderError(f"The library of ${self._project.name} does not build in release, see ${log}");
+        }
+
+        let library = Path(GameLibrary::fileOf(directory)).file();
+        let source = Path(built).push(library);
+        if !isFile(source) {
+            throw copy BalderError(f"The release build of the library wrote no ${library} in ${built}");
+        }
+
+        {
+            makeDir(Path(staging).push(GameExport::LIBRARY_DIR));
+            rename(source, Path(staging).push(GameExport::LIBRARY_DIR).push(library));
+            removeDir(Path(built), recursive-> true);
+        } catch {
+            err: &FsError => {
+                throw copy BalderError(f"The library could not be put in the folder of the game: ${reasonOf(err)}");
+            }
+        }
+    }
+
+    /**
+     * Build the runtime in release, in the engine, the executable of the folder named after the game
+     * */
+    fn buildRuntime(mut self, staging: [c8], package: [c8], log: [c8])
+        throws BalderError
+    {
+        self._report:.begin(ExportStep::BUILD_RUNTIME);
+        let engine = getEnginePath();
+        if !isFile(engine.push("gyllir.toml")) {
+            throw copy BalderError(f"The runtime cannot be built: ${engine.toStr()} holds no sources of Balder (its gyllir.toml)");
+        }
+
+        let built = Path(staging).push(".runtime").toStr();
+        if self:.runLogged("gyllir", copy ["build", GameExport::RUNTIME_TARGET, "--release", "-v", "--output-dir", built], log, cwd-> engine.toStr()) != 0 {
+            throw copy BalderError(f"The runtime does not build in release, see ${log}");
+        }
+
+        {
+            rename(Path(built).push(GameExport::RUNTIME), Path(staging).push(package));
+            removeDir(Path(built), recursive-> true);
+        } catch {
+            err: &FsError => {
+                throw copy BalderError(f"The runtime could not be put in the folder of the game: ${reasonOf(err)}");
+            }
+        }
+    }
+
+    /**
+     * Copy the files of the game into the folder, then its project.toml naming its library
+     * */
+    fn write(mut self, staging: [c8], files: &ResourceSet)
+        throws BalderError
+    {
+        let mut paths: [[c8]] = [];
+        for f in files.files { paths ~= [f._0]; }
+        for b in files.bodies {
+            let hulls = ConvexDecomposition::fileOf(b);
+            if !files.holds(hulls) { paths ~= [hulls]; }
+        }
+
+        self._report:.begin(ExportStep::WRITE, total-> paths.len);
+        for p in paths {
+            self:.stopIfCancelled();
+            if !insideAnother(p, paths) {
+                let source = files.sourceOf(p);
+                let target = Path(ResourceSet::exportedPath(staging, p));
+                {
+                    if isDir(source) {
+                        copyDir(source, target, recursive-> true, create-> true);
+                    } else {
+                        makeDir(target.parent());
+                        copyFile(source, target);
+                    }
+                } catch {
+                    err: &FsError => {
+                        throw copy BalderError(f"${p} could not be copied: ${reasonOf(err)}");
+                    }
+                }
+            }
+
+            self._report:.advance(p);
+        }
+
+        let directory = self._project.directory;
+        let library = Path(GameExport::LIBRARY_DIR).push(Path(GameLibrary::fileOf(directory)).file()).toStr();
+        {
+            let content = readFile(Path(directory).push(Project::FILE));
+            writeFile(Path(staging).push(Project::FILE), f"${GameLibrary::KEY} = ${toml_file::quoted(library)}\n" ~ content);
+        } catch {
+            err: &FsError => {
+                throw copy BalderError(f"The ${Project::FILE} of the game could not be written: ${reasonOf(err)}");
+            }
+        }
+    }
+
+    /**
+     * Run a program as process::runLogged does, cancelled once the export is (see ExportReport::cancel)
+     * @returns: its exit code, 127 when the program is not found
+     * @throws:
+     *    - &BalderError: if it cannot be started, or once the export is cancelled
+     * */
+    fn runLogged(mut self, program: [c8], args: [[c8]], log: [c8], cwd: [c8] = ".")-> i32
+        throws BalderError
+    {
+        let dmut p = copy LoggedProcess(program, args, log, cwd-> cwd);
+        while !p:.isFinished() {
+            if self._report:.isCancelled() { p:.cancel(); }
+            sleep(millis(LoggedProcess::POLL));
+        }
+
+        let res = p:.wait();
+        self:.stopIfCancelled();
+        res
+    }
+
+    /**
+     * Stop the export once it is cancelled (see ExportReport::cancel)
+     * @throws:
+     *    - &BalderError: once it is
+     * */
+    fn stopIfCancelled(mut self)
+        throws BalderError
+    {
+        if self._report:.isCancelled() {
+            throw copy BalderError(GameExport::CANCELLED);
+        }
+    }
+
+    /**
+     * Remove the folder of an export that failed, left as it is when it cannot be
+     * */
+    fn drop(mut self, staging: [c8]) {
+        {
+            if isDir(Path(staging)) { removeDir(Path(staging), recursive-> true); }
+        } catch {
+            _ => {}
+        }
+    }
+
+}
+
+/**
+ * The files of an export
+ * */
+pub mod GameExport {
+
+    /**
+     * The log of the export, in the directory of the project
+     * */
+    pub def LOG = ".target/export.log";
+
+    /**
+     * Why an export cancelled stopped
+     * */
+    pub def CANCELLED = "The export was cancelled";
+
+    /**
+     * The directory of the library of the game in the folder of an export
+     * */
+    pub def LIBRARY_DIR = "lib";
+
+    /**
+     * The target of the runtime in the gyllir.toml of the engine, and the executable it builds
+     * */
+    pub def RUNTIME_TARGET = "runtime";
+    pub def RUNTIME = "balder-runtime";
+
+    /**
+     * @returns: the absolute path of the log of the export of a project
+     * @params:
+     *    - directory: the absolute path of the directory of the project
+     * */
+    pub fn logOf(directory: [c8])-> [c8] {
+        Path(directory).push(LOG).toStr()
+    }
+
+}
+
+/**
+ * @returns: true iif a path lies in a directory among others, copied with it
+ * */
+fn insideAnother(path: [c8], paths: [[c8]])-> bool {
+    for o in paths {
+        let prefix = o ~ "/";
+        if path.len > prefix.len && path[0us .. prefix.len] == prefix { return true; }
+    }
+
+    false
+}
+
+/**
+ * Create a directory and its parents, nothing when it exists
+ * */
+fn makeDir(path: Path)
+    throws FsError
+{
+    if !isDir(path) { createDir(path, recursive-> true); }
+}
+
+/**
+ * @returns: why a file could not be read or written, its message and its code, without the stack trace
+ * */
+fn reasonOf(err: &FsError)-> [c8] {
+    f"${err.msg} (${err.code})"
+}
