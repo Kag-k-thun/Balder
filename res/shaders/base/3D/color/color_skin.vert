@@ -70,6 +70,7 @@ layout (location = 3) flat out uint outMaterial;
 layout (location = 4) out vec4 outCurrent;
 layout (location = 5) out vec4 outPrevious;
 
+#ifdef BALDER_DEBUG
 // The debug view of the camera (see DebugView), the word of the instance, the slot of the cluster the command draws
 // (NO_CLUSTER when the command draws a whole level, culled on the CPU) and the level of detail of the draw
 layout (location = 6) flat out uvec4 outDebug;
@@ -82,6 +83,7 @@ const uint NO_CLUSTER = 0xffffffffu;
 
 // The role of the draw of the outgoing level of a cross-fade, in the low bits of its word
 const uint OUTGOING_DRAW = 1u;
+#endif
 
 // Computed as the depth prepass computes it, so the fragments it found closest pass the depth test
 out gl_PerVertex {
@@ -103,6 +105,7 @@ void main () {
     outFade = vec2 (object.fade, float (word & 3u));
     outMaterial = object.material;
 
+#ifdef BALDER_DEBUG
     // the cull pass writes the slot of the cluster after the word of the instance of its commands, marked, as no word of
     // an instance is
     uint cluster = NO_CLUSTER;
@@ -113,4 +116,5 @@ void main () {
 
     uint level = (word & 3u) == OUTGOING_DRAW ? object.lod >> 16 : object.lod & 0xffffu;
     outDebug = uvec4 (camera.debugView, word, cluster, level);
+#endif
 }
