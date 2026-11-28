@@ -1,0 +1,225 @@
+in activity;
+
+use balder::core::{_, application::_};
+use balder::game::{project, requests};
+use balder::interface::widget::layout::d3scene;
+use balder::scene::{description, node, node::node3D::camera};
+use balder::utils::log;
+
+use std::time;
+
+/**
+ * The interface of the window of a game, a Scene3D filling it, and the sheet styling it
+ * */
+def GAME_GUI = "engine:/config/game.gui";
+def GAME_STYLE = "engine:/config/game.style";
+
+/**
+ * The id of the Scene3D of the interface of a game
+ * */
+def SCENE_WIDGET = "scene";
+
+/**
+ * The window of a game: a Scene3D filling it (engine:/config/game.gui) rendered at the resolution of the project,
+ * playing a scene of the project, then the scenes the game asks for (changeScene), until the window is closed or the
+ * game quits (quitGame)
+ * @info: the scene the game asks for is built at the next update, never inside a tick; its file names its active
+ * camera, the first camera of the file drawing it when it names none
+ * */
+pub class GameActivity over Activity {
+
+    // The project played, none until play is called
+    let mut _project: (&Project)? = none;
+
+    // The name of the scene the game starts with
+    let mut _first: [c8] = "";
+
+    // The scene of the Scene3D, none when the interface could not be loaded
+    let dmut _scene: (&Scene)? = none;
+
+    pub self (uid: usize, dmut app: &Application, dmut window: &Window)
+        with super(uid, alias app, alias window)
+    {}
+
+    /**
+     * Play a project once the activity starts, from one of its scenes
+     * @params:
+     *    - project: the project, installed already (see Project::install)
+     *    - scene: the name of the scene the game starts with, in the [scenes] of the project
+     * */
+    pub fn play(mut self, project: &Project, scene: [c8]) {
+        self._project = project?;
+        self._first = scene;
+    }
+
+    over onStart(mut self) {
+        self.input:.quit():.connect(self.box, &self:.onQuit);
+        clearGameRequests();
+
+        let project = if let Ok(p) = self._project { p } else { return; };
+        {
+            self.gui:.loadStyleFile(GAME_STYLE);
+
+            // the resolution of the scene is the one it is configured at as it is attached
+            let dmut root = alias self.gui:.loadGUIFile(GAME_GUI, set-> false);
+            if let Ok(dmut w: &Scene3DLayout) = root:.find(SCENE_WIDGET) {
+                let (width, height) = project.render.resolution;
+                w:.setResolution(width, height);
+            }
+
+            self.gui:.setContent(alias root);
+        } catch {
+            err => {
+                log::error #("Game", "Failed to load the interface of the game", err);
+                self:.onQuit();
+                return;
+            }
+        }
+
+        // the scene reads the input actions while its widget has the focus
+        if let Ok(dmut w: &Scene3DLayout) = self.gui:.find(SCENE_WIDGET) {
+            self._scene = w:.getScene();
+            self.gui:.setFocus((alias w)?);
+        }
+
+        if !self._scene.hasValue {
+            log::error #("Game", f"${GAME_GUI} holds no Scene3D #${SCENE_WIDGET}");
+            self:.onQuit();
+            return;
+        }
+
+        {
+            self:.loadScene(self._first);
+        } catch {
+            err: &BalderError => {
+                log::error #("Game", "Failed to load the first scene of the game", err);
+                self:.onQuit();
+            }
+        }
+    }
+
+    /**
+     * Run the requests of the game: quit, or play another scene, the one played staying when it cannot be loaded
+     * */
+    over onUpdate(mut self, _: Duration) {
+        if takeQuitRequest() {
+            self:.onQuit();
+            return;
+        }
+
+        if let Ok(name) = takeSceneRequest() {
+            {
+                self:.loadScene(name);
+            } catch {
+                err: &BalderError => {
+                    log::error #("Game", f"Failed to load the scene '${name}' the game asked for", err);
+                }
+            }
+        }
+    }
+
+    /**
+     * Drop the nodes of the scene, so that none of a class of the library of the game outlives it (see GameLibrary)
+     * */
+    over onClose(mut self) {
+        self.window:.lockFrame();
+        self:.dropNodes();
+        self.window:.unlockFrame();
+    }
+
+    /**
+     * The window is closed, or the game quits
+     * */
+    fn onQuit(mut self) {
+        self.app:.close(alias self);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCENES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Play a scene of the project in place of the one played: the nodes under the root of the scene dropped, the nodes
+     * of the scene file built under it, its active camera, or its first camera when it names none, drawing it
+     * @params:
+     *    - name: the name of the scene, in the [scenes] of the project
+     * @throws:
+     *    - &BalderError: if the project has no scene of that name, or its file cannot be read or built; the scene
+     *                    played stays when the file cannot be read
+     * */
+    fn loadScene(mut self, name: [c8])
+        throws BalderError
+    {
+        let project = if let Ok(p) = self._project { p } else { return; };
+        let path = if let Ok(p) = project.scenePath(name) { p } else { throw copy BalderError(unknownScene(project, name)); };
+
+        let description = copy SceneDescription::fromFile(path);
+        let dmut scene = if let Ok(dmut s) = alias self._scene { alias s } else { return; };
+
+        self.window:.lockFrame();
+        {
+            self:.dropNodes();
+            let dmut root = alias scene:.getRootNode();
+            description.build(alias root);
+            if !scene:.getActiveCamera().hasValue {
+                if let Ok(dmut c) = alias firstCamera(alias root:.getChildrenInOrder()) {
+                    scene:.setActiveCamera(alias c);
+                } else {
+                    log::warn #("Game", f"The scene '${name}' has no camera, nothing draws it");
+                }
+            }
+        } catch {
+            err: &BalderError => {
+                self.window:.unlockFrame();
+                throw err;
+            }
+        }
+
+        self.window:.unlockFrame();
+        log::info #("Game", f"Playing the scene '${name}' (${path})");
+    }
+
+    /**
+     * Drop the nodes under the root of the scene
+     * @info: called between Window::lockFrame and unlockFrame
+     * */
+    fn dropNodes(mut self) {
+        let dmut scene = if let Ok(dmut s) = alias self._scene { alias s } else { return; };
+        let dmut root = alias scene:.getRootNode();
+        let dmut nodes: [&Node] = [];
+        for dmut n in alias root:.getChildrenInOrder() if !isReservedName(n.name.file()) {
+            nodes ~= [alias n];
+        }
+
+        for dmut n in alias nodes { n:.dispose(); }
+    }
+
+}
+
+/**
+ * @returns: the first camera among nodes and the nodes under them, depth first, none when there is none
+ * */
+fn firstCamera(dmut nodes: [&Node])-> dmut (&Camera)? {
+    for dmut n in alias nodes {
+        if let dmut c: &Camera = alias n { return (alias c)?; }
+        if let Ok(dmut c) = alias firstCamera(alias n:.getChildrenInOrder()) { return (alias c)?; }
+    }
+
+    none
+}
+
+/**
+ * @returns: the message of a scene the project does not have, naming the scenes it has
+ * */
+pub fn unknownScene(project: &Project, name: [c8])-> [c8] {
+    let mut names = "";
+    for s in project.scenes {
+        names ~= (if names.len == 0us { "" } else { ", " }) ~ s._0;
+    }
+
+    f"The project has no scene '${name}', its scenes being: ${names}"
+}
