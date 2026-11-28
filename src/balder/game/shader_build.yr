@@ -1,0 +1,173 @@
+in shader_build;
+
+use balder::core::error;
+use balder::core::config::shader;
+use balder::game::{process, resource_set};
+use balder::utils::{path, toml_file};
+
+use std::{config, fs};
+
+/**
+ * The shaders of a game compiled for release into the folder of its export: each config copied as it is, keeping its
+ * shaders:/ paths, and each SPIR-V file it names (its passes, its prepass, its skinned variant...) compiled again from
+ * its source, optimized, without BALDER_DEBUG (the debug views and the outline of the editor) and without debug
+ * information
+ * @info: the source of a stage is its SPIR-V path without the extension (pbr.frag.spv is compiled from pbr.frag), as
+ * compile.sh names them; a missing source is an error, never a copy of the dev SPIR-V, which holds the debug code
+ * @example:
+ * ```
+ * let dmut b = copy ShaderBuild("/tmp/export/my_game", "/tmp/export/shaders.log");
+ * b:.compile(ShaderBuild::shipped());
+ * ```
+ * */
+pub class ShaderBuild {
+
+    // The folder of the export
+    let _folder: [c8];
+
+    // The file the output of glslc and spirv-opt is appended to
+    let _log: [c8];
+
+    // The SPIR-V files compiled already, several configs sharing some (the depth prepass)
+    let dmut _compiled: [[c8] => ()] = copy [];
+
+    /**
+     * @params:
+     *    - folder: the folder of the export, the shaders written under engine/res/shaders in it
+     *    - log: the file the output of the compilers is appended to
+     * */
+    pub self (folder: [c8], log: [c8])
+        with _folder = folder
+        , _log = log
+    {}
+
+    /**
+     * Compile shader configs and the stages they name into the folder of the export
+     * @params:
+     *    - configs: the paths of the configs (shaders:/…toml)
+     * @throws:
+     *    - &BalderError: if glslc is not found, a config cannot be read, or a stage does not compile, naming it
+     * */
+    pub fn compile(mut self, configs: [[c8]])
+        throws BalderError
+    {
+        if !isInstalled("glslc") {
+            throw copy BalderError("glslc is not found: the shaders of the game cannot be compiled (install the Vulkan SDK or shaderc)");
+        }
+
+        let optimizer = isInstalled("spirv-opt");
+        for c in configs {
+            let target = ResourceSet::exportedPath(self._folder, c);
+            {
+                makeDir(Path(target).parent());
+                copyFile(projectPath(c), Path(target));
+            } catch {
+                err: &FsError => {
+                    throw copy BalderError(f"The shader config ${c} could not be copied: ${reasonOf(err)}");
+                }
+            }
+
+            for spv in stagesOf(toml_file::readToml(projectPath(c).toStr())) {
+                self:.compileStage(spv, optimizer);
+            }
+        }
+    }
+
+    /**
+     * Compile a stage again from its source, optimized, stripped of its debug information when spirv-opt is installed
+     * @params:
+     *    - spv: the path of its SPIR-V file (shaders:/…spv)
+     * */
+    fn compileStage(mut self, spv: [c8], optimizer: bool)
+        throws BalderError
+    {
+        if spv in self._compiled { return; }
+        self._compiled[spv] = ();
+
+        let source = projectPath(spv).stripExtension().toStr();
+        if !isFile(Path(source)) {
+            throw copy BalderError(f"The source of the shader ${spv} is missing: ${source}");
+        }
+
+        let output = ResourceSet::exportedPath(self._folder, spv);
+        {
+            makeDir(Path(output).parent());
+        } catch {
+            err: &FsError => {
+                throw copy BalderError(f"${output} could not be written: ${reasonOf(err)}");
+            }
+        }
+
+        if runLogged("glslc", copy ["-O", source, "-o", output], self._log) != 0 {
+            throw copy BalderError(f"The shader ${source} does not compile for release, see ${self._log}");
+        }
+
+        if optimizer && runLogged("spirv-opt", copy ["--strip-debug", output, "-o", output], self._log) != 0 {
+            throw copy BalderError(f"The shader ${output} could not be stripped, see ${self._log}");
+        }
+    }
+
+}
+
+/**
+ * The shaders every game ships
+ * */
+pub mod ShaderBuild {
+
+    /**
+     * @returns: the shader configs every exported game ships: those of the engine (DefaultShaders) but the gizmo of the
+     * editor, the scenes configuring most of them whatever they draw (the occlusion, the environment...), those whose
+     * file exists
+     * */
+    pub fn shipped()-> [[c8]] {
+        let mut res: [[c8]] = [];
+        for s in DefaultShaders::__members__ if s != DefaultShaders::GIZMO_3D && isFile(projectPath(s)) {
+            res ~= [s];
+        }
+
+        res
+    }
+
+}
+
+/**
+ * @returns: the SPIR-V files a shader config names, the `shader` entries of its tables, at any depth
+ * */
+fn stagesOf(cfg: &Config)-> [[c8]] {
+    let mut res: [[c8]] = [];
+    match cfg {
+        d: &Dict => {
+            for key, value in d[] {
+                if let Str(value-> s) = value && key == "shader" {
+                    res ~= [s];
+                } else {
+                    res ~= stagesOf(value);
+                }
+            }
+        }
+        a: &Array => {
+            for value in a[] {
+                res ~= stagesOf(value);
+            }
+        }
+        _ => {}
+    }
+
+    res
+}
+
+/**
+ * Create a directory and its parents, nothing when it exists
+ * */
+fn makeDir(path: Path)
+    throws FsError
+{
+    if !isDir(path) { createDir(path, recursive-> true); }
+}
+
+/**
+ * @returns: why a file could not be read or written, its message and its code, without the stack trace
+ * */
+fn reasonOf(err: &FsError)-> [c8] {
+    f"${err.msg} (${err.code})"
+}
