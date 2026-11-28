@@ -1,0 +1,243 @@
+in binding;
+
+use balder::core::error;
+
+use std::{config, conv};
+
+use ::sdl3::{gamepad, keyboard, mouse, scancode};
+
+/**
+ * The kind of device an input binding reads
+ * */
+pub enum InputDevice
+| KEY        = 0u8
+| MOUSE      = 1u8
+| PAD_BUTTON = 2u8
+| PAD_AXIS   = 3u8;
+
+/**
+ * The names of the mouse buttons in the text of a binding
+ * */
+enum MouseButtonName
+| LEFT   = ("left", SDL_BUTTON_LEFT)
+| MIDDLE = ("middle", SDL_BUTTON_MIDDLE)
+| RIGHT  = ("right", SDL_BUTTON_RIGHT)
+| X1     = ("x1", SDL_BUTTON_X1)
+| X2     = ("x2", SDL_BUTTON_X2);
+
+/**
+ * A key, a mouse button, a gamepad button or the half of a gamepad axis an input action is bound to, written in
+ * project.toml as `device:name`: "key:Space", "key:Left Shift" (the place of the key, named as SDL_GetScancodeName names
+ * it), "mouse:left", "pad:a" (SDL_GetGamepadButtonFromString, `a` being the south button whatever is printed on it),
+ * "pad:lefty-" or "pad:righttrigger+" (SDL_GetGamepadAxisFromString, then the half)
+ * @info: a binding names no gamepad, "pad:a" is the button of every gamepad plugged in
+ * */
+pub record InputBinding {
+
+    // The kind of device read
+    pub let device: InputDevice;
+
+    // The SDL code read on the device: a SDL_Scancode, a SDL_BUTTON_*, a SDL_GamepadButton or a SDL_GamepadAxis
+    pub let code: u32;
+
+    // The half of a gamepad axis read, true for its positive values, true for the other devices
+    pub let positive: bool;
+
+    /**
+     * @params:
+     *    - device: the kind of device read
+     *    - code: the SDL code read on the device
+     *    - positive: the half of a gamepad axis read
+     * */
+    pub self (device: InputDevice, code: u32, positive: bool = true)
+        with device = device
+        , code = code
+        , positive = positive
+    {}
+
+    /**
+     * @returns: the text of the binding in project.toml, named by SDL: InputBinding::parse reads it back as the same binding
+     * */
+    pub fn text(self)-> [c8] {
+        match self.device {
+            InputDevice::KEY => {
+                let name = InputBinding::scancodeName(self.code);
+                return f"key:${name}";
+            }
+            InputDevice::MOUSE => {
+                let name = InputBinding::mouseName(self.code);
+                return f"mouse:${name}";
+            }
+            InputDevice::PAD_BUTTON => {
+                let name = InputBinding::padButtonName(self.code);
+                return f"pad:${name}";
+            }
+            _ => {
+                let name = InputBinding::padAxisName(self.code);
+                if self.positive { return f"pad:${name}+"; }
+                return f"pad:${name}-";
+            }
+        }
+    }
+
+    /**
+     * Serialized as its text, a string of toml
+     * */
+    impl Serializable {
+        pub over serialize(self)-> &Config {
+            Str(self.text())
+        }
+    }
+
+}
+
+@companion
+pub mod InputBinding {
+
+    /**
+     * Read the text of a binding, `device:name`, split at its first `:`, the name resolved by SDL (see InputBinding)
+     * @params:
+     *    - text: the text of the binding
+     *    - action: the name of the action bound, naming it in the error
+     * @throws:
+     *    - &BalderError: when the device is unknown, or its name names nothing on it
+     * */
+    pub fn parse(text: [c8], action: [c8])-> InputBinding
+        throws BalderError
+    {
+        let mut colon = text.len;
+        for i, c in text {
+            if c == ':' { colon = i; break; }
+        }
+
+        if colon == text.len {
+            throw copy BalderError(f"bad binding \"${text}\" of action \"${action}\": expected device:name");
+        }
+
+        let device = text[0us .. colon];
+        let name = text[colon + 1us .. $];
+        if device == "key" {
+            if let Ok(b) = keyOf(name) { return b; }
+            throw copy BalderError(f"unknown key \"${name}\" in \"${text}\" of action \"${action}\"");
+        }
+
+        if device == "mouse" {
+            if let Ok(b) = mouseOf(name) { return b; }
+            throw copy BalderError(f"unknown mouse button \"${name}\" in \"${text}\" of action \"${action}\"");
+        }
+
+        if device == "pad" {
+            if let Ok(b) = padOf(name) { return b; }
+            if InputBinding::isAxisName(name) {
+                throw copy BalderError(f"bad binding \"${text}\" of action \"${action}\": an axis needs + or -");
+            }
+
+            throw copy BalderError(f"unknown gamepad input \"${name}\" in \"${text}\" of action \"${action}\"");
+        }
+
+        throw copy BalderError(f"unknown device \"${device}\" in \"${text}\" of action \"${action}\"");
+    }
+
+    /**
+     * @returns: the key named, none when SDL knows no key of that name
+     * @info: the name is not trimmed, the names of SDL holding spaces and symbols ("Left Shift", "Keypad +")
+     * */
+    fn keyOf(name: [c8])-> (InputBinding)? {
+        let code = SDL_GetScancodeFromName(name.toStringZ());
+        if code == SDL_Scancode::SDL_SCANCODE_UNKNOWN { return none; }
+
+        (InputBinding(InputDevice::KEY, cast!u32(code)))?
+    }
+
+    /**
+     * @returns: the mouse button named (MouseButtonName), none when there is none
+     * */
+    fn mouseOf(name: [c8])-> (InputBinding)? {
+        for m in MouseButtonName::__members__ {
+            if m._0 == name { return (InputBinding(InputDevice::MOUSE, cast!u32(m._1)))?; }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the gamepad button named, else the half of the axis named with its sign, none when there is none
+     * @info: the whole name is tried as a button first, so a sign is only read on an axis
+     * */
+    fn padOf(name: [c8])-> (InputBinding)? {
+        let button = SDL_GetGamepadButtonFromString(name.toStringZ());
+        if button != SDL_GamepadButton::SDL_GAMEPAD_BUTTON_INVALID {
+            return (InputBinding(InputDevice::PAD_BUTTON, cast!u32(button)))?;
+        }
+
+        if name.len < 2us { return none; }
+        let sign = name[$ - 1us];
+        if sign != '+' && sign != '-' { return none; }
+
+        let axis = SDL_GetGamepadAxisFromString(name[0us .. $ - 1us].toStringZ());
+        if axis == SDL_GamepadAxis::SDL_GAMEPAD_AXIS_INVALID { return none; }
+
+        (InputBinding(InputDevice::PAD_AXIS, cast!u32(axis), positive-> sign == '+'))?
+    }
+
+    /**
+     * @returns: true iif the name is the one of a gamepad axis, without its sign
+     * */
+    fn isAxisName(name: [c8])-> bool {
+        SDL_GetGamepadAxisFromString(name.toStringZ()) != SDL_GamepadAxis::SDL_GAMEPAD_AXIS_INVALID
+    }
+
+    /**
+     * @returns: the name SDL gives to a scancode, empty for a code it does not name
+     * */
+    pub fn scancodeName(code: u32)-> [c8] {
+        for s in SDL_Scancode::__members__ {
+            if s == code {
+                return unsafe { SDL_GetScancodeName(s).fromStringZ() };
+            }
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: the name of a mouse button (MouseButtonName), empty for a button it does not name
+     * */
+    pub fn mouseName(code: u32)-> [c8] {
+        for m in MouseButtonName::__members__ {
+            if cast!u32(m._1) == code { return m._0; }
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: the name SDL gives to a gamepad button, empty for a code it does not name
+     * */
+    pub fn padButtonName(code: u32)-> [c8] {
+        for b in SDL_GamepadButton::__members__ {
+            if b != SDL_GamepadButton::SDL_GAMEPAD_BUTTON_INVALID && cast!u32(b) == code {
+                let name = SDL_GetGamepadStringForButton(b);
+                if name == null { return ""; }
+                return unsafe { name.fromStringZ() };
+            }
+        }
+
+        ""
+    }
+
+    /**
+     * @returns: the name SDL gives to a gamepad axis, empty for a code it does not name
+     * */
+    pub fn padAxisName(code: u32)-> [c8] {
+        for a in SDL_GamepadAxis::__members__ {
+            if a != SDL_GamepadAxis::SDL_GAMEPAD_AXIS_INVALID && cast!u32(a) == code {
+                let name = SDL_GetGamepadStringForAxis(a);
+                if name == null { return ""; }
+                return unsafe { name.fromStringZ() };
+            }
+        }
+
+        ""
+    }
+}

@@ -1,0 +1,182 @@
+in logged_process;
+
+use balder::core::error;
+
+use etc::c::process;
+
+use std::{concurrency, fs, time};
+
+// The signals sent to the process group of a program cancelled: asked to stop first, then killed when it did not
+def SIGTERM = 15;
+def SIGKILL = 9;
+
+// How long a program cancelled is given to stop before it is killed, in milliseconds
+def GRACE = 3000u64;
+
+/**
+ * A program run in the background, its output and its errors appended to a log file, which can be cancelled with
+ * everything it started: gyllir, and the compilers it runs
+ * @info:
+ * =====
+ * The program runs in a process group of its own (`setsid`, when it is installed), its pid written beside its log
+ * (`<log>.pid`) by the shell starting it; cancel asks the whole group to stop (SIGTERM, the compilers removing the
+ * files they were writing), and kills it once GRACE is over:
+ * ```
+ * let dmut p = copy LoggedProcess("gyllir", copy ["build", "-v"], "/tmp/build.log", cwd-> directory);
+ * // … the user cancels
+ * p:.cancel();
+ * // … at each update, until it is finished
+ * if p:.isFinished() { println(p:.wait(), p.isCancelled); }
+ * ```
+ * ====
+ * */
+pub class LoggedProcess {
+
+    // The program, the shell starting it
+    let dmut _process: &SubProcess;
+
+    // The file the shell writes the pid of the program in, the one of its process group
+    let _pidFile: [c8];
+
+    // The process group of the program, 0 until it is read from the pid file
+    let mut _group: u32 = 0u32;
+
+    // When the program was cancelled, none while it was not, and the signal sent to its group last, 0 for none
+    let mut _cancelled: (Instant)? = none;
+    let mut _sent: i32 = 0;
+
+    /**
+     * Start a program, in the background
+     * @params:
+     *    - program: the program, found in the PATH
+     *    - args: its arguments, given as they are (never read as shell syntax)
+     *    - log: the file its output is appended to
+     *    - cwd: the directory it runs in
+     * @throws:
+     *    - &BalderError: if it cannot be started
+     * */
+    pub self (program: [c8], args: [[c8]], log: [c8], cwd: [c8] = ".")
+        with _process = copy SubProcess("sh", copy ["-c", LoggedProcess::SCRIPT, "sh", log ~ ".pid", log, program] ~ args,
+                                        cwd-> Path(cwd))
+        , _pidFile = log ~ ".pid"
+        throws BalderError
+    {
+        {
+            // the pid of a program run before is never read as the one of this one
+            if isFile(Path(self._pidFile)) { removeFile(Path(self._pidFile)); }
+            self._process:.start(redirect-> false);
+        } catch {
+            err => {
+                throw copy BalderError(f"${program} could not be started: ${err}");
+            }
+        }
+    }
+
+    /**
+     * @returns: true iif the program was cancelled
+     * */
+    @field
+    pub fn isCancelled(self)-> bool {
+        self._cancelled.hasValue
+    }
+
+    /**
+     * Ask the program to stop, with everything it started; it is killed if it still runs once GRACE is over (see
+     * isFinished)
+     * */
+    pub fn cancel(mut self) {
+        if self._cancelled.hasValue { return; }
+
+        self._cancelled = (Instant::now())?;
+        self:.signal(SIGTERM);
+    }
+
+    /**
+     * @returns: true iif the program is finished; a program cancelled is asked to stop again until its group is known,
+     * and killed once GRACE is over
+     * */
+    pub fn isFinished(mut self)-> bool {
+        if self._process:.isFinished() { return true; }
+
+        if let Ok(since) = self._cancelled {
+            if self._sent == 0 {
+                self:.signal(SIGTERM);
+            } else if self._sent == SIGTERM && (Instant::now() - since).allMillis >= GRACE {
+                self:.signal(SIGKILL);
+            }
+        }
+
+        false
+    }
+
+    /**
+     * Wait for the program to finish
+     * @returns: its exit code, 127 when the program is not found, `128 + n` when the signal n stopped it
+     * */
+    pub fn wait(mut self)-> i32 {
+        while !self:.isFinished() {
+            sleep(millis(LoggedProcess::POLL));
+        }
+
+        let res = self._process:.wait();
+        {
+            if isFile(Path(self._pidFile)) { removeFile(Path(self._pidFile)); }
+        } catch {
+            _ => {}
+        }
+
+        res
+    }
+
+    /**
+     * Send a signal to the process group of the program, once the shell starting it wrote its pid
+     * */
+    fn signal(mut self, sig: i32) {
+        if self._group == 0u32 {
+            self._group = readPid(self._pidFile);
+            if self._group == 0u32 { return; }
+        }
+
+        // a negative pid names a process group, the program alone when setsid is not installed
+        if kill(cast!u32(-cast!i32(self._group)), sig) != 0 { kill(self._group, sig); }
+        self._sent = sig;
+    }
+
+}
+
+/**
+ * The shell running a program
+ * */
+pub mod LoggedProcess {
+
+    /**
+     * The script of the shell, given the pid file, the log, the program and its arguments: the program replaces the
+     * shell (its pid is the one written), in a session and a process group of its own when setsid is installed
+     * */
+    pub def SCRIPT = "echo $$ > \"$1\"; log=\"$2\"; shift 2; "
+        ~ "if command -v setsid > /dev/null 2>&1; then exec setsid -w \"$@\" >> \"$log\" 2>&1; fi; "
+        ~ "exec \"$@\" >> \"$log\" 2>&1";
+
+    /**
+     * How often wait looks whether the program is finished, in milliseconds
+     * */
+    pub def POLL = 50u64;
+
+}
+
+/**
+ * @returns: the pid written in a file, 0 when it is not written yet
+ * */
+fn readPid(file: [c8])-> u32 {
+    {
+        let mut res = 0u32;
+        for c in readFile(Path(file)) {
+            if c < '0' || c > '9' { break; }
+            res = res * 10u32 + cast!u32(cast!u8(c) - cast!u8('0'));
+        }
+
+        res
+    } catch {
+        _ => { 0u32 }
+    }
+}

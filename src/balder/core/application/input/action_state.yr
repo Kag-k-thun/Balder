@@ -1,0 +1,195 @@
+in action_state;
+
+use balder::core::application::input::{action, binding, device_state, input_devices};
+use balder::utils::log;
+
+/**
+ * The input actions as a scene reads them at a tick, from two copies of the input devices (see InputDevices): the one
+ * of the tick before and the one of this tick. An action went down or up when the copies differ, so the scenes each
+ * read every press on their own, none consuming it
+ * @example:
+ * ===
+ * if let Ok(a) = self:.actions() {
+ *     let front = a.axis("back", "forward");
+ *     if a.pressed("jump") { ... }
+ * }
+ * ===
+ * */
+pub class ActionState {
+
+    // The copy of the input devices at the tick before
+    let mut _before: DeviceState = DeviceState();
+
+    // The copy of the input devices at this tick
+    let mut _now: DeviceState = DeviceState();
+
+    // The unknown actions read, warned about once each
+    let dmut _warned: [[c8] => ()] = copy [];
+
+    /**
+     * Nothing held, nothing pressed
+     * */
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          SAMPLING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start a tick: the copy of the last tick becomes the one before, the devices are copied again
+     * */
+    pub fn sample(mut self) {
+        self._before = self._now;
+        self._now = inputDevices():.snapshot();
+    }
+
+    /**
+     * Start a tick of a scene not having the focus: both copies are the devices with every input released, so nothing
+     * is held, pressed or released while it has no focus, the keys typed meanwhile (in a text field of the editor) never
+     * reading as pressed once it has the focus again
+     * */
+    pub fn sampleIdle(mut self) {
+        let idle = inputDevices():.snapshot().released();
+        self._before = idle;
+        self._now = idle;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          ACTIONS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif a key or a button bound to the action is held, or a gamepad axis bound to it is pushed past its
+     * dead zone
+     * */
+    pub fn held(mut self, action: [c8])-> bool {
+        if let Ok(a) = self:.actionOf(action) {
+            for b in a.bindings {
+                if b.device == InputDevice::PAD_AXIS {
+                    if self._now.strength(b) > a.deadZone { return true; }
+                } else if self._now.isHeld(b) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif a key or a button bound to the action went down since the tick before, or a gamepad axis bound
+     * to it was pushed past its dead zone
+     * @info: a key pressed and released between two ticks reads as pressed
+     * */
+    pub fn pressed(mut self, action: [c8])-> bool {
+        if let Ok(a) = self:.actionOf(action) {
+            for b in a.bindings {
+                if b.device == InputDevice::PAD_AXIS {
+                    if self._before.strength(b) <= a.deadZone && self._now.strength(b) > a.deadZone { return true; }
+                } else if self._now.downs(b) != self._before.downs(b) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif a key or a button bound to the action went up since the tick before, or a gamepad axis bound to
+     * it went back under its dead zone, none of its bindings being held now
+     * */
+    pub fn released(mut self, action: [c8])-> bool {
+        if let Ok(a) = self:.actionOf(action) {
+            let mut up = false;
+            for b in a.bindings {
+                if b.device == InputDevice::PAD_AXIS {
+                    if self._now.strength(b) > a.deadZone { return false; }
+                    if self._before.strength(b) > a.deadZone { up = true; }
+                } else {
+                    if self._now.isHeld(b) { return false; }
+                    if self._now.ups(b) != self._before.ups(b) { up = true; }
+                }
+            }
+
+            return up;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: how far the action is pushed, from 0 to 1, the strongest of its bindings: 1 for a key or a button held,
+     * for a gamepad axis 0 under the dead zone and rescaled from it to 1 past it
+     * */
+    pub fn strength(mut self, action: [c8])-> f32 {
+        if let Ok(a) = self:.actionOf(action) {
+            return ActionState::strengthIn(self._now, a);
+        }
+
+        0.0f
+    }
+
+    /**
+     * @returns: the strength of an action going one way minus the one of an action going the other, from -1 to 1
+     * @params:
+     *    - negative: the action of the negative way ("back", "turn-left")
+     *    - positive: the action of the positive way ("forward", "turn-right")
+     * */
+    pub fn axis(mut self, negative: [c8], positive: [c8])-> f32 {
+        self:.strength(positive) - self:.strength(negative)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          PRIVATES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the input action named, none for an unknown name, warned about once
+     * */
+    fn actionOf(mut self, name: [c8])-> (InputAction)? {
+        if let Ok(a) = inputAction(name) { return (a)?; }
+
+        if name !in self._warned {
+            self._warned[name] = ();
+            log::warn #("Input", "Unknown input action", name, "read as never acted");
+        }
+
+        none
+    }
+
+}
+
+@companion
+mod ActionState {
+
+    /**
+     * @returns: the strength of an action in a copy of the input devices (see ActionState::strength)
+     * */
+    pub fn strengthIn(s: DeviceState, a: InputAction)-> f32 {
+        let mut strongest = 0.0f;
+        for b in a.bindings {
+            let mut v = s.strength(b);
+            if b.device == InputDevice::PAD_AXIS {
+                v = if v <= a.deadZone { 0.0f } else { (v - a.deadZone) / (1.0f - a.deadZone) };
+            }
+
+            if v > strongest { strongest = v; }
+        }
+
+        strongest
+    }
+
+}

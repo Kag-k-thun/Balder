@@ -3,7 +3,7 @@
 The editor of Balder lives in `editor/`, beside the library, as the start of a game engine editor. It edits a
 project: it opens on the project manager, then the editor window shows the outline of the scene on the left, over
 the files of the project, its viewport in the middle and the inspector of the node selected on the right, under a top row and above a status bar.
-The top row holds the logo, the menus (Scene, Add, Edit, View, and Gizmo: Select, Translate, Rotate and Scale, Q, W, E
+The top row holds the logo, the menus (Scene, Project, Add, Edit, View, and Gizmo: Select, Translate, Rotate and Scale, Q, W, E
 and R, as the tools of the toolbar of the viewport), a seam, the tabs of the scenes opened (see the
 documents below), then Compile, the camera the game is played through, and Play, Pause, Step and Stop (see *Playing*
 below). The window reads as one:
@@ -18,6 +18,7 @@ target/bin/balder-editor                                       # the project man
 target/bin/balder-editor --project path/to/game                # the editor, on a project
 target/bin/balder-editor --project path/to/game --scene res:/scenes/level.scene
 target/bin/balder-editor --engine-dir path/to/balder           # run from elsewhere than the engine's directory
+target/bin/balder-editor --project path/to/game --export path/to/folder  # export the game, without a window
 ```
 
 | Directory | Holds |
@@ -34,7 +35,7 @@ A project is a game made with Balder, a directory as Godot or Unreal have one:
 
 ```
 my_game/
-    project.toml             # its name, its scenes by name, the scene the game starts with
+    project.toml             # its name, its scenes by name, the scene the game starts with, its settings
     gyllir.toml              # the library of the game, a shared one, depending on Balder
     gyllir.toml.override     # the link of Balder to the engine of the editor, local, ignored by git
     src/my_game.yr           # the root module of the library: its actor classes
@@ -43,18 +44,40 @@ my_game/
 ```
 
 ```
-# The project of a game made with Balder: its name, its scenes by name and the scene the game starts with
+# The project of a game made with Balder: its name, its scenes by name, the scene the game starts with, then its settings
 name = "My game"
 main-scene = "main"
 
 [scenes]
 main = "res:/scenes/main.scene"
+
+[window]                          # the tables BalderConfig reads: [window], [vulkan], [timer], [shadow], [physics]
+name = "My game"
+width = {relative = 0.8, min = 1280}
+height = {relative = 0.8, min = 720}
+resizable = true
+
+[render]
+resolution = [1280, 720]          # the resolution the scene of the runtime renders at, scaled to the window
+
+[actions]                         # the input actions of the game (see doc/actors.md)
+forward = ["key:W", "pad:lefty-"]
+jump = ["key:Space", "pad:a"]
+aim = {bindings = ["mouse:right", "pad:lefttrigger+"], dead-zone = 0.3}
+
+[export]                          # see Export below
+include = ["res:/audio"]          # files or folders the code loads by path, shipped as they are
+archive = true
+decomposition = {hulls = 16, vertices = 32, concavity = 0.01, resolution = 64}
 ```
 
-The scenes are named, the game loading a scene by its name and the export knowing the scenes it ships. A project has
-no `main`: its library holds what the game adds to the engine, and the export (BAL-138) is to build the executable
-around it, a runtime of Balder loading the library and starting the main scene, as Unreal's launcher module runs the
-module of a game.
+The scenes are named, the game loading a scene by its name (`changeScene`) and the export knowing the scenes it ships.
+A project has no `main`: its library holds what the game adds to the engine, and the runtime of Balder
+(`balder-runtime`, see *The runtime* below) loads it and plays its main scene, as Unreal's launcher module runs the
+module of a game. `Project` (`balder::game`) reads and writes the file, the same for the same project, the engine tables
+kept as they are read; the runtime opens its window with `BalderConfig` of the file itself, which ignores the other
+tables. `Project::install` makes a project the one the program runs: its directory the one `res:/` names, its input
+actions the ones the scenes read.
 
 - **The library of the game.** The `gyllir.toml` of a project declares the library of the game as a shared target
   (`type = "shared"`, `libmy_game.so` in `target/lib`), its actor classes (see `doc/actors.md`), compiled against
@@ -84,13 +107,15 @@ module of a game.
   `{{compiler}}` filled in the names and the contents of its files, a name starting with `_` starting with a dot, the
   scenes given ids of their own); *Import…* opens the folder of a project; *Remove from the list* forgets one, its
   files staying. The list is kept in `$XDG_CONFIG_HOME/balder/projects.toml` (`~/.config/balder/projects.toml`,
-  `RecentProjects`), with the scene of each project edited last and the location of the last project created.
+  `RecentProjects`), with the scene of each project edited last, the folder it was exported to last (the one the
+  next export proposes, `export`), and the location of the last project created.
 - **The editor** opens on the scene of the project edited last, or on its main scene, or on a new scene. A library of
   the game newer than every source it is built from (the `.yr` files and the `gyllir.toml` of the project and of its
   dependencies, Balder included) is loaded first; otherwise the editor builds it in the background (`GameBuild`,
   `gyllir build <target> -v` in the folder of the project, its output in `.target/game-build.log`), the status bar
   telling how far (`BuildProgress`: the step, the target compiled and its modules, the steps of the last build, in
-  `.target/game-build.steps`, telling how many to expect), then loads it, the scene built again with its classes.
+  `.target/game-build.steps`, telling how many to expect) and a bar on its right with a cross cancelling the build
+  (see *Background tasks*), then loads it, the scene built again with its classes.
   **Compile**, the button on the right of the menu bar (or Ctrl+R), builds it again and reloads it, a change of the
   code of an actor taken without leaving the editor: the scene is described as its file would save it, its nodes
   dropped with the history naming them, the library closed (its classes unregistered, `unregisterActorClass`, the
@@ -133,6 +158,87 @@ camera. The outline shows the nodes played. The scene cannot change while it is 
 status bar telling to stop the game first, undo and redo do nothing; *Save* writes the nodes edited, not the nodes
 played; showing another tab, closing the scene, compiling the library of the game or going back to the project manager
 stops the game first.
+
+The game played reads the input actions of the project (`[actions]`, installed as the editor opens it and again once its
+settings are saved), through the scene while the viewport has the focus: typing in a field of the inspector moves
+nothing. Its requests are run at the next update of the editor (`PlayBar::update`): `changeScene` stops the game, opens
+the scene named in its tab and plays it, `quitGame` stops it. Nothing is played while the game is exported.
+
+## Project settings
+
+*Project → Settings…* (Ctrl+,) edits the settings of the project in a dialog (`ProjectSettingsDialog`,
+`editor/ui/project_settings.gui`), written to its `project.toml` on OK, Cancel dropping them (they are not undone as
+the changes of a scene are):
+
+| Tab | Holds |
+|---|---|
+| General | the name of the project, its main scene, the files the export ships as they are (`[export] include`, separated by commas), the archive, and the settings of the hulls the export decomposes |
+| Window | the title of the window, its width and its height as a share of the screen and a minimum in pixels (written only when they are changed, the other entries of `[window]` kept), resizable, and the resolution the scene renders at |
+| Input | the input actions, a row each with its bindings; *Add* and *Remove* an action, *Add a binding…* takes the next key (by its place on the keyboard), mouse button, gamepad button, or gamepad axis pushed past half its range as a binding of the action selected (Escape cancels), *Remove the last* drops its last binding |
+
+## Export
+
+*Project → Export…* (Ctrl+Shift+E) exports the game to a folder chosen (the `export` folder of the project first, which
+the templates ignore in git); `balder-editor --project <dir> --export <dir>` does the same without a window, printing each
+step and the problems, exiting 1 when it fails. The export (`GameExport`, `balder::game`) runs in a thread of its own,
+the status bar telling its step and the bar on its right how far it is, the cross beside it cancelling it (see
+*Background tasks*); the game played is stopped first, and the library of the game is neither built again nor played
+until it ends. Its steps, each told by its report (`ExportReport`):
+
+1. **Check**: the files of the game are found from the scenes of the project (`ResourceSet`): the assets their nodes
+   name (models, material files, the maps of both, the hulls saved next to a model, the materials and the buffers an
+   `.obj` or a `.gltf` reads beside it), the `[export] include`, and the files of the engine the runtime reads (its
+   interface `engine:/config/game.gui`, the fonts, the images, the colour tables, the tooltips, the dialogs). A file
+   missing and an actor of a class the library of the game does not declare (the dev build the editor loaded) are
+   errors naming the scene and the node, and nothing is written.
+2. **Decompose**: the models of the dynamic bodies shaped by their hulls are decomposed again when their file changed
+   since (`ConvexDecomposition::isUpToDate`, by the checksum of the model), with the settings they were decomposed
+   with, those of `[export] decomposition` for a model never decomposed; the hulls are saved in the project, next to
+   their model, for the editor and the next export.
+3. **Build the library and the runtime** in release (`gyllir build … --release --output-dir`, never replacing the dev
+   library the editor loaded), the runtime from the sources of the engine (`getEnginePath`); their output goes to
+   `.target/export.log` in the project, a failure showing its errors as a failed build of the library does.
+4. **Compile the shaders** the game ships (`ShaderBuild`): every config of `DefaultShaders` but the gizmo of the editor,
+   each SPIR-V file compiled again from its source with `glslc -O`, without `BALDER_DEBUG` (the debug views and the
+   outline of the editor), stripped by `spirv-opt` when it is installed.
+5. **Write** the folder, in `<folder>.partial` renamed at the end, so that a failed export leaves the last folder as it
+   was; then **pack** it in `<package>-<version>-linux-x86_64.tar.gz` when `[export] archive` is set.
+
+```
+export/my_game/
+    my_game                  # balder-runtime, renamed after the game; finds the rest next to it
+    project.toml             # the one of the project, naming the library: library = "lib/libmy_game.so"
+    lib/libmy_game.so        # the release build of the library of the game
+    res/…                    # the files of the project the scenes name, and the [export] includes
+    engine/res/…             # the files of the engine the runtime reads, and the shaders compiled for release
+```
+
+SDL3, Vulkan, assimp, harfbuzz and freetype stay libraries of the system.
+
+### Background tasks
+
+The export and the build of the library of the game (never both at once) show a bar on the right of the status bar,
+with a cross cancelling them (`project::cancel`). The programs they run (`gyllir`, `tar`) are `LoggedProcess`es
+(`balder::game`): each runs in a process group of its own (`setsid`), its pid written beside its log (`<log>.pid`), so
+that a cancel stops gyllir and the compilers it started, SIGTERM first (the compilers removing the files they were
+writing), SIGKILL 3 seconds later. An export cancelled (`ExportReport::cancel`) stops at its next step, or at the next
+piece of the work of its step (a model decomposed, a shader compiled, a file copied), its `<folder>.partial` removed,
+the last folder written staying; a build cancelled leaves the library loaded as it was.
+
+## The runtime
+
+`balder-runtime` (the target `runtime` of `gyllir.toml`, `runtime/`, linked with its symbols exported as the editor is)
+plays a game: it reads its `project.toml`, installs it, loads the library of the game (`GameLibrary::ofProject`: the
+`library` the file names, else the shared target of its `gyllir.toml`), opens its window and plays its main scene in a
+Scene3D filling it (`engine:/config/game.gui`) at the resolution of `[render]`, its active camera, or its first camera,
+drawing it (`GameActivity`). A scene the game asks for (`changeScene`) is built at the next update in place of the one
+played, `quitGame` closes the window.
+
+```
+target/bin/balder-runtime --project path/to/game               # a project, its dev library, the engine in the current directory
+target/bin/balder-runtime --project path/to/game --scene level2 --engine-dir path/to/balder --library path/to/lib.so
+export/my_game/my_game                                         # an exported game: the folder of the executable
+```
 
 ## Documents
 
@@ -391,7 +497,7 @@ the assets, shared by every mesh node drawing it, so a change is seen at once in
   `teapot.hulls`, see the convex decomposition of `doc/physics.md`), the shape of a body of the hulls of the model: the
   hulls and their vertices, the settings they were made with, drawn over the model, each in its colour, in the `hulls`
   layer of the debug lines of the scene (*Show the hulls* hides them). The editor does not decompose the models: the
-  export of a project will (BAL-138), the `decompose` tool meanwhile; a model without hulls saved gives a body the hull
+  export of a project decomposes the models of the dynamic bodies (see *Export*), the `decompose` tool any model; a model without hulls saved gives a body the hull
   of each of its parts (`MeshAsset.hulls`) (`HullsPanel`).
 - **Connections**: an actor has a panel of the connections of its signals to the slots of the actors of the scene
   (`ConnectionsPanel`, `Node3D.connections`), which the game makes as it builds the scene (`connectActors`), the editor

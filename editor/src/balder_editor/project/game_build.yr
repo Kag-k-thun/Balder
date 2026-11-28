@@ -2,8 +2,10 @@ in game_build;
 
 use balder_editor::project::build_progress;
 use balder::core::error;
+use balder::game::{game_library, logged_process};
+use balder::utils::toml_file;
 
-use std::{algorithm::searching, concurrency, config, fs, time};
+use std::{algorithm::searching, fs, time};
 
 /**
  * The build of the library of the game of a project: the shared target of its gyllir.toml (`type = "shared"`, see the
@@ -12,7 +14,7 @@ use std::{algorithm::searching, concurrency, config, fs, time};
  * =====
  * The build runs in the background (`gyllir build <target> -v`, in the directory of the project), its output written
  * to a log under the build cache of the project (GameBuild::LOG), from which `progress` tells how far it is and
- * `errors` why it failed:
+ * `errors` why it failed; `cancel` stops it, with the compilers gyllir runs (see LoggedProcess):
  * ```
  * let dmut b = copy GameBuild(directory);
  * b:.build();
@@ -35,7 +37,10 @@ pub class GameBuild {
     let _library: [c8];
 
     // The build running, none before build is called
-    let dmut _build: (&SubProcess)? = none;
+    let dmut _build: (&LoggedProcess)? = none;
+
+    // True once the build running, or the last one, is cancelled
+    let mut _cancelled: bool = false;
 
     // How far the build running is, and the length of its log read
     let dmut _progress: &BuildProgress = copy BuildProgress(0u32);
@@ -49,8 +54,8 @@ pub class GameBuild {
      * */
     pub self (directory: [c8])
         with _directory = directory
-        , _target = GameBuild::sharedTarget(directory)._0
-        , _library = GameBuild::libraryOf(directory)
+        , _target = GameLibrary::sharedTarget(directory)._0
+        , _library = GameLibrary::fileOf(directory)
         throws BalderError
     {}
 
@@ -105,6 +110,24 @@ pub class GameBuild {
     }
 
     /**
+     * @returns: true iif the build running, or the last one, was cancelled
+     * */
+    @field
+    pub fn isCancelled(self)-> bool {
+        self._cancelled
+    }
+
+    /**
+     * Stop the build running, the compilers it runs with it; finished tells once it stopped
+     * */
+    pub fn cancel(mut self) {
+        if let Ok(dmut p) = alias self._build {
+            p:.cancel();
+            self._cancelled = true;
+        }
+    }
+
+    /**
      * Start the build of the library, in the background
      * @throws:
      *    - &BalderError: if the build cannot be started
@@ -120,12 +143,8 @@ pub class GameBuild {
             if isFile(log) { removeFile(log); }
             self._progress = copy BuildProgress(self.expectedSteps());
             self._read = 0u64;
-
-            // the log and the target are given to sh as its arguments, so that they are never read as shell syntax
-            let dmut p = copy SubProcess("sh", copy ["-c", "exec gyllir build \"$2\" -v > \"$1\" 2>&1",
-                                                    "sh", self.log, self._target], cwd-> Path(self._directory));
-            p:.start(redirect-> false);
-            self._build = (alias p)?;
+            self._cancelled = false;
+            self._build = (copy LoggedProcess("gyllir", copy ["build", self._target, "-v"], self.log, cwd-> self._directory))?;
         } catch {
             err: &FsError => {
                 throw copy BalderError(f"The build of the library of ${self._directory} could not start: ${err}");
@@ -150,7 +169,7 @@ pub class GameBuild {
         if let Ok(c) = code && c == 0 {
             self:.readLog();
             {
-                utils::writeFile(Path(self._directory).push(GameBuild::STEPS).toStr(), f"${self._progress.steps}\n");
+                toml_file::writeFile(Path(self._directory).push(GameBuild::STEPS).toStr(), f"${self._progress.steps}\n");
             } catch {
                 _ => {}
             }
@@ -173,14 +192,7 @@ pub class GameBuild {
      * cannot be read
      * */
     pub fn errors(self)-> [[c8]] {
-        {
-            let dmut f = File::open(Path(self.log));
-            let text = f:.readAll();
-            f:.close();
-            errorsOf(text)
-        } catch {
-            _ => { [] }
-        }
+        GameBuild::errorsIn(self.log)
     }
 
     /**
@@ -199,7 +211,7 @@ pub class GameBuild {
             text ~= "\n" ~ e ~ "\n";
         }
 
-        utils::writeFile(file, text);
+        toml_file::writeFile(file, text);
         file
     }
 
@@ -280,6 +292,24 @@ pub mod GameBuild {
     pub def ERRORS = ".target/game-build-errors.txt";
 
     /**
+     * @returns: the errors of the log of a build of gyllir (the library of the game, the export), plain, each as the
+     * compiler writes it, its message, the place it names and the code there, or a line of gyllir; an error written
+     * twice kept once, none when the log names none or cannot be read
+     * @params:
+     *    - log: the absolute path of the log
+     * */
+    pub fn errorsIn(log: [c8])-> [[c8]] {
+        {
+            let dmut f = File::open(Path(log));
+            let text = f:.readAll();
+            f:.close();
+            errorsOf(text)
+        } catch {
+            _ => { [] }
+        }
+    }
+
+    /**
      * @returns: an error of the build on one line, its message and the place it names, `Error[E3027] : undefined
      * symbol x (src/a.yr:(3,5))`
      * */
@@ -308,7 +338,7 @@ pub mod GameBuild {
      * */
     pub fn has(directory: [c8])-> bool {
         {
-            GameBuild::sharedTarget(directory);
+            GameLibrary::sharedTarget(directory);
             true
         } catch {
             _ => { false }
@@ -321,7 +351,7 @@ pub mod GameBuild {
      * */
     pub fn hasEditor(directory: [c8])-> bool {
         {
-            let cfg = utils::readToml(Path(directory).push("gyllir.toml").toStr());
+            let cfg = toml_file::readToml(Path(directory).push("gyllir.toml").toStr());
             if let Ok(targets) = cfg["targets"]? {
                 return (targets[GameBuild::EDITOR_TARGET]?).hasValue;
             }
@@ -330,51 +360,6 @@ pub mod GameBuild {
         } catch {
             _ => { false }
         }
-    }
-
-    /**
-     * @returns: the name and the table of the shared target of the gyllir.toml of a project (`type = "shared"`), the
-     * first one when it declares several, and the configuration of the package
-     * @throws:
-     *    - &BalderError: if the file cannot be read, or declares no shared target
-     * */
-    pub fn sharedTarget(directory: [c8])-> ([c8], &Config, &Config)
-        throws BalderError
-    {
-        let file = Path(directory).push("gyllir.toml").toStr();
-        let cfg = utils::readToml(file);
-        if let Ok(targets: &Dict) = cfg["targets"]? {
-            for name in targets.sortedKeys() {
-                if let Ok(target) = targets[name]? && utils::stringOf(target, "type", file, optional-> true) == "shared" {
-                    return (name, target, cfg);
-                }
-            }
-        }
-
-        throw copy BalderError(f"${file} declares no shared target (type = \"shared\")");
-    }
-
-    /**
-     * @returns: the path of the library of a project, relative to its directory unless absolute: lib<output>.so, the
-     * output of its shared target (its name by default) in its output directory (the one of the package by default,
-     * else the directory of the project), as gyllir names them
-     * @throws:
-     *    - &BalderError: if the gyllir.toml of the project cannot be read, or declares no shared target
-     * */
-    pub fn libraryOf(directory: [c8])-> [c8]
-        throws BalderError
-    {
-        let (name, target, cfg) = GameBuild::sharedTarget(directory);
-        let file = Path(directory).push("gyllir.toml").toStr();
-        let mut output = utils::stringOf(target, "output", file, optional-> true);
-        if output.len == 0us { output = name; }
-
-        let library = f"lib${output}.so";
-        let mut dir = utils::stringOf(target, "output-dir", file, optional-> true);
-        if dir.len == 0us { dir = utils::stringOf(cfg, "output-dir", file, optional-> true); }
-        if dir.len == 0us { return library; }
-
-        Path(dir).push(library).toStr()
     }
 
 }

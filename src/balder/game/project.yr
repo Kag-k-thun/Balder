@@ -1,0 +1,388 @@
+in project;
+
+mod ::utils;
+
+use balder::core::{config, error};
+use balder::core::application::input::action;
+use balder::game::{export_settings, render_settings};
+use balder::game::project::utils;
+use balder::utils::{path, toml_file};
+
+use std::{config, fs};
+use std::algorithm::sorting;
+
+/**
+ * A game made with Balder: a directory holding project.toml, the gyllir.toml of the library of the game (its actor
+ * classes, built as a shared library the editor loads, see GameLibrary) and res/, the files the paths res:/ name (its
+ * scenes, its models...)
+ * @info:
+ * =====
+ * project.toml names the project, its scenes by name (the game loading a scene by its name, the export knowing the
+ * scenes it ships) and the scene the game starts with, then its settings:
+ * ```
+ * name = "My game"
+ * main-scene = "main"
+ *
+ * [scenes]
+ * main = "res:/scenes/main.scene"
+ *
+ * [window]                          # the tables BalderConfig reads: [window], [vulkan], [timer], [shadow], [physics]
+ * name = "My game"
+ * resizable = true
+ *
+ * [render]
+ * resolution = [1280, 720]          # the Scene3D of the runtime (see RenderSettings)
+ *
+ * [actions]                         # the input actions of the game (see InputAction, InputBinding)
+ * forward = ["key:W", "pad:lefty-"]
+ * aim = {bindings = ["mouse:right", "pad:lefttrigger+"], dead-zone = 0.3}
+ *
+ * [export]                          # see ExportSettings
+ * include = ["res:/audio"]
+ * archive = true
+ * decomposition = {hulls = 16, vertices = 32, concavity = 0.01, resolution = 64}
+ * ```
+ * A scene of the project saved by the editor joins its scenes, named after its file; the first one is its main scene.
+ * The tables BalderConfig reads are kept as they are read, the runtime opening its window with BalderConfig of the
+ * file itself (see config). The file is written by the std (toml::dump of the settings serialized), the same for the
+ * same project, its keys in order.
+ * ====
+ * */
+pub class Project {
+
+    // The absolute path of the directory of the project
+    let _directory: [c8];
+
+    // The name of the project
+    let mut _name: [c8];
+
+    // The scenes of the project, their paths (res:/…) by name
+    let dmut _scenes: [[c8] => [c8]] = copy [];
+
+    // The name of the scene the game starts with, empty when the project has no scene
+    let mut _mainScene: [c8] = "";
+
+    // The entries BalderConfig reads (the window, the driver...), by their keys, as they are read
+    let mut _engine: &Dict = Dict();
+
+    // How the runtime renders the scenes
+    let mut _render: RenderSettings = RenderSettings();
+
+    // The input actions of the game
+    let mut _actions: [InputAction] = [];
+
+    // How the game is exported
+    let mut _export: ExportSettings = ExportSettings();
+
+    /**
+     * A project of no scene yet
+     * @params:
+     *    - directory: the absolute path of its directory
+     *    - name: its name
+     * */
+    pub self (directory: [c8], name: [c8])
+        with _directory = directory
+        , _name = name
+    {}
+
+    /**
+     * Read the project of a directory, from its project.toml
+     * @params:
+     *    - directory: the absolute path of the directory of the project
+     * @throws:
+     *    - &BalderError: if the directory holds no project.toml, or one that cannot be read, its message telling why
+     * */
+    pub self open(directory: [c8])
+        with _directory = directory
+        , _name = ""
+        throws BalderError
+    {
+        let file = Path(directory).push(Project::FILE).toStr();
+        let cfg = toml_file::readToml(file);
+
+        self._name = toml_file::stringOf(cfg, "name", file);
+        self._mainScene = toml_file::stringOf(cfg, "main-scene", file, optional-> true);
+        if let Ok(scenes) = cfg["scenes"]? {
+            for s in toml_file::stringsOf(scenes, "scenes", file) {
+                self._scenes[s._0] = dcopy s._1;
+            }
+        }
+
+        if self._mainScene.len != 0us && self._mainScene !in self._scenes {
+            throw copy BalderError(f"${file}: the main scene '${self._mainScene}' is not one of the [scenes]");
+        }
+
+        self._engine = utils::engineOf(cfg);
+        self._render = utils::renderOf(cfg, file);
+        self._actions = utils::actionsOf(cfg, file);
+        self._export = utils::exportOf(cfg, file);
+    }
+
+    /**
+     * @returns: the absolute path of the directory of the project
+     * */
+    @field
+    pub fn directory(self)-> [c8] {
+        self._directory
+    }
+
+    /**
+     * @returns: the name of the project
+     * */
+    @field
+    pub fn name(self)-> [c8] {
+        self._name
+    }
+
+    /**
+     * Rename the project
+     * */
+    @field
+    pub fn name(mut self, name: [c8]) {
+        self._name = name;
+    }
+
+    /**
+     * @returns: the name of the scene the game starts with, empty when the project has no scene
+     * */
+    @field
+    pub fn mainScene(self)-> [c8] {
+        self._mainScene
+    }
+
+    /**
+     * Make a scene of the project the one the game starts with, nothing for a name none of its scenes has
+     * */
+    @field
+    pub fn mainScene(mut self, name: [c8]) {
+        if name in self._scenes { self._mainScene = name; }
+    }
+
+    /**
+     * @returns: the scenes of the project, their names and their paths (res:/…), in the order of their names
+     * */
+    @field
+    pub fn scenes(self)-> [([c8], [c8])] {
+        let dmut res: [([c8], [c8])] = [];
+        for name, path in self._scenes {
+            res ~= [(copy name, copy path)];
+        }
+
+        sort(alias res, |x, y| => { x._0 < y._0 });
+        res
+    }
+
+    /**
+     * @returns: the input actions of the game, in the order of their names
+     * */
+    @field
+    pub fn actions(self)-> [InputAction] {
+        self._actions
+    }
+
+    /**
+     * Replace the input actions of the game
+     * @info: the program reads them once the project is installed again (see install)
+     * */
+    @field
+    pub fn actions(mut self, actions: [InputAction]) {
+        self._actions = actions;
+    }
+
+    /**
+     * @returns: the table [window] of the project, as BalderConfig reads it, empty when it has none
+     * */
+    @field
+    pub fn window(self)-> &Config {
+        if let Ok(w) = self._engine[EngineEntry::WINDOW]? { return w; }
+        Dict()
+    }
+
+    /**
+     * Replace the table [window] of the project, an empty one removing it
+     * */
+    @field
+    pub fn window(mut self, table: &Config) {
+        let dmut engine = copy Dict();
+        for key, value in self._engine[] if key != EngineEntry::WINDOW {
+            engine[key] = value;
+        }
+
+        let empty = if let d: &Dict = table { d.len == 0us } else { false };
+        if !empty { engine[EngineEntry::WINDOW] = table; }
+
+        self._engine = engine;
+    }
+
+    /**
+     * @returns: how the runtime renders the scenes of the game
+     * */
+    @field
+    pub fn render(self)-> RenderSettings {
+        self._render
+    }
+
+    /**
+     * Change how the runtime renders the scenes of the game
+     * */
+    @field
+    pub fn render(mut self, render: RenderSettings) {
+        self._render = render;
+    }
+
+    /**
+     * @returns: how the game is exported
+     * */
+    @field
+    pub fn exportSettings(self)-> ExportSettings {
+        self._export
+    }
+
+    /**
+     * Change how the game is exported
+     * */
+    @field
+    pub fn exportSettings(mut self, export: ExportSettings) {
+        self._export = export;
+    }
+
+    /**
+     * @returns: the configuration of Balder of the project, read from its project.toml (its window, its driver...)
+     * @throws:
+     *    - &BalderError: if the file cannot be read, or holds a table BalderConfig refuses
+     * */
+    pub fn config(self)-> &BalderConfig
+        throws BalderError
+    {
+        BalderConfig(Path(self._directory).push(Project::FILE).toStr())
+    }
+
+    /**
+     * Make the project the one the program runs: its directory the one the paths res:/ name, its input actions the
+     * ones the scenes read
+     * @info: called by the runtime before the game ticks and by the play mode of the editor, between Window::lockFrame
+     * and unlockFrame once the game ticks
+     * */
+    pub fn install(self) {
+        setProjectPath(Path(self._directory));
+        setInputActions(self._actions);
+    }
+
+    /**
+     * @returns: the path (res:/…) of the scene the game starts with, none when the project has no scene
+     * */
+    pub fn mainScenePath(self)-> ([c8])? {
+        self._scenes[self._mainScene]
+    }
+
+    /**
+     * @returns: the path (res:/…) of a scene of the project, none when the project has no scene of that name
+     * @params:
+     *    - name: the name of the scene, in the [scenes] of project.toml
+     * */
+    pub fn scenePath(self, name: [c8])-> ([c8])? {
+        self._scenes[name]
+    }
+
+    /**
+     * @returns: the name of a scene of the project, none when the path is not one of its scenes
+     * @params:
+     *    - path: the path of the scene, as the project names it (res:/…)
+     * */
+    pub fn sceneNamed(self, path: [c8])-> ([c8])? {
+        for name, p in self._scenes if p == path {
+            return name?;
+        }
+
+        none
+    }
+
+    /**
+     * Put a scene in the project, named after its file (a free name when another scene has it), the main scene when the
+     * project had none
+     * @returns: the name of the scene, the one it had when it is in the project already
+     * @params:
+     *    - path: the path of the scene, under the res/ directory of the project (res:/…)
+     * */
+    pub fn addScene(mut self, path: [c8])-> [c8] {
+        if let Ok(name) = self.sceneNamed(path) { return name; }
+
+        let base = Path(path).stripExtension().file();
+        let mut name = base;
+        let mut i = 2us;
+        while name in self._scenes {
+            name = f"${base}_${i}";
+            i += 1us;
+        }
+
+        self._scenes[name] = dcopy path;
+        if self._mainScene.len == 0us { self._mainScene = name; }
+
+        name
+    }
+
+    /**
+     * @returns: the content of the project.toml of the project, the same for the same project
+     * */
+    pub fn content(self)-> [c8] {
+        let dmut file = copy Dict();
+        file["name"] = self._name.to!{&Config} ();
+        if self._mainScene.len != 0us {
+            file["main-scene"] = self._mainScene.to!{&Config} ();
+        }
+
+        for key, value in self._engine[] {
+            file[key] = value;
+        }
+
+        let dmut scenes = copy Dict();
+        for name, path in self._scenes {
+            scenes[name] = path.to!{&Config} ();
+        }
+
+        file["scenes"] = scenes;
+        file["render"] = self._render.to!{&Config} ();
+        file["actions"] = utils::actionsConfig(self._actions);
+        file["export"] = self._export.to!{&Config} ();
+
+        // the dump sorts the keys, the values at the root coming before the tables
+        let text = toml::dump(file);
+        let mut start = 0us;
+        while start < text.len && text[start] == '\n' {
+            start += 1us;
+        }
+
+        "# The project of a game made with Balder: its name, its scenes by name, the scene the game starts with, then its settings\n" ~ text[start .. $]
+    }
+
+    /**
+     * Write the project.toml of the project, replacing the one there
+     * @throws:
+     *    - &BalderError: if the file cannot be written
+     * */
+    pub fn save(self)
+        throws BalderError
+    {
+        toml_file::writeFile(Path(self._directory).push(Project::FILE).toStr(), self.content());
+    }
+
+}
+
+/**
+ * The file describing a project
+ * */
+pub mod Project {
+
+    /**
+     * The name of the file describing a project, at the root of its directory
+     * */
+    pub def FILE = "project.toml";
+
+    /**
+     * @returns: true iif a directory holds a project, its project.toml
+     * */
+    pub fn isProject(directory: [c8])-> bool {
+        isFile(Path(directory).push(FILE))
+    }
+
+}

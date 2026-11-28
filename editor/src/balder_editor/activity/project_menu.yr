@@ -1,0 +1,368 @@
+in project_menu;
+
+use balder_editor::{arguments, build_error_dialog, export_command, project_settings_dialog};
+use balder_editor::activity::{editor_context, file_choice, game_library_behavior, play_bar};
+use balder_editor::project::{game_build, recent};
+use balder::core::application::signal;
+use balder::game::{export_report, game_export};
+use balder::interface::dialog;
+use balder::interface::dialog::{file, message};
+use balder::interface::loader::registry::behaviors;
+use balder::utils::{log, path};
+
+use std::{concurrency, fs};
+
+use ::sdl3::mouse;
+
+// The .gui files of the dialogs of the menu
+def SETTINGS_DIALOG = "ui/project_settings.gui";
+def BUILD_ERROR_DIALOG = "ui/build_error.gui";
+
+// The problems listed in the dialog closing an export, the others counted
+def SHOWN_PROBLEMS = 12us;
+
+// The directory the games of a project are exported to first, in the directory of the project
+def DEFAULT_FOLDER = "export";
+
+/**
+ * The Project menu of the editor, mounted under the behavior 'project': the settings of the project edited in a dialog
+ * (see ProjectSettingsDialog), the game exported in a folder chosen in a file dialog (see GameExport), and that folder
+ * opened in the file manager; the button of the task of the status bar (project::cancel) cancels the export running,
+ * or the build of the library of the game
+ * @info:
+ * =====
+ * The export runs in a thread of its own, the status bar telling its step and the bar of its task, on its right, how
+ * far it is at each update (see update); the game played is stopped first, and the library of the game is neither
+ * built again nor played while it runs, the export checking the scenes against its classes. A dialog tells how it
+ * ended: the problems found, the folder written, or why it stopped; a build that failed shows its errors as the build
+ * of the library does, an export cancelled tells it in the status bar only.
+ * ====
+ * */
+#[behavior]
+pub class ProjectMenu over Behavior {
+
+    // What the behaviors of the editor share
+    let dmut _ctx: &EditorContext;
+
+    // The game played, stopped before an export
+    let dmut _play: &PlayBar;
+
+    // The library of the game, never exported while it is built
+    let dmut _library: &GameLibraryBehavior;
+
+    // The directory the game is exported to, the one chosen last (see lastExportFolder)
+    let dmut _folders: &FileChoice = copy FileChoice([], "");
+
+    // The export running, its report and its thread, none when none runs
+    let dmut _report: (&ExportReport)? = none;
+    let mut _thread: (future-> void)? = none;
+
+    // The dialog of the settings, while it is open
+    let dmut _settings: (&ProjectSettingsDialog)? = none;
+
+    // What the status bar told of the export last
+    let mut _told: [c8] = "";
+
+    // The directory the game was exported to in this editor, empty before the first export
+    let mut _exported: [c8] = "";
+
+    /**
+     * @params:
+     *    - ctx: what the behaviors of the editor share
+     *    - play: the game played
+     *    - library: the library of the game
+     * */
+    pub self (dmut ctx: &EditorContext, dmut play: &PlayBar, dmut library: &GameLibraryBehavior)
+        with _ctx = alias ctx
+        , _play = alias play
+        , _library = alias library
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SLOTS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    #[slot (name-> "settings")]
+    fn onSettingsClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.openSettings(); }
+    }
+
+    #[slot (name-> "export")]
+    fn onExportClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.chooseExport(); }
+    }
+
+    #[slot (name-> "open-export")]
+    fn onOpenExportClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.openExportFolder(); }
+    }
+
+    #[slot (name-> "cancel")]
+    fn onCancelClicked(mut self, b: u8) {
+        if b == SDL_BUTTON_LEFT { self:.cancelTask(); }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SETTINGS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Open the settings of the project in a dialog, written to its project.toml when they are accepted
+     * */
+    pub fn openSettings(mut self) {
+        if self._ctx.isAsking() { return; }
+        let dmut project = if let Ok(dmut p) = alias self._ctx.project { alias p } else {
+            self._ctx:.setStatus("The project could not be read: it has no settings to edit");
+            return;
+        };
+
+        if self.isExporting {
+            self._ctx:.setStatus("The game is being exported: its settings are edited once it is");
+            return;
+        }
+
+        let dmut d = copy ProjectSettingsDialog(editorFile(SETTINGS_DIALOG), alias project);
+        d:.answered():.connect(alias self._ctx.box, &self:.onSettingsAnswered);
+        self._settings = (alias d)?;
+        self._ctx:.openDialog(alias d);
+    }
+
+    /**
+     * The settings are written or cancelled: the project written is the one the program runs, its input actions read
+     * by the game played from its next tick
+     * */
+    fn onSettingsAnswered(mut self, saved: bool) {
+        self._ctx:.answered();
+        self._settings = none;
+        if saved {
+            if let Ok(p) = self._ctx.project {
+                self._ctx.window:.lockFrame();
+                p.install();
+                self._ctx.window:.unlockFrame();
+            }
+        }
+
+        self._ctx:.setStatus(if saved { f"Saved the settings of ${self._ctx.projectName()}" } else { "The settings are as they were" });
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          EXPORT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif an export runs
+     * */
+    @field
+    pub fn isExporting(self)-> bool {
+        self._thread.hasValue
+    }
+
+    /**
+     * Cancel the task running in the background: the export, which stops at its next step or at the next piece of its
+     * work (see GameExport), else the build of the library of the game
+     * */
+    pub fn cancelTask(mut self) {
+        if let Ok(dmut report) = alias self._report {
+            if report:.isCancelled() { return; }
+
+            report:.cancel();
+            self._told = "Cancelling the export…";
+            self._ctx:.setStatus(self._told);
+            return;
+        }
+
+        self._library:.cancel();
+    }
+
+    /**
+     * Choose the directory the game is exported to, then export it there
+     * */
+    pub fn chooseExport(mut self) {
+        if self._ctx.isAsking() { return; }
+        if self.isExporting {
+            self._ctx:.setStatus("The game is being exported already");
+            return;
+        }
+
+        if self._library:.isBuilding() {
+            self._ctx:.setStatus(f"The library of ${self._ctx.projectName()} is being built: export the game once it is");
+            return;
+        }
+
+        // the folder shown first is the one of the last export, its parent when it was removed, the project before any
+        let last = self.lastExportFolder();
+        self._folders.directory = if isDir(Path(last)) { last }
+                                  else if isDir(Path(last).parent()) { Path(last).parent().toStr() }
+                                  else { getProjectPath().toStr() };
+        self._ctx:.choose(alias self._folders, FileDialogMode::DIRECTORY, "Export the game to", &self:.onExportChosen);
+    }
+
+    fn onExportChosen(mut self, chosen: ([c8])?) {
+        let folder = if let Ok(f) = chosen { f } else { return; };
+        let project = if let Ok(p) = self._ctx.project { p } else { return; };
+        self._folders.directory = folder;
+        self._ctx:.keepExportFolder(folder);
+
+        // the game played holds nodes of the classes of the library, which the export checks the scenes against
+        self._play:.stop();
+
+        let dmut report = copy ExportReport();
+        let dmut export = copy GameExport(project, folder, alias report);
+        self._report = (alias report)?;
+        self._exported = folder;
+        self._told = "";
+        self._ctx.exporting = true;
+        self._thread = (spawn export:.runReported())?;
+        self._ctx:.showTask(0.0f);
+        self._ctx:.setStatus(f"Exporting ${project.name} to ${folder}");
+    }
+
+    /**
+     * Tell how far the export is in the status bar, and how it ended once it ends
+     * @info: called at each update of the editor
+     * */
+    pub fn update(mut self) {
+        if let Ok(dmut d) = alias self._settings { d:.update(); }
+
+        let dmut report = if let Ok(dmut r) = alias self._report { alias r } else { return; };
+        if !report:.isFinished() {
+            let text = if report:.isCancelled() { "Cancelling the export…" } else { report:.text() };
+            if text != self._told {
+                self._ctx:.setStatus(text);
+                self._told = text;
+            }
+
+            self._ctx:.showTask(report:.progress());
+            return;
+        }
+
+        self._ctx:.hideTask();
+
+        if let Ok(t) = self._thread { t.value; }
+        self._thread = none;
+        self._report = none;
+        self._ctx.exporting = false;
+        self:.tellEnd(alias report);
+    }
+
+    /**
+     * Tell how an export ended: the errors of a build that failed in the dialog of the build errors, else a dialog of the
+     * problems found and of the folder written, or of why the export stopped
+     * */
+    fn tellEnd(mut self, dmut report: &ExportReport) {
+        let name = self._ctx.projectName();
+        let directory = getProjectPath().toStr();
+        let logFile = GameExport::logOf(directory);
+        let problems = report:.problems();
+
+        let mut text = "";
+        // an export cancelled once its last step was done is written still
+        if report:.isCancelled() && report:.failure().hasValue {
+            self._ctx:.setStatus(f"The export of ${name} was cancelled");
+            return;
+        }
+
+        if let Ok(failure) = report:.failure() {
+            self._ctx:.setStatus(f"The export failed: ${failure}");
+            let errors = GameBuild::errorsIn(logFile);
+            if errors.len != 0us {
+                self:.showBuildErrors(name, errors, logFile);
+                return;
+            }
+
+            text = failure;
+        } else if let Ok(result) = report:.result() {
+            self._ctx:.setStatus(f"Exported ${name} to ${result}");
+            if problems.len == 0us { return; }
+            text = f"Exported ${name} to ${result}";
+        }
+
+        for i, p in problems if i < SHOWN_PROBLEMS {
+            text ~= "\n" ~ textOf(p);
+        }
+
+        if problems.len > SHOWN_PROBLEMS {
+            text ~= f"\n… and ${problems.len - SHOWN_PROBLEMS} more, see ${logFile}";
+        }
+
+        let dmut d = copy MessageDialog(text, title-> f"Export of ${name}", yes-> "Close", no-> "Open the folder");
+        d:.answered():.connect(alias self._ctx.box, &self:.onEndAnswered);
+        {
+            d:.open(DialogMode::OVERLAY, alias self._ctx.gui);
+        } catch {
+            err => {
+                log::error #("Editor", "Failed to open the dialog of the export", err);
+            }
+        }
+    }
+
+    fn onEndAnswered(mut self, answer: MessageDialogStatus) {
+        if answer == MessageDialogStatus::NO { self:.openExportFolder(); }
+    }
+
+    /**
+     * Show the errors of a build of the export, as the build of the library shows them
+     * */
+    fn showBuildErrors(mut self, name: [c8], errors: [[c8]], logFile: [c8]) {
+        let first = GameBuild::summary(errors[0]);
+        {
+            let dmut d = copy BuildErrorDialog(editorFile(BUILD_ERROR_DIALOG), f"${name} (exported in release)", first, "", logFile);
+            d:.open(DialogMode::OVERLAY, alias self._ctx.gui);
+        } catch {
+            err => {
+                log::error #("Editor", "Failed to open the dialog of the errors of the build", err);
+            }
+        }
+    }
+
+    /**
+     * Open the directory of the last export in the file manager of the desktop
+     * */
+    pub fn openExportFolder(mut self) {
+        let folder = self.lastExportFolder();
+        if !isDir(Path(folder)) {
+            self._ctx:.setStatus(f"No game was exported to ${folder} yet");
+            return;
+        }
+
+        {
+            let dmut p = copy SubProcess("xdg-open", copy [folder]);
+            p:.start(redirect-> false);
+            __OPENERS__ ~= [alias p];
+        } catch {
+            err => {
+                self._ctx:.setStatus(f"${folder} could not be opened: ${err}");
+            }
+        }
+    }
+
+    /**
+     * @returns: the directory the game was exported to last: in this editor, else in another one (kept in the recent
+     * projects, see EditorContext::keepExportFolder), else the `export` folder of the project, which may not exist yet
+     * */
+    fn lastExportFolder(self)-> [c8] {
+        if self._exported.len != 0us { return self._exported; }
+
+        let project = getProjectPath().toStr();
+        let kept = copy RecentProjects().exportFolderOf(project);
+        if kept.len != 0us { kept } else { Path(project).push(DEFAULT_FOLDER).toStr() }
+    }
+
+}
+
+/**
+ * The file managers started, kept until the editor quits so that they are never collected while they run
+ * */
+lazy dmut __OPENERS__: [&SubProcess] = [];

@@ -3,10 +3,11 @@ in game_library_behavior;
 use balder_editor::{arguments, build_error_dialog, material_document};
 use balder_editor::activity::{documents, editor_context};
 use balder_editor::command::open;
-use balder_editor::project::{game_build, game_library};
+use balder_editor::project::game_build;
 
 use balder::core::application::signal;
 use balder::core::error;
+use balder::game::game_library;
 use balder::interface::dialog;
 use balder::interface::loader::registry::behaviors;
 use balder::interface::widget::button::push;
@@ -38,8 +39,9 @@ def BUILD_REFRESH = 250u64;
  * The library of the game of the project (the shared target of its gyllir.toml, see GameBuild) is loaded in the editor
  * (see GameLibrary), the #[actor] tags of its classes registering them: the Add menu lists them (see actorsChanged),
  * the inspector edits their nodes and the scene files build them. A library newer than its sources is loaded before
- * the first scene is opened; otherwise it is built in the background, the status bar telling how far, then loaded, the
- * scene rebuilt with its classes. Compile builds it again and reloads it, a change of the code of an actor taken
+ * the first scene is opened; otherwise it is built in the background, the status bar telling how far, and the bar of
+ * its task on its right (see EditorContext::showTask), then loaded, the scene rebuilt with its classes; the button of
+ * the task cancels the build (see cancel). Compile builds it again and reloads it, a change of the code of an actor taken
  * without leaving the editor: the scene is described as its file would save it, its nodes dropped, the library closed
  * (its classes unregistered) and opened again, then the scene is built again from its description with the classes of
  * the new library, read leniently (an entry, a signal or a connection its class no longer declares dropped and logged,
@@ -182,6 +184,11 @@ pub class GameLibraryBehavior over Behavior {
             return;
         };
 
+        if self._ctx.exporting {
+            self._ctx:.setStatus("The game is being exported: its library is built again once it is");
+            return;
+        }
+
         if b:.isRunning() {
             self._ctx:.setStatus(f"The library of ${self._ctx.projectName()} is being built");
             return;
@@ -199,7 +206,21 @@ pub class GameLibraryBehavior over Behavior {
 
         self._sinceRefresh = 0u64;
         self._ctx:.setStatus(f"Building the library of ${self._ctx.projectName()}…");
+        self._ctx:.showTask(0.0f);
         self:.showCompile();
+    }
+
+    /**
+     * Cancel the build of the library, the library loaded staying
+     * */
+    pub fn cancel(mut self) {
+        if !self:.isBuilding() { return; }
+        if let Ok(dmut b) = alias self._build {
+            if b.isCancelled { return; }
+            b:.cancel();
+        }
+
+        self._ctx:.setStatus(f"Cancelling the build of the library of ${self._ctx.projectName()}…");
     }
 
     /**
@@ -212,10 +233,11 @@ pub class GameLibraryBehavior over Behavior {
         if let Ok(dmut b) = alias self._build {
             code = b:.finished();
             self._sinceRefresh += delta.allMillis;
-            if !code.hasValue && self._sinceRefresh >= BUILD_REFRESH && b:.isRunning() {
+            if !code.hasValue && self._sinceRefresh >= BUILD_REFRESH && !b.isCancelled && b:.isRunning() {
                 self._sinceRefresh = 0u64;
                 let progress = b:.progress();
                 status = f"Building the library of ${self._ctx.projectName()}: ${cast!u32(progress.done * 100.0f)}% — ${progress.step}";
+                self._ctx:.showTask(progress.done);
             }
         }
 
@@ -237,13 +259,18 @@ pub class GameLibraryBehavior over Behavior {
 
     /**
      * The library of the game is built, or failed to: it is loaded, the scene rebuilt with its classes, or the status
-     * bar tells the first error of the build, and a dialog shows it as the compiler wrote it, the library loaded staying
+     * bar tells the first error of the build, and a dialog shows it as the compiler wrote it, the library loaded
+     * staying; a build cancelled is only told
      * @params:
      *    - code: the exit code of the build
      * */
     fn onBuilt(mut self, code: i32) {
         self:.showCompile();
-        if code == 127 {
+        self._ctx:.hideTask();
+        let cancelled = if let Ok(b) = self._build { b.isCancelled } else { false };
+        if cancelled && code != 0 {
+            self._ctx:.setStatus(f"The build of the library of ${self._ctx.projectName()} was cancelled");
+        } else if code == 127 {
             self._ctx:.setStatus(f"The library of ${self._ctx.projectName()} could not be built: gyllir is not found");
         } else if code != 0 {
             self:.onBuildFailed();

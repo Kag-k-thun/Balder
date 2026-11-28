@@ -1,0 +1,231 @@
+in export_report;
+
+use balder::game::{export_problem, export_step};
+
+/**
+ * How far the export of a game is, written by the export (run in a thread of its own by the editor) and read by the
+ * status bar of the editor at each update: the step running, the work done in it, the problems found, and the end of
+ * the export; the editor asks the export to stop through it (see cancel)
+ * @info: every method takes the lock of the report, the export writing it while the editor reads it
+ * */
+pub class ExportReport {
+
+    // The step running
+    let mut _step: ExportStep = ExportStep::CHECK;
+
+    // The work done in the step and the work it has, 0 of 0 for a step not counted
+    let mut _done: usize = 0us;
+    let mut _total: usize = 0us;
+
+    // What the step works on, a model decomposed, a file copied, empty for nothing told
+    let mut _item: [c8] = "";
+
+    // The problems found
+    let mut _problems: [ExportProblem] = [];
+
+    // The end of the export: the folder or the archive written, or the error that stopped it, none while it runs
+    let mut _result: ([c8])? = none;
+    let mut _failure: ([c8])? = none;
+
+    // True once the export is asked to stop
+    let mut _cancelled: bool = false;
+
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          WRITING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Start a step
+     * @params:
+     *    - total: the work it has, 0 when it is not counted
+     * */
+    pub fn begin(mut self, step: ExportStep, total: usize = 0us) {
+        atomic self {
+            self._step = step;
+            self._done = 0us;
+            self._total = total;
+            self._item = "";
+        }
+    }
+
+    /**
+     * Count a piece of the work of the step done
+     * @params:
+     *    - item: what it was
+     * */
+    pub fn advance(mut self, item: [c8]) {
+        atomic self {
+            self._done += 1us;
+            self._item = item;
+        }
+    }
+
+    /**
+     * Tell what the step works on, without counting it
+     * */
+    pub fn working(mut self, item: [c8]) {
+        atomic self {
+            self._item = item;
+        }
+    }
+
+    /**
+     * Add problems found
+     * */
+    pub fn addProblems(mut self, problems: [ExportProblem]) {
+        atomic self {
+            self._problems ~= problems;
+        }
+    }
+
+    /**
+     * End the export
+     * @params:
+     *    - result: the folder or the archive written
+     * */
+    pub fn succeed(mut self, result: [c8]) {
+        atomic self {
+            self._step = ExportStep::DONE;
+            self._result = result?;
+        }
+    }
+
+    /**
+     * End the export on an error
+     * @params:
+     *    - message: why it stopped
+     * */
+    pub fn fail(mut self, message: [c8]) {
+        atomic self {
+            self._failure = message?;
+        }
+    }
+
+    /**
+     * Ask the export to stop: it stops at its next step, or at the next piece of work of its step, the programs it runs
+     * cancelled (a build, the archive), and ends failed, nothing written
+     * */
+    pub fn cancel(mut self) {
+        atomic self {
+            self._cancelled = true;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          READING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the step running, or the step that failed
+     * */
+    pub fn step(mut self)-> ExportStep {
+        atomic self {
+            self._step
+        }
+    }
+
+    /**
+     * @returns: the problems found
+     * */
+    pub fn problems(mut self)-> [ExportProblem] {
+        atomic self {
+            self._problems
+        }
+    }
+
+    /**
+     * @returns: true iif the export was asked to stop
+     * */
+    pub fn isCancelled(mut self)-> bool {
+        atomic self {
+            self._cancelled
+        }
+    }
+
+    /**
+     * @returns: true iif the export ended, done or stopped by an error
+     * */
+    pub fn isFinished(mut self)-> bool {
+        atomic self {
+            self._result.hasValue || self._failure.hasValue
+        }
+    }
+
+    /**
+     * @returns: the folder or the archive written, none while the export runs or when it failed
+     * */
+    pub fn result(mut self)-> ([c8])? {
+        atomic self {
+            self._result
+        }
+    }
+
+    /**
+     * @returns: why the export stopped, none while it runs or when it succeeded
+     * */
+    pub fn failure(mut self)-> ([c8])? {
+        atomic self {
+            self._failure
+        }
+    }
+
+    /**
+     * @returns: how far the export is, from 0 to 1: the steps done, and the share of the step running done when its work
+     * is counted (the models decomposed, the shaders compiled, the files copied), 1 once it is done
+     * */
+    pub fn progress(mut self)-> f32 {
+        atomic self {
+            let steps = cast!f32(cast!u32(cast!u8(ExportStep::DONE)));
+            let mut inside = 0.0f;
+            if self._total != 0us { inside = cast!f32(cast!u32(self._done)) / cast!f32(cast!u32(self._total)); }
+            let res = (cast!f32(cast!u32(cast!u8(self._step))) + inside) / steps;
+            if res > 1.0f { 1.0f } else { res }
+        }
+    }
+
+    /**
+     * @returns: the step as the status bar tells it: `Export: decomposing 2/5 · res:/models/teapot.obj`
+     * */
+    pub fn text(mut self)-> [c8] {
+        atomic self {
+            let mut res = f"Export: ${ExportReport::verbOf(self._step)}";
+            if self._total != 0us { res ~= f" ${self._done}/${self._total}"; }
+            if self._item.len != 0us { res ~= f" · ${self._item}"; }
+            res
+        }
+    }
+
+}
+
+/**
+ * The steps as a report tells them
+ * */
+pub mod ExportReport {
+
+    /**
+     * @returns: what a step does, as the status bar tells it
+     * */
+    pub fn verbOf(step: ExportStep)-> [c8] {
+        match step {
+            ExportStep::CHECK         => { "checking the scenes" }
+            ExportStep::DECOMPOSE     => { "decomposing the hulls" }
+            ExportStep::BUILD_LIBRARY => { "building the library of the game in release" }
+            ExportStep::BUILD_RUNTIME => { "building the runtime in release" }
+            ExportStep::SHADERS       => { "compiling the shaders" }
+            ExportStep::WRITE         => { "writing the files" }
+            ExportStep::ARCHIVE       => { "packing the archive" }
+            _                         => { "done" }
+        }
+    }
+
+}

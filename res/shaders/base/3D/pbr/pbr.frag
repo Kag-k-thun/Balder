@@ -16,8 +16,10 @@ layout (location = 4) in vec4 inTangents;
 layout (location = 5) in vec4 inCurrent;
 layout (location = 6) in vec4 inPrevious;
 
+#ifdef BALDER_DEBUG
 // The debug view of the camera, the word of the instance, the cluster drawn and the level of detail, see the vertex shader
 layout (location = 7) flat in uvec4 inDebug;
+#endif
 
 // The normal, folded by octEncode
 layout (location = 0) out vec2 normals;
@@ -71,12 +73,14 @@ layout (std430, set = 0, binding = 7) readonly buffer Materials {
 // The bit of the material word set when the object is outlined, the other bits holding its material
 const uint OUTLINED = 0x80000000u;
 
+#ifdef BALDER_DEBUG
 // The first debug view of a channel of the materials (see DebugView), shaded by the composition from the materials
 const uint FIRST_CHANNEL_VIEW = 5u;
 
 // The debug view of the edges of the triangles, the g-buffer holding the colour of each triangle as for TRIANGLES, the
 // composition drawing the edges where it changes
 const uint WIREFRAME_VIEW = 4u;
+#endif
 
 /**
  * The threshold of a pixel in a 4x4 ordered dithering matrix, in (0, 1)
@@ -148,6 +152,7 @@ vec2 motion () {
     return (current - previous) * 0.5;
 }
 
+#ifdef BALDER_DEBUG
 // The cluster of a command drawing a whole level
 const uint NO_CLUSTER = 0xffffffffu;
 
@@ -193,6 +198,7 @@ vec3 debugColor () {
                                       vec3 (1.0, 0.5, 0.05), vec3 (0.9, 0.1, 0.1), vec3 (0.8, 0.1, 0.8));
     return levels [min (inDebug.w, 5u)];
 }
+#endif
 
 void main() {
     crossFade ();
@@ -207,12 +213,14 @@ void main() {
     surface = vec2 (metallicRoughness.b, metallicRoughness.g);
     emissive = vec4 (texture (emissiveMap, uv).rgb, 1.0);
 
+#ifdef BALDER_DEBUG
     // the debug views of the geometry show a flat colour, the composition lighting it from the eye
     if (inDebug.x != 0u && inDebug.x < FIRST_CHANNEL_VIEW) {
         albedo = vec4 (debugColor (), 1.0);
         surface = vec2 (0.0, 1.0);
         emissive = vec4 (0.0);
     }
+#endif
 
     materialID = inMaterial;
     velocity = motion ();
