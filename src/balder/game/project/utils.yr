@@ -1,0 +1,266 @@
+in utils;
+
+use balder::core::error;
+use balder::core::application::input::{action, binding};
+use balder::game::{export_settings, render_settings};
+
+use std::config;
+
+/**
+ * The entries of project.toml BalderConfig reads (the window, the driver, the timer, the shadows, the physics, the
+ * filters of the log), kept as they are read and written back as they are
+ * */
+pub enum EngineEntry
+| LOG_FILTER = "log-filter"
+| PHYSICS    = "physics"
+| SHADOW     = "shadow"
+| TIMER      = "timer"
+| VULKAN     = "vulkan"
+| WINDOW     = "window";
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          READING          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the entries of a project.toml that BalderConfig reads (see EngineEntry), by their keys, as they are
+ * */
+pub fn engineOf(cfg: &Config)-> &Dict {
+    let dmut res = copy Dict();
+    for e in EngineEntry::__members__ {
+        if let Ok(value) = cfg[e]? {
+            res[e] = value;
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the table [render] of a project.toml, the defaults of RenderSettings when it is missing
+ * @throws:
+ *    - &BalderError: if an entry is not of its type
+ * */
+pub fn renderOf(cfg: &Config, file: [c8])-> RenderSettings
+    throws BalderError
+{
+    let mut render = RenderSettings();
+    if let Ok(table) = cfg["render"]? {
+        if let Ok(value) = table["resolution"]? {
+            let mut size: [u32] = [];
+            if let arr: &Array = value {
+                for v in arr[] {
+                    size ~= [integerOf(v, "render.resolution", file)];
+                }
+            }
+
+            if size.len != 2us || size[0] == 0u32 || size[1] == 0u32 {
+                throw copy BalderError(f"${file}: 'render.resolution' must be two positive integers, [width, height]");
+            }
+
+            render.resolution = (size[0], size[1]);
+        }
+    }
+
+    render
+}
+
+/**
+ * @returns: the table [actions] of a project.toml, in the order of their names: an action is the array of the texts of
+ * its bindings (see InputBinding), or a table of them, `bindings` and `dead-zone`
+ * @throws:
+ *    - &BalderError: if an action is neither, or a binding cannot be read, the file and the action named
+ * */
+pub fn actionsOf(cfg: &Config, file: [c8])-> [InputAction]
+    throws BalderError
+{
+    let mut res: [InputAction] = [];
+    if let Ok(table) = cfg["actions"]? {
+        if let d: &Dict = table {
+            for name in d.sortedKeys() {
+                if let Ok(value) = d[name]? {
+                    res ~= [actionOf(name, value, file)];
+                }
+            }
+        } else {
+            throw copy BalderError(f"${file}: [actions] must be a table of actions");
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the table [export] of a project.toml, the defaults of ExportSettings for what it does not set
+ * @throws:
+ *    - &BalderError: if an entry is not of its type
+ * */
+pub fn exportOf(cfg: &Config, file: [c8])-> ExportSettings
+    throws BalderError
+{
+    let mut export = ExportSettings();
+    if let Ok(table) = cfg["export"]? {
+        if let Ok(value) = table["include"]? {
+            export.include = stringListOf(value, "export.include", file);
+        }
+
+        if let Ok(value) = table["archive"]? {
+            match value {
+                Bool(value-> b) => { export.archive = b; }
+                _ => {
+                    throw copy BalderError(f"${file}: 'export.archive' must be a boolean");
+                }
+            }
+        }
+
+        if let Ok(d) = table["decomposition"]? {
+            let path = "export.decomposition";
+            if let Ok(v) = d["hulls"]? { export.decomposition.maxHulls = integerOf(v, f"${path}.hulls", file); }
+            if let Ok(v) = d["vertices"]? { export.decomposition.maxVertices = integerOf(v, f"${path}.vertices", file); }
+            if let Ok(v) = d["concavity"]? { export.decomposition.concavity = numberOf(v, f"${path}.concavity", file); }
+            if let Ok(v) = d["resolution"]? { export.decomposition.resolution = integerOf(v, f"${path}.resolution", file); }
+        }
+    }
+
+    export
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          WRITING          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the table [actions], the bindings of each action by its name (see InputBinding's serialization), in a table
+ * with its dead zone when it is not the default one
+ * */
+pub fn actionsConfig(actions: [InputAction])-> &Dict {
+    let dmut table = copy Dict();
+    for a in actions {
+        let bindings = a.bindings.to!{&Config} ();
+        if a.deadZone == InputAction().deadZone {
+            table[a.name] = bindings;
+        } else {
+            let dmut entry = copy Dict();
+            entry["bindings"] = bindings;
+            entry["dead-zone"] = a.deadZone.to!{&Config} ();
+            table[a.name] = entry;
+        }
+    }
+
+    table
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          PRIVATES          ====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * @returns: the action of the table [actions] named, read from its value
+ * @throws:
+ *    - &BalderError: if the value is neither an array of strings nor a table of them and of a dead zone, or a binding
+ *      cannot be read
+ * */
+fn actionOf(name: [c8], value: &Config, file: [c8])-> InputAction
+    throws BalderError
+{
+    let mut texts: [[c8]] = [];
+    let mut deadZone = InputAction().deadZone;
+    if let d: &Dict = value {
+        if let Ok(b) = d["bindings"]? {
+            texts = stringListOf(b, f"actions.${name}.bindings", file);
+        }
+
+        if let Ok(z) = d["dead-zone"]? {
+            deadZone = numberOf(z, f"actions.${name}.dead-zone", file);
+            if deadZone < 0.0f || deadZone >= 1.0f {
+                throw copy BalderError(f"${file}: the dead zone of action \"${name}\" must be in [0, 1)");
+            }
+        }
+    } else {
+        texts = stringListOf(value, f"actions.${name}", file);
+    }
+
+    let mut bindings: [InputBinding] = [];
+    for t in texts {
+        let b = {
+            InputBinding::parse(t, name)
+        } catch {
+            err: &BalderError => {
+                throw copy BalderError(f"${file}: ${err.msg}");
+            }
+        };
+
+        bindings ~= [b];
+    }
+
+    InputAction(name-> name, bindings-> bindings, deadZone-> deadZone)
+}
+
+/**
+ * @returns: the strings of an array of toml
+ * @throws:
+ *    - &BalderError: if the value is not an array of strings
+ * */
+fn stringListOf(value: &Config, key: [c8], file: [c8])-> [[c8]]
+    throws BalderError
+{
+    let mut res: [[c8]] = [];
+    if let arr: &Array = value {
+        for v in arr[] {
+            match v {
+                Str(value-> s) => { res ~= [s]; }
+                _ => {
+                    throw copy BalderError(f"${file}: '${key}' must be an array of strings");
+                }
+            }
+        }
+
+        return res;
+    }
+
+    throw copy BalderError(f"${file}: '${key}' must be an array of strings");
+}
+
+/**
+ * @returns: the positive integer of a toml value
+ * @throws:
+ *    - &BalderError: if the value is not an integer from 0 to u32::max
+ * */
+fn integerOf(value: &Config, key: [c8], file: [c8])-> u32
+    throws BalderError
+{
+    if let Int(value-> i) = value {
+        if i >= 0i64 && i <= cast!i64(u32::max) { return cast!u32(i); }
+    }
+
+    throw copy BalderError(f"${file}: '${key}' must be a positive integer");
+}
+
+/**
+ * @returns: the number of a toml value, a float or an integer
+ * @throws:
+ *    - &BalderError: if the value is not a number
+ * */
+fn numberOf(value: &Config, key: [c8], file: [c8])-> f32
+    throws BalderError
+{
+    match value {
+        Float(value-> f) => { return cast!f32(f); }
+        Int(value-> i) => { return cast!f32(i); }
+        _ => {
+            throw copy BalderError(f"${file}: '${key}' must be a number");
+        }
+    }
+}
